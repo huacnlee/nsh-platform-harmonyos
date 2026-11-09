@@ -406,13 +406,14 @@ impl TextEngine for OhosTextEngine {
                     style.set_font_families(&[&family]);
                 }
             }
-            if span.style.line_height.0 > 0.0
-                && span.style.font_size.0 > 0.0
-                && let Err(error) = style.set_font_height(
+            if span.style.line_height.0 > 0.0 && span.style.font_size.0 > 0.0 {
+                // Match the other text engines: split extra line height above and below the font.
+                style.set_half_leading(true);
+                if let Err(error) = style.set_font_height(
                     span.style.line_height.0 as f64 / span.style.font_size.0 as f64,
-                )
-            {
-                log::warn!("OHOS text line height: {error}");
+                ) {
+                    log::warn!("OHOS text line height: {error}");
+                }
             }
             builder.push_text_style(&mut style);
             let mut start = span.start as usize;
