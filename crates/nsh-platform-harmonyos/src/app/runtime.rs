@@ -714,9 +714,7 @@ impl App {
         }
     }
     pub(crate) fn grant(&mut self, granted: Option<nsh_engine::Capabilities>) {
-        if let nsh_engine::App::Js(bundle) = &mut self.app
-            && bundle.policy.granted.is_none()
-        {
+        if let nsh_engine::App::Js(bundle) = &mut self.app {
             bundle.policy.granted = granted;
         }
     }
