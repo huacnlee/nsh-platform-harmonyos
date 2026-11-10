@@ -377,10 +377,16 @@ impl System {
                 Ok(())
             }
             A::Open { id, src, settings } => {
-                // Asset reads and temp copies still run on the UI thread. Move Open
-                // to a worker like Load only when command ordering can be preserved.
+                // HAP rawfiles go straight to AVPlayer by descriptor. Other asset
+                // providers retain staging and its existing command ordering.
+                let asset = if src.starts_with("asset:/") {
+                    assets.raw_asset(&src)
+                } else {
+                    None
+                };
                 let (uri, temp_file, open_error) =
-                    if src.starts_with("http://") || src.starts_with("https://") {
+                    if asset.is_some() || src.starts_with("http://") || src.starts_with("https://")
+                    {
                         (src, false, None)
                     } else if let Some(rest) = src.strip_prefix("file://") {
                         let path = percent_encoding::percent_decode_str(rest)
@@ -417,6 +423,7 @@ impl System {
                         op: "audio-open".into(),
                         count: Some(id),
                         uri: Some(uri),
+                        asset,
                         has_only: Some(temp_file),
                         text: open_error,
                         volume: Some(f64::from(settings.volume)),
@@ -776,6 +783,7 @@ pub(crate) struct SystemCommand {
     pub op: String,
     pub text: Option<String>,
     pub uri: Option<String>,
+    pub asset: Option<String>,
     pub has_only: Option<bool>,
     pub name: Option<String>,
     pub title: Option<String>,

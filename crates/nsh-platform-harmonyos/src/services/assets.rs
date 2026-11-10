@@ -10,6 +10,13 @@ const MAX_ASSET: u64 = 64 << 20;
 /// The engine's assets, with the streaming reads the video player and web
 /// views take large files with.
 pub(crate) trait StreamAssets: nsh_engine::Assets {
+    /// The rawfile name (`assets/...`) behind an `asset:/` URI when the
+    /// platform's assets are the HAP's rawfiles; `None` for custom asset
+    /// directories, packages and the dev server.
+    fn raw_asset(&self, _uri: &str) -> Option<String> {
+        None
+    }
+
     /// The file behind `uri` when it is one on disk, opened.
     fn open_file(&self, _uri: &str) -> Option<Result<std::fs::File, String>> {
         None
@@ -48,6 +55,17 @@ impl HostAssets {
 }
 
 impl StreamAssets for HostAssets {
+    fn raw_asset(&self, uri: &str) -> Option<String> {
+        if self.directory.is_some() {
+            return None;
+        }
+        let name = uri.strip_prefix("asset:/")?;
+        crate::app::session::resource_name(name).ok()?;
+        let path = format!("assets/{name}");
+        self.host.resource_reader(&path).ok()?;
+        Some(path)
+    }
+
     fn open_file(&self, uri: &str) -> Option<Result<std::fs::File, String>> {
         self.directory.as_ref().map(|directory| {
             self.host.check().map_err(|e| e.to_string())?;

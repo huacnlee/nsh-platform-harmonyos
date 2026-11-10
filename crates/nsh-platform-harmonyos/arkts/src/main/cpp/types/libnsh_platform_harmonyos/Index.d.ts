@@ -254,7 +254,10 @@ export interface NshNativeProperty {
 
 /** Per-surface resources and VM limits selected by the embedding host. */
 export interface NshOptions {
-  /** Directory containing the build's `assets/` contents. */
+  /**
+   * Directory containing the build's `assets/` contents.
+   * Setting it also disables downloaded-package updates.
+   */
   assetDirectory?: string
   /** Override this app's storage directory, from the next load. */
   storageDirectory?: string
@@ -304,6 +307,7 @@ export interface SystemCommand {
   op: string
   text?: string
   uri?: string
+  asset?: string
   hasOnly?: boolean
   name?: string
   title?: string
