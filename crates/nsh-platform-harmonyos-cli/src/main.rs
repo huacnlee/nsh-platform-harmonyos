@@ -165,6 +165,12 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
         "run" | "dev" => {
             let is_dev = options.command == "dev";
             let app = app_dir(&options)?;
+            if is_dev && is_rust_app(&app) {
+                bail!(
+                    "nsh dev hot-reloads TSX bundles on HarmonyOS; an app whose nsh.json has a \
+                     Rust \"root\" has no bundle. Run it with nsh run --target harmonyos"
+                );
+            }
             let out = app.join(".nsh/harmonyos/project");
             let release = options.release.unwrap_or(false);
             let config = package(&app, &out, release, is_dev, &options)?;
@@ -721,6 +727,24 @@ mod tests {
         let dev = parse(args("dev examples/counter --port 8791")).unwrap();
         assert_eq!(dev.command, "dev");
         assert_eq!(dev.port, Some(8791));
+    }
+
+    #[test]
+    fn dev_rejects_rust_roots_before_packaging() {
+        let app = env::temp_dir().join(format!("nsh-hm-rust-dev-{}", std::process::id()));
+        fs::create_dir_all(&app).unwrap();
+        fs::write(app.join("nsh.json"), r#"{ "root": "app::Root" }"#).unwrap();
+        let error = run(Ok(Options {
+            command: "dev".into(),
+            app: Some(app.clone()),
+            ..Default::default()
+        }))
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("Rust \"root\" has no bundle"), "{message}");
+        assert!(message.contains("nsh run --target harmonyos"), "{message}");
+        assert!(!app.join(".nsh").exists());
+        fs::remove_dir_all(app).unwrap();
     }
 
     #[test]
