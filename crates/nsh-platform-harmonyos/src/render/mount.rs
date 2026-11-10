@@ -1397,6 +1397,34 @@ impl Mounter {
                                 nsh_core::PayloadValue::Number(f64::from(id)),
                             )]),
                         ),
+                        Command::Audio(nsh_core::audio::AudioCommand::Load {
+                            id,
+                            bytes,
+                            hint,
+                            max_duration,
+                        }) => {
+                            // Sound.load waits for Loaded before Play or Unload, so
+                            // staging on a worker preserves the command order.
+                            let host = self.host.clone();
+                            let route = self.dispatcher.clone();
+                            std::thread::Builder::new()
+                                .name("nsh-audio-load".into())
+                                .spawn(move || {
+                                    if let Err(error) = host.system.load_sound(
+                                        &host,
+                                        route,
+                                        id,
+                                        bytes,
+                                        hint,
+                                        max_duration,
+                                    ) {
+                                        log::warn!("OHOS sound load failed: {error}");
+                                    }
+                                })
+                                .map_err(|error| {
+                                    napi_ohos::Error::from_reason(error.to_string())
+                                })?;
+                        }
                         Command::Audio(audio) => {
                             self.host.system.audio(
                                 &self.host,

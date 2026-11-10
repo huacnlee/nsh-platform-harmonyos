@@ -1,3 +1,6 @@
+// Sound uses a short-lived AVPlayer per play, not a decoded buffer pool.
+// media.createSoundPool would reduce per-play latency, but its quantized,
+// pitch-based rate control needs a product decision before a rewrite.
 import { SystemReply, SystemRequest } from "./NativeSystem";
 import { BusinessError } from "@ohos.base";
 import fs from "@ohos.file.fs";
@@ -493,6 +496,8 @@ export class NativeAudio {
           releaseProbe();
           const truncated = maxDurationMs > 0 && durationMs > maxDurationMs;
           const keptMs = maxDurationMs > 0 ? Math.min(durationMs, maxDurationMs) : durationMs;
+          // Upper-bound budget estimate: 44.1 kHz x 4 bytes per frame, converted
+          // from milliseconds. The decoder does not expose its real allocation.
           const bytes = Math.floor((keptMs * 44100) / 1000) * 4;
           if (truncated) {
             unlinkQuietly(entry.path);

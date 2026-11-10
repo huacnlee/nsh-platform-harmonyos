@@ -280,6 +280,78 @@ impl System {
         }
     }
 
+    fn stage_audio_temp(
+        host: &Services,
+        prefix: &str,
+        id: u32,
+        hint: &str,
+        bytes: &[u8],
+    ) -> Result<String, String> {
+        let dir = host.cache_directory().join("audio");
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let ext = std::path::Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+            .unwrap_or("bin");
+        let mut random = [0u8; 8];
+        let _ = getrandom::fill(&mut random);
+        let path = dir.join(format!(
+            "{prefix}-{id}-{:016x}.{ext}",
+            u64::from_le_bytes(random)
+        ));
+        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    pub(crate) fn load_sound(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        id: u32,
+        bytes: nsh_core::image::ImageData,
+        hint: String,
+        max_duration: std::time::Duration,
+    ) -> napi_ohos::Result<()> {
+        use nsh_core::audio::{AudioError, AudioEvent as E};
+        let path = match Self::stage_audio_temp(host, "sound", id, &hint, &bytes) {
+            Ok(path) => path,
+            Err(message) => {
+                if let Some(route) = route.upgrade() {
+                    route.send(Message::HostEvent(
+                        EventKind::Audio,
+                        EventPayload::Audio {
+                            id,
+                            event: E::Failed {
+                                error: AudioError::Failed,
+                                message,
+                            },
+                        },
+                    ));
+                }
+                return Ok(());
+            }
+        };
+        self.submit(
+            host,
+            Request {
+                route,
+                kind: EventKind::Audio,
+                id,
+                stream: false,
+                answer: true,
+                paste: None,
+            },
+            SystemCommand {
+                op: "audio-load".into(),
+                count: Some(id),
+                uri: Some(path),
+                duration_ms: Some(max_duration.as_secs_f64() * 1000.0),
+                ..Default::default()
+            },
+        )
+    }
+
     pub(crate) fn audio(
         &self,
         host: &Services,
@@ -288,68 +360,7 @@ impl System {
         command: nsh_core::audio::AudioCommand,
     ) -> napi_ohos::Result<()> {
         use nsh_core::audio::{AudioCommand as A, AudioError, AudioEvent as E};
-        let stage_temp =
-            |prefix: &str, id: u32, hint: &str, bytes: &[u8]| -> Result<String, String> {
-                let dir = host.cache_directory().join("audio");
-                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                let ext = std::path::Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
-                    .unwrap_or("bin");
-                let mut random = [0u8; 8];
-                let _ = getrandom::fill(&mut random);
-                let path = dir.join(format!(
-                    "{prefix}-{id}-{:016x}.{ext}",
-                    u64::from_le_bytes(random)
-                ));
-                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-                Ok(path.to_string_lossy().into_owned())
-            };
         match command {
-            A::Load {
-                id,
-                bytes,
-                hint,
-                max_duration,
-            } => {
-                let path = match stage_temp("sound", id, &hint, &bytes) {
-                    Ok(path) => path,
-                    Err(message) => {
-                        if let Some(route) = route.upgrade() {
-                            route.send(Message::HostEvent(
-                                EventKind::Audio,
-                                EventPayload::Audio {
-                                    id,
-                                    event: E::Failed {
-                                        error: AudioError::Failed,
-                                        message,
-                                    },
-                                },
-                            ));
-                        }
-                        return Ok(());
-                    }
-                };
-                self.submit(
-                    host,
-                    Request {
-                        route,
-                        kind: EventKind::Audio,
-                        id,
-                        stream: false,
-                        answer: true,
-                        paste: None,
-                    },
-                    SystemCommand {
-                        op: "audio-load".into(),
-                        count: Some(id),
-                        uri: Some(path),
-                        duration_ms: Some(max_duration.as_secs_f64() * 1000.0),
-                        ..Default::default()
-                    },
-                )
-            }
             A::LoadUrl { id, .. } => {
                 if let Some(route) = route.upgrade() {
                     route.send(Message::HostEvent(
@@ -366,6 +377,8 @@ impl System {
                 Ok(())
             }
             A::Open { id, src, settings } => {
+                // Asset reads and temp copies still run on the UI thread. Move Open
+                // to a worker like Load only when command ordering can be preserved.
                 let (uri, temp_file, open_error) =
                     if src.starts_with("http://") || src.starts_with("https://") {
                         (src, false, None)
@@ -377,10 +390,9 @@ impl System {
                     } else if src.starts_with('/') {
                         (src, false, None)
                     } else if src.starts_with("asset:/") {
-                        match assets
-                            .read(&src)
-                            .and_then(|bytes| stage_temp("player", id, &src, &bytes))
-                        {
+                        match assets.read(&src).and_then(|bytes| {
+                            Self::stage_audio_temp(host, "player", id, &src, &bytes)
+                        }) {
                             Ok(path) => (path, true, None),
                             Err(err) => (String::new(), false, Some(err)),
                         }
