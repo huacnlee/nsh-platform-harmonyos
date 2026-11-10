@@ -40,7 +40,10 @@ pub(crate) fn register_custom_scheme() {
     SCHEME_REGISTERED.get_or_init(|| {
         CustomProtocol::add_protocol_with_option(
             SCHEME,
-            CustomProtocolOption::Standard | CustomProtocolOption::Secure,
+            CustomProtocolOption::Standard
+                | CustomProtocolOption::Secure
+                | CustomProtocolOption::CorsEnabled
+                | CustomProtocolOption::FetchEnabled,
         );
         CustomProtocol::register();
     });
@@ -71,6 +74,7 @@ impl Drop for AssetReply {
 fn send_response(handle: &ResourceHandle, status: u16, mime_type: &str, body: &[u8]) {
     let response = ArkWebResponse::new();
     response.set_header("content-type", mime_type, true);
+    response.set_header("access-control-allow-origin", "*", true);
     response.set_status(i32::from(status));
     handle.receive_response(response);
     handle.receive_data(body);
@@ -82,6 +86,7 @@ struct Route {
     access: Arc<Access>,
     assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
+    url_schemes: Vec<nsh_core::web_resource::WebUrlScheme>,
     proxy: RefCell<Option<WebProxy>>,
 }
 
@@ -103,6 +108,7 @@ struct DocumentSettings {
     javascript: bool,
     shared_cookies: bool,
     script: Option<Arc<str>>,
+    url_schemes: Vec<nsh_core::web_resource::WebUrlScheme>,
 }
 
 pub(crate) struct WebView {
@@ -140,6 +146,7 @@ impl WebView {
                         access: owner.access.clone(),
                         assets: owner.assets.clone(),
                         host: owner.host.clone(),
+                        url_schemes: Vec::new(),
                         proxy: RefCell::new(None),
                     }),
                 );
@@ -271,16 +278,30 @@ impl WebView {
                 }
             }
             Command::Load(load) => {
+                let schemes = self
+                    .props
+                    .borrow()
+                    .as_ref()
+                    .map(|p| p.url_schemes.clone())
+                    .unwrap_or_default();
                 if !node.access.allows_webviews()
-                    || (!load.src.starts_with("asset:/") && !node.access.allows_webview(&load.src))
+                    || (!load.src.starts_with("asset:/")
+                        && !has_custom_scheme(&load.src, &schemes)
+                        && !node.access.allows_webview(&load.src))
                 {
                     node.control.dispatch_event(
                         node.id,
                         EventKind::Error,
-                        EventPayload::Map(vec![(
-                            "message",
-                            PayloadValue::Str("WebView source is not granted".into()),
-                        )]),
+                        EventPayload::Map(vec![
+                            (
+                                "message",
+                                PayloadValue::Str("WebView source is not granted".into()),
+                            ),
+                            (
+                                "code",
+                                PayloadValue::Str(nsh_core::element::codes::ACCESS_DENIED.into()),
+                            ),
+                        ]),
                     );
                     return Ok(());
                 }
@@ -357,6 +378,12 @@ impl WebView {
     fn replace_target(&self, node: &Node) -> Result<u32> {
         let attachment = NativeAttachment::new(&self.native)?;
         let id = attachment.id();
+        let url_schemes = self
+            .props
+            .borrow()
+            .as_ref()
+            .map(|p| p.url_schemes.clone())
+            .unwrap_or_default();
         ROUTES.with(|routes| {
             routes.borrow_mut().insert(
                 id,
@@ -365,6 +392,7 @@ impl WebView {
                     access: node.access.clone(),
                     assets: node.assets.clone(),
                     host: node.host.clone(),
+                    url_schemes,
                     proxy: RefCell::new(None),
                 }),
             );
@@ -389,16 +417,24 @@ impl WebView {
             || matches!(
                 &props.source,
                 WebSource::Uri(uri)
-                    if !uri.starts_with("asset:/") && !node.access.allows_webview(uri)
+                    if !uri.starts_with("asset:/")
+                        && !has_custom_scheme(uri, &props.url_schemes)
+                        && !node.access.allows_webview(uri)
             )
         {
             node.control.dispatch_event(
                 node.id,
                 EventKind::Error,
-                EventPayload::Map(vec![(
-                    "message",
-                    PayloadValue::Str("WebView source is not granted".into()),
-                )]),
+                EventPayload::Map(vec![
+                    (
+                        "message",
+                        PayloadValue::Str("WebView source is not granted".into()),
+                    ),
+                    (
+                        "code",
+                        PayloadValue::Str(nsh_core::element::codes::ACCESS_DENIED.into()),
+                    ),
+                ]),
             );
             return Ok(());
         }
@@ -407,13 +443,16 @@ impl WebView {
             javascript: props.javascript_enabled,
             shared_cookies,
             script: props.injected_js_before.clone(),
+            url_schemes: props.url_schemes.clone(),
         };
         let document_changed = self
             .applied_document
             .borrow()
             .as_ref()
             .is_some_and(|old| old != &document);
-        let new_document = document_changed || self.target.borrow().is_none();
+        let new_document = document_changed
+            || self.target.borrow().is_none()
+            || (self.applied_document.borrow().is_none() && !props.url_schemes.is_empty());
         // The initial native target can already exist when the first props
         // arrive. Its private store still needs clearing before navigation.
         let first_document = self.applied_document.borrow().is_none();
@@ -475,7 +514,12 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
         let Some(node) = route.node.upgrade() else {
             return Ok(false);
         };
-        install_asset_protocol(native_tag, route.assets.clone(), route.host.clone())?;
+        install_asset_protocol(
+            native_tag,
+            route.assets.clone(),
+            route.host.clone(),
+            &route.url_schemes,
+        )?;
         let control = node.control.clone();
         let node_id = node.id;
         let proxy = WebProxyBuilder::new(native_tag.to_owned(), "__nshNative".to_owned())
@@ -501,6 +545,7 @@ fn install_asset_protocol(
     native_tag: &str,
     assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
+    url_schemes: &[nsh_core::web_resource::WebUrlScheme],
 ) -> napi_ohos::Result<()> {
     let handler = CustomProtocolHandler::new();
     handler.on_request_start(move |request, request_handle| {
@@ -546,13 +591,47 @@ fn install_asset_protocol(
                 "Failed to bind WebView custom protocol: {error}"
             ))
         })?;
-    if attached {
-        Ok(())
-    } else {
-        Err(napi_ohos::Error::from_reason(
+    if !attached {
+        return Err(napi_ohos::Error::from_reason(
             "ArkWeb rejected the custom protocol handler for this WebView tag",
-        ))
+        ));
     }
+    for scheme in url_schemes {
+        let name = scheme.scheme();
+        if !CustomProtocol::is_protocol_registered(name) {
+            CustomProtocol::add_protocol_with_option(
+                name,
+                CustomProtocolOption::Standard
+                    | CustomProtocolOption::Secure
+                    | CustomProtocolOption::CorsEnabled
+                    | CustomProtocolOption::FetchEnabled,
+            );
+            CustomProtocol::register();
+        }
+        let scheme_handler = CustomProtocolHandler::new();
+        let scheme_clone = scheme.clone();
+        scheme_handler.on_request_start(move |request, request_handle| {
+            let url = request.url();
+            let method = request.method();
+            let responder = AssetReply(Some(request_handle));
+            let (req, _cancel) = nsh_core::web_resource::WebResourceRequest::new(
+                url,
+                if method.is_empty() {
+                    "GET".to_owned()
+                } else {
+                    method
+                },
+                move |resource| match resource {
+                    Some(res) => responder.respond(200, res.mime_type_or_default(), &res.bytes),
+                    None => responder.respond(404, "text/plain; charset=utf-8", &[]),
+                },
+            );
+            scheme_clone.handle(req);
+            true
+        });
+        let _ = Web::new(native_tag.to_owned()).custom_protocol(name.to_owned(), scheme_handler);
+    }
+    Ok(())
 }
 
 pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> {
@@ -570,7 +649,7 @@ pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> 
         {
             return true;
         }
-        !allows_navigation(&route.access, url)
+        !allows_navigation(&route.access, url, &route.url_schemes)
     })
 }
 
@@ -724,14 +803,28 @@ fn asset_name_from_url(url: &str) -> Option<String> {
         .map(|s| s.into_owned())
 }
 
-fn allows_navigation(access: &Access, url: &str) -> bool {
+fn has_custom_scheme(url: &str, schemes: &[nsh_core::web_resource::WebUrlScheme]) -> bool {
+    let Some((scheme, _)) = url.split_once(':') else {
+        return false;
+    };
+    schemes
+        .iter()
+        .any(|s| s.scheme().eq_ignore_ascii_case(scheme))
+}
+
+fn allows_navigation(
+    access: &Access,
+    url: &str,
+    schemes: &[nsh_core::web_resource::WebUrlScheme],
+) -> bool {
     // ArkWeb represents loadData's already-authorized inline HTML as a data
     // URL in onLoadIntercept. It is not an additional network capability.
     (access.allows_webviews()
         && (url.is_empty()
             || url == "about:srcdoc"
             || url.starts_with("data:text/html;")
-            || url.starts_with("nsh-asset://app/")))
+            || url.starts_with("nsh-asset://app/")
+            || has_custom_scheme(url, schemes)))
         || access.allows_webview(url)
 }
 

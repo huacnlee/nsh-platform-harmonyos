@@ -201,10 +201,11 @@ impl Node {
         if let Some(input) = self.input.borrow().as_ref() {
             callback(|| input.close());
         }
-        if let Some(scroll) = self.scroll.borrow().as_ref()
-            && let Some(plane) = scroll.overlay.borrow().as_ref()
-        {
-            callback(|| plane.close(self));
+        if let Some(scroll) = self.scroll.borrow().as_ref() {
+            self.scroll_watchers.remove(self.id);
+            if let Some(plane) = scroll.overlay.borrow().as_ref() {
+                callback(|| plane.close(self));
+            }
         }
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
             self.accessibility_wrappers

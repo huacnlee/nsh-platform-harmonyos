@@ -11,6 +11,7 @@ pub(crate) mod session;
 pub(crate) mod surface;
 pub(crate) mod trust;
 
+pub use crate::scroll::NshScrollHandle;
 pub use entry::{NshCapabilities, get_capabilities};
 pub use environment::NshEnvironment;
 pub use options::{NshCacheOptions, NshOptions};

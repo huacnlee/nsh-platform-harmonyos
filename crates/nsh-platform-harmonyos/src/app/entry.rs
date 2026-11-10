@@ -191,6 +191,7 @@ pub(crate) fn nsh_update_keyboard(session_id: u32, duration: f64) -> Result<()> 
 }
 
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nsh_update_config(
     session_id: u32,
     color_mode: i32,
@@ -199,6 +200,10 @@ pub(crate) fn nsh_update_config(
     rtl: bool,
     device_type: Option<String>,
     pixel_ratio: Option<f64>,
+    languages: Option<Vec<String>>,
+    time_zone: Option<String>,
+    regional_locale: Option<String>,
+    is_24_hour_clock: Option<bool>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
         let mut environment = crate::app::session::environment_from_config(
@@ -207,6 +212,10 @@ pub(crate) fn nsh_update_config(
             language,
             device_type.as_deref(),
             rtl,
+            languages,
+            time_zone,
+            regional_locale,
+            is_24_hour_clock,
         );
         environment.pixel_ratio = pixel_ratio;
         host.update(environment)?;

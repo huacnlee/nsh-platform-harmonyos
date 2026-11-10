@@ -70,6 +70,8 @@ pub(crate) struct EditorCommand {
     pub x: f64,
     pub y: f64,
     pub animated: bool,
+    pub text: Option<String>,
+    pub actions: Option<Vec<String>>,
 }
 
 #[derive(Default)]

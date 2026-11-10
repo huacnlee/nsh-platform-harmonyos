@@ -65,7 +65,7 @@ export class NativeNotifications {
           : "default",
     };
   }
-  async show(name: string, title: string, body: string): Promise<NotificationReply> {
+  async show(name: string, title: string, body: string, silent: boolean = false): Promise<NotificationReply> {
     const agent = await wantAgent.getWantAgent({
       wants: [
         {
@@ -81,6 +81,9 @@ export class NativeNotifications {
     await notification.publish({
       id: this.id(name),
       label: name,
+      notificationSlotType: silent
+        ? notification.SlotType.OTHER_TYPES
+        : notification.SlotType.SOCIAL_COMMUNICATION,
       content: {
         notificationContentType: notification.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
         normal: { title, text: body },

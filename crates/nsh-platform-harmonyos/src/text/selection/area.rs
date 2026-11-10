@@ -34,6 +34,9 @@ impl SelectionTexts for Texts {
     fn content(&self, i: usize) -> &str {
         &self.0[i].text.text
     }
+    fn copied(&self, i: usize, range: std::ops::Range<u32>) -> String {
+        self.0[i].text.source.copied_text(range)
+    }
     fn frame(&self, i: usize) -> Bounds<Points> {
         self.0[i].frame
     }

@@ -47,6 +47,9 @@ impl ResourceChunks {
                 .map_err(|e| e.to_string())
         })
     }
+    pub(crate) fn read_optional(&self, name: &str) -> Option<Vec<u8>> {
+        self.host.resource(&format!("{}{name}", self.prefix)).ok()
+    }
     pub(crate) fn load(self: &Arc<Self>, id: &str, route: Weak<Dispatcher>) -> bool {
         let id = id.to_owned();
         let loader = self.clone();

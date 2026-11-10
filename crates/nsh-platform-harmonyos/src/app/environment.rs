@@ -28,6 +28,20 @@ pub struct NshEnvironment {
     pub color_scheme: Option<String>,
     /// BCP 47 locale tag.
     pub locale: Option<String>,
+    /// Preferred BCP 47 language tags, most preferred first.
+    pub languages: Option<Vec<String>>,
+    /// IANA time zone name (e.g. `Asia/Shanghai`, `UTC`).
+    pub time_zone: Option<String>,
+    /// Regional locale identifier or BCP 47 tag with `-u-` extension keywords.
+    pub regional_locale: Option<String>,
+    /// Hour cycle preference (`h11`, `h12`, `h23`, `h24`).
+    pub hour_cycle: Option<String>,
+    /// First day of week (ISO 8601: 1 for Monday through 7 for Sunday).
+    pub first_day_of_week: Option<u32>,
+    /// Measurement system (`metric`, `us`, `uk`).
+    pub measurement_system: Option<String>,
+    /// Temperature unit (`celsius`, `fahrenheit`).
+    pub temperature_unit: Option<String>,
     /// System layout direction.
     pub rtl: Option<bool>,
     /// Reduced motion preference.
@@ -58,6 +72,13 @@ impl NshEnvironment {
             font_scale,
             color_scheme,
             locale,
+            languages,
+            time_zone,
+            regional_locale,
+            hour_cycle,
+            first_day_of_week,
+            measurement_system,
+            temperature_unit,
             rtl,
             reduce_motion,
             screen_reader,
@@ -85,6 +106,19 @@ impl NshEnvironment {
                 .into(),
             ),
             locale: Some(env.locale.as_str().to_owned()),
+            languages: Some(
+                env.locale_settings
+                    .languages
+                    .iter()
+                    .map(|l| l.as_str().to_owned())
+                    .collect(),
+            ),
+            time_zone: Some(env.locale_settings.time_zone.as_str().to_owned()),
+            regional_locale: None,
+            hour_cycle: Some(env.locale_settings.hour_cycle.name().to_owned()),
+            first_day_of_week: Some(u32::from(env.locale_settings.first_day_of_week.number())),
+            measurement_system: Some(env.locale_settings.measurement_system.name().to_owned()),
+            temperature_unit: Some(env.locale_settings.temperature_unit.name().to_owned()),
             rtl: Some(env.rtl),
             reduce_motion: Some(env.reduce_motion),
             screen_reader: Some(env.screen_reader),
@@ -144,8 +178,55 @@ impl NshEnvironment {
             };
         }
         if let Some(value) = self.locale {
-            env.locale = Locale::parse(&value)
+            let locale = Locale::parse(&value)
                 .ok_or_else(|| napi_ohos::Error::from_reason("invalid locale tag"))?;
+            env.locale = locale;
+            if self.regional_locale.is_none() {
+                let preferences = nsh_core::platform::LocaleSettings::parse(&value);
+                env.locale_settings.hour_cycle = preferences.hour_cycle;
+                env.locale_settings.first_day_of_week = preferences.first_day_of_week;
+                env.locale_settings.measurement_system = preferences.measurement_system;
+                env.locale_settings.temperature_unit = preferences.temperature_unit;
+            }
+            if self.languages.is_none() {
+                env.locale_settings.languages = env.locale_settings.languages.preferring(locale);
+            }
+        }
+        if let Some(regional) = self.regional_locale {
+            let preferences = nsh_core::platform::LocaleSettings::parse(&regional);
+            env.locale_settings.hour_cycle = preferences.hour_cycle;
+            env.locale_settings.first_day_of_week = preferences.first_day_of_week;
+            env.locale_settings.measurement_system = preferences.measurement_system;
+            env.locale_settings.temperature_unit = preferences.temperature_unit;
+        }
+        if let Some(languages) = self.languages {
+            env.locale_settings.languages =
+                nsh_core::platform::Languages::parse(languages.iter().map(String::as_str))
+                    .unwrap_or_else(|| nsh_core::platform::Languages::one(env.locale));
+        }
+        if let Some(time_zone) = self.time_zone {
+            env.locale_settings.time_zone = nsh_core::platform::TimeZone::parse(&time_zone)
+                .ok_or_else(|| napi_ohos::Error::from_reason("invalid timeZone"))?;
+        }
+        if let Some(hour_cycle) = self.hour_cycle {
+            env.locale_settings.hour_cycle = nsh_core::platform::HourCycle::parse(&hour_cycle)
+                .ok_or_else(|| napi_ohos::Error::from_reason("invalid hourCycle"))?;
+        }
+        if let Some(first_day) = self.first_day_of_week {
+            env.locale_settings.first_day_of_week = u8::try_from(first_day)
+                .ok()
+                .and_then(nsh_core::platform::Weekday::from_number)
+                .ok_or_else(|| napi_ohos::Error::from_reason("invalid firstDayOfWeek"))?;
+        }
+        if let Some(system) = self.measurement_system {
+            env.locale_settings.measurement_system =
+                nsh_core::platform::MeasurementSystem::parse(&system)
+                    .ok_or_else(|| napi_ohos::Error::from_reason("invalid measurementSystem"))?;
+        }
+        if let Some(unit) = self.temperature_unit {
+            env.locale_settings.temperature_unit =
+                nsh_core::platform::TemperatureUnit::parse(&unit)
+                    .ok_or_else(|| napi_ohos::Error::from_reason("invalid temperatureUnit"))?;
         }
         if let Some(value) = self.rtl {
             env.rtl = value;

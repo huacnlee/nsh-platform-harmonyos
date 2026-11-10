@@ -27,7 +27,7 @@ pub const PLATFORM: &str = "harmonyos";
 
 pub use app::{
     NshCacheOptions, NshCapabilities, NshEnvironment, NshOptions, NshPackage, NshPackageInfo,
-    NshSurface, NshTrust, get_capabilities, init_logging,
+    NshScrollHandle, NshSurface, NshTrust, get_capabilities, init_logging,
 };
 pub use interop::NshNativeProperty;
 pub use linked::LinkedApp;

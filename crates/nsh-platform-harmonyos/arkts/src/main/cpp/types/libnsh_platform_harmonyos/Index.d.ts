@@ -44,6 +44,8 @@ export interface EditorCommand {
   x: number
   y: number
   animated: boolean
+  text?: string
+  actions?: Array<string>
 }
 
 export interface EditorEvent {
@@ -126,6 +128,10 @@ export interface HostInit {
   colorMode: number
   fontSizeScale: number
   language: string
+  languages?: Array<string>
+  timeZone?: string
+  regionalLocale?: string
+  is24HourClock?: boolean
   screenReader: boolean
   reduceMotion?: boolean
 }
@@ -205,6 +211,20 @@ export interface NshEnvironment {
   colorScheme?: string
   /** BCP 47 locale tag. */
   locale?: string
+  /** Preferred BCP 47 language tags, most preferred first. */
+  languages?: Array<string>
+  /** IANA time zone name (e.g. `Asia/Shanghai`, `UTC`). */
+  timeZone?: string
+  /** Regional locale identifier or BCP 47 tag with `-u-` extension keywords. */
+  regionalLocale?: string
+  /** Hour cycle preference (`h11`, `h12`, `h23`, `h24`). */
+  hourCycle?: string
+  /** First day of week (ISO 8601: 1 for Monday through 7 for Sunday). */
+  firstDayOfWeek?: number
+  /** Measurement system (`metric`, `us`, `uk`). */
+  measurementSystem?: string
+  /** Temperature unit (`celsius`, `fahrenheit`). */
+  temperatureUnit?: string
   /** System layout direction. */
   rtl?: boolean
   /** Reduced motion preference. */
@@ -288,10 +308,16 @@ export interface SystemCommand {
   name?: string
   title?: string
   body?: string
+  silent?: boolean
   count?: number
   ask?: boolean
   lang?: string
   interim?: boolean
+  volume?: number
+  rate?: number
+  looped?: boolean
+  positionMs?: number
+  durationMs?: number
 }
 
 /** Typed completion shared by clipboard, notification and speech services. */
@@ -310,6 +336,11 @@ export interface SystemEvent {
   code?: string
   phase?: string
   final?: boolean
+  durationMs?: number
+  positionMs?: number
+  bytes?: number
+  truncated?: boolean
+  buffering?: boolean
 }
 
 export interface TextureInsets {
@@ -428,7 +459,7 @@ export declare function nshSetLifecycle(sessionId: number, lifecycle: string): v
 
 export declare function nshUpdateAccessibility(sessionId: number, screenReader?: boolean | undefined | null, reduceMotion?: boolean | undefined | null): void
 
-export declare function nshUpdateConfig(sessionId: number, colorMode: number, fontSizeScale: number, language: string, rtl: boolean, deviceType?: string | undefined | null, pixelRatio?: number | undefined | null): void
+export declare function nshUpdateConfig(sessionId: number, colorMode: number, fontSizeScale: number, language: string, rtl: boolean, deviceType?: string | undefined | null, pixelRatio?: number | undefined | null, languages?: Array<string> | undefined | null, timeZone?: string | undefined | null, regionalLocale?: string | undefined | null, is24HourClock?: boolean | undefined | null): void
 
 export declare function nshUpdateKeyboard(sessionId: number, duration: number): void
 
@@ -462,6 +493,40 @@ export declare class NshPackage {
   get info(): NshPackageInfo
   /** Whether a surface has consumed this package. */
   get isConsumed(): boolean
+}
+
+/** A `<Scroll>` of the app watched by the host on the UI thread. */
+export declare class NshScrollHandle {
+  /** Whether the scroll view is still mounted with the watched `nativeID`. */
+  get isAlive(): boolean
+  /** The horizontal scroll offset in vp. */
+  get scrollX(): number
+  /** The vertical scroll offset in vp. */
+  get scrollY(): number
+  /** The content's width in vp (at least the viewport's). */
+  get contentWidth(): number
+  /** The content's height in vp (at least the viewport's). */
+  get contentHeight(): number
+  /** The visible width in vp. */
+  get viewportWidth(): number
+  /** The visible height in vp. */
+  get viewportHeight(): number
+  /** Scrolls by `dx`, `dy`, clamped to the content. */
+  scrollBy(dx: number, dy: number, animated?: boolean | undefined | null): void
+  /** Ends a fling or an animated scroll where it is. */
+  stopScrolling(): void
+  /**
+  * Calls `listener(scrollX, scrollY, dx, dy)` on every offset change.
+  * Returns a listener id for `removeListener`.
+  */
+  onScroll(listener: (arg0: number, arg1: number, arg2: number, arg3: number) => void): number
+  /**
+  * Calls `listener(contentWidth, contentHeight)` when the content size changes.
+  * Returns a listener id for `removeListener`.
+  */
+  onContentSizeChange(listener: (arg0: number, arg1: number) => void): number
+  /** Stops calling listener `id`. */
+  removeListener(id: number): void
 }
 
 /**
@@ -557,6 +622,20 @@ export declare class NshSurface {
   * for all subsequent loads on this surface.
   */
   setThemeOverrides(json?: string | undefined | null): void
+  /**
+  * Registers a font file (TrueType, OpenType, WOFF or WOFF2) the host ships,
+  * so every app this surface loads can name its family in `fontFamily` without
+  * bundling the file. A font registered before a load is in that app's first
+  * frame; one registered while an app runs is used from the next layout.
+  * Registering the same file again does nothing.
+  */
+  registerFont(data: Uint8Array): void
+  /**
+  * Watches the `<Scroll>` whose `nativeID` is `native_id` on the UI thread,
+  * calling `watcher` with its `NshScrollHandle` when mounted and `null` when
+  * unmounted. Pass `null` or `undefined` to remove the watcher.
+  */
+  watchScroll(nativeId: string, watcher?: ((scroll: NshScrollHandle | null) => void) | null | undefined): void
   /** Forwards per-instance environment observations, including before the first load. */
   setEnvironment(changes: NshEnvironment): void
   /** Receives asynchronous load, engine and native mount errors for this instance. */

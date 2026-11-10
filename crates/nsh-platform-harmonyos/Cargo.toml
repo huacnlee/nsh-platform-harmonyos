@@ -74,6 +74,7 @@ glow.workspace = true
 khronos-egl.workspace = true
 ohos-hilog-binding.workspace = true
 ohos-net-connection-binding.workspace = true
+ohos-vibrator-binding.workspace = true
 log.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

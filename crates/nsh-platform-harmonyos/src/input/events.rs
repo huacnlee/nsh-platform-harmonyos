@@ -390,7 +390,13 @@ impl Interaction {
             &props.accessibility,
         )?;
         let disabled = props.accessibility.state.disabled;
+        let native_id = props.native_id.clone();
         *self.props.borrow_mut() = props;
+        if let Some(scroll) = owner.scroll.borrow().as_ref() {
+            owner
+                .scroll_watchers
+                .props(owner.env, owner.id, scroll, native_id);
+        }
         owner.update_wrapper()?;
         self.hit_region(owner)?;
         self.state(owner, state::DISABLED, disabled)?;

@@ -2116,7 +2116,7 @@ dependencies = [
 [[package]]
 name = "nsh-base"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "chrono",
  "html5ever",
@@ -2146,7 +2146,7 @@ dependencies = [
 [[package]]
 name = "nsh-core"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "cap-std",
  "crc32fast",
@@ -2183,7 +2183,7 @@ dependencies = [
 [[package]]
 name = "nsh-dev"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "base64 0.22.1",
  "dunce",
@@ -2196,7 +2196,7 @@ dependencies = [
 [[package]]
 name = "nsh-engine"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "crossbeam-channel",
  "libc",
@@ -2216,12 +2216,12 @@ dependencies = [
 [[package]]
 name = "nsh-i18n"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 
 [[package]]
 name = "nsh-js"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2244,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "nsh-macros"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -2257,7 +2257,7 @@ dependencies = [
 [[package]]
 name = "nsh-package"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -2300,6 +2300,7 @@ dependencies = [
  "ohos-pasteboard-binding",
  "ohos-resource-manager-binding",
  "ohos-udmf-binding",
+ "ohos-vibrator-binding",
  "ohos-vsync-binding",
  "ohos-web-binding",
  "ohos-window-manager-binding",
@@ -2326,7 +2327,7 @@ dependencies = [
 [[package]]
 name = "nsh-updater"
 version = "0.4.0"
-source = "git+https://github.com/longbridge/nsh?rev=826654b5cd10f02fec795f66fb53c4fe3dbb9981#826654b5cd10f02fec795f66fb53c4fe3dbb9981"
+source = "git+https://github.com/longbridge/nsh?rev=c5214aaf4bbdf33bc1d59e9595e009b6aa54d702#c5214aaf4bbdf33bc1d59e9595e009b6aa54d702"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -2764,6 +2765,22 @@ checksum = "bb0fbdf76430b57da06eee20dd9e8197acce4c561006ddc1f438979b67b04a66"
 dependencies = [
  "ohos-image-native-sys",
 ]
+
+[[package]]
+name = "ohos-vibrator-binding"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59a848e90ec930ed2e0c4895996d3f17b38be13f00c3c735475bc0290a7dcc33"
+dependencies = [
+ "ohos-enum-derive",
+ "ohos-vibrator-sys",
+]
+
+[[package]]
+name = "ohos-vibrator-sys"
+version = "0.2.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea214c4bf3b9383eccabdc3c2e73230234cf9ed4aad324025c4c3718db6536f2"
 
 [[package]]
 name = "ohos-vsync-binding"

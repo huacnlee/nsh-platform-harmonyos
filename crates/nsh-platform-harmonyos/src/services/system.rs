@@ -25,6 +25,8 @@ struct Request<R> {
     id: u32,
     stream: bool,
     answer: bool,
+    #[cfg(target_env = "ohos")]
+    paste: Option<(u32, bool)>,
 }
 #[cfg(target_env = "ohos")]
 #[derive(Default)]
@@ -61,6 +63,7 @@ impl System {
                             name: Some(notification.id),
                             title: Some(notification.title),
                             body: Some(notification.body),
+                            silent: Some(notification.silent),
                             ..Default::default()
                         },
                     ),
@@ -189,13 +192,344 @@ impl System {
                 | "notification-badge"
                 | "notification-listen"
         );
-        let request = Request {
-            route,
-            kind,
-            id,
-            stream,
-            answer,
-        };
+        self.submit(
+            host,
+            Request {
+                route,
+                kind,
+                id,
+                stream,
+                answer,
+                paste: None,
+            },
+            data,
+        )
+    }
+
+    pub(crate) fn paste_to_input(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        node_id: u32,
+        report_only: bool,
+    ) -> napi_ohos::Result<()> {
+        self.submit(
+            host,
+            Request {
+                route,
+                kind: EventKind::Clipboard,
+                id: 0,
+                stream: false,
+                answer: false,
+                paste: Some((node_id, report_only)),
+            },
+            SystemCommand {
+                op: "clipboard-read".into(),
+                has_only: Some(false),
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn file_request(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        id: u32,
+        request: nsh_core::file_dialog::FileRequest,
+    ) -> napi_ohos::Result<()> {
+        use nsh_core::file_dialog::FileRequest as F;
+        match request {
+            F::OpenPath(path) => self.submit(
+                host,
+                Request {
+                    route,
+                    kind: EventKind::FileRequest,
+                    id,
+                    stream: false,
+                    answer: true,
+                    paste: None,
+                },
+                SystemCommand {
+                    op: "file-open-path".into(),
+                    uri: Some(path.to_string_lossy().into_owned()),
+                    ..Default::default()
+                },
+            ),
+            F::OpenDialog(_) | F::SaveDialog(_) | F::RevealPath(_) | F::MoveToTrash(_) => {
+                if let Some(route) = route.upgrade() {
+                    route.send(Message::HostEvent(
+                        EventKind::FileRequest,
+                        EventPayload::file_failed(
+                            id,
+                            "local path file dialogs and file manager actions are not supported on HarmonyOS",
+                        ),
+                    ));
+                }
+                Ok(())
+            }
+            _ => {
+                if let Some(route) = route.upgrade() {
+                    route.send(Message::HostEvent(
+                        EventKind::FileRequest,
+                        EventPayload::file_failed(id, "unsupported file request on HarmonyOS"),
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) fn audio(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        assets: &std::sync::Arc<dyn crate::services::assets::StreamAssets>,
+        command: nsh_core::audio::AudioCommand,
+    ) -> napi_ohos::Result<()> {
+        use nsh_core::audio::{AudioCommand as A, AudioError, AudioEvent as E};
+        let stage_temp =
+            |prefix: &str, id: u32, hint: &str, bytes: &[u8]| -> Result<String, String> {
+                let dir = host.cache_directory().join("audio");
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let ext = std::path::Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+                    .unwrap_or("bin");
+                let mut random = [0u8; 8];
+                let _ = getrandom::fill(&mut random);
+                let path = dir.join(format!(
+                    "{prefix}-{id}-{:016x}.{ext}",
+                    u64::from_le_bytes(random)
+                ));
+                std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
+                Ok(path.to_string_lossy().into_owned())
+            };
+        match command {
+            A::Load {
+                id,
+                bytes,
+                hint,
+                max_duration,
+            } => {
+                let path = match stage_temp("sound", id, &hint, &bytes) {
+                    Ok(path) => path,
+                    Err(message) => {
+                        if let Some(route) = route.upgrade() {
+                            route.send(Message::HostEvent(
+                                EventKind::Audio,
+                                EventPayload::Audio {
+                                    id,
+                                    event: E::Failed {
+                                        error: AudioError::Failed,
+                                        message,
+                                    },
+                                },
+                            ));
+                        }
+                        return Ok(());
+                    }
+                };
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::Audio,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "audio-load".into(),
+                        count: Some(id),
+                        uri: Some(path),
+                        duration_ms: Some(max_duration.as_secs_f64() * 1000.0),
+                        ..Default::default()
+                    },
+                )
+            }
+            A::LoadUrl { id, .. } => {
+                if let Some(route) = route.upgrade() {
+                    route.send(Message::HostEvent(
+                        EventKind::Audio,
+                        EventPayload::Audio {
+                            id,
+                            event: E::Failed {
+                                error: AudioError::NotSupported,
+                                message: "LoadUrl is not supported on native platforms".into(),
+                            },
+                        },
+                    ));
+                }
+                Ok(())
+            }
+            A::Open { id, src, settings } => {
+                let (uri, temp_file, open_error) =
+                    if src.starts_with("http://") || src.starts_with("https://") {
+                        (src, false, None)
+                    } else if let Some(rest) = src.strip_prefix("file://") {
+                        let path = percent_encoding::percent_decode_str(rest)
+                            .decode_utf8_lossy()
+                            .into_owned();
+                        (path, false, None)
+                    } else if src.starts_with('/') {
+                        (src, false, None)
+                    } else if src.starts_with("asset:/") {
+                        match assets
+                            .read(&src)
+                            .and_then(|bytes| stage_temp("player", id, &src, &bytes))
+                        {
+                            Ok(path) => (path, true, None),
+                            Err(err) => (String::new(), false, Some(err)),
+                        }
+                    } else {
+                        (
+                            String::new(),
+                            false,
+                            Some(format!("unsupported audio source: {src}")),
+                        )
+                    };
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::Audio,
+                        id,
+                        stream: true,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "audio-open".into(),
+                        count: Some(id),
+                        uri: Some(uri),
+                        has_only: Some(temp_file),
+                        text: open_error,
+                        volume: Some(f64::from(settings.volume)),
+                        rate: Some(f64::from(settings.rate)),
+                        looped: Some(settings.looped),
+                        ..Default::default()
+                    },
+                )
+            }
+            A::Play { id, volume, rate } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-play".into(),
+                    count: Some(id),
+                    volume: Some(f64::from(volume)),
+                    rate: Some(f64::from(rate)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Stop { id } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-stop".into(),
+                    count: Some(id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Unload { id } => {
+                self.requests.lock().unwrap().retain(|_, r| {
+                    !(r.kind == EventKind::Audio && r.id == id && Weak::ptr_eq(&r.route, &route))
+                });
+                host.send_host_command(HostCommand {
+                    kind: "system".into(),
+                    open_id: Some(0),
+                    system: Some(SystemCommand {
+                        op: "audio-unload".into(),
+                        count: Some(id),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            }
+            A::Preload { id } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-preload".into(),
+                    count: Some(id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Resume { id } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-resume".into(),
+                    count: Some(id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Pause { id } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-pause".into(),
+                    count: Some(id),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Seek { id, position } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-seek".into(),
+                    count: Some(id),
+                    position_ms: Some(position.as_secs_f64() * 1000.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Set { id, settings } => host.send_host_command(HostCommand {
+                kind: "system".into(),
+                open_id: Some(0),
+                system: Some(SystemCommand {
+                    op: "audio-set".into(),
+                    count: Some(id),
+                    volume: Some(f64::from(settings.volume)),
+                    rate: Some(f64::from(settings.rate)),
+                    looped: Some(settings.looped),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            A::Close { id } => {
+                self.requests.lock().unwrap().retain(|_, r| {
+                    !(r.kind == EventKind::Audio && r.id == id && Weak::ptr_eq(&r.route, &route))
+                });
+                host.send_host_command(HostCommand {
+                    kind: "system".into(),
+                    open_id: Some(0),
+                    system: Some(SystemCommand {
+                        op: "audio-close".into(),
+                        count: Some(id),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })
+            }
+            _ => Err(napi_ohos::Error::from_reason("unsupported audio command")),
+        }
+    }
+
+    fn submit(
+        &self,
+        host: &Services,
+        request: Request<Dispatcher>,
+        data: SystemCommand,
+    ) -> napi_ohos::Result<()> {
         let key = match self
             .next
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
@@ -258,7 +592,75 @@ impl System {
         else {
             return;
         };
-        let payload = if request.kind == EventKind::Speech {
+        if let Some((node_id, report_only)) = request.paste {
+            if let Some(text) = value.text.filter(|t| !t.is_empty()) {
+                route.send(Message::InputPaste {
+                    id: node_id,
+                    text,
+                    report_only,
+                });
+            }
+            return;
+        }
+        let payload = if request.kind == EventKind::FileRequest {
+            match value.error {
+                Some(error) => EventPayload::file_failed(request.id, error),
+                None => EventPayload::file_answer(request.id, Vec::new()),
+            }
+        } else if request.kind == EventKind::Audio {
+            use nsh_core::audio::{AudioError, AudioEvent as E};
+            use std::time::Duration;
+            let ms = |v: Option<f64>| {
+                v.filter(|d| d.is_finite() && *d >= 0.0)
+                    .map(|d| Duration::from_secs_f64(d / 1000.0))
+            };
+            let event = match value.phase.as_deref() {
+                Some("loaded") => E::Loaded {
+                    duration: ms(value.duration_ms).unwrap_or_default(),
+                    bytes: value.bytes.unwrap_or(0.0).max(0.0) as u64,
+                    truncated: value.truncated.unwrap_or(false),
+                },
+                Some("load") => E::Load {
+                    duration: ms(value.duration_ms).filter(|d| !d.is_zero()),
+                },
+                Some("playing") => E::Playing,
+                Some("paused") => E::Paused,
+                Some("progress") => E::Progress {
+                    position: ms(value.position_ms).unwrap_or_default(),
+                    duration: ms(value.duration_ms).filter(|d| !d.is_zero()),
+                },
+                Some("buffer") => E::Buffer {
+                    buffering: value.buffering.unwrap_or(false),
+                },
+                Some("ended") => E::Ended,
+                Some("failed" | "end") => E::Failed {
+                    error: value
+                        .code
+                        .as_deref()
+                        .and_then(AudioError::from_name)
+                        .unwrap_or(AudioError::Failed),
+                    message: value.error.unwrap_or_default(),
+                },
+                _ => {
+                    if let Some(error) = value.error {
+                        E::Failed {
+                            error: value
+                                .code
+                                .as_deref()
+                                .and_then(AudioError::from_name)
+                                .unwrap_or(AudioError::Failed),
+                            message: error,
+                        }
+                    } else {
+                        return;
+                    }
+                }
+            };
+            EventPayload::Audio {
+                id: request.id,
+                event,
+            }
+        } else if request.kind == EventKind::Speech {
             use nsh_core::speech::{SpeechError, SpeechEvent as E};
             let event = match value.phase.as_deref() {
                 Some("start") => E::Start,
@@ -276,6 +678,9 @@ impl System {
                 event,
             }
         } else {
+            if !request.answer && value.error.is_none() {
+                return;
+            }
             if let Some(error) = value.error.as_deref() {
                 route.send(Message::Error(format!("system service: {error}")));
             }
@@ -321,6 +726,8 @@ impl<R> Clone for Request<R> {
             id: self.id,
             stream: self.stream,
             answer: self.answer,
+            #[cfg(target_env = "ohos")]
+            paste: self.paste,
         }
     }
 }
@@ -356,10 +763,16 @@ pub(crate) struct SystemCommand {
     pub name: Option<String>,
     pub title: Option<String>,
     pub body: Option<String>,
+    pub silent: Option<bool>,
     pub count: Option<u32>,
     pub ask: Option<bool>,
     pub lang: Option<String>,
     pub interim: Option<bool>,
+    pub volume: Option<f64>,
+    pub rate: Option<f64>,
+    pub looped: Option<bool>,
+    pub position_ms: Option<f64>,
+    pub duration_ms: Option<f64>,
 }
 impl SystemCommand {
     fn notification_listener(command: nsh_core::notifications::NotificationCommand) -> Self {
@@ -393,6 +806,11 @@ pub(crate) struct SystemEvent {
     pub phase: Option<String>,
     #[cfg_attr(target_env = "ohos", napi(js_name = "final"))]
     pub is_final: Option<bool>,
+    pub duration_ms: Option<f64>,
+    pub position_ms: Option<f64>,
+    pub bytes: Option<f64>,
+    pub truncated: Option<bool>,
+    pub buffering: Option<bool>,
 }
 impl SystemEvent {
     #[cfg(target_env = "ohos")]
@@ -414,12 +832,18 @@ impl SystemEvent {
             ("files", self.files),
             ("error", self.error),
             ("code", self.code),
+            ("phase", self.phase),
         ] {
             if let Some(value) = value {
                 fields.push((name, PayloadValue::Str(value)));
             }
         }
-        for (name, value) in [("shown", self.shown), ("has", self.has)] {
+        for (name, value) in [
+            ("shown", self.shown),
+            ("has", self.has),
+            ("truncated", self.truncated),
+            ("buffering", self.buffering),
+        ] {
             if let Some(value) = value {
                 fields.push((name, PayloadValue::Bool(value)));
             }
@@ -428,6 +852,9 @@ impl SystemEvent {
             ("width", self.width),
             ("height", self.height),
             ("tooLarge", self.too_large),
+            ("durationMs", self.duration_ms),
+            ("positionMs", self.position_ms),
+            ("bytes", self.bytes),
         ] {
             if let Some(value) = value {
                 fields.push((name, PayloadValue::Number(value)));
@@ -581,6 +1008,8 @@ mod tests {
                     id: 0,
                     stream: true,
                     answer: false,
+                    #[cfg(target_env = "ohos")]
+                    paste: None,
                 },
                 |_| true,
             )
@@ -608,6 +1037,8 @@ mod tests {
                     id: key,
                     stream,
                     answer: true,
+                    #[cfg(target_env = "ohos")]
+                    paste: None,
                 },
                 |_| true,
             )

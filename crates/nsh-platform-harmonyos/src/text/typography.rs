@@ -264,19 +264,10 @@ impl TextEngine for OhosTextEngine {
     }
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
         let data = nsh_core::font_data(data)?;
-        let face = ttf_parser::Face::parse(&data, 0).map_err(|e| e.to_string())?;
-        let family = face
-            .names()
-            .into_iter()
-            .filter(|name| {
-                matches!(
-                    name.name_id,
-                    ttf_parser::name_id::TYPOGRAPHIC_FAMILY | ttf_parser::name_id::FAMILY
-                )
-            })
-            .find_map(|name| name.to_string())
-            .filter(|name| !name.is_empty() && !name.contains('\0'))
-            .ok_or("font has no valid family name")?;
+        let family = nsh_core::font_family(&data)?;
+        if family.is_empty() || family.contains('\0') {
+            return Err("font has no valid family name".into());
+        }
         let mut bytes: Arc<[u8]> = Arc::from(data.as_ref());
         let mut fonts = self.fonts.lock().expect("font collection");
         fonts

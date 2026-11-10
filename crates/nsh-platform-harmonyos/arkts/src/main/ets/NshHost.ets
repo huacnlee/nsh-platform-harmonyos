@@ -55,6 +55,10 @@ interface HostInitPayload {
   colorMode: number;
   fontSizeScale: number;
   language: string;
+  languages?: string[];
+  timeZone?: string;
+  regionalLocale?: string;
+  is24HourClock?: boolean;
   screenReader: boolean;
   reduceMotion?: boolean;
 }
@@ -102,6 +106,10 @@ interface NshNativeModule {
     rtl: boolean,
     deviceType?: string,
     pixelRatio?: number,
+    languages?: string[],
+    timeZone?: string,
+    regionalLocale?: string,
+    is24HourClock?: boolean,
   ): void;
   nshUpdateAccessibility(sessionId: number, screenReader?: boolean, reduceMotion?: boolean): void;
   nshUpdateWindow(
@@ -184,6 +192,36 @@ function safeAvoidArea(win: window.Window, type: window.AvoidAreaType): AvoidAre
   } catch {
     return emptyAvoidArea();
   }
+}
+
+interface SystemLocaleDetails {
+  languages?: string[];
+  timeZone?: string;
+  regionalLocale?: string;
+  is24HourClock?: boolean;
+}
+
+function readSystemLocaleDetails(): SystemLocaleDetails {
+  let languages: string[] | undefined = undefined;
+  try {
+    const list = i18n.System.getPreferredLanguageList();
+    if (Array.isArray(list) && list.length > 0) {
+      languages = list;
+    }
+  } catch {}
+  let timeZone: string | undefined = undefined;
+  try {
+    timeZone = i18n.getTimeZone().getID();
+  } catch {}
+  let regionalLocale: string | undefined = undefined;
+  try {
+    regionalLocale = i18n.System.getSystemLocale();
+  } catch {}
+  let is24HourClock: boolean | undefined = undefined;
+  try {
+    is24HourClock = i18n.System.is24HourClock();
+  } catch {}
+  return { languages, timeZone, regionalLocale, is24HourClock };
 }
 
 class ComponentRuntimeContext implements NshRuntimeContext {
@@ -443,6 +481,7 @@ class HostSession {
 
     const config = abilityContext.config;
     const language = config?.language || i18n.System.getSystemLanguage();
+    const localeDetails = readSystemLocaleDetails();
     let pixelRatio = uiContext.vp2px(1);
     const displayId = mainWindow.getWindowProperties().displayId;
     if (displayId !== undefined) {
@@ -463,6 +502,10 @@ class HostSession {
         colorMode: config?.colorMode ?? -1,
         fontSizeScale: config?.fontSizeScale ?? 1.0,
         language,
+        languages: localeDetails.languages,
+        timeZone: localeDetails.timeZone,
+        regionalLocale: localeDetails.regionalLocale,
+        is24HourClock: localeDetails.is24HourClock,
         rtl: i18n.isRTL(language),
         pixelRatio,
         lifecycle,
@@ -559,6 +602,7 @@ class HostSession {
       return;
     }
     try {
+      const localeDetails = readSystemLocaleDetails();
       this.mod.nshUpdateConfig(
         this.sessionId,
         newConfig.colorMode ?? -1,
@@ -567,6 +611,10 @@ class HostSession {
         i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
         deviceInfo.deviceType,
         this.runtimeContext.getUIContext().vp2px(1),
+        localeDetails.languages,
+        localeDetails.timeZone,
+        localeDetails.regionalLocale,
+        localeDetails.is24HourClock,
       );
     } catch {}
   }

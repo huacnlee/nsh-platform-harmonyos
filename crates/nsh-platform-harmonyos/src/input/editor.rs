@@ -107,6 +107,21 @@ impl Input {
                 EventKind::Paste,
                 EventPayload::Paste(Box::new(nsh_core::PasteEvent::new(event.text))),
             ),
+            "edit-action" => {
+                if event.text == "paste" {
+                    owner.host.system.paste_to_input(
+                        &owner.host,
+                        owner.dispatcher.clone(),
+                        owner.id,
+                        self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report,
+                    )?;
+                } else {
+                    owner.emit(
+                        EventKind::EditAction,
+                        EventPayload::Map(vec![("action", PayloadValue::Str(event.text))]),
+                    );
+                }
+            }
             "caret" => {
                 let content = self.content.get();
                 owner.emit(
@@ -436,6 +451,65 @@ impl Input {
     pub(crate) fn selection(&self, start: u32, end: u32) -> Result<()> {
         let (start, end) = editor_state::selection(&self.state.borrow().text, start, end);
         self.command("selection", start as u32, end as u32);
+        Ok(())
+    }
+    pub(crate) fn insert_text(&self, text: String) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
+            && let Some(target_id) = self.target_id()
+        {
+            owner.editor_command(EditorCommand {
+                target_id,
+                kind: "insert".into(),
+                text: Some(text),
+                ..Default::default()
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn complete_paste(&self, text: String, report_only: bool) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
+            owner.emit(
+                EventKind::Paste,
+                EventPayload::Paste(Box::new(nsh_core::PasteEvent::new(text.clone()))),
+            );
+            if !report_only && self.config.borrow().editable && !text.is_empty() {
+                self.insert_text(text)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn open_edit_menu(
+        &self,
+        bounds: nsh_core::Bounds<nsh_core::Points>,
+        actions: Vec<nsh_core::EditAction>,
+    ) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
+            && let Some(target_id) = self.target_id()
+        {
+            owner.editor_command(EditorCommand {
+                target_id,
+                kind: "open-edit-menu".into(),
+                x: f64::from(bounds.origin.x.0 + bounds.size.width.0 * 0.5),
+                y: f64::from(bounds.origin.y.0),
+                actions: Some(
+                    actions
+                        .into_iter()
+                        .filter_map(|a| match a {
+                            nsh_core::EditAction::Cut => Some("cut".to_owned()),
+                            nsh_core::EditAction::Copy => Some("copy".to_owned()),
+                            nsh_core::EditAction::Paste => Some("paste".to_owned()),
+                            nsh_core::EditAction::SelectAll => Some("selectAll".to_owned()),
+                            _ => None,
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            });
+        }
+        Ok(())
+    }
+    pub(crate) fn close_edit_menu(&self) -> Result<()> {
+        self.command("close-edit-menu", 0, 0);
         Ok(())
     }
     pub(crate) fn hit_test(&self, mode: HitTestMode) -> Result<()> {

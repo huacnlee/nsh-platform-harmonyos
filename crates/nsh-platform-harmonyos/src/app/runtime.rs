@@ -98,6 +98,11 @@ pub(crate) enum Message {
     DismissKeyboard,
     ReconcileNavigation,
     FlushScrollLayout(nsh_core::NodeId),
+    InputPaste {
+        id: nsh_core::NodeId,
+        text: String,
+        report_only: bool,
+    },
     DialogResult {
         id: u32,
         index: i32,
@@ -353,6 +358,15 @@ impl State {
             Message::FlushScrollLayout(id) => {
                 self.mounter.as_ref().unwrap().flush_scroll_layout(id)?
             }
+            Message::InputPaste {
+                id,
+                text,
+                report_only,
+            } => self
+                .mounter
+                .as_ref()
+                .unwrap()
+                .input_paste(id, text, report_only)?,
             Message::ReconcileNavigation => {
                 self.mounter.as_mut().unwrap().reconcile_navigation()?;
             }
@@ -700,12 +714,15 @@ impl App {
         }
     }
     pub(crate) fn grant(&mut self, granted: Option<nsh_engine::Capabilities>) {
-        if let nsh_engine::App::Js(bundle) = &mut self.app {
+        if let nsh_engine::App::Js(bundle) = &mut self.app
+            && bundle.policy.granted.is_none()
+        {
             bundle.policy.granted = granted;
         }
     }
 }
 impl Runtime {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
         env: Env,
         parent: NativeNode,
@@ -713,6 +730,7 @@ impl Runtime {
         size: Size,
         config: &Config,
         components: crate::interop::component::Components,
+        scroll_watchers: crate::scroll::watch::ScrollWatchers,
         errors: Errors,
     ) -> napi_ohos::Result<Self> {
         config.host.check()?;
@@ -806,6 +824,8 @@ impl Runtime {
             web_input: true,
             notifications: true,
             speech: config.host.speech_available,
+            file_requests: true,
+            audio: true,
             pixel_ratio: scale,
             window: size.into(),
             ..Environment::default()
@@ -856,6 +876,7 @@ impl Runtime {
             windows: None,
         };
         let host_tokens = config.host_tokens.clone();
+        let host_fonts = config.fonts.clone();
         let fonts = crate::text::fonts::Fonts::new();
         let engine_fonts = fonts.clone();
         let scale = environment.pixel_ratio;
@@ -872,6 +893,9 @@ impl Runtime {
                 if let Some(tokens) = host_tokens {
                     control.set_tokens(Some(tokens));
                 }
+                for font in host_fonts {
+                    control.register_font(font);
+                }
             },
         )
         .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
@@ -883,6 +907,7 @@ impl Runtime {
             shaders: crate::render::shader::Shaders::new(shader_vsync),
             fullscreen_video: RefCell::default(),
             scroll_reports: RefCell::default(),
+            scroll_watchers,
             flushing_batch: std::cell::Cell::new(false),
             scene: RefCell::default(),
             compositor: std::cell::RefCell::default(),
@@ -1011,6 +1036,13 @@ impl Runtime {
         let state = self.state.try_borrow().map_err(reentry)?;
         if let Some(engine) = &state.engine {
             engine.control().set_tokens(tokens);
+        }
+        Ok(())
+    }
+    pub(crate) fn register_font(&self, data: Vec<u8>) -> napi_ohos::Result<()> {
+        let state = self.state.try_borrow().map_err(reentry)?;
+        if let Some(engine) = &state.engine {
+            engine.control().register_font(data);
         }
         Ok(())
     }

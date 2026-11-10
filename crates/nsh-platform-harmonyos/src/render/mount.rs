@@ -80,6 +80,7 @@ pub(crate) struct UiContext {
     /// The video whose native Stack is temporarily the root's last child.
     pub(crate) fullscreen_video: std::cell::RefCell<std::rc::Weak<Node>>,
     pub(crate) scroll_reports: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
+    pub(crate) scroll_watchers: crate::scroll::watch::ScrollWatchers,
     pub(crate) flushing_batch: std::cell::Cell<bool>,
     pub(crate) scene: std::cell::RefCell<Option<Rc<crate::render::composition::scene::Scene>>>,
     pub(crate) compositor:
@@ -1040,13 +1041,14 @@ impl Mounter {
                                 .0
                                 .downcast_ref::<NativeText>()
                                 .ok_or(Error::Unsupported("foreign text layout"))?;
-                            node.accessibility_state.text(node, &raster.text);
+                            let shown: Arc<str> = Arc::from(raster.source.shown_text());
+                            node.accessibility_state.text(node, &shown);
                             let links_changed =
                                 node.text(raster, content.into(), layout.clone())?;
                             if links_changed {
                                 node.set_events(node.interaction.mask())?;
                             }
-                            node.interaction.text(node, &raster.text)?;
+                            node.interaction.text(node, &shown)?;
                         }
                     }
                     MountItem::Gestures { id, values } => self
@@ -1306,6 +1308,21 @@ impl Mounter {
                                 input.selection(start, end)?;
                             }
                         }
+                        Command::InsertText(text) => {
+                            if let Some(input) = self.node(id)?.input.borrow().as_ref() {
+                                input.insert_text(text)?;
+                            }
+                        }
+                        Command::OpenEditMenu { bounds, actions } => {
+                            if let Some(input) = self.node(id)?.input.borrow().as_ref() {
+                                input.open_edit_menu(bounds, actions)?;
+                            }
+                        }
+                        Command::CloseEditMenu => {
+                            if let Some(input) = self.node(id)?.input.borrow().as_ref() {
+                                input.close_edit_menu()?;
+                            }
+                        }
                         Command::SetJsResponder { block } => {
                             let mut node = Some(self.node(id)?.clone());
                             while let Some(current) = node {
@@ -1357,9 +1374,13 @@ impl Mounter {
                         }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
-                        | Command::Haptic(_) => {}
+                        | Command::CancelPress => {}
+                        Command::Haptic(haptic) => {
+                            self.host.haptic(haptic)?;
+                        }
                         Command::PerfMonitor(enabled) => {
-                            self.control.set_perf_monitor(enabled.then(Default::default));
+                            self.control
+                                .set_perf_monitor(enabled.then(Default::default));
                         }
                         Command::ScrollToIndex { .. }
                         | Command::ScrollToEnd { .. }
@@ -1376,13 +1397,21 @@ impl Mounter {
                                 nsh_core::PayloadValue::Number(f64::from(id)),
                             )]),
                         ),
-                        Command::Audio(_) => {
-                            return Err(Error::Unsupported("audio (environment.audio is false)"));
+                        Command::Audio(audio) => {
+                            self.host.system.audio(
+                                &self.host,
+                                self.dispatcher.clone(),
+                                &self.assets,
+                                audio,
+                            )?;
                         }
-                        Command::FileRequest { .. } => {
-                            return Err(Error::Unsupported(
-                                "file requests (environment.file_requests is false)",
-                            ));
+                        Command::FileRequest { id, request } => {
+                            self.host.system.file_request(
+                                &self.host,
+                                self.dispatcher.clone(),
+                                id,
+                                *request,
+                            )?;
                         }
                     },
                     // Appearance and direction also reach native controls and SDK subtrees.
@@ -1561,7 +1590,17 @@ impl Mounter {
         Ok(())
     }
 
+    pub(crate) fn input_paste(&self, id: NodeId, text: String, report_only: bool) -> Result<()> {
+        if let Some(node) = self.slots.get(id as usize).and_then(Option::as_ref)
+            && let Some(input) = node.input.borrow().as_ref()
+        {
+            input.complete_paste(text, report_only)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn close(&mut self) -> Result<()> {
+        self.scroll_watchers.clear_nodes();
         self.dialogs.clear();
         self.mount.unmount()?;
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {

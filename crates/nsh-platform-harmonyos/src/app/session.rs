@@ -81,6 +81,10 @@ pub(crate) struct HostInit {
     pub color_mode: i32,
     pub font_size_scale: f64,
     pub language: String,
+    pub languages: Option<Vec<String>>,
+    pub time_zone: Option<String>,
+    pub regional_locale: Option<String>,
+    pub is_24_hour_clock: Option<bool>,
     pub screen_reader: bool,
     pub reduce_motion: Option<bool>,
 }
@@ -491,6 +495,46 @@ impl Services {
             text: Some(cursor.name().into()),
             ..Default::default()
         })
+    }
+
+    pub(crate) fn haptic(&self, haptic: nsh_core::Haptic) -> Result<()> {
+        self.check()?;
+        let (duration, usage) = match haptic {
+            nsh_core::Haptic::Selection => (10, ohos_vibrator_binding::VibratorUsage::Touch),
+            nsh_core::Haptic::Impact(nsh_core::HapticImpact::Soft) => {
+                (12, ohos_vibrator_binding::VibratorUsage::Touch)
+            }
+            nsh_core::Haptic::Impact(nsh_core::HapticImpact::Light) => {
+                (15, ohos_vibrator_binding::VibratorUsage::Touch)
+            }
+            nsh_core::Haptic::Impact(nsh_core::HapticImpact::Rigid) => {
+                (20, ohos_vibrator_binding::VibratorUsage::PhysicalFeedback)
+            }
+            nsh_core::Haptic::Impact(nsh_core::HapticImpact::Medium) => {
+                (25, ohos_vibrator_binding::VibratorUsage::PhysicalFeedback)
+            }
+            nsh_core::Haptic::Impact(nsh_core::HapticImpact::Heavy) => {
+                (40, ohos_vibrator_binding::VibratorUsage::PhysicalFeedback)
+            }
+            nsh_core::Haptic::Notification(nsh_core::HapticNotification::Success) => {
+                (30, ohos_vibrator_binding::VibratorUsage::Notification)
+            }
+            nsh_core::Haptic::Notification(nsh_core::HapticNotification::Warning) => {
+                (45, ohos_vibrator_binding::VibratorUsage::Notification)
+            }
+            nsh_core::Haptic::Notification(nsh_core::HapticNotification::Error) => {
+                (60, ohos_vibrator_binding::VibratorUsage::Notification)
+            }
+            _ => return Ok(()),
+        };
+        let _ = ohos_vibrator_binding::start(
+            duration,
+            ohos_vibrator_binding::Attribute {
+                vibrator_id: 0,
+                usage,
+            },
+        );
+        Ok(())
     }
     pub(crate) fn send_host_command(&self, command: HostCommand) -> Result<()> {
         self.check()?;
@@ -1048,13 +1092,34 @@ pub(crate) fn idiom(device_type: &str) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn environment_from_config(
     color_mode: i32,
     font_size_scale: f64,
     language: String,
     device_type: Option<&str>,
     rtl: bool,
+    languages: Option<Vec<String>>,
+    time_zone: Option<String>,
+    regional_locale: Option<String>,
+    is_24_hour_clock: Option<bool>,
 ) -> NshEnvironment {
+    let regional_source = regional_locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&language);
+    let preferences = nsh_core::platform::LocaleSettings::parse(regional_source);
+    let hour_cycle = is_24_hour_clock.map(|twenty_four| {
+        let twelve = !twenty_four;
+        let cycle = if preferences.hour_cycle.twelve_hour() == twelve {
+            preferences.hour_cycle
+        } else if twelve {
+            nsh_core::platform::HourCycle::H12
+        } else {
+            nsh_core::platform::HourCycle::H23
+        };
+        cycle.name().to_owned()
+    });
     NshEnvironment {
         font_scale: (font_size_scale.is_finite() && font_size_scale > 0.0)
             .then_some(font_size_scale),
@@ -1070,6 +1135,10 @@ pub(crate) fn environment_from_config(
             .or_else(|| ohos_device_binding::device_type().map(idiom))
             .map(str::to_owned),
         locale: (!language.is_empty()).then_some(language),
+        languages: languages.filter(|list| !list.is_empty()),
+        time_zone: time_zone.filter(|tz| !tz.is_empty()),
+        regional_locale: regional_locale.filter(|tag| !tag.is_empty()),
+        hour_cycle,
         ..NshEnvironment::default()
     }
 }
@@ -1081,6 +1150,10 @@ fn environment_from_init(init: &HostInit) -> NshEnvironment {
         init.language.clone(),
         Some(&init.device_type),
         init.rtl,
+        init.languages.clone(),
+        init.time_zone.clone(),
+        init.regional_locale.clone(),
+        init.is_24_hour_clock,
     );
     env.pixel_ratio = Some(init.pixel_ratio);
     env.lifecycle = Some(init.lifecycle.clone());

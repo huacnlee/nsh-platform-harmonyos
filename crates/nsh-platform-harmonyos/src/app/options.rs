@@ -93,11 +93,13 @@ pub(crate) fn directory(value: Option<String>) -> napi_ohos::Result<Option<std::
 pub(crate) struct Config {
     pub(crate) host: Arc<crate::app::session::Services>,
     pub(crate) assets: Arc<dyn crate::services::assets::StreamAssets>,
+    pub(crate) has_custom_assets: bool,
     pub(crate) policy: nsh_engine::Policy,
     pub(crate) limits: nsh_engine::Limits,
     pub(crate) environment: NshEnvironment,
     pub(crate) channel: nsh_engine::HostChannel,
     pub(crate) host_tokens: Option<nsh_engine::Tokens>,
+    pub(crate) fonts: Vec<Vec<u8>>,
     pub(crate) storage: Option<std::path::PathBuf>,
     pub(crate) cache: nsh_engine::CacheOptions,
     pub(crate) manages_status_bar: bool,
@@ -113,6 +115,7 @@ impl Config {
             .map(AssetDirectory::new)
             .transpose()
             .map_err(napi_ohos::Error::from_reason)?;
+        let has_custom_assets = asset_directory.is_some();
         let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
             crate::services::assets::HostAssets::new(host.clone(), asset_directory),
         );
@@ -192,11 +195,13 @@ impl Config {
             manages_status_bar: options.manages_status_bar.unwrap_or(true),
             host,
             assets,
+            has_custom_assets,
             policy,
             limits,
             environment,
             channel: nsh_engine::HostChannel::new(),
             host_tokens: None,
+            fonts: Vec::new(),
         })
     }
 }

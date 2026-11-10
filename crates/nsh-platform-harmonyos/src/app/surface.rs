@@ -163,6 +163,7 @@ struct State {
     config: Option<Config>,
     host: Rc<RefCell<Option<Arc<crate::app::session::Services>>>>,
     components: Components,
+    scroll_watchers: crate::scroll::watch::ScrollWatchers,
     host_handlers: FxHashMap<String, Rc<HostHandler>>,
     open_url_handler: Option<Rc<OpenUrlHandler>>,
     pending_urls: Vec<String>,
@@ -402,6 +403,7 @@ impl State {
             size,
             config,
             self.components.clone(),
+            self.scroll_watchers.clone(),
             self.errors.clone(),
         )?;
         runtime.set_attached(self.attached)?;
@@ -565,6 +567,7 @@ impl State {
         if let Some(runtime) = self.phase.runtime() {
             runtime.close()?;
         }
+        self.scroll_watchers.clear_nodes();
         self.phase = SurfacePhase::Empty;
         Ok(())
     }
@@ -610,6 +613,7 @@ impl State {
             return Err(error);
         }
         self.components.clear();
+        self.scroll_watchers.close();
         self.host_handlers.clear();
         self.open_url_handler = None;
         self.pending_urls.clear();
@@ -693,6 +697,7 @@ impl NshSurface {
             config: Some(config),
             host: host_slot.clone(),
             components: components.clone(),
+            scroll_watchers: crate::scroll::watch::ScrollWatchers::default(),
             host_handlers: FxHashMap::default(),
             open_url_handler: None,
             pending_urls: Vec::new(),
@@ -923,16 +928,20 @@ impl NshSurface {
         let host = self.host()?;
         crate::app::session::resource_name(&name)?;
         let permit = host.reserve_load()?;
-        let (token, generation) = {
+        let (token, generation, granted, has_custom_assets) = {
             let mut state = self.state.try_borrow_mut().map_err(reentry)?;
             #[cfg(feature = "dev")]
             state.disconnect_dev();
             if let Some(runtime) = state.phase.runtime() {
                 runtime.close()?;
             }
+            let (granted, has_custom_assets) = {
+                let config = state.config()?;
+                (config.policy.granted.clone(), config.has_custom_assets)
+            };
             let token = state.next_load()?;
             state.phase = SurfacePhase::Loading { token };
-            (token, state.generation.clone())
+            (token, state.generation.clone(), granted, has_custom_assets)
         };
         let chunks = crate::app::chunks::ResourceChunks::new(host.clone(), &name);
         let entry_chunks_loader = chunks.clone();
@@ -960,7 +969,34 @@ impl NshSurface {
                 entry_chunks_loader
                     .preload(&mut bundle)
                     .map_err(Error::from_reason)?;
-                Ok(bundle)
+                bundle.policy.granted = granted;
+                let updater = entry_chunks_loader.read_optional("assets/nsh-updater.json");
+                let package = if !has_custom_assets {
+                    nsh_engine::updates::package_to_run(
+                        &mut bundle,
+                        updater,
+                        Some(&host.data_directory()),
+                    )
+                } else {
+                    bundle.updater_config = updater.map(Arc::from);
+                    None
+                };
+                if let Some(run) = package {
+                    match crate::services::assets::AssetDirectory::from_path(&run.assets) {
+                        Ok(dir) => {
+                            let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
+                                crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
+                            );
+                            return Ok((run.bundle, Some(assets)));
+                        }
+                        Err(err) => {
+                            log::warn!(
+                                "cannot set the package's assets, running the app's own: {err}"
+                            );
+                        }
+                    }
+                }
+                Ok((bundle, None))
             })
             .await
             .map_err(|error| Error::from_reason(error.to_string()))
@@ -976,14 +1012,25 @@ impl NshSurface {
                 return Err(cancelled());
             }
             state.phase = SurfacePhase::Empty;
-            let result = state.check().and(result).and_then(|mut bundle| {
-                let config = state.config()?;
-                bundle.policy.granted = config.policy.granted.clone();
-                bundle.source_map = source_map.map(Into::into);
-                let mut app = App::new(bundle, config.assets.clone());
-                app.chunks = Some(chunks);
-                state.accept_app(*env, app)
-            });
+            let result = state
+                .check()
+                .and(result)
+                .and_then(|(mut bundle, package_assets)| {
+                    let config = state.config()?;
+                    let is_package = package_assets.is_some();
+                    if !is_package {
+                        bundle.policy.granted = config.policy.granted.clone();
+                        bundle.source_map = source_map.map(Into::into);
+                    }
+                    let mut app = App::new(
+                        bundle,
+                        package_assets.unwrap_or_else(|| config.assets.clone()),
+                    );
+                    if !is_package {
+                        app.chunks = Some(chunks);
+                    }
+                    state.accept_app(*env, app)
+                });
             if let Err(error) = &result {
                 state.errors.report(error.to_string());
             }
@@ -1259,6 +1306,44 @@ impl NshSurface {
         }
         state.config_mut()?.host_tokens = tokens;
         Ok(())
+    }
+
+    /// Registers a font file (TrueType, OpenType, WOFF or WOFF2) the host ships,
+    /// so every app this surface loads can name its family in `fontFamily` without
+    /// bundling the file. A font registered before a load is in that app's first
+    /// frame; one registered while an app runs is used from the next layout.
+    /// Registering the same file again does nothing.
+    #[napi]
+    pub fn register_font(&self, data: napi_ohos::bindgen_prelude::Uint8Array) -> Result<()> {
+        self.check()?;
+        let family = nsh_core::font_family(&data).map_err(Error::from_reason)?;
+        if family.is_empty() || family.contains('\0') {
+            return Err(Error::from_reason("font has no valid family name"));
+        }
+        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        if !nsh_core::keep_font(&mut state.config_mut()?.fonts, &data) {
+            return Ok(());
+        }
+        if let Some(runtime) = state.phase.runtime() {
+            runtime.register_font(data.to_vec())?;
+        }
+        Ok(())
+    }
+
+    /// Watches the `<Scroll>` whose `nativeID` is `native_id` on the UI thread,
+    /// calling `watcher` with its `NshScrollHandle` when mounted and `null` when
+    /// unmounted. Pass `null` or `undefined` to remove the watcher.
+    #[napi]
+    pub fn watch_scroll(
+        &self,
+        env: Env,
+        native_id: String,
+        #[napi(ts_arg_type = "((scroll: NshScrollHandle | null) => void) | null | undefined")]
+        watcher: Option<Function<'_, Option<crate::scroll::watch::NshScrollHandle>, ()>>,
+    ) -> Result<()> {
+        self.check()?;
+        let state = self.state.try_borrow().map_err(reentry)?;
+        state.scroll_watchers.watch(env, &native_id, watcher)
     }
 
     /// Forwards per-instance environment observations, including before the first load.

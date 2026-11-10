@@ -57,6 +57,7 @@ ohos-xcomponent-binding = { version = "0.6.0", default-features = false, feature
 ohos-native-window-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
+ohos-vibrator-binding = { version = "0.2.4", default-features = false, features = ["api-20"] }
 
 [profile.release]
 opt-level = 3
@@ -72,11 +73,12 @@ opt-level = 3
 # extension points (longbridge/nsh#1393) are on `main` and not in a release yet.
 # To build against a local checkout, give each a `path = "<checkout>/crates/<name>"`.
 [patch.crates-io]
-nsh-core = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-engine = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-base = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-package = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-dev = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-js = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-macros = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-i18n = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-engine = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-package = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-dev = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-js = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-macros = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-i18n = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-updater = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }

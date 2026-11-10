@@ -420,6 +420,43 @@ impl Scroller {
         self.content
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedLayout)?;
+        if let Some(owner) = self.owner.upgrade() {
+            owner.scroll_watchers.resized(owner.id);
+        }
+        Ok(())
+    }
+    pub(crate) fn current_offset(&self) -> (f32, f32) {
+        let (x, y) = self.offset.get();
+        let inset = self.behavior.borrow().content_inset;
+        (x + inset.left.0, y + inset.top.0)
+    }
+    pub(crate) fn current_viewport(&self) -> (f32, f32) {
+        let viewport = self.viewport_size.get();
+        let inset = self.behavior.borrow().content_inset;
+        (
+            (viewport.width - inset.left.0 - inset.right.0).max(0.0),
+            (viewport.height - inset.top.0 - inset.bottom.0).max(0.0),
+        )
+    }
+    pub(crate) fn current_content_size(&self) -> (f32, f32) {
+        let size = self.size.get();
+        let zoom = self.zoom.get();
+        let (vw, vh) = self.current_viewport();
+        ((size.width * zoom).max(vw), (size.height * zoom).max(vh))
+    }
+    pub(crate) fn host_scroll_by(&self, dx: f32, dy: f32, animated: bool) -> Result<()> {
+        let (x, y) = self.offset.get();
+        self.command_to(x + dx, y + dy, animated)
+    }
+    pub(crate) fn host_stop_scrolling(&self) -> Result<()> {
+        let (x, y) = self
+            .read_native_offset()?
+            .unwrap_or_else(|| self.offset.get());
+        self.to(x, y, false)?;
+        self.report()?;
+        if self.phase.get() != 0 {
+            self.phase(0)?;
+        }
         Ok(())
     }
     pub(crate) fn mirrored(&self) -> bool {
@@ -777,6 +814,7 @@ impl Scroller {
             if !self.horizontal.get() && !self.refresh.borrow().is_mounted() {
                 self.pulled((-reported.1).max(0.0))?;
             }
+            owner.scroll_watchers.scrolled(owner.id);
         }
         Ok(())
     }

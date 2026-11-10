@@ -1,5 +1,6 @@
-import { BuilderNode, FrameNode, NodeContent } from "@ohos.arkui.node";
+import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
+import pasteboard from "@ohos.pasteboard";
 
 export interface EditorSettings {
   targetId: number;
@@ -50,6 +51,8 @@ export interface EditorCommand {
   x: number;
   y: number;
   animated: boolean;
+  text?: string | null;
+  actions?: string[] | null;
 }
 export interface EditorEventPayload {
   readonly kind: string;
@@ -338,6 +341,51 @@ function editorContent(entry: EditorEntry) {
 
 // Failed retirement cannot release a BuilderNode still borrowed by native code.
 const quarantinedEditors: Set<EditorEntry> = new Set();
+
+interface EditMenuParams {
+  entry: EditorEntry;
+  actions: string[];
+}
+
+function editActionLabel(action: string): string {
+  switch (action) {
+    case "cut":
+      return "Cut";
+    case "copy":
+      return "Copy";
+    case "paste":
+      return "Paste";
+    case "selectAll":
+      return "Select All";
+    default:
+      return action;
+  }
+}
+
+@Component
+struct EditMenuView {
+  entry!: EditorEntry;
+  @Prop actions: string[] = [];
+  build() {
+    Menu() {
+      ForEach(
+        this.actions,
+        (action: string) => {
+          MenuItem({ content: editActionLabel(action) }).onClick((): void => {
+            this.entry.chooseEditAction(action);
+          });
+        },
+        (action: string): string => action,
+      );
+    }.padding(8);
+  }
+}
+
+@Builder
+function editMenuBuilder(params: EditMenuParams) {
+  EditMenuView({ entry: params.entry, actions: params.actions });
+}
+
 class EditorSizeCallback extends FrameCallback {
   private entry: EditorEntry;
   constructor(entry: EditorEntry) {
@@ -377,7 +425,10 @@ class EditorEntry {
   private caretX: number = 0;
   private caretY: number = 0;
   private caretHeight: number = 0;
+  private selStart: number = 0;
+  private selEnd: number = 0;
   private pendingScroll?: EditorCommand;
+  private editMenuContent?: ComponentContent<EditMenuParams>;
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
     this.context = context;
     this.settings = settings;
@@ -466,6 +517,8 @@ class EditorEntry {
     if (!this.canEdit() || this.settings.reportPaste) event.preventDefault?.();
   }
   selection(start: number, end: number): void {
+    this.selStart = Math.max(0, start);
+    this.selEnd = Math.max(this.selStart, end);
     this.emit("selection", "", start, end);
     this.revealCaret = true;
     this.scheduleSize();
@@ -618,6 +671,9 @@ class EditorEntry {
     }
     if (kind === "focus" || kind === "blur") {
       this.focused = kind === "focus";
+      if (!this.focused) {
+        this.closeEditMenu();
+      }
       this.caretIndex = -1;
       this.scheduleSize();
     }
@@ -672,17 +728,188 @@ class EditorEntry {
       }
     } else if (command.kind === "selection") {
       try {
+        this.selStart = Math.max(0, command.start);
+        this.selEnd = Math.max(this.selStart, command.end);
         if (this.settings.multiline && !this.settings.secure) {
           this.area.setTextSelection(command.start, command.end);
         } else {
           this.line.setTextSelection(command.start, command.end);
         }
       } catch {}
+    } else if (command.kind === "insert") {
+      this.insertText(command.text ?? "");
+    } else if (command.kind === "open-edit-menu") {
+      this.openEditMenu(command.x, command.y, command.actions ?? []);
+    } else if (command.kind === "close-edit-menu") {
+      this.closeEditMenu();
     } else {
       throw new Error(`Unsupported editor command '${command.kind}'`);
     }
   }
+  insertText(inserted: string): void {
+    if (!this.canEdit() || this.closed) {
+      return;
+    }
+    const controller: TextContentControllerBase =
+      this.settings.multiline && !this.settings.secure ? this.area : this.line;
+    let start = Math.min(this.text.length, this.selStart);
+    let end = Math.min(this.text.length, Math.max(start, this.selEnd));
+    try {
+      const range = controller.getSelection();
+      if (
+        range &&
+        typeof range.start === "number" &&
+        typeof range.end === "number" &&
+        range.start >= 0 &&
+        range.end >= range.start
+      ) {
+        start = Math.min(this.text.length, range.start);
+        end = Math.min(this.text.length, range.end);
+      } else {
+        const caret = controller.getCaretOffset();
+        if (caret && typeof caret.index === "number" && caret.index >= 0) {
+          start = Math.min(this.text.length, caret.index);
+          end = start;
+        }
+      }
+    } catch {}
+    const maxLen = this.settings.maxLength;
+    const room =
+      maxLen != null ? Math.max(0, maxLen - (this.text.length - (end - start))) : inserted.length;
+    const clipped = inserted.slice(0, room);
+    const next = this.text.slice(0, start) + clipped + this.text.slice(end);
+    const caret = start + clipped.length;
+    try {
+      if (end > start) {
+        controller.deleteText({ start, end });
+      }
+      if (clipped.length > 0) {
+        controller.addText(clipped, { offset: start });
+      }
+    } catch {}
+    if (this.text !== next) {
+      this.change(next);
+    }
+    this.selStart = caret;
+    this.selEnd = caret;
+    try {
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(caret, caret);
+      } else {
+        this.line.setTextSelection(caret, caret);
+      }
+    } catch {}
+    this.selection(caret, caret);
+  }
+  chooseEditAction(action: string): void {
+    this.closeEditMenu();
+    if (this.closed || !this.context.isActive()) {
+      return;
+    }
+    if (action === "paste") {
+      try {
+        pasteboard
+          .getSystemPasteboard()
+          .getData()
+          .then((data: pasteboard.PasteData): void => {
+            if (this.closed || !this.context.isActive()) {
+              return;
+            }
+            if (data.getRecordCount() === 0 && pasteboard.getSystemPasteboard().hasDataSync()) {
+              this.emit("edit-action", "paste");
+              return;
+            }
+            const text = data.getPrimaryText() ?? "";
+            this.emit("paste", text);
+            if (!this.settings.reportPaste && this.canEdit()) {
+              this.insertText(text);
+            }
+          })
+          .catch((): void => {
+            this.emit("edit-action", "paste");
+          });
+      } catch {
+        this.emit("edit-action", "paste");
+      }
+      return;
+    }
+    this.emit("edit-action", action);
+  }
+  private openEditMenu(x: number, y: number, actions: string[]): void {
+    this.closeEditMenu();
+    if (this.closed || !this.context.isActive() || actions.length === 0) {
+      return;
+    }
+    const frame = this.node.getFrameNode();
+    if (!frame) {
+      return;
+    }
+    const ui = this.context.getUIContext();
+    let localX = x;
+    let localY = y;
+    try {
+      const pos = frame.getPositionToWindow();
+      localX = x - pos.x;
+      localY = y - pos.y;
+    } catch {}
+    const content = new ComponentContent<EditMenuParams>(
+      ui,
+      wrapBuilder(editMenuBuilder),
+      { entry: this, actions },
+      { nestingBuilderSupported: true },
+    );
+    this.editMenuContent = content;
+    ui.getPromptAction()
+      .openMenu(
+        content,
+        { id: frame.getUniqueId() },
+        {
+          placement: Placement.TopLeft,
+          offset: { x: localX, y: -localY },
+          showInSubWindow: false,
+          onDisappear: (): void => {
+            if (this.editMenuContent === content) {
+              this.editMenuContent = undefined;
+            }
+            try {
+              content.dispose();
+            } catch {}
+          },
+        },
+      )
+      .catch((): void => {
+        if (this.editMenuContent === content) {
+          this.editMenuContent = undefined;
+        }
+        try {
+          content.dispose();
+        } catch {}
+      });
+  }
+  private closeEditMenu(): void {
+    const content = this.editMenuContent;
+    if (!content) {
+      return;
+    }
+    this.editMenuContent = undefined;
+    try {
+      this.context
+        .getUIContext()
+        .getPromptAction()
+        .closeMenu(content)
+        .finally((): void => {
+          try {
+            content.dispose();
+          } catch {}
+        });
+    } catch {
+      try {
+        content.dispose();
+      } catch {}
+    }
+  }
   private release(): void {
+    this.closeEditMenu();
     try {
       this.node.dispose();
       this.disposed = true;
