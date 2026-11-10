@@ -520,6 +520,17 @@ fn free_dev_port() -> u16 {
         .unwrap_or(8790)
 }
 
+fn clear_dev_forward(hdc: &Path, device: Option<&str>, port: u16) {
+    let node = format!("tcp:{port}");
+    for subcommand in ["rport", "fport"] {
+        let mut command = Command::new(hdc);
+        if let Some(device) = device {
+            command.args(["-t", device]);
+        }
+        let _ = command.args([subcommand, "rm", &node, &node]).output();
+    }
+}
+
 /// Installs the development HAP, forwards `port` from the device to this
 /// machine (`hdc rport`), launches the ability with `nsh.devUrl`, and runs
 /// `nsh dev --server-only`.
@@ -543,7 +554,7 @@ fn dev(
         cmd
     };
     let node = format!("tcp:{port}");
-    let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+    clear_dev_forward(&hdc, device, port);
     let rport = hdc_command()
         .args(["rport", &node, &node])
         .output()
@@ -558,7 +569,7 @@ fn dev(
     }
     let dev_url = format!("ws://127.0.0.1:{port}/ws");
     if let Err(err) = install(deveco, hap, bundle, device, Some(&dev_url)) {
-        let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+        clear_dev_forward(&hdc, device, port);
         return Err(err);
     }
     let mut server = Command::new(nsh());
@@ -572,7 +583,7 @@ fn dev(
         server.arg("--release");
     }
     let status = server.status().context("running nsh dev --server-only");
-    let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+    clear_dev_forward(&hdc, device, port);
     let status = status?;
     if !status.success() {
         bail!("nsh dev exited with {status}");
