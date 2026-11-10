@@ -27,7 +27,7 @@ pub(crate) struct AppConfig {
     pub(crate) icon: Option<PathBuf>,
     /// `"schemes"`: URL schemes that open the app (`myapp://...`).
     pub(crate) schemes: Vec<String>,
-    /// Whether the app may recognize speech (`ohos.permission.MICROPHONE`).
+    /// Explicit `capabilities.speech` opt-in to `ohos.permission.MICROPHONE`.
     pub(crate) speech: bool,
 }
 
@@ -90,10 +90,11 @@ impl AppConfig {
                 }
             }
         }
-        let speech = match json.get("capabilities") {
-            None => true,
-            Some(capabilities) => capabilities.get("speech") == Some(&Value::Bool(true)),
-        };
+        let speech = json
+            .get("capabilities")
+            .and_then(|capabilities| capabilities.get("speech"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         AppConfig {
             name: json["name"]
                 .as_str()
@@ -228,6 +229,7 @@ fn json_text(value: &str) -> String {
 }
 
 fn request_permissions(speech: bool) -> String {
+    // Haptics has no nsh capability; VIBRATE is a normal permission for every app.
     if speech {
         "[\n      {\n        \"name\": \"ohos.permission.INTERNET\"\n      },\n      {\n        \"name\": \"ohos.permission.VIBRATE\"\n      },\n      {\n        \"name\": \"ohos.permission.MICROPHONE\",\n        \"reason\": \"$string:nsh_microphone_reason\",\n        \"usedScene\": {\n          \"abilities\": [\n            \"EntryAbility\"\n          ],\n          \"when\": \"inuse\"\n        }\n      }\n    ]"
             .to_owned()
@@ -415,9 +417,14 @@ mod tests {
                 bare.build,
                 bare.speech
             ),
-            ("counter", "com.example.counter", 1, true)
+            ("counter", "com.example.counter", 1, false)
         );
         assert!(bare.schemes.is_empty());
+        let speech = AppConfig::from_json(
+            Path::new("/apps/speech"),
+            &serde_json::json!({ "capabilities": { "speech": true } }),
+        );
+        assert!(speech.speech);
     }
 
     #[test]
@@ -502,7 +509,8 @@ mod tests {
         assert!(profile.contains("\"targetSdkVersion\": \"6.0.0(20)\","));
         let module = fs::read_to_string(out.join("entry/src/main/module.json5")).unwrap();
         assert!(module.contains("\"default\","), "{module}");
-        assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");
+        assert!(!module.contains("ohos.permission.MICROPHONE"), "{module}");
+        assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
         assert!(module.contains("ohos.want.action.viewData"), "{module}");
         assert!(module.contains("\"scheme\": \"counterapp\""), "{module}");
         assert!(!module.contains("{{"), "{module}");
@@ -539,6 +547,16 @@ mod tests {
             "{profile}"
         );
         assert!(profile.contains("{ \"name\": \"release\", \"material\": {} }"));
+
+        let speech = AppConfig::from_json(
+            Path::new("/apps/speech"),
+            &serde_json::json!({ "capabilities": { "speech": true } }),
+        );
+        write(&out, &speech, &contents).unwrap();
+        let module = fs::read_to_string(out.join("entry/src/main/module.json5")).unwrap();
+        assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");
+        assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
+        assert!(!module.contains("{{"), "{module}");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
