@@ -5,15 +5,32 @@ pub(crate) struct State {
     pub(crate) text: String,
     pub(crate) count: u32,
     focused: bool,
+    composing: bool,
+    deferred: Option<(String, u32)>,
 }
 
 impl State {
     pub(crate) fn controlled(&mut self, text: String, count: u32) -> bool {
-        if count != self.count || self.text == text {
+        if count != self.count {
+            return false;
+        }
+        if self.composing {
+            self.deferred = Some((text, count));
+            return false;
+        }
+        if self.text == text {
             return false;
         }
         self.text = text;
         true
+    }
+
+    pub(crate) fn composition(&mut self, composing: bool) -> bool {
+        self.composing = composing;
+        if !composing && let Some((text, count)) = self.deferred.take() {
+            return self.controlled(text, count);
+        }
+        false
     }
 
     pub(crate) fn changed(&mut self, text: String) -> Option<u32> {
@@ -63,6 +80,27 @@ mod tests {
         assert!(state.controlled("accepted".into(), 1));
         assert_eq!(state.count, 1);
         assert_eq!(state.changed("accepted".into()), None);
+    }
+
+    #[test]
+    fn composition_holds_controlled_values_and_rejects_stale_deferred_edits() {
+        let mut state = State::default();
+        state.changed("preedit".into());
+        state.composition(true);
+        assert!(!state.controlled("PREEDIT".into(), 1));
+        assert_eq!(state.text, "preedit");
+        assert!(state.composition(false));
+        assert_eq!(state.text, "PREEDIT");
+        state.composition(true);
+        assert!(!state.controlled("old".into(), 1));
+        state.changed("committed".into());
+        assert!(!state.composition(false));
+        assert_eq!(state.text, "committed");
+        state.composition(true);
+        state.controlled("obsolete".into(), 2);
+        state.controlled("committed".into(), 2);
+        assert!(!state.composition(false));
+        assert_eq!(state.text, "committed");
     }
 
     #[test]

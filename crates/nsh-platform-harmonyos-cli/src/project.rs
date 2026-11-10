@@ -264,6 +264,21 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
             fs::copy(&source, rawfile.join(name))?;
         }
     }
+    if contents.build.is_dir() {
+        for entry in fs::read_dir(contents.build)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|ext| matches!(ext, "js" | "nshc" | "map"))
+                {
+                    fs::copy(&path, rawfile.join(entry.file_name()))?;
+                }
+            }
+        }
+    }
     let assets = contents.build.join("assets");
     if assets.is_dir() {
         copy_dir(&assets, &rawfile.join("assets"))?;

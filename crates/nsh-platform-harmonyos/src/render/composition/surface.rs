@@ -1,14 +1,8 @@
-//! A shader view's XComponent: a native surface first among the view's
-//! children (under the app's), the size of its box and clipped to its
-//! corners, whose native window the shader thread draws into.
-//!
-//! It is kept (in the tree, its callbacks unregistered) until the shader
-//! thread has dropped its surface of the window, as a video's is until its
-//! player lets it go.
+//! XComponent ownership shared by shader fills and exported composites.
+//! The UI retains a node until the compositor has released its EGL window.
 
-use std::{cell::Cell, ptr::NonNull, sync::mpsc};
+use std::{cell::Cell, ptr::NonNull};
 
-use nsh_core::NodeId;
 use ohos_arkui_binding::{
     common::{attribute::ArkUINodeAttributeNumber as Number, node_registry},
     component::{attribute::ArkUICommonAttribute, built_in_component::XComponent},
@@ -21,49 +15,50 @@ use ohos_arkui_binding::{
 use ohos_native_window_binding::NativeWindow;
 use ohos_xcomponent_binding::NativeXComponent;
 
-use super::Command;
+use super::worker::WindowEvents;
 use crate::render::node::{NativeNode, Result};
 
 /// A box: its size in points and its corner radii (top-left first).
 type Placement = ((f32, f32), [f32; 4]);
 
-pub(super) struct Surface {
-    pub(super) native: NativeNode,
+pub(crate) struct Surface {
+    pub(crate) native: NativeNode,
     xcomponent: NativeXComponent,
     /// The box last given it.
     applied: Cell<Option<Placement>>,
 }
 
 impl Surface {
-    pub(super) fn new(id: NodeId, send: mpsc::Sender<Command>) -> Result<Surface> {
+    pub(crate) fn new(name: String, events: WindowEvents, clip: bool) -> Result<Surface> {
         let native = XComponent::new()?.into_node();
         {
             let node = native.borrow();
             node.set_length_metric_unit(LengthMetricUnit::Vp)?;
-            node.set_string_attribute(A::XComponentId, format!("nsh-shader-{id}"))?;
+            node.set_string_attribute(A::XComponentId, name)?;
             // A picture: presses and screen readers go to the view it is in.
             node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
             node.set_i32_attribute(A::AccessibilityMode, AccessibilityMode::Disabled.into())?;
-            node.set_bool_attribute(A::Clip, true)?;
+            node.set_bool_attribute(A::Clip, clip)?;
+            node.background_color(0)?;
         }
         let xcomponent = native
             .borrow()
             .native_xcomponent()
             .ok_or_else(|| napi_ohos::Error::from_reason("shader XComponent is unavailable"))?;
-        let created = send.clone();
+        let created = events.clone();
         xcomponent.on_surface_created(move |_, window| {
             let raw = NonNull::new(window.0)
                 .ok_or_else(|| napi_ohos::Error::from_reason("shader window is null"))?;
             // SAFETY: the SDK lends a live window for this callback; the
-            // XComponent that produces it is kept until the shader thread has
+            // XComponent that produces it is kept until the compositor worker has
             // dropped its surface of it (`Shaders::collect`).
             let window = unsafe { NativeWindow::retain_from_ptr(raw) }
                 .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
-            let _ = created.send(Command::Window(id, Some(window)));
+            created.created(window);
             Ok(())
         });
         xcomponent.on_surface_destroyed(move |_, window| {
-            let _ = send.send(Command::WindowGone(id, window.0 as usize));
+            events.destroyed(window.0 as usize);
             Ok(())
         });
         xcomponent.register_callback()?;
@@ -75,7 +70,7 @@ impl Surface {
     }
 
     /// Gives it the view's size in points and its corner radii.
-    pub(super) fn place(&self, size: (f32, f32), radii: [f32; 4]) -> Result<bool> {
+    pub(crate) fn place(&self, size: (f32, f32), radii: [f32; 4]) -> Result<bool> {
         if self.applied.get() == Some((size, radii)) {
             return Ok(false);
         }
@@ -87,9 +82,9 @@ impl Surface {
         Ok(true)
     }
 
-    /// Takes it out of `parent` and releases it: once the shader thread no
+    /// Takes it out of `parent` and releases it: once the compositor worker no
     /// longer draws into its window.
-    pub(super) fn dispose(&self, parent: Option<&NativeNode>) -> Result<()> {
+    pub(crate) fn dispose(&self, parent: Option<&NativeNode>) -> Result<()> {
         self.xcomponent.unregister_callbacks();
         if !self.native.borrow().is_owned() {
             return Ok(());

@@ -13,6 +13,7 @@ use ohos_drawing_binding::{
     PathEffect, PathFillType, Pen, Rect, RoundRect, ShaderEffect, TileMode,
 };
 
+use super::shadow_geometry::visible_shadow;
 use crate::{
     render::{
         geometry::Size,
@@ -131,10 +132,10 @@ impl Decoration {
             owner
                 .visual_node()
                 .borrow()
-                .set_f32_attribute(A::Blur, effect.blur * owner.scale)?;
+                .set_f32_attribute(A::Blur, effect.blur.max(0.0))?;
         }
         if old.backdrop_blur != effect.backdrop_blur {
-            native.set_f32_attribute(A::BackdropBlur, effect.backdrop_blur * owner.scale)?;
+            native.set_f32_attribute(A::BackdropBlur, effect.backdrop_blur.max(0.0))?;
         }
         if old.blend != effect.blend {
             let mode = match effect.blend {
@@ -232,9 +233,7 @@ impl Decoration {
             .effects
             .as_ref()
             .map_or(&[][..], |effects| effects.box_shadows.as_slice());
-        let visible_layer = |layer: &nsh_core::BoxShadow| {
-            layer.inset == inset && layer.is_visible() && (!inset || layer.blur.0 > 0.0)
-        };
+        let visible_layer = |layer: &nsh_core::BoxShadow| visible_shadow(layer, inset);
         if !layers.iter().any(visible_layer) {
             self.shadows.borrow_mut()[usize::from(inset)] = None;
             return;
@@ -452,18 +451,23 @@ pub(crate) fn outline(style: &ViewStyle, size: Size, spread: f32) -> Path {
     )
     .to_array()
     .map(|r| r.0);
-    let rect = Rect::new(-spread, -spread, -spread + w, -spread + h);
-    let mut round_rect = RoundRect::new(&rect, 0.0, 0.0);
-    let positions = [
-        CornerPosition::TopLeft,
-        CornerPosition::TopRight,
-        CornerPosition::BottomRight,
-        CornerPosition::BottomLeft,
-    ];
-    for (i, pos) in positions.into_iter().enumerate() {
-        round_rect.set_corner(pos, radii[i], radii[i]);
-    }
-    path.add_round_rect(&round_rect, PathDirection::Cw);
+    nsh_core::shape::rounded_rect(
+        nsh_core::Bounds::new(
+            nsh_core::Point::new(Points(-spread), Points(-spread)),
+            CoreSize::new(Points(w), Points(h)),
+        ),
+        nsh_core::Corners::from(radii.map(|r| CoreSize::new(Points(r), Points(r)))),
+        style.continuous_corners,
+        false,
+        &mut |segment| match segment {
+            nsh_core::shape::Segment::Move(p) => path.move_to(p.x.0, p.y.0),
+            nsh_core::shape::Segment::Line(p) => path.line_to(p.x.0, p.y.0),
+            nsh_core::shape::Segment::Cubic([a, b, c]) => {
+                path.bezier_curve_to(a.x.0, a.y.0, b.x.0, b.y.0, c.x.0, c.y.0)
+            }
+            nsh_core::shape::Segment::Close => path.close(),
+        },
+    );
     path
 }
 pub(crate) fn drawing_blend(mode: nsh_core::BlendMode) -> ohos_drawing_binding::BlendMode {
@@ -489,7 +493,7 @@ pub(crate) fn drawing_blend(mode: nsh_core::BlendMode) -> ohos_drawing_binding::
         M::PlusLighter => B::Plus,
     }
 }
-fn gradient(g: &Gradient, size: Size) -> Brush {
+pub(crate) fn gradient(g: &Gradient, size: Size) -> Brush {
     let mut brush = Brush::new();
     brush.set_anti_alias(true);
     if g.stops.is_empty() {

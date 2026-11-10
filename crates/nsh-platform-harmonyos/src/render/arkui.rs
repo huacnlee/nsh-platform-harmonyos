@@ -87,7 +87,7 @@ impl crate::render::mount::UiContext {
         self.editor_wake();
     }
     fn retire_unattached(&self, target: NativeAttachment) -> Option<NativeAttachment> {
-        if self.host.has_ui_context() && !matches!(target.with_child(|_| ()), Ok(None)) {
+        if self.host.check().is_ok() && !matches!(target.with_child(|_| ()), Ok(None)) {
             return Some(target);
         }
         // No SDK owner needs a removal turn in these states. Release the
@@ -106,7 +106,7 @@ impl crate::render::mount::UiContext {
         }
     }
     pub(crate) fn flush_arkui(&self) -> crate::render::node::Result<()> {
-        if !self.host.has_ui_context() {
+        if self.host.check().is_err() {
             return Ok(());
         }
         if let Some(scene) = self.scene.borrow().as_ref() {
@@ -118,7 +118,9 @@ impl crate::render::mount::UiContext {
             nodes.iter().filter_map(std::rc::Weak::upgrade).collect()
         };
         for owner in owners {
-            owner.update_wrapper()?;
+            if owner.composite_dirty.get() {
+                owner.update_wrapper()?;
+            }
         }
         loop {
             let dirty = std::mem::take(&mut *self.accessibility_dirty.borrow_mut());

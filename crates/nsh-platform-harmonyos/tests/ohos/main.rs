@@ -25,6 +25,8 @@ mod navigation_motion;
 #[path = "../../src/scroll/motion.rs"]
 mod scroll_motion;
 mod selection;
+#[path = "../../src/render/shader/navigation.rs"]
+mod shader_navigation;
 #[cfg(unix)]
 #[path = "../../src/media/video/source.rs"]
 mod video_source;
@@ -44,3 +46,17 @@ mod video_controls;
 
 #[path = "../../src/render/shadow_geometry.rs"]
 mod shadow_geometry;
+
+#[path = "../../src/render/frame_clock.rs"]
+mod frame_clock;
+
+#[path = "../../src/app/chunks.rs"]
+mod chunks;
+
+#[path = "../../src/render/transition.rs"]
+#[allow(dead_code)]
+mod transition;
+
+#[path = "../../src/services/system.rs"]
+#[allow(dead_code)]
+mod system;

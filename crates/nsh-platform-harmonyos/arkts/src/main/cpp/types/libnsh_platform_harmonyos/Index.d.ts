@@ -35,16 +35,21 @@ export interface EditorAccessibility {
   disabled: boolean
 }
 
-/** Focus and selection operations ordered after this batch's state updates. */
+/** Focus, selection and scrolling operations ordered after this batch's state updates. */
 export interface EditorCommand {
   targetId: number
   kind: string
   start: number
   end: number
+  x: number
+  y: number
+  animated: boolean
 }
 
 export interface EditorEvent {
   kind: string
+  x: number
+  y: number
   text: string
   count: number
   start: number
@@ -76,6 +81,8 @@ export interface EditorSettings {
   caretColor: number
   selectionColor: number
   editable: boolean
+  autoCorrect: boolean
+  reportPaste: boolean
   scrollbarVisible: boolean
   hitTest: number
   align: number
@@ -92,6 +99,7 @@ export interface EditorSettings {
 }
 
 export interface HostCommand {
+  system?: SystemCommand
   kind: string
   enabled?: boolean
   lightContent?: boolean
@@ -102,13 +110,19 @@ export interface HostCommand {
   elementId?: number
   openId?: number
   limit?: number
+  filters?: Array<string>
   url?: string
 }
 
 export interface HostInit {
+  speechAvailable: boolean
   sdkApiVersion: number
   deviceType: string
   cacheDir: string
+  filesDir: string
+  pixelRatio: number
+  rtl: boolean
+  lifecycle: string
   colorMode: number
   fontSizeScale: number
   language: string
@@ -137,6 +151,19 @@ export interface MenuItem {
   kind: string
 }
 
+/**
+  * Disk caches use the host's cache directory unless a directory or `disabled`
+  * is supplied. Each app keeps its own directory under the cache root.
+  */
+export interface NshCacheOptions {
+  /** Absolute cache root; omitted follows the host's cache directory. */
+  directory?: string
+  /** Disable disk caching. Default false. */
+  disabled?: boolean
+  /** Maximum downloaded image size per app, in MiB; zero disables image caching. */
+  imagesMaxMegabytes?: number
+}
+
 /** Capabilities available to the embedding host on this runtime. */
 export interface NshCapabilities {
   /** Actual system API level, independent of surface environment overrides. */
@@ -158,6 +185,8 @@ export interface NshCapabilities {
   * their current values. Insets and keyboard height are relative to the surface in vp.
   */
 export interface NshEnvironment {
+  /** Physical pixels per vp (0.25 through 8). */
+  pixelRatio?: number
   /** Safe inset at the top, in vp. */
   safeTop?: number
   /** Safe inset at the right, in vp. */
@@ -168,7 +197,7 @@ export interface NshEnvironment {
   safeLeft?: number
   /** Keyboard overlap in vp; zero when hidden. */
   keyboardHeight?: number
-  /** Keyboard animation duration in seconds. */
+  /** Keyboard animation duration in milliseconds. */
   keyboardDuration?: number
   /** Preferred text scale (0.25 through 8). */
   fontScale?: number
@@ -184,6 +213,8 @@ export interface NshEnvironment {
   screenReader?: boolean
   /** Device category: `phone`, `pad`, `desktop` or `tv`. */
   idiom?: string
+  /** Window lifecycle: `active`, `inactive` or `background`. */
+  lifecycle?: string
   /** OHOS API level. */
   apiLevel?: number
 }
@@ -205,6 +236,12 @@ export interface NshNativeProperty {
 export interface NshOptions {
   /** Directory containing the build's `assets/` contents. */
   assetDirectory?: string
+  /** Override this app's storage directory, from the next load. */
+  storageDirectory?: string
+  /** Disk cache policy, from the next load. */
+  cacheOptions?: NshCacheOptions
+  /** Allow explicit status-bar and fullscreen-video requests to manage window bars. Default true. */
+  managesStatusBar?: boolean
   /** System observations available before the app starts. */
   environment?: NshEnvironment
   /** Interpreter stack ceiling in bytes (64 KiB through 4 MiB). */
@@ -235,6 +272,44 @@ export interface NshPackageInfo {
   version: string
   /** Signed build number, as decimal text. */
   build: string
+}
+
+export interface PickedDescriptor {
+  fd: number
+  name: string
+}
+
+/** Typed SDK request; fields cross N-API directly without a JSON envelope. */
+export interface SystemCommand {
+  op: string
+  text?: string
+  uri?: string
+  hasOnly?: boolean
+  name?: string
+  title?: string
+  body?: string
+  count?: number
+  ask?: boolean
+  lang?: string
+  interim?: boolean
+}
+
+/** Typed completion shared by clipboard, notification and speech services. */
+export interface SystemEvent {
+  permission?: string
+  shown?: boolean
+  pressed?: string
+  has?: boolean
+  text?: string
+  uri?: string
+  width?: number
+  height?: number
+  tooLarge?: number
+  files?: string
+  error?: string
+  code?: string
+  phase?: string
+  final?: boolean
 }
 
 export interface TextureInsets {
@@ -272,7 +347,19 @@ export interface ViewOptions {
 export interface WebCommand {
   targetId: number
   kind: string
+  url?: string
+  headers?: Array<WebHeader>
   script?: string
+  x?: number
+  y?: number
+}
+
+export interface WebDownload {
+  state: string
+  id: string
+  filename: string
+  path: string
+  bytes: number
 }
 
 export interface WebEvent {
@@ -285,9 +372,17 @@ export interface WebEvent {
   canGoForward: boolean
   message?: string
   code?: number
+  download?: WebDownload
+}
+
+export interface WebHeader {
+  headerKey: string
+  headerValue: string
 }
 
 export interface WebSettings {
+  sharedCookies: boolean
+  clearCookies: boolean
   targetId: number
   url?: string
   html?: string
@@ -298,6 +393,7 @@ export interface WebSettings {
   userAgent?: string
   injectedJavascript?: string
   documentStartScript: string
+  downloadDirectory: string
 }
 
 /** Returns compiled enhancements intersected with the running system API level. */
@@ -312,15 +408,13 @@ export declare function nshAttachNativeSubtree(targetId: number, content: FrameN
 
 export declare function nshCloseSession(sessionId: number): void
 
-export declare function nshCreateSession(init: HostInit, windowName: string, platformWindowId: number, resourceManager: object, applyBatch: (batch: Batch) => void, onCommand: (command: HostCommand) => void): number
+export declare function nshCreateSession(init: HostInit, platformWindowId: number, resourceManager: object, applyBatch: (batch: Batch) => void, onCommand: (command: HostCommand) => void, tabBar: (context: TabBarContext) => object): number
 
 export declare function nshEditorEvent(targetId: number, event: EditorEvent): EditorReceipt
 
-export declare function nshFindSession(windowName: string): number
-
 export declare function nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void
 
-export declare function nshPickImagesResult(sessionId: number, pickId: number, paths: Array<string>): void
+export declare function nshPickImagesResult(sessionId: number, pickId: number, files: Array<PickedDescriptor>): void
 
 export declare function nshRegisterSessionBinder(sdkApiVersion: number, binder: (uiContext: object) => number): void
 
@@ -328,11 +422,15 @@ export declare function nshReportHostError(sessionId: number, message: string): 
 
 export declare function nshRetireNativeNode(targetId: number): void
 
-export declare function nshSetForeground(sessionId: number, foreground: boolean): void
+export declare function nshServiceEvent(sessionId: number, key: number, value: SystemEvent): void
+
+export declare function nshSetLifecycle(sessionId: number, lifecycle: string): void
 
 export declare function nshUpdateAccessibility(sessionId: number, screenReader?: boolean | undefined | null, reduceMotion?: boolean | undefined | null): void
 
-export declare function nshUpdateConfig(sessionId: number, colorMode: number, fontSizeScale: number, language: string, deviceType?: string | undefined | null): void
+export declare function nshUpdateConfig(sessionId: number, colorMode: number, fontSizeScale: number, language: string, rtl: boolean, deviceType?: string | undefined | null, pixelRatio?: number | undefined | null): void
+
+export declare function nshUpdateKeyboard(sessionId: number, duration: number): void
 
 export declare function nshUpdateWindow(sessionId: number, platformWindowId: number, visual: Array<AvoidArea>, keyboard: AvoidArea): void
 
@@ -340,11 +438,13 @@ export declare function nshViewAction(action: MenuAction): boolean
 
 export declare function nshWebControllerAttached(targetId: number, nativeTag: string): boolean
 
+export declare function nshWebDownloadAllowed(targetId: number, url: string): boolean
+
 export declare function nshWebEvent(event: WebEvent): boolean
 
 export declare function nshWebNavigate(targetId: number, url: string): boolean
 
-export declare function onBackPressIntercept(uiContext?: import('@ohos.arkui.UIContext').UIContext): boolean
+export declare function onBackPressIntercept(uiContext: import('@ohos.arkui.UIContext').UIContext): boolean
 
 /** Reply handle for a `host.call(...)` or `host.post(...)` from the app (`nsh/host`). */
 export declare class NshHostReply {
@@ -387,20 +487,15 @@ export declare class NshSurface {
   */
   runPackage(package: NshPackage): void
   /**
-  * Starts the app linked into this library: an app written in Rust,
-  * whose root the runner links (`nsh package --target harmonyos`).
-  * Its assets come from this surface's `assetDirectory` or the HAP's
-  * `rawfile/assets`.
-  */
-  runApp(): void
-  /** Whether a Rust app is linked into this library (`runApp`). */
-  get hasApp(): boolean
-  /**
   * Reads a source or precompiled HAP resource and its companion capabilities.
   * The promise resolves when accepted; JS evaluation errors use the error
   * handler. A later load, stop, dispose or Ability teardown cancels this load.
   */
   loadResource(name: string, sourceMap?: string | undefined | null): Promise<void>
+  /** Starts the Rust app linked into this binary (`nsh_platform_harmonyos::app!`). */
+  runApp(): void
+  /** Whether this binary was built with a linked Rust app (`runApp()`). */
+  get hasApp(): boolean
   /**
   * Stops the app and cancels pending loads, retaining this view and its factories.
   * A subsequent load starts a fresh engine in the same native view.
@@ -446,6 +541,16 @@ export declare class NshSurface {
   * fall back to the system URL handler. Pass `null` or `undefined` to remove.
   */
   setOpenUrlHandler(handler?: ((url: string) => boolean) | null | undefined): void
+  /**
+  * Hands `url`, one the embedding Ability was opened with (its launch `Want.uri`
+  * or `onNewWant`), to the running app's `UrlScheme.on("open")` listeners (`nsh`).
+  * While no app runs, the next one loaded gets it.
+  */
+  openUrl(url: string): void
+  /** Sets this app's storage directory for subsequent loads; omitted follows filesDir. */
+  setStorageDirectory(path?: string | undefined | null): void
+  /** Sets disk cache options for subsequent loads; omitted restores the host's defaults. */
+  setCacheOptions(options?: NshCacheOptions | undefined | null): void
   /**
   * Applies the embedding app's theme overrides (a shadcn/ui `cssVars` theme JSON string,
   * or `null`/`undefined` to restore the app's own theme), taking effect immediately and
@@ -495,9 +600,14 @@ export declare class NshTrust {
   * Rejection leaves every running surface unchanged.
   */
   openPackage(path: string): Promise<NshPackage>
-  /**
-  * Verifies a signed HAP rawfile using the Ability resource manager bound to `uiContext`
-  * (or an active host session when `uiContext` is omitted).
-  */
+  /** Verifies a signed HAP rawfile using `uiContext`, or the sole active NSH session when omitted. */
   openResource(name: string, uiContext?: import('@ohos.arkui.UIContext').UIContext): Promise<NshPackage>
+}
+
+/** Native callback ownership for the system tab bar, scoped to its surface load. */
+export declare class TabBarContext {
+  /** Reports the native selection while the component remains mounted. */
+  change(index: number): void
+  /** Supplies the tab bar's intrinsic height in vp. */
+  height(height: number): void
 }

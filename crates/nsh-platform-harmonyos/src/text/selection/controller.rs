@@ -4,6 +4,7 @@ use std::{ops::Range, rc::Rc};
 use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{Brush, Canvas, Point, Rect};
 
+use super::area::{Area, project};
 use crate::{
     interop::sdk::{Menu as ViewMenu, MenuAction as NativeViewAction, MenuItem as ViewAction},
     render::node::{Node, Result},
@@ -30,7 +31,62 @@ impl Node {
         Some(f(layout))
     }
     pub(crate) fn selectable(&self) -> bool {
-        self.selection_layout(|l| l.len() > 0).unwrap_or(false)
+        let raster = self.raster.borrow();
+        let Some(text) = raster
+            .as_ref()
+            .and_then(|r| r.0.downcast_ref::<NativeText>())
+        else {
+            return false;
+        };
+        if text.selection.is_none() {
+            return false;
+        }
+        if text.selectable || self.interaction.selectable_view() {
+            return true;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if node.interaction.selectable_view() {
+                return true;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        false
+    }
+    pub(crate) fn selection_configure(self: &Rc<Self>) -> Result<()> {
+        if self.raster.borrow().is_some() {
+            if self.selectable() {
+                self.ensure_wrapper()?;
+            }
+            self.set_events(self.interaction.mask())?;
+        }
+        for child in self
+            .children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+        {
+            child.selection_configure()?;
+        }
+        Ok(())
+    }
+    pub(crate) fn has_selection(&self) -> bool {
+        self.selection_area
+            .borrow()
+            .as_ref()
+            .is_some_and(|a| !a.model.is_empty())
+    }
+    pub(crate) fn selection_refresh(&self) -> Result<()> {
+        if !self.selectable() {
+            return self.selection_clear();
+        }
+        if let Some(area) = self.selection_area.borrow_mut().as_mut() {
+            area.update(self, |_, _, _| {})?;
+        }
+        if !self.has_selection() {
+            return self.selection_clear();
+        }
+        self.update_wrapper()
     }
     fn selection_range(&self) -> Option<Range<usize>> {
         self.selection.range.get().map(|(start, end)| start..end)
@@ -47,45 +103,56 @@ impl Node {
         Ok(())
     }
     pub(crate) fn selection_clear(&self) -> Result<()> {
-        let selected = self
-            .selected_text
-            .borrow()
-            .as_ref()
-            .is_some_and(|node| std::ptr::eq(node.as_ptr(), self));
-        if selected {
-            self.selected_text.borrow_mut().take();
+        if self.selection.range.get().is_none() && !self.has_selection() {
+            return Ok(());
         }
+        let owner = self
+            .selected_text
+            .borrow_mut()
+            .take()
+            .and_then(|n| n.upgrade());
+        let owner = owner.as_deref().unwrap_or(self);
+        if let Some(mut area) = owner.selection_area.borrow_mut().take() {
+            area.clear(owner)?;
+        }
+        if let Some(route) = owner.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().selection = None;
+        }
+        owner.selection.menu.set(false);
+        owner.selection_clear_local()?;
+        owner.update_wrapper()
+    }
+    pub(crate) fn selection_clear_local(&self) -> Result<()> {
         if self.selection.range.take().is_some() {
             self.selection.invalidate_menu();
+            self.selection.handles.set([false; 2]);
             *self.selection.geometry.borrow_mut() = Default::default();
-            if let Some(route) = self.dispatcher.upgrade() {
-                let mut keys = route.keyboard.lock().unwrap();
-                if keys.selection == Some(self.id) {
-                    keys.selection = None;
-                }
-            }
-            self.selection.menu.set(false);
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
-            self.update_wrapper()?;
         }
         Ok(())
     }
     pub(crate) fn selection_begin(self: &Rc<Self>, x: f32, y: f32) -> Result<bool> {
-        if !self.visible_in_tree() || self.accessibility_state.spec.borrow().state.disabled {
+        if !self.selectable()
+            || !self.visible_in_tree()
+            || self.accessibility_state.spec.borrow().state.disabled
+        {
             return Ok(false);
         }
-        let content = self.content.get();
-        let Some(Some(range)) = self.selection_layout(|l| l.word((x - content.x, y - content.y)))
-        else {
-            return Ok(false);
-        };
         self.clear_text_selection()?;
+        let mut area = Area::new(&Area::root(self));
+        area.update(self, |model, texts, matrix| {
+            model.select_word_at(texts, project(matrix, (x, y)));
+        })?;
+        if area.model.is_empty() {
+            return Ok(false);
+        }
+        *self.selection_area.borrow_mut() = Some(area);
         *self.selected_text.borrow_mut() = Some(Rc::downgrade(self));
-        self.selection_set(range.clone())?;
+        if let Some(route) = self.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().selection = Some(self.id);
+        }
         self.selection_menu_show(true)?;
-        self.touches
-            .borrow_mut()
-            .selection_started(self, range, (x, y))?;
+        self.touches.borrow_mut().selection_started(self, (x, y))?;
         Ok(true)
     }
     pub(crate) fn selection_set(&self, range: Range<usize>) -> Result<()> {
@@ -103,46 +170,46 @@ impl Node {
         }
         self.selection.invalidate_menu();
         self.selection.range.set(Some((range.start, range.end)));
-        if let Some(route) = self.dispatcher.upgrade() {
-            route.keyboard.lock().unwrap().selection = Some(self.id);
-        }
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
     }
-    pub(crate) fn selection_extend(&self, anchor: usize, point: (f32, f32)) -> Result<()> {
-        let content = self.content.get();
-        if let Some(Some(end)) =
-            self.selection_layout(|l| l.boundary((point.0 - content.x, point.1 - content.y)))
-        {
-            // Keep an actual character selected while a handle crosses its anchor.
-            if anchor != end {
-                self.selection_set(anchor.min(end)..anchor.max(end))?;
-            }
+    pub(crate) fn selection_extend(&self, point: (f32, f32)) -> Result<()> {
+        if let Some(area) = self.selection_area.borrow_mut().as_mut() {
+            area.update(self, |model, texts, matrix| {
+                model.drag(texts, project(matrix, point));
+            })?;
         }
-        Ok(())
+        self.update_wrapper()
     }
-    pub(crate) fn selection_handle(&self, point: (f32, f32)) -> Option<usize> {
-        let range = self.selection_range()?;
-        let handles = self.selection.geometry.borrow().handles?;
-        let content = self.content.get();
-        handles
+    pub(crate) fn selection_handle(&self, point: (f32, f32)) -> Result<bool> {
+        let mut area = self.selection_area.borrow_mut();
+        let Some(area) = area.as_mut() else {
+            return Ok(false);
+        };
+        let handle = area
+            .handles(self)?
             .into_iter()
-            .enumerate()
-            .filter_map(|(index, (x, top, bottom))| {
-                let dx = point.0 - content.x - x;
-                let dy = point.1 - content.y - (bottom + 5.0);
-                (dx.abs() <= 22.0 && point.1 >= content.y + top - 12.0 && dy.abs() <= 28.0)
-                    .then_some((
-                        dx * dx + dy * dy,
-                        if index == 0 { range.end } else { range.start },
-                    ))
+            .filter_map(|(handle, (x, top, bottom))| {
+                let dx = point.0 - x;
+                let dy = point.1 - (bottom + 5.0);
+                (dx.abs() <= 22.0 && point.1 >= top - 12.0 && dy.abs() <= 28.0).then_some((
+                    dx * dx + dy * dy,
+                    handle,
+                    (x, bottom),
+                ))
             })
-            .min_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|(_, anchor)| anchor)
+            .min_by(|a, b| a.0.total_cmp(&b.0));
+        let Some((_, handle, at)) = handle else {
+            return Ok(false);
+        };
+        area.update(self, |model, texts, matrix| {
+            model.move_handle(texts, handle, project(matrix, at));
+        })?;
+        Ok(true)
     }
     pub(crate) fn selection_menu_show(&self, visible: bool) -> Result<()> {
-        if visible && self.selection.range.get().is_some() {
-            if !self.selection.open_menu() {
+        if visible && self.has_selection() {
+            if !self.selection.open_menu(true) {
                 return Ok(());
             }
         } else {
@@ -152,48 +219,35 @@ impl Node {
     }
     pub(crate) fn selection_menu(&self) -> Option<ViewMenu> {
         // A selectable block keeps its hidden menu; disabling selection removes its actions.
-        if !self.selectable() {
+        if !self.selectable() && !self.has_selection() {
             return None;
         }
-        let content = self.content.get();
         let anchor = self
-            .selection
-            .geometry
+            .selection_area
             .borrow()
-            .handles
-            .map_or((0.0, 0.0), |h| (h[0].0, h[0].1));
+            .as_ref()
+            .and_then(|a| a.handles(self).ok())
+            .and_then(|h| h.first().map(|(_, p)| (p.0, p.1)))
+            .unwrap_or((0.0, 0.0));
         Some(ViewMenu {
             generation: self.selection.generation.get().max(1),
             visible: self.selection.menu.get()
-                && self.selection.range.get().is_some()
+                && self.has_selection()
                 && !self.accessibility_state.spec.borrow().state.disabled
                 && self.visible_in_tree(),
-            x: (content.x + anchor.0).clamp(-16384.0, 16384.0) as f64,
-            y: (content.y + anchor.1).clamp(-16384.0, 16384.0) as f64,
+            x: anchor.0.clamp(-16384.0, 16384.0) as f64,
+            y: anchor.1.clamp(-16384.0, 16384.0) as f64,
             items: {
                 let mut items = vec![ViewAction {
                     kind: "action".into(),
                     name: "copy".into(),
                     label: "Copy".into(),
                 }];
-                let len = self
-                    .raster
-                    .borrow()
-                    .as_ref()
-                    .and_then(|layout| {
-                        layout
-                            .0
-                            .downcast_ref::<crate::text::typography::NativeText>()
-                    })
-                    .and_then(|raster| raster.selection.as_ref())
-                    .map_or(0, |layout| layout.len());
-                if self.selection.range.get() != Some((0, len)) {
-                    items.push(ViewAction {
-                        kind: "action".into(),
-                        name: "select-all".into(),
-                        label: "Select All".into(),
-                    });
-                }
+                items.push(ViewAction {
+                    kind: "action".into(),
+                    name: "select-all".into(),
+                    label: "Select All".into(),
+                });
                 items
             },
         })
@@ -205,7 +259,7 @@ impl Node {
         {
             return Ok(false);
         }
-        if self.selection_range().is_none() {
+        if !self.has_selection() {
             return Ok(false);
         }
         match event.kind.as_deref() {
@@ -227,23 +281,32 @@ impl Node {
         if !self.visible_in_tree() || self.accessibility_state.spec.borrow().state.disabled {
             return Ok(());
         }
-        let Some(range) = self.selection_range() else {
+        if !self.has_selection() {
             return Ok(());
-        };
+        }
         match command {
             Command::Copy => {
-                if let Some(text) = self.selection_layout(|l| l.copy(range)) {
-                    self.host
-                        .enqueue_clipboard(self.dispatcher.clone(), Some(text), None)?;
-                    self.selection_clear()?;
-                }
+                let text = self
+                    .selection_area
+                    .borrow()
+                    .as_ref()
+                    .map(|a| a.text())
+                    .transpose()?
+                    .unwrap_or_default();
+                self.host.system.command(
+                    &self.host,
+                    self.dispatcher.clone(),
+                    nsh_core::Command::SetClipboard(text),
+                )?;
+                self.selection_clear()?;
             }
             Command::SelectAll => {
-                if let Some(len) = self.selection_layout(Layout::len) {
-                    self.selection_set(0..len)?;
-                    // The native menu dismisses after a choice. A subsequent tap reopens it.
-                    self.selection_menu_show(false)?;
+                if let Some(area) = self.selection_area.borrow_mut().as_mut() {
+                    area.update(self, |model, texts, _| {
+                        model.select_all(texts);
+                    })?;
                 }
+                self.selection_menu_show(false)?;
             }
             Command::Clear => self.selection_clear()?,
         }
@@ -272,21 +335,32 @@ impl Node {
         let geometry = self.selection.geometry.borrow();
         if handles {
             if let Some(edges) = geometry.handles {
-                for (x, top, bottom) in edges {
-                    let x = (content.x + x) * self.scale;
-                    let top = (content.y + top) * self.scale;
-                    let bottom = (content.y + bottom) * self.scale;
-                    canvas.draw_rect(&Rect::new(x - self.scale, top, x + self.scale, bottom));
-                    canvas.draw_circle(&Point::new(x, bottom + 5.0 * self.scale), 5.0 * self.scale);
+                for (index, (x, top, bottom)) in edges.into_iter().enumerate() {
+                    if !self.selection.handles.get()[index] {
+                        continue;
+                    }
+                    let x = (content.x + x) * self.scale.get();
+                    let top = (content.y + top) * self.scale.get();
+                    let bottom = (content.y + bottom) * self.scale.get();
+                    canvas.draw_rect(&Rect::new(
+                        x - self.scale.get(),
+                        top,
+                        x + self.scale.get(),
+                        bottom,
+                    ));
+                    canvas.draw_circle(
+                        &Point::new(x, bottom + 5.0 * self.scale.get()),
+                        5.0 * self.scale.get(),
+                    );
                 }
             }
         } else {
             for r in &geometry.rectangles {
                 canvas.draw_rect(&Rect::new(
-                    (content.x + r[0]) * self.scale,
-                    (content.y + r[1]) * self.scale,
-                    (content.x + r[2]) * self.scale,
-                    (content.y + r[3]) * self.scale,
+                    (content.x + r[0]) * self.scale.get(),
+                    (content.y + r[1]) * self.scale.get(),
+                    (content.x + r[2]) * self.scale.get(),
+                    (content.y + r[3]) * self.scale.get(),
                 ));
             }
         }

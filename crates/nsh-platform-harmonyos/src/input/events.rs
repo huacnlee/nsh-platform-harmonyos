@@ -49,6 +49,12 @@ pub(crate) struct Interaction {
 }
 
 impl Interaction {
+    pub(crate) fn selectable_view(&self) -> bool {
+        self.props.borrow().selectable_view
+    }
+    pub(crate) fn continues_text(&self) -> bool {
+        self.props.borrow().continues_text
+    }
     pub(crate) fn test_id(&self) -> Option<String> {
         self.props.borrow().test_id.as_deref().map(str::to_owned)
     }
@@ -63,12 +69,12 @@ impl Interaction {
         let eff_w = if frame.width > 0.0 {
             frame.width
         } else {
-            1.0 / owner.scale
+            1.0 / owner.scale.get()
         };
         let eff_h = if frame.height > 0.0 {
             frame.height
         } else {
-            1.0 / owner.scale
+            1.0 / owner.scale.get()
         };
         if !owner.clips_children()
             && let Some(extent) = owner.overflow.get()
@@ -135,10 +141,12 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade()
                             && !owner.interaction.long_fired.replace(false)
                         {
+                            // OnClick's component payload is physical pixels on
+                            // device; touch input below already uses the node's vp.
                             owner.press(
                                 EventKind::Press,
-                                event.component_f32(0).unwrap_or_default() / owner.scale,
-                                event.component_f32(1).unwrap_or_default() / owner.scale,
+                                event.component_f32(0).unwrap_or_default() / owner.scale.get(),
+                                event.component_f32(1).unwrap_or_default() / owner.scale.get(),
                             );
                         }
                     });
@@ -171,7 +179,10 @@ impl Interaction {
                             let y = input.pointer_y_by_index(0);
                             match input.action {
                                 UIInputAction::Down => {
-                                    owner.touches.borrow_mut().record_down(owner.scale, &input);
+                                    owner
+                                        .touches
+                                        .borrow_mut()
+                                        .record_down(owner.scale.get(), &input);
                                     owner.interaction.long_fired.set(false);
                                     if owner.press_feedback_allowed() {
                                         owner.interaction.state(&owner, state::PRESSED, true)?;
@@ -197,7 +208,8 @@ impl Interaction {
         let hover = !blocked
             && (events.contains(EventKind::MouseEnter)
                 || events.contains(EventKind::MouseLeave)
-                || self.tracked.get() & state::HOVERED != 0);
+                || self.tracked.get() & state::HOVERED != 0
+                || owner.style.borrow().cursor != nsh_core::Cursor::Auto);
         if self.hover_registered.replace(hover) != hover {
             if hover {
                 let weak = Rc::downgrade(owner);
@@ -210,6 +222,7 @@ impl Interaction {
                                 && let Some(input) = event.input_event()
                             {
                                 let hovered = input.is_hovered();
+                                owner.cursor.update(&owner, hovered)?;
                                 owner.interaction.state(&owner, state::HOVERED, hovered)?;
                                 owner.emit(
                                     if hovered {
@@ -322,7 +335,10 @@ impl Interaction {
                             return;
                         }
                         owner.interaction.long_fired.set(true);
-                        let (x, y) = event.input.map_or((0.0, 0.0), |input| (input.x, input.y));
+                        // Gesture input snapshots are physical pixels even on VP nodes.
+                        let (x, y) = event.input.map_or((0.0, 0.0), |input| {
+                            (input.x / owner.scale.get(), input.y / owner.scale.get())
+                        });
                         owner.press(EventKind::LongPress, x, y);
                         callback(|| {
                             owner.selection_begin(x, y)?;
@@ -340,6 +356,7 @@ impl Interaction {
         Ok(())
     }
     pub(crate) fn props(&self, owner: &Rc<Node>, props: ViewProps) -> Result<()> {
+        let selection_changed = self.props.borrow().selectable_view != props.selectable_view;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -379,7 +396,11 @@ impl Interaction {
         self.state(owner, state::DISABLED, disabled)?;
         self.apply_label(owner)?;
         self.apply_opacity(owner)?;
-        self.pointer(owner, self.inherited_block.get())
+        self.pointer(owner, self.inherited_block.get())?;
+        if selection_changed {
+            owner.selection_configure()?;
+        }
+        Ok(())
     }
     pub(crate) fn label(&self, owner: &Node, label: Option<Arc<str>>) -> Result<()> {
         self.props.borrow_mut().accessibility.label = label;
@@ -415,7 +436,7 @@ impl Interaction {
     pub(crate) fn pointer(&self, owner: &Rc<Node>, inherited: bool) -> Result<()> {
         self.inherited_block.set(inherited);
         let pointer = self.props.borrow().pointer_events;
-        let mode = if inherited {
+        let mode = if inherited || owner.export_repair.get() != 0 {
             HitTestMode::None
         } else {
             match pointer {
@@ -485,9 +506,9 @@ impl Interaction {
                 0 => Gesture::create_pan_gesture(
                     1,
                     GestureDirection::All,
-                    10.0 * owner.scale as f64,
+                    10.0 * owner.scale.get() as f64,
                 )?,
-                1 => Gesture::create_pinch_gesture(2, 5.0 * owner.scale as f64)?,
+                1 => Gesture::create_pinch_gesture(2, 5.0 * owner.scale.get() as f64)?,
                 _ => Gesture::create_rotation_gesture(2, 1.0)?,
             };
             let weak = Rc::downgrade(owner);
@@ -520,20 +541,20 @@ impl Interaction {
                                 if let Some(id) = values.pan_x {
                                     owner
                                         .animator
-                                        .set(id, start[0] + pan.offset_x / owner.scale)?;
+                                        .set(id, start[0] + pan.offset_x / owner.scale.get())?;
                                 }
                                 if let Some(id) = values.pan_y {
                                     owner
                                         .animator
-                                        .set(id, start[1] + pan.offset_y / owner.scale)?;
+                                        .set(id, start[1] + pan.offset_y / owner.scale.get())?;
                                 }
                                 if accept || ended {
                                     let translation = nsh_core::Point::new(
-                                        nsh_core::Points(pan.offset_x / owner.scale),
-                                        nsh_core::Points(pan.offset_y / owner.scale),
+                                        nsh_core::Points(pan.offset_x / owner.scale.get()),
+                                        nsh_core::Points(pan.offset_y / owner.scale.get()),
                                     );
-                                    let velocity_x = pan.velocity_x / owner.scale;
-                                    let velocity_y = pan.velocity_y / owner.scale;
+                                    let velocity_x = pan.velocity_x / owner.scale.get();
+                                    let velocity_y = pan.velocity_y / owner.scale.get();
                                     let value_x = values
                                         .pan_x
                                         .map(|id| nsh_core::Points(owner.animator.value(id)));
@@ -640,6 +661,9 @@ impl Interaction {
             .control
             .set_states(owner.id, self.states.get() & tracked);
         self.events(owner, self.events.get())
+    }
+    pub(crate) fn hovered(&self) -> bool {
+        self.states.get() & state::HOVERED != 0
     }
     pub(crate) fn state(&self, owner: &Node, bit: u16, enabled: bool) -> Result<()> {
         let old = self.states.get();

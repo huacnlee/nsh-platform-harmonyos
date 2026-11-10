@@ -19,6 +19,8 @@ export interface EditorSettings {
   caretColor: number;
   selectionColor: number;
   editable: boolean;
+  autoCorrect: boolean;
+  reportPaste: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
   align: number;
@@ -45,6 +47,9 @@ export interface EditorCommand {
   kind: string;
   start: number;
   end: number;
+  x: number;
+  y: number;
+  animated: boolean;
 }
 export interface EditorEventPayload {
   readonly kind: string;
@@ -54,6 +59,8 @@ export interface EditorEventPayload {
   readonly end: number;
   readonly width: number;
   readonly height: number;
+  readonly x: number;
+  readonly y: number;
 }
 export interface EditorReceipt {
   accepted: boolean;
@@ -65,6 +72,13 @@ export interface MenuActionPayload {
   kind?: string;
   generation?: number;
 }
+export interface WebDownloadPayload {
+  state: string;
+  id: string;
+  filename: string;
+  path: string;
+  bytes: number;
+}
 export interface WebEventPayload {
   targetId: number;
   phase: string;
@@ -75,6 +89,7 @@ export interface WebEventPayload {
   canGoForward: boolean;
   message?: string;
   code?: number;
+  download?: WebDownloadPayload;
 }
 export interface NshRuntimeContext {
   isActive(): boolean;
@@ -86,6 +101,7 @@ export interface NshRuntimeContext {
   viewAction(action: MenuActionPayload): boolean;
   webControllerAttached(targetId: number, nativeTag: string): boolean;
   webNavigate(targetId: number, url: string): boolean;
+  webDownloadAllowed(targetId: number, url: string): boolean;
   webEvent(event: WebEventPayload): boolean;
 }
 const inputTypes: Map<string, InputType> = new Map([
@@ -181,6 +197,8 @@ class EditorEvent implements EditorEventPayload {
   readonly end: number;
   readonly width: number;
   readonly height: number;
+  readonly x: number;
+  readonly y: number;
   constructor(
     entry: EditorEntry,
     kind: string,
@@ -189,6 +207,8 @@ class EditorEvent implements EditorEventPayload {
     end = 0,
     width = 0,
     height = 0,
+    x = 0,
+    y = 0,
   ) {
     this.kind = kind;
     this.text = text;
@@ -197,6 +217,8 @@ class EditorEvent implements EditorEventPayload {
     this.end = end;
     this.width = width;
     this.height = height;
+    this.x = x;
+    this.y = y;
   }
 }
 
@@ -209,7 +231,7 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
     const s = this.entry.settings;
     node
       .width(s.width)
-      .height(s.height)
+      .height(this.entry.editorHeight())
       .padding(0)
       .borderWidth(0)
       // The outer NSH node owns corners; theme rounding would clip this content box.
@@ -223,8 +245,10 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       .placeholderColor(argbColor(s.placeholderColor))
       .caretColor(argbColor(s.caretColor))
       .selectedBackgroundColor(argbColor(s.selectionColor))
-      .enabled(s.editable && s.accessibility?.disabled !== true)
-      .barState(s.scrollbarVisible ? BarState.Auto : BarState.Off)
+      .enabled(s.accessibility?.disabled !== true)
+      .enableKeyboardOnFocus(s.editable)
+      .enablePreviewText(s.editable)
+      .barState(BarState.Off)
       .accessibilityText(s.accessibility?.label ?? "")
       .accessibilityDescription(s.accessibility?.hint ?? "")
       .accessibilityLevel(
@@ -256,32 +280,58 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
 @Builder
 function editorContent(entry: EditorEntry) {
   if (entry.settings.multiline && !entry.settings.secure) {
-    TextArea({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.area })
-      .id(`nsh-editor-${entry.settings.targetId}`)
-      .attributeModifier(new EditorModifier(entry))
-      .onChange((text: string) => entry.change(text))
-      .onFocus(() => entry.emit("focus"))
-      .onBlur(() => entry.emit("blur"))
-      .onSubmit((_key: EnterKeyType, event?: SubmitEvent) => entry.submit(event))
-      .onTextSelectionChange((start: number, end: number) =>
-        entry.emit("selection", "", start, end),
-      )
-      .onWillInsert((value: InsertValue): boolean => { entry.editKey(value.insertValue); return true; })
-      .onWillDelete((): boolean => { entry.editKey("Backspace"); return true; })
-      .onAppear(() => entry.appeared());
+    Scroll(entry.scroller) {
+      TextArea({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.area })
+        .id(`nsh-editor-${entry.settings.targetId}`)
+        .attributeModifier(new EditorModifier(entry))
+        .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
+        .onFocus(() => entry.emit("focus"))
+        .onBlur(() => entry.emit("blur"))
+        .onSubmit((_key: EnterKeyType, event?: SubmitEvent) => entry.submit(event))
+        .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
+        .onContentScroll(() => entry.scrolled())
+        .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
+        .onWillChange(() => entry.canEdit())
+        .onWillInsert((value: InsertValue): boolean => {
+          if (!entry.canEdit()) return false;
+          entry.editKey(value.insertValue);
+          return true;
+        })
+        .onWillDelete((): boolean => {
+          if (!entry.canEdit()) return false;
+          entry.editKey("Backspace");
+          return true;
+        })
+        .onAppear(() => entry.appeared());
+    }
+      .width(entry.settings.width)
+      .height(entry.settings.height)
+      .scrollable(ScrollDirection.Vertical)
+      .scrollBar(entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
+      .clip(true)
+      .onDidScroll(() => entry.scrolled());
   } else {
     TextInput({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.line })
       .id(`nsh-editor-${entry.settings.targetId}`)
       .attributeModifier(new EditorModifier(entry))
-      .onChange((text: string) => entry.change(text))
+      .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
       .onFocus(() => entry.emit("focus"))
       .onBlur(() => entry.emit("blur"))
       .onSubmit((_key: EnterKeyType, event: SubmitEvent) => entry.submit(event))
-      .onTextSelectionChange((start: number, end: number) =>
-        entry.emit("selection", "", start, end),
-      )
-      .onWillInsert((value: InsertValue): boolean => { entry.editKey(value.insertValue); return true; })
-      .onWillDelete((): boolean => { entry.editKey("Backspace"); return true; })
+      .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
+      .onContentScroll(() => entry.scrolled())
+      .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
+      .onWillChange(() => entry.canEdit())
+      .onWillInsert((value: InsertValue): boolean => {
+        if (!entry.canEdit()) return false;
+        entry.editKey(value.insertValue);
+        return true;
+      })
+      .onWillDelete((): boolean => {
+        if (!entry.canEdit()) return false;
+        entry.editKey("Backspace");
+        return true;
+      })
       .onAppear(() => entry.appeared());
   }
 }
@@ -300,6 +350,7 @@ class EditorSizeCallback extends FrameCallback {
 }
 class EditorEntry {
   readonly node: BuilderNode<[EditorEntry]>;
+  readonly scroller: Scroller = new Scroller();
   readonly line: TextInputController = new TextInputController();
   readonly area: TextAreaController = new TextAreaController();
   settings: EditorSettings;
@@ -318,6 +369,15 @@ class EditorEntry {
   private sizePending: boolean = false;
   private contentWidth: number = -1;
   private contentHeight: number = -1;
+  private focused: boolean = false;
+  private preview: string = "";
+  private previewStart: number = 0;
+  private revealCaret: boolean = false;
+  private caretIndex: number = -1;
+  private caretX: number = 0;
+  private caretY: number = 0;
+  private caretHeight: number = 0;
+  private pendingScroll?: EditorCommand;
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
     this.context = context;
     this.settings = settings;
@@ -330,12 +390,16 @@ class EditorEntry {
     this.sdkBusy = true;
     try {
       this.node.build(wrapBuilder(editorContent), this);
-      if (this.closed || !this.context.isActive()) { throw new Error("Editor creation was cancelled"); }
+      if (this.closed || !this.context.isActive()) {
+        throw new Error("Editor creation was cancelled");
+      }
       const accepted = this.context.attachNativeNode(
         this.settings.targetId,
         this.node.getFrameNode(),
       );
-      if (!accepted || this.closed) { throw new Error("Native editor target is no longer live"); }
+      if (!accepted || this.closed) {
+        throw new Error("Native editor target is no longer live");
+      }
       this.attached = true;
     } catch (error) {
       this.dispose();
@@ -343,19 +407,26 @@ class EditorEntry {
     } finally {
       this.updating = false;
       this.sdkBusy = false;
-      if (this.disposePending) { this.disposePending = false; this.release(); }
+      if (this.disposePending) {
+        this.disposePending = false;
+        this.release();
+      }
       this.autoFocus();
     }
   }
   update(settings: EditorSettings): void {
-    if (this.closed) { throw new Error("Native editor is retired"); }
+    if (this.closed) {
+      throw new Error("Native editor is retired");
+    }
     if (
       settings.targetId !== this.settings.targetId ||
       settings.multiline !== this.settings.multiline
     ) {
       throw new Error("Editor replacement requires a new generation");
     }
-    if (settings.count === this.count) { this.text = settings.text; }
+    if (settings.count === this.count) {
+      this.text = settings.text;
+    }
     this.settings = settings;
     this.refresh();
   }
@@ -367,7 +438,10 @@ class EditorEntry {
     } finally {
       this.updating = false;
       this.sdkBusy = false;
-      if (this.disposePending) { this.disposePending = false; this.release(); }
+      if (this.disposePending) {
+        this.disposePending = false;
+        this.release();
+      }
       this.autoFocus();
     }
     this.scheduleSize();
@@ -379,10 +453,45 @@ class EditorEntry {
       this.emit("key", character);
     }
   }
-  change(text: string): void {
-    if (this.updating || this.closed || this.text === text) {
+  canEdit(): boolean {
+    return this.updating || (this.settings.editable && this.settings.accessibility?.disabled !== true);
+  }
+  editorHeight(): number {
+    return this.settings.multiline && !this.settings.secure
+      ? Math.max(this.settings.height, this.contentHeight)
+      : this.settings.height;
+  }
+  paste(text: string, event: PasteEvent): void {
+    this.emit("paste", text);
+    if (!this.canEdit() || this.settings.reportPaste) event.preventDefault?.();
+  }
+  selection(start: number, end: number): void {
+    this.emit("selection", "", start, end);
+    this.revealCaret = true;
+    this.scheduleSize();
+  }
+  scrolled(): void {
+    if (this.settings.multiline && !this.settings.secure) {
+      const offset = this.scroller.currentOffset();
+      this.emit("scroll", "", 0, 0,
+        Math.max(this.settings.width, this.contentWidth),
+        Math.max(this.settings.height, this.contentHeight), offset.xOffset, offset.yOffset);
+    }
+    this.scheduleSize();
+  }
+  change(text: string, preview?: PreviewText): void {
+    if (this.updating || this.closed || !this.canEdit()) {
       return;
     }
+    const composed = preview?.value ?? "";
+    const start = Math.max(0, preview?.offset ?? 0);
+    // Mark composition before ChangeText can cause a controlled update.
+    if (composed.length > 0 && (composed !== this.preview || start !== this.previewStart)) {
+      this.emit("composition", composed, start, start + composed.length);
+    }
+    const wasComposing = this.preview.length > 0;
+    this.preview = composed;
+    this.previewStart = start;
     let next = text;
     if (digitsOnly(this.settings.keyboard)) {
       // ArkUI's number input keeps only digits even of the text the app
@@ -412,8 +521,14 @@ class EditorEntry {
       }
       next = this.text.slice(0, at) + text.slice(common);
     }
-    this.text = next;
-    this.emit("change", next);
+    if (this.text !== next) {
+      this.text = next;
+      this.emit("change", next);
+    }
+    if (wasComposing && composed.length === 0) {
+      this.emit("composition", "", start, start);
+    }
+    this.revealCaret = true;
     this.scheduleSize();
   }
   submit(event?: SubmitEvent): void {
@@ -434,24 +549,85 @@ class EditorEntry {
     if (this.closed || !this.context.isActive()) {
       return;
     }
-    const rect = this.settings.multiline && !this.settings.secure
-      ? this.area.getTextContentRect()
-      : this.line.getTextContentRect();
-    if (rect.width !== this.contentWidth || rect.height !== this.contentHeight) {
-      this.contentWidth = rect.width;
-      this.contentHeight = rect.height;
-      this.emit("size", "", 0, 0, rect.width, rect.height);
+    const rect =
+      this.settings.multiline && !this.settings.secure
+        ? this.area.getTextContentRect()
+        : this.line.getTextContentRect();
+    const ui = this.context.getUIContext();
+    const width = ui.px2vp(rect.width);
+    const height = ui.px2vp(rect.height);
+    if (width !== this.contentWidth || height !== this.contentHeight) {
+      const oldHeight = this.editorHeight();
+      this.contentWidth = width;
+      this.contentHeight = height;
+      this.emit("size", "", 0, 0, width, height);
+      if (this.preview.length === 0 && oldHeight !== this.editorHeight()) {
+        this.refresh();
+        return;
+      }
+      this.scrolled();
+    }
+    if (this.pendingScroll !== undefined) {
+      const command = this.pendingScroll;
+      this.pendingScroll = undefined;
+      this.scroller.scrollTo({ xOffset: command.x, yOffset: command.y, animation: command.animated });
+      this.scrolled();
+    }
+    if (this.focused) {
+      const controller: TextContentControllerBase = this.settings.multiline && !this.settings.secure
+        ? this.area : this.line;
+      const caret = controller.getCaretOffset();
+      const lineHeight = height > 0
+        ? height / Math.max(1, controller.getTextContentLineCount())
+        : this.settings.fontSize * 1.2;
+      let x = ui.px2vp(caret.x);
+      let y = ui.px2vp(caret.y);
+      if (this.settings.multiline && !this.settings.secure) {
+        let offset = this.scroller.currentOffset();
+        if (this.revealCaret) {
+          const top = offset.yOffset;
+          const bottom = top + this.settings.height;
+          if (y < top || y + lineHeight > bottom) {
+            this.scroller.scrollTo({ xOffset: 0,
+              yOffset: Math.max(0, y < top ? y : y + lineHeight - this.settings.height),
+              animation: false });
+            offset = this.scroller.currentOffset();
+          }
+        }
+        x -= offset.xOffset;
+        y -= offset.yOffset;
+      }
+      this.revealCaret = false;
+      if (caret.index !== this.caretIndex || x !== this.caretX || y !== this.caretY || lineHeight !== this.caretHeight) {
+        this.caretIndex = caret.index;
+        this.caretX = x;
+        this.caretY = y;
+        this.caretHeight = lineHeight;
+        this.emit("caret", "", caret.index, caret.index, 1.5, lineHeight, x, y);
+      }
     }
   }
-  emit(kind: string, text = "", start = 0, end = 0, width = 0, height = 0): void {
-    if (!this.attached || this.closed || !this.context.isActive() || (this.updating && kind !== "focus" && kind !== "blur")) {
+  emit(kind: string, text = "", start = 0, end = 0, width = 0, height = 0, x = 0, y = 0): void {
+    if (
+      !this.attached ||
+      this.closed ||
+      !this.context.isActive() ||
+      (this.updating && kind !== "focus" && kind !== "blur")
+    ) {
       return;
+    }
+    if (kind === "focus" || kind === "blur") {
+      this.focused = kind === "focus";
+      this.caretIndex = -1;
+      this.scheduleSize();
     }
     const response = this.context.editorEvent(
       this.settings.targetId,
-      new EditorEvent(this, kind, text, start, end, width, height),
+      new EditorEvent(this, kind, text, start, end, width, height, x, y),
     );
-    if (response.accepted) { this.count = response.count; }
+    if (response.accepted) {
+      this.count = response.count;
+    }
   }
   appeared(): void {
     this.scheduleSize();
@@ -459,18 +635,26 @@ class EditorEntry {
     this.autoFocus();
   }
   private autoFocus(): void {
-    if (this.sdkBusy || !this.attached || this.closed || !this.context.isActive()) { return; }
+    if (this.sdkBusy || !this.attached || this.closed || !this.context.isActive()) {
+      return;
+    }
     if (this.appearedPending && !this.focusedOnce && this.settings.autoFocus) {
       this.focusedOnce = true;
       try {
-        this.context.getUIContext().getFocusController().requestFocus(`nsh-editor-${this.settings.targetId}`);
+        this.context
+          .getUIContext()
+          .getFocusController()
+          .requestFocus(`nsh-editor-${this.settings.targetId}`);
       } catch {}
     }
   }
   command(command: EditorCommand): void {
     if (command.kind === "focus") {
       try {
-        this.context.getUIContext().getFocusController().requestFocus(`nsh-editor-${this.settings.targetId}`);
+        this.context
+          .getUIContext()
+          .getFocusController()
+          .requestFocus(`nsh-editor-${this.settings.targetId}`);
       } catch {}
     } else if (command.kind === "blur") {
       try {
@@ -480,6 +664,12 @@ class EditorEntry {
           this.line.stopEditing();
         }
       } catch {}
+    } else if (command.kind === "scroll") {
+      if (this.settings.multiline && !this.settings.secure) {
+        this.revealCaret = false;
+        this.pendingScroll = command;
+        this.scheduleSize();
+      }
     } else if (command.kind === "selection") {
       try {
         if (this.settings.multiline && !this.settings.secure) {
@@ -493,11 +683,19 @@ class EditorEntry {
     }
   }
   private release(): void {
-    try { this.node.dispose(); this.disposed = true; quarantinedEditors.delete(this); }
-    catch (error) { quarantinedEditors.add(this); throw new Error(String(error)); }
+    try {
+      this.node.dispose();
+      this.disposed = true;
+      quarantinedEditors.delete(this);
+    } catch (error) {
+      quarantinedEditors.add(this);
+      throw new Error(String(error));
+    }
   }
   dispose(cleanup: NshRuntimeContext = this.context): void {
-    if (this.disposed) { return; }
+    if (this.disposed) {
+      return;
+    }
     this.closed = true;
     try {
       if (!this.retired) {
@@ -506,7 +704,11 @@ class EditorEntry {
         }
         this.retired = true;
       }
-      if (this.sdkBusy) { this.disposePending = true; } else { this.release(); }
+      if (this.sdkBusy) {
+        this.disposePending = true;
+      } else {
+        this.release();
+      }
     } catch (error) {
       quarantinedEditors.add(this);
       throw new Error(`Native editor retirement failed: ${String(error)}`);
@@ -517,29 +719,43 @@ class EditorEntry {
 export class NativeEditors {
   private entries: Map<number, EditorEntry> = new Map();
   remove(ids: number[], context: NshRuntimeContext): void {
-    for (const id of ids) { this.entries.get(id)?.dispose(context); this.entries.delete(id); }
+    for (const id of ids) {
+      this.entries.get(id)?.dispose(context);
+      this.entries.delete(id);
+    }
   }
   update(states: EditorSettings[], commands: EditorCommand[], context: NshRuntimeContext): void {
     for (const state of states) {
-      if (!context.isActive()) { throw new Error("NSH SDK session is inactive"); }
+      if (!context.isActive()) {
+        throw new Error("NSH SDK session is inactive");
+      }
       let entry = this.entries.get(state.targetId);
-      if (entry) { entry.update(state); }
-      else {
+      if (entry) {
+        entry.update(state);
+      } else {
         entry = new EditorEntry(state, context);
         // Publish before SDK build: onAppear/onClosing may reenter synchronously.
         this.entries.set(state.targetId, entry);
         entry.create();
       }
     }
-    for (const command of commands) { this.entries.get(command.targetId)?.command(command); }
+    for (const command of commands) {
+      this.entries.get(command.targetId)?.command(command);
+    }
   }
   dispose(context: NshRuntimeContext): void {
     let failure: Error | undefined;
     for (const id of Array.from(this.entries.keys())) {
       const entry = this.entries.get(id)!;
-      try { entry.dispose(context); this.entries.delete(id); }
-      catch (error) { failure ??= new Error(String(error)); }
+      try {
+        entry.dispose(context);
+        this.entries.delete(id);
+      } catch (error) {
+        failure ??= new Error(String(error));
+      }
     }
-    if (failure) { throw failure; }
+    if (failure) {
+      throw failure;
+    }
   }
 }

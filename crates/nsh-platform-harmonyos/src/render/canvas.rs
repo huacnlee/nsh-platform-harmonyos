@@ -20,10 +20,9 @@ use nsh_core::{
 };
 use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{
-    Bitmap, BlendMode, Brush, Canvas, ClipOperation, FilterMode, FontCollection, FontSlant,
-    FontStyle, FontWeight, FontWidth, Matrix, MipmapMode, Path, PathEffect, PathFillType, Pen,
-    Rect, SamplingOptions, ShaderEffect, ShadowLayer, TextStyle, TileMode, TypographyBuilder,
-    TypographyStyle,
+    Bitmap, BlendMode, Brush, Canvas, ClipOperation, FilterMode, FontSlant, FontStyle, FontWeight,
+    FontWidth, Matrix, MipmapMode, Path, PathEffect, PathFillType, Pen, Rect, SamplingOptions,
+    ShaderEffect, ShadowLayer, TextBlob, TextStyle, TileMode, TypographyBuilder, TypographyStyle,
 };
 
 use crate::{
@@ -45,7 +44,7 @@ pub(crate) struct CanvasView {
     generation: Cell<u64>,
     scheduled: Cell<bool>,
     isolated: Cell<bool>,
-    fonts: RefCell<FontCollection>,
+    texts: RefCell<Vec<ShapedText>>,
     budget: std::rc::Rc<Cell<usize>>,
     image_bytes: Cell<usize>,
 }
@@ -59,7 +58,7 @@ impl CanvasView {
             generation: Cell::new(0),
             scheduled: Cell::new(false),
             isolated: Cell::new(false),
-            fonts: RefCell::new(FontCollection::shared()),
+            texts: RefCell::default(),
             budget,
             image_bytes: Cell::new(0),
         }
@@ -74,6 +73,7 @@ impl CanvasView {
             .checked_add(1)
             .ok_or(Error::Unsupported("exhausted canvas generation"))?;
         self.generation.set(generation);
+        self.texts.borrow_mut().clear();
         let mut images = self.images.borrow_mut();
         for image in images.iter() {
             image.job.store(true, Ordering::Relaxed);
@@ -195,8 +195,8 @@ impl CanvasView {
         let bounds = Rect::new(
             0.0,
             0.0,
-            frame.width * owner.scale,
-            frame.height * owner.scale,
+            frame.width * owner.scale.get(),
+            frame.height * owner.scale.get(),
         );
         target.save();
         target.clip_rect(&bounds, ClipOperation::Intersect, false);
@@ -214,10 +214,12 @@ impl CanvasView {
         let mut replay = Replay {
             canvas,
             matrix: RefCell::new(Matrix::new()),
-            scale: owner.scale,
+            scale: owner.scale.get(),
             slots: &self.slots.borrow(),
             images: &self.images.borrow(),
-            fonts: &mut self.fonts.borrow_mut(),
+            fonts: &owner.fonts,
+            texts: &mut self.texts.borrow_mut(),
+            text_index: 0,
             rtl: owner.platform.get().rtl,
             state: State::default(),
             saved: Vec::new(),
@@ -328,7 +330,9 @@ struct Replay<'a> {
     scale: f32,
     slots: &'a [AnimationValue],
     images: &'a [Image],
-    fonts: &'a mut FontCollection,
+    fonts: &'a Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
+    texts: &'a mut Vec<ShapedText>,
+    text_index: usize,
     rtl: bool,
     state: State,
     saved: Vec<State>,
@@ -681,46 +685,22 @@ impl Replay<'_> {
     }
     fn text(&mut self, text: &str, x: f32, y: f32, max_width: Option<f32>, stroke: bool) {
         let font = self.state.font.with_numeric(self.state.numeric);
-        let mut style = TypographyStyle::new();
-        style.set_max_lines(1);
-        style.set_text_direction(if self.rtl {
-            ohos_drawing_binding::TextDirection::Rtl
-        } else {
-            ohos_drawing_binding::TextDirection::Ltr
-        });
-        let mut text_style = TextStyle::new();
-        text_style.set_font_size(font.size.0 as f64);
-        text_style.set_font_style(FontStyle::new(
-            FontWeight::from_css(font.weight),
-            FontWidth::Normal,
-            if font.italic {
-                FontSlant::Italic
+        let index = self.text_index;
+        self.text_index += 1;
+        let mut fonts = self.fonts.lock().expect("font collection");
+        if self.texts.get(index).is_none_or(|shaped| {
+            shaped.font != font || shaped.rtl != self.rtl || shaped.generation != fonts.generation
+        }) {
+            let shaped = ShapedText::new(text, font, self.rtl, &mut fonts);
+            if index == self.texts.len() {
+                self.texts.push(shaped);
             } else {
-                FontSlant::Normal
-            },
-        ));
-        if let Some(family) = &font.family
-            && !family.contains('\0')
-        {
-            text_style.set_font_families(&[family]);
+                self.texts[index] = shaped;
+            }
         }
-        for tag in font.variant.tags() {
-            text_style.add_font_feature(tag, 1);
-        }
-        let brush = self.brush(&self.state.fill);
-        let pen = self.pen();
-        if stroke {
-            text_style.set_foreground_pen(&pen);
-        } else {
-            text_style.set_foreground_brush(&brush);
-        }
-        let mut builder = TypographyBuilder::new(&mut style, self.fonts);
-        builder.push_text_style(&mut text_style);
-        builder.add_text(&text.replace(['\n', '\r'], " "));
-        builder.pop_text_style();
-        let mut paragraph = builder.build();
-        paragraph.layout(1_000_000.0);
-        let width = paragraph.longest_line() as f32;
+        drop(fonts);
+        let shaped = &self.texts[index];
+        let width = shaped.width;
         let fit = max_width.map_or(1.0, |v| (v / width.max(0.001)).clamp(0.0, 1.0));
         let right = match self.state.align {
             CanvasTextAlign::Right => true,
@@ -735,22 +715,30 @@ impl Replay<'_> {
         } else {
             0.0
         };
-        let ascent = paragraph
-            .line_metrics(0)
-            .map_or(font.size.0 * 0.8, |m| m.ascender as f32);
+        let ascent = shaped.ascent;
         let dy = match self.state.baseline {
             CanvasTextBaseline::Alphabetic => ascent,
             CanvasTextBaseline::Top => 0.0,
             CanvasTextBaseline::Hanging => ascent * 0.2,
-            CanvasTextBaseline::Middle => paragraph.height() as f32 * 0.5,
-            CanvasTextBaseline::Ideographic | CanvasTextBaseline::Bottom => {
-                paragraph.height() as f32
-            }
+            CanvasTextBaseline::Middle => shaped.height * 0.5,
+            CanvasTextBaseline::Ideographic | CanvasTextBaseline::Bottom => shaped.height,
         };
         self.save_transform();
         self.canvas.translate(x, y - dy);
         self.canvas.scale(fit, 1.0);
-        paragraph.paint(self.canvas, 0.0, 0.0);
+        if stroke {
+            self.canvas.attach_pen(&self.pen());
+        } else {
+            self.canvas.attach_brush(&self.brush(&self.state.fill));
+        }
+        for (blob, x) in &shaped.blobs {
+            self.canvas.draw_text_blob(blob, *x, ascent);
+        }
+        if stroke {
+            self.canvas.detach_pen();
+        } else {
+            self.canvas.detach_brush();
+        }
         self.canvas.restore();
     }
 }
@@ -1027,4 +1015,88 @@ pub(crate) fn sample(stops: &[(f32, Color)], t: f32) -> Color {
         }
     }
     stops.last().unwrap().1
+}
+
+// One shaped result per immutable drawing text operation; paint, transforms and
+// animation slots stay live. A new drawing or newly registered font replaces it.
+struct ShapedText {
+    font: CanvasFont,
+    rtl: bool,
+    generation: u64,
+    width: f32,
+    ascent: f32,
+    height: f32,
+    blobs: Vec<(TextBlob, f32)>,
+    _data: Vec<Arc<[u8]>>,
+}
+impl ShapedText {
+    fn new(text: &str, font: CanvasFont, rtl: bool, fonts: &mut crate::text::fonts::Fonts) -> Self {
+        let mut style = TypographyStyle::new();
+        style.set_max_lines(1);
+        style.set_text_direction(if rtl {
+            ohos_drawing_binding::TextDirection::Rtl
+        } else {
+            ohos_drawing_binding::TextDirection::Ltr
+        });
+        let mut text_style = TextStyle::new();
+        text_style.set_font_size(font.size.0 as f64);
+        text_style.set_font_style(FontStyle::new(
+            FontWeight::from_css(font.weight),
+            FontWidth::Normal,
+            if font.italic {
+                FontSlant::Italic
+            } else {
+                FontSlant::Normal
+            },
+        ));
+        if let Some(family) = &font.family {
+            text_style.set_font_families(&crate::text::fonts::families(family));
+        }
+        for tag in font.variant.tags() {
+            text_style.add_font_feature(tag, 1);
+        }
+        let mut builder = TypographyBuilder::new(&mut style, &mut fonts.collection);
+        builder.push_text_style(&mut text_style);
+        builder.add_text(&text.replace(['\n', '\r'], " "));
+        builder.pop_text_style();
+        let mut paragraph = builder.build();
+        paragraph.layout(1_000_000.0);
+        let width = paragraph.longest_line() as f32;
+        let ascent = paragraph
+            .line_metrics(0)
+            .map_or(font.size.0 * 0.8, |m| m.ascender as f32);
+        let height = paragraph.height() as f32;
+        let mut blobs = Vec::new();
+        for line in paragraph.text_lines().iter() {
+            for run in line.glyph_runs().iter() {
+                if let Some(run_font) = run.font()
+                    && let Some(blob) = TextBlob::from_glyph_positions(
+                        &run.glyphs(),
+                        &run.positions(),
+                        &run_font,
+                        None,
+                    )
+                {
+                    let (start, length) = run.string_range();
+                    let x = paragraph
+                        .range_boxes(start as usize, start.saturating_add(length) as usize)
+                        .iter()
+                        .map(|rect| rect.bounds[0])
+                        .reduce(f32::min)
+                        .unwrap_or(0.0);
+                    blobs.push((blob, x));
+                }
+            }
+        }
+        Self {
+            font,
+            rtl,
+            generation: fonts.generation,
+            width,
+            ascent,
+            height,
+            blobs,
+            _data: fonts.data.clone(),
+        }
+    }
 }

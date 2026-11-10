@@ -76,20 +76,23 @@ impl ShadowLayer {
         let weak = Rc::downgrade(&layer);
         let node = Rc::downgrade(owner);
         layer.native.borrow_mut().on_custom_draw(move |event| {
-            if let (Some(layer), Some(owner)) = (weak.upgrade(), node.upgrade()) {
-                let b = layer.bounds.get();
-                if b.width <= 0 || b.height <= 0 {
-                    return;
+            callback(|| {
+                if let (Some(layer), Some(owner)) = (weak.upgrade(), node.upgrade()) {
+                    let b = layer.bounds.get();
+                    if b.width <= 0 || b.height <= 0 {
+                        return Ok(());
+                    }
+                    if let Some(raw) = event.draw_context_in_draw().and_then(|cx| cx.canvas()) {
+                        // SAFETY: ArkUI retains the canvas through this draw callback.
+                        let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
+                        canvas.save();
+                        canvas.translate(-b.x as f32, -b.y as f32);
+                        owner.draw_outer_shadows(&canvas);
+                        canvas.restore();
+                    }
                 }
-                if let Some(raw) = event.draw_context_in_draw().and_then(|cx| cx.canvas()) {
-                    // SAFETY: ArkUI retains the canvas through this draw callback.
-                    let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
-                    canvas.save();
-                    canvas.translate(-b.x as f32, -b.y as f32);
-                    owner.draw_outer_shadows(&canvas);
-                    canvas.restore();
-                }
-            }
+                Ok(())
+            });
         });
         // Decorations are appended after all logical children; insertion/removal
         // indexes remain those of the NSH tree. zIndex keeps the ink underneath.
@@ -116,7 +119,7 @@ impl ShadowLayer {
         let bounds = if native_box_shadow(style).is_some() {
             PaintBounds::default()
         } else {
-            PaintBounds::shadows(style, frame.width, frame.height, owner.scale)
+            PaintBounds::shadows(style, frame.width, frame.height, owner.scale.get())
         };
         let next = PaintKey {
             size: Size::new(frame.width, frame.height),
@@ -151,6 +154,10 @@ impl ShadowLayer {
     pub(crate) fn layout(&self, event: &NodeCustomEvent) -> Result<()> {
         let b = self.bounds.get();
         event.layout_child(&self.native.borrow(), b.x, b.y)?;
+        Ok(())
+    }
+    pub(crate) fn invalidate(&self) -> Result<()> {
+        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
     }
 }

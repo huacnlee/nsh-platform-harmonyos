@@ -11,11 +11,12 @@ use nsh_core::{
 use ohos_arkui_binding::{
     component::{
         attribute::{ArkUICommonAttribute, ArkUIEvent},
-        built_in_component::{Stack, Text},
+        built_in_component::{Custom, Stack, Text},
     },
     types::{
         advanced::{LengthMetricUnit, NodeDirtyFlag},
         attribute::ArkUINodeAttributeType as A,
+        node_type::ArkUINodeType,
     },
 };
 
@@ -39,14 +40,19 @@ pub(crate) struct Screen {
     progress: Cell<f32>,
     peer: RefCell<Weak<Node>>,
     motion: RefCell<Option<Motion>>,
+    shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     immediate_removal: Cell<bool>,
     insets: Cell<Option<EdgeInsets>>,
 }
 impl Screen {
+    pub(crate) fn header(&self) -> &NativeNode {
+        &self.header
+    }
+
     pub(crate) fn new(owner: Weak<Node>) -> Result<Rc<Self>> {
         let header = Stack::new()?.into_node();
         let title = Text::new()?.into_node();
-        let back = Text::new()?.into_node();
+        let back = Custom::new()?.into_node();
         for node in [&header, &title, &back] {
             node.borrow().set_length_metric_unit(LengthMetricUnit::Vp)?;
         }
@@ -61,9 +67,12 @@ impl Screen {
         )?;
         header.borrow_mut().add_child(back.clone())?;
         header.borrow_mut().add_child(title.clone())?;
-        back.borrow().set_string_attribute(A::TextContent, "‹")?;
-        back.borrow().set_f32_attribute(A::FontSize, 28.0)?;
-        back.borrow().set_i32_attribute(A::TextAlign, 1)?;
+        back.borrow()
+            .set_u32_attribute(A::AccessibilityRole, ArkUINodeType::Button.into())?;
+        back.borrow().set_i32_attribute(
+            A::AccessibilityMode,
+            ohos_arkui_binding::types::view::AccessibilityMode::Enabled.into(),
+        )?;
         back.borrow().id("nsh-header-back")?;
         back.borrow().width(44.0)?;
         back.borrow().height(44.0)?;
@@ -84,8 +93,58 @@ impl Screen {
             progress: Cell::new(0.0),
             peer: RefCell::default(),
             motion: RefCell::default(),
+            shader: RefCell::default(),
             immediate_removal: Cell::new(false),
             insets: Cell::new(None),
+        });
+        let weak = Rc::downgrade(&screen);
+        screen.back.borrow_mut().on_custom_draw(move |event| {
+            crate::render::node::callback(|| {
+                let Some(screen) = weak.upgrade() else {
+                    return Ok(());
+                };
+                let Some(owner) = screen.owner.upgrade() else {
+                    return Ok(());
+                };
+                let Some(context) = event.draw_context_in_draw() else {
+                    return Ok(());
+                };
+                let Some(raw) = context.canvas() else {
+                    return Ok(());
+                };
+                // SAFETY: ArkUI owns this canvas throughout the draw callback.
+                let canvas = unsafe { ohos_drawing_binding::Canvas::from_raw_borrowed(raw) };
+                use ohos_drawing_binding::{LineCap, LineJoin, Path, Pen};
+                let size = context.size();
+                let scale = owner.scale.get();
+                let (x, y) = (size.width as f32 / 2.0, size.height as f32 / 2.0);
+                let direction = if owner.platform.get().rtl { -1.0 } else { 1.0 };
+                let mut path = Path::new();
+                path.move_to(x + 4.0 * scale * direction, y - 8.0 * scale);
+                path.line_to(x - 4.0 * scale * direction, y);
+                path.line_to(x + 4.0 * scale * direction, y + 8.0 * scale);
+                let dark = owner
+                    .appearance
+                    .get()
+                    .resolve(owner.platform.get().color_scheme)
+                    == nsh_engine::ColorScheme::Dark;
+                let color = screen
+                    .config
+                    .borrow()
+                    .tint_color
+                    .map(argb)
+                    .unwrap_or_else(|| owner.theme.borrow().color("foreground", dark));
+                let mut pen = Pen::new();
+                pen.set_anti_alias(true);
+                pen.set_color(color);
+                pen.set_width(2.0 * scale);
+                pen.set_cap(LineCap::RoundCap);
+                pen.set_join(LineJoin::RoundJoin);
+                canvas.attach_pen(&pen);
+                canvas.draw_path(&path);
+                canvas.detach_pen();
+                Ok(())
+            });
         });
         let weak = Rc::downgrade(&screen);
         screen.back.borrow_mut().on_click(move || {
@@ -101,8 +160,17 @@ impl Screen {
     pub(crate) fn has_back(&self) -> bool {
         self.has_back.get()
     }
+    pub(crate) fn insets_initialized(&self) -> bool {
+        self.insets.get().is_some()
+    }
     pub(crate) fn paint_visible(&self) -> bool {
-        self.is_top() || self.revealed.get() || self.motion.borrow().is_some()
+        if self.shader.borrow().as_ref().is_some_and(|n| n.backwards) {
+            return false;
+        }
+        self.is_top()
+            || self.revealed.get()
+            || self.motion.borrow().is_some()
+            || self.shader.borrow().is_some()
     }
     pub(crate) fn large_title_offset(&self) -> f32 {
         let c = self.config.borrow();
@@ -117,7 +185,10 @@ impl Screen {
     }
     pub(crate) fn configure(&self, config: ScreenConfig) -> Result<()> {
         *self.config.borrow_mut() = config;
-        self.update(self.has_back.get())
+        if self.insets.get().is_some() {
+            self.update(self.has_back.get())?;
+        }
+        Ok(())
     }
     pub(crate) fn update_environment(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
@@ -136,7 +207,7 @@ impl Screen {
             .get()
             .resolve(owner.platform.get().color_scheme)
             == nsh_engine::ColorScheme::Dark;
-        let fg = if dark { 0xffeeeeee } else { 0xff161616 };
+        let fg = owner.theme.borrow().color("foreground", dark);
         let overlap = owner.top_overlap();
         let height = if c.header_visible {
             52.0 + overlap
@@ -177,7 +248,7 @@ impl Screen {
         } else {
             c.background_color
                 .map(argb)
-                .unwrap_or(if dark { 0xff202020 } else { 0xfff8f8f8 })
+                .unwrap_or_else(|| owner.theme.borrow().color("card", dark))
         })?;
         self.title
             .borrow()
@@ -185,19 +256,27 @@ impl Screen {
         self.title
             .borrow()
             .set_u32_attribute(A::FontColor, c.title_color.map(argb).unwrap_or(fg))?;
-        self.title
-            .borrow()
-            .width((owner.frame.get().width - 112.0).max(0.0))?;
-        self.title
-            .borrow()
-            .set_position(vec![56.0, 4.0 + overlap])?;
+        self.layout_title(&owner, &c)?;
         self.title
             .borrow()
             .set_i32_attribute(A::Visibility, i32::from(c.title_view.is_some()))?;
-        self.back.borrow().set_position(vec![4.0, 4.0 + overlap])?;
+        self.back.borrow().set_position(vec![
+            if owner.platform.get().rtl {
+                (owner.frame.get().width - 48.0).max(0.0)
+            } else {
+                4.0
+            },
+            4.0 + overlap,
+        ])?;
+        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        let label = self.previous().and_then(|previous| {
+            let screen = previous.screen.borrow();
+            let config = screen.as_ref()?.config.borrow();
+            config.back_title.clone().or_else(|| config.title.clone())
+        });
         self.back
             .borrow()
-            .set_u32_attribute(A::FontColor, c.tint_color.map(argb).unwrap_or(fg))?;
+            .set_string_attribute(A::AccessibilityText, label.as_deref().unwrap_or(""))?;
         self.back
             .borrow()
             .set_i32_attribute(A::Visibility, i32::from(!has_back || !c.back_visible))?;
@@ -218,6 +297,55 @@ impl Screen {
             .native
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedLayout)?;
+        Ok(())
+    }
+    fn title_bounds(&self, owner: &Node, config: &ScreenConfig) -> (f32, f32) {
+        let mut left = 0.0;
+        let mut right = 0.0;
+        for child in owner.children.borrow().iter().filter_map(Weak::upgrade) {
+            if child.kind != ViewKind::HeaderItem || !child.header_item_visible() {
+                continue;
+            }
+            if config.left == Some(child.id) {
+                left = child.frame.get().width;
+            }
+            if config.right == Some(child.id) {
+                right = child.frame.get().width;
+            }
+        }
+        super::motion::title_bounds(
+            owner.frame.get().width,
+            self.has_back.get() && config.back_visible,
+            left,
+            right,
+            owner.platform.get().rtl,
+        )
+    }
+    fn layout_title(&self, owner: &Node, config: &ScreenConfig) -> Result<()> {
+        let (x, width) = self.title_bounds(owner, config);
+        self.title.borrow().width(width)?;
+        self.title
+            .borrow()
+            .set_position(vec![x, 4.0 + owner.top_overlap()])?;
+        Ok(())
+    }
+    pub(crate) fn restore_visibility(&self) -> Result<()> {
+        let c = self.config.borrow();
+        self.header
+            .borrow()
+            .set_i32_attribute(A::Visibility, i32::from(!c.header_visible))?;
+        self.title
+            .borrow()
+            .set_i32_attribute(A::Visibility, i32::from(c.title_view.is_some()))?;
+        self.back.borrow().set_i32_attribute(
+            A::Visibility,
+            i32::from(!self.has_back.get() || !c.back_visible),
+        )?;
+        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        Ok(())
+    }
+    pub(crate) fn invalidate_paint(&self) -> Result<()> {
+        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         Ok(())
     }
     pub(crate) fn request_back(&self) -> Result<()> {
@@ -276,7 +404,9 @@ impl Screen {
         };
         if let Some(screen) = previous.screen.borrow().as_ref() {
             // A new push can interrupt the preceding push at its settled position.
-            screen.settle()?;
+            if screen.motion.borrow().is_some() || screen.shader.borrow().is_some() {
+                screen.settle()?;
+            }
             screen.revealed.set(true);
             screen.show()?;
         }
@@ -287,6 +417,13 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
+        if self.shader.borrow().is_some() {
+            owner.navigation_presentation(1.0, 0.0)?;
+            if let Some(peer) = self.peer.borrow().upgrade() {
+                peer.navigation_presentation(1.0, 0.0)?;
+            }
+            return Ok(());
+        }
         let p = self.progress.get();
         let fade = self.config.borrow().animation == ScreenAnimation::Fade
             || owner.platform.get().reduce_motion;
@@ -310,13 +447,30 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
-        let animated = self.config.borrow().animation != ScreenAnimation::None
-            && !owner.platform.get().reduce_motion;
+        let start_shader =
+            (to == 1.0 && self.progress.get() == 0.0) || (to == 0.0 && self.progress.get() == 1.0);
+        if start_shader
+            && let Some(navigation) =
+                owner
+                    .shaders
+                    .begin_navigation(&owner, self.peer.borrow().upgrade(), to == 1.0)?
+        {
+            self.motion.borrow_mut().take();
+            *self.shader.borrow_mut() = Some(navigation);
+            self.show()?;
+            self.paint()?;
+            owner.animator.track(&owner);
+            return Ok(());
+        }
+        let motion = nsh_core::navigation::screen_motion(
+            self.config.borrow().animation,
+            owner.platform.get().reduce_motion,
+        );
         *self.motion.borrow_mut() = Some(Motion::new(
             owner.animator.now(),
             self.progress.get(),
             to,
-            animated,
+            motion.map(|motion| motion.0),
         ));
         self.show()?;
         self.paint()?;
@@ -324,7 +478,11 @@ impl Screen {
         Ok(())
     }
     fn push(&self) -> Result<()> {
-        if self.config.borrow().animation != ScreenAnimation::None && self.reveal()? {
+        let shader = self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.navigation_shader.borrow().is_some());
+        if (shader || self.config.borrow().animation != ScreenAnimation::None) && self.reveal()? {
             self.progress.set(1.0);
             self.animate(0.0)?;
         }
@@ -342,10 +500,14 @@ impl Screen {
             .borrow()
             .as_ref()
             .is_some_and(|motion| motion.to == 1.0)
+            || self.shader.borrow().as_ref().is_some_and(|n| n.backwards)
         {
             return Ok(true);
         }
-        if self.config.borrow().animation == ScreenAnimation::None || !self.reveal()? {
+        if (self.config.borrow().animation == ScreenAnimation::None
+            && owner.navigation_shader.borrow().is_none())
+            || !self.reveal()?
+        {
             self.show()?;
             return Ok(false);
         }
@@ -374,11 +536,9 @@ impl Screen {
         Ok(())
     }
     fn settle(&self) -> Result<()> {
+        let shader = self.shader.borrow_mut().take();
         self.motion.borrow_mut().take();
         self.progress.set(0.0);
-        if let Some(owner) = self.owner.upgrade() {
-            owner.navigation_presentation(1.0, 0.0)?;
-        }
         if let Some(peer) = self.peer.replace(Weak::new()).upgrade() {
             let shared = self
                 .owner
@@ -403,24 +563,41 @@ impl Screen {
                         })
                 });
             if !shared {
-                peer.navigation_presentation(1.0, 0.0)?;
                 if let Some(screen) = peer.screen.borrow().as_ref() {
                     screen.revealed.set(false);
                     screen.show()?;
                 }
+                peer.navigation_presentation(1.0, 0.0)?;
                 peer.invalidate_scene();
             }
         }
-        self.show()
+        self.show()?;
+        if let Some(owner) = self.owner.upgrade() {
+            owner.navigation_presentation(1.0, 0.0)?;
+        }
+        // Establish final native visibility before switching the root out of
+        // export, so its attachment repair includes every newly hidden screen.
+        if shader.is_some()
+            && let Some(owner) = self.owner.upgrade()
+        {
+            owner.shaders.end_navigation(owner.id)?;
+        }
+        Ok(())
     }
     pub(crate) fn frame(&self, now: f64) -> Result<(bool, bool)> {
-        let state = self.motion.borrow().as_ref().map(|motion| {
-            let reduced = self
-                .owner
-                .upgrade()
-                .is_some_and(|owner| owner.platform.get().reduce_motion);
-            motion.step(now, reduced)
-        });
+        let shader = self
+            .shader
+            .borrow()
+            .as_ref()
+            .map(|n| (n.running(), n.backwards));
+        if let Some((running, backwards)) = shader {
+            if running {
+                return Ok((true, false));
+            }
+            self.settle()?;
+            return Ok((false, backwards));
+        }
+        let state = self.motion.borrow().as_ref().map(|motion| motion.step(now));
         let Some((progress, done, to)) = state else {
             return Ok((false, false));
         };
@@ -440,6 +617,7 @@ impl Screen {
             && self.has_back.get()
             && c.gesture_enabled
             && self.motion.borrow().is_none()
+            && self.shader.borrow().is_none()
             && !owner.platform.get().screen_reader
             && if owner.platform.get().rtl {
                 x >= owner.frame.get().width - 24.0
@@ -477,8 +655,54 @@ impl Screen {
         &self,
         event: &ohos_arkui_binding::api::node_custom_event::NodeCustomEvent,
     ) -> Result<()> {
-        crate::render::layout::ChildMeasure::new(event).child(&self.header.borrow())?;
+        let mut measure = crate::render::layout::ChildMeasure::new(event);
+        if let Some(owner) = self.owner.upgrade() {
+            self.layout_title(&owner, &self.config.borrow())?;
+            // These slots are explicitly laid out below. A newly attached
+            // export wrapper needs measurement in the same parent pass, even
+            // when its engine-resolved size has not changed.
+            for child in owner
+                .children
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|node| node.kind == ViewKind::HeaderItem)
+            {
+                measure.child(&child.mounted().borrow())?;
+            }
+        }
+        measure.child(&self.header.borrow())?;
         Ok(())
+    }
+    pub(crate) fn item_position(&self, child: &Node) -> Option<(f32, f32)> {
+        let owner = self.owner.upgrade()?;
+        let c = self.config.borrow();
+        if !c.header_visible {
+            return None;
+        }
+        let width = owner.frame.get().width;
+        let frame = child.frame.get();
+        let x = if c.left == Some(child.id) {
+            if self.has_back.get() && c.back_visible {
+                56.0
+            } else {
+                12.0
+            }
+        } else if c.right == Some(child.id) {
+            width - frame.width - 12.0
+        } else if c.title_view == Some(child.id) {
+            let (start, available) = self.title_bounds(&owner, &c);
+            start + (available - frame.width).max(0.0) * 0.5
+        } else {
+            return None;
+        };
+        let x = if owner.platform.get().rtl && c.title_view != Some(child.id) {
+            width - x - frame.width
+        } else {
+            x
+        };
+        let y = owner.top_overlap() + (52.0 - frame.height).max(0.0) * 0.5;
+        Some((x, y))
     }
     pub(crate) fn layout(
         &self,
@@ -486,11 +710,6 @@ impl Screen {
     ) -> Result<()> {
         event.layout_child(&self.header.borrow(), 0, 0)?;
         if let Some(owner) = self.owner.upgrade() {
-            let c = self.config.borrow();
-            let width = owner.frame.get().width;
-            if !c.header_visible {
-                return Ok(());
-            }
             for child in owner
                 .children
                 .borrow()
@@ -498,26 +717,13 @@ impl Screen {
                 .filter_map(Weak::upgrade)
                 .filter(|n| n.kind == ViewKind::HeaderItem)
             {
-                let frame = child.frame.get();
-                let x = if c.left == Some(child.id) {
-                    if self.has_back.get() && c.back_visible {
-                        56.0
-                    } else {
-                        12.0
-                    }
-                } else if c.right == Some(child.id) {
-                    width - frame.width - 12.0
-                } else if c.title_view == Some(child.id) {
-                    (width - frame.width) * 0.5
-                } else {
-                    continue;
-                };
-                let y = owner.top_overlap() + (52.0 - frame.height).max(0.0) * 0.5;
-                child.place(
-                    event,
-                    (x * owner.scale).round() as i32,
-                    (y * owner.scale).round() as i32,
-                )?;
+                if let Some((x, y)) = self.item_position(&child) {
+                    child.place(
+                        event,
+                        (x * owner.scale.get()).round() as i32,
+                        (y * owner.scale.get()).round() as i32,
+                    )?;
+                }
             }
         }
         Ok(())

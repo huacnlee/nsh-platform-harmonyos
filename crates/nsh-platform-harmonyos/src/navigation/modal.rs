@@ -4,7 +4,6 @@
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
-    time::Instant,
 };
 
 use nsh_core::{
@@ -19,10 +18,10 @@ use crate::render::{
     node::{Node, Result},
 };
 struct Transition {
-    start: Instant,
+    start: f64,
     from: f32,
     to: f32,
-    duration: f32,
+    duration: f64,
 }
 pub(crate) struct Modal {
     owner: Weak<Node>,
@@ -32,6 +31,7 @@ pub(crate) struct Modal {
     shown: Cell<bool>,
     progress: Cell<f32>,
     transition: RefCell<Option<Transition>>,
+    shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     closing: Cell<bool>,
     insets: Cell<EdgeInsets>,
     reported: Cell<nsh_core::navigation::Reported>,
@@ -53,6 +53,7 @@ impl Modal {
             shown: Cell::new(false),
             progress: Cell::new(0.0),
             transition: RefCell::default(),
+            shader: RefCell::default(),
             closing: Cell::new(false),
             insets: Cell::new(EdgeInsets::default()),
             reported: Cell::new(nsh_core::navigation::Reported::default()),
@@ -61,12 +62,26 @@ impl Modal {
         let weak = Rc::downgrade(&modal);
         modal.dialog.borrow().dismiss_handler(move |reason| {
             if let Some(modal) = weak.upgrade() {
-                crate::render::node::callback(|| modal.on_dismiss_attempt(reason.into()));
+                let reason: i32 = reason.into();
+                if reason == 0 {
+                    // ArkUI delivers hardware Back to the native dialog before
+                    // the ability. Route it through the same nested-stack policy.
+                    if let Some(owner) = modal.owner.upgrade()
+                        && let Some(route) = owner.dispatcher.upgrade()
+                    {
+                        route.send(crate::app::runtime::Message::Back);
+                    }
+                } else {
+                    crate::render::node::callback(|| modal.on_dismiss_attempt(reason));
+                }
             }
             // Dismissal is always answered from mounted props and animated here.
             true
         })?;
         Ok(modal)
+    }
+    pub(crate) fn node_id(&self) -> Option<nsh_core::NodeId> {
+        self.owner.upgrade().map(|node| node.id)
     }
     pub(crate) fn presentation(&self) -> ModalPresentation {
         self.config.get().presentation
@@ -219,20 +234,31 @@ impl Modal {
         Ok(())
     }
     fn begin(&self, to: f32) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade()
+            && let Some(navigation) = owner.shaders.begin_navigation(&owner, None, to == 0.0)?
+        {
+            self.transition.borrow_mut().take();
+            *self.shader.borrow_mut() = Some(navigation);
+            owner.presentation(1.0, 0.0)?;
+            owner.animator.request_frame();
+            return Ok(());
+        }
         let reduced = self
             .owner
             .upgrade()
             .is_some_and(|owner| owner.platform.get().reduce_motion);
-        let duration = if self.config.get().animation == ModalAnimation::None || reduced {
-            0.0
-        } else {
-            nsh_core::navigation::MODAL.as_secs_f32() * (self.progress.get() - to).abs()
-        };
+        let duration = nsh_core::navigation::modal_motion(self.config.get().animation, reduced)
+            .map_or(0.0, |motion| {
+                motion.0.as_secs_f64() * 1000.0 * (self.progress.get() - to).abs() as f64
+            });
         if duration <= 0.0 {
             return self.finish(to);
         }
         *self.transition.borrow_mut() = Some(Transition {
-            start: Instant::now(),
+            start: self
+                .owner
+                .upgrade()
+                .map_or(0.0, |owner| owner.animator.now()),
             from: self.progress.get(),
             to,
             duration,
@@ -243,11 +269,22 @@ impl Modal {
         }
         Ok(())
     }
-    pub(crate) fn frame(&self) -> Result<bool> {
+    pub(crate) fn frame(&self, now: f64) -> Result<bool> {
+        let shader = self
+            .shader
+            .borrow()
+            .as_ref()
+            .map(|n| (n.running(), n.backwards));
+        if let Some((running, backwards)) = shader {
+            if running {
+                return Ok(true);
+            }
+            self.finish(if backwards { 0.0 } else { 1.0 })?;
+            return Ok(false);
+        }
         let state = self.transition.borrow().as_ref().map(|transition| {
-            let t =
-                (transition.start.elapsed().as_secs_f32() / transition.duration).clamp(0.0, 1.0);
-            let eased = nsh_core::navigation::ease(t as f64);
+            let t = ((now - transition.start) / transition.duration).clamp(0.0, 1.0);
+            let eased = nsh_core::navigation::ease(t);
             (
                 transition.from + (transition.to - transition.from) * eased,
                 t >= 1.0,
@@ -265,13 +302,17 @@ impl Modal {
     }
     fn paint(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
+            if self.shader.borrow().is_some() {
+                return owner.presentation(1.0, 0.0);
+            }
             let progress = self.progress.get();
-            let fade = if self.config.get().animation == ModalAnimation::Fade {
-                progress
-            } else {
-                1.0
-            };
-            let dy = if self.config.get().animation == ModalAnimation::Slide {
+            let crossfade = nsh_core::navigation::modal_motion(
+                self.config.get().animation,
+                owner.platform.get().reduce_motion,
+            )
+            .is_some_and(|motion| motion.1);
+            let fade = if crossfade { progress } else { 1.0 };
+            let dy = if self.config.get().animation == ModalAnimation::Slide && !crossfade {
                 nsh_core::navigation::modal_in_offset(Points(owner.frame.get().height), progress).0
             } else {
                 0.0
@@ -281,19 +322,25 @@ impl Modal {
         Ok(())
     }
     fn finish(&self, to: f32) -> Result<()> {
+        let shader = self.shader.borrow_mut().take();
+        if shader.is_some()
+            && let Some(owner) = self.owner.upgrade()
+        {
+            owner.shaders.end_navigation(owner.id)?;
+        }
         self.transition.borrow_mut().take();
         self.progress.set(to);
         if to == 0.0 {
-            if let Some(owner) = self.owner.upgrade() {
-                owner.presentation(1.0, 0.0)?;
-            }
             if self.shown.replace(false) {
                 self.dialog.borrow().close()?;
                 self.overlay.borrow_mut().take();
                 self.dialog.borrow().remove_content()?;
                 if let Some(owner) = self.owner.upgrade() {
+                    owner.presentation(1.0, 0.0)?;
                     owner.emit(EventKind::Dismiss, EventPayload::None);
                 }
+            } else if let Some(owner) = self.owner.upgrade() {
+                owner.presentation(1.0, 0.0)?;
             }
         } else {
             self.paint()?;
@@ -377,7 +424,7 @@ impl Modal {
         };
         let size = if let Some(constraint) = event.layout_constraint_in_measure() {
             let bound = |value: i32, fallback: f32| {
-                let value = value as f32 / owner.scale;
+                let value = value as f32 / owner.scale.get();
                 if value > 0.0 && value <= 16384.0 {
                     value
                 } else {
@@ -400,7 +447,12 @@ impl Modal {
 }
 impl Drop for Modal {
     fn drop(&mut self) {
-        let _ = self.dialog.borrow().close();
-        let _ = self.dialog.borrow().remove_content();
+        let dialog = self.dialog.get_mut();
+        if self.shown.get() {
+            let _ = dialog.close();
+        }
+        if let Err(error) = dialog.dispose() {
+            log::warn!("OHOS dialog retirement: {error}");
+        }
     }
 }

@@ -1,4 +1,4 @@
-//! Bounded blocking IO lanes. Slow fetch bodies cannot starve image or WebView assets.
+//! Bounded connection and asset lanes; streaming bodies run on admitted reader threads.
 use std::sync::{Arc, Mutex, OnceLock, mpsc};
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
@@ -33,17 +33,24 @@ impl Executor {
             .as_ref()
             .map_err(ToString::to_string)
     }
-    pub(crate) fn images() -> Result<&'static Self, String> {
-        static POOL: OnceLock<std::io::Result<Executor>> = OnceLock::new();
-        POOL.get_or_init(|| Self::new("nsh-image", 4, 256))
-            .as_ref()
-            .map_err(ToString::to_string)
-    }
     pub(crate) fn assets() -> Result<&'static Self, String> {
         static POOL: OnceLock<std::io::Result<Executor>> = OnceLock::new();
         POOL.get_or_init(|| Self::new("nsh-web-asset", 2, 256))
             .as_ref()
             .map_err(ToString::to_string)
+    }
+    /// Callers reserve a per-surface request permit before creating a reader.
+    /// A response waiting indefinitely for bytes never occupies a connection worker.
+    pub(crate) fn stream(job: impl FnOnce() + Send + 'static) -> Result<(), String> {
+        std::thread::Builder::new()
+            .name("nsh-fetch-body".into())
+            .spawn(move || {
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(job)).is_err() {
+                    log::error!("OHOS streaming reader panicked");
+                }
+            })
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
     pub(crate) fn submit(&self, job: impl FnOnce() + Send + 'static) -> Result<(), String> {
         // Admission never waits on the UI or engine thread. Dropping a rejected job
@@ -76,6 +83,39 @@ mod tests {
         release.send(()).unwrap();
     }
     #[test]
+    fn six_open_streams_release_all_connection_workers() {
+        let pool = Executor::new("test-fetch", 6, 16).unwrap();
+        let (started, ready) = mpsc::channel();
+        let mut stops = Vec::new();
+        for _ in 0..6 {
+            let started = started.clone();
+            let (stop, wait) = mpsc::channel();
+            stops.push(stop);
+            pool.submit(move || {
+                Executor::stream(move || {
+                    started.send(()).unwrap();
+                    wait.recv().unwrap();
+                })
+                .unwrap();
+            })
+            .unwrap();
+        }
+        for _ in 0..6 {
+            ready
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        }
+        pool.submit(move || {
+            started.send(()).unwrap();
+        })
+        .unwrap();
+        let result = ready.recv_timeout(std::time::Duration::from_secs(5));
+        for stop in stops {
+            stop.send(()).unwrap();
+        }
+        result.unwrap();
+    }
+    #[test]
     fn separate_lanes_are_reused() {
         assert!(std::ptr::eq(
             Executor::fetch().unwrap(),
@@ -85,6 +125,5 @@ mod tests {
             Executor::fetch().unwrap(),
             Executor::assets().unwrap()
         ));
-        assert!(Executor::images().is_ok());
     }
 }

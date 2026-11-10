@@ -107,6 +107,19 @@ pub(crate) fn visual_insets(
     insets
 }
 
+/// Projects a local point through the same matrix used for input picking.
+pub(crate) fn page_point(m: &[f64; 16], point: (f32, f32)) -> Option<(f32, f32)> {
+    let (x, y) = (point.0 as f64, point.1 as f64);
+    let w = x * m[3] + y * m[7] + m[15];
+    if !w.is_finite() || w <= 0.0 {
+        return None;
+    }
+    let x = (x * m[0] + y * m[4] + m[12]) / w;
+    let y = (point.0 as f64 * m[1] + point.1 as f64 * m[5] + m[13]) / w;
+    (x.is_finite() && y.is_finite() && x.abs() <= f32::MAX as f64 && y.abs() <= f32::MAX as f64)
+        .then_some((x as f32, y as f32))
+}
+
 /// Maps a surface point onto the local z=0 plane of a row-vector transform.
 /// Inverting a 4D point with screen z=0 loses depth after perspective division.
 pub(crate) fn local_point(matrix: &[f64; 16], point: (f32, f32)) -> Option<(f32, f32)> {
@@ -133,7 +146,7 @@ pub(crate) fn local_point(matrix: &[f64; 16], point: (f32, f32)) -> Option<(f32,
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowRect, local_point, visual_insets};
+    use super::{WindowRect, local_point, page_point, visual_insets};
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> WindowRect {
         WindowRect {
@@ -235,9 +248,22 @@ mod tests {
             ((x * m[0] + y * m[4] + m[12]) / w) as f32,
             ((x * m[1] + y * m[5] + m[13]) / w) as f32,
         );
+        assert_eq!(page_point(&m, (x as f32, y as f32)), Some(p));
         let actual = local_point(&m, p).unwrap();
         assert!((actual.0 - x as f32).abs() < 0.0001);
         assert!((actual.1 - y as f32).abs() < 0.0001);
+    }
+
+    #[test]
+    fn page_coordinates_include_transform_scroll_and_pinning() {
+        use nsh_core::{Matrix, TransformKind as K};
+        let transform = Matrix::of(K::Scale, 2.0)
+            .mul(&Matrix::of(K::TranslateX, 10.0))
+            .mul(&Matrix::of(K::TranslateY, 7.0))
+            .mul(&Matrix::of(K::TranslateY, -30.0))
+            .mul(&Matrix::of(K::TranslateY, 100.0));
+        assert_eq!(page_point(&transform.0, (4.0, 6.0)), Some((18.0, 89.0)));
+        assert_eq!(page_point(&[f64::NAN; 16], (4.0, 6.0)), None);
     }
 
     #[test]

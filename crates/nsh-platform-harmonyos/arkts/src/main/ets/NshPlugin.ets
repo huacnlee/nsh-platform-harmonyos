@@ -25,7 +25,7 @@ export class NshPlugin {
     }
     context.getUIContext();
     this.editors.remove(batch.removeEditors, context);
-    this.views.remove(batch.removeViews, context);
+    this.views.remove(batch.removeViews, context, batch.views);
     this.webs.remove(batch.removeWebs, context);
     this.editors.update(batch.editors, batch.commands, context);
     this.views.update(batch.views, context);

@@ -1,7 +1,13 @@
 //! OHOS host session binding. Each window owns its own `Services` session,
 //! bound explicitly from its `UIContext` without global single-window state.
 
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::RefCell,
+    sync::{
+        Arc,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 use napi_derive_ohos::napi;
 use napi_ohos::{
@@ -16,6 +22,51 @@ use crate::app::{
     session::{AvoidArea, HostCommand, HostInit, Services},
 };
 
+/// Capabilities available to the embedding host on this runtime.
+#[napi(object)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NshCapabilities {
+    /// Actual system API level, independent of surface environment overrides.
+    pub api_level: u32,
+    /// Native Shell's minimum supported system API level.
+    pub minimum_api_level: u32,
+    /// API-23 support was included in this library.
+    pub compiled_api23: bool,
+    /// API-26 support was included in this library.
+    pub compiled_api26: bool,
+    /// API-23 enhancements may be used on this runtime.
+    pub api23: bool,
+    /// API-26 enhancements may be used on this runtime.
+    pub api26: bool,
+}
+
+static RUNTIME_API_VERSION: AtomicI32 = AtomicI32::new(0);
+
+fn set_runtime_api_version(version: i32) {
+    RUNTIME_API_VERSION.store(version.max(0), Ordering::Relaxed);
+}
+
+/// Returns compiled enhancements intersected with the running system API level.
+#[napi]
+pub fn get_capabilities() -> NshCapabilities {
+    let mut version = RUNTIME_API_VERSION.load(Ordering::Relaxed);
+    if version <= 0 {
+        version = ohos_device_binding::sdk_api_version() as i32;
+        if version > 0 {
+            RUNTIME_API_VERSION.store(version, Ordering::Relaxed);
+        }
+    }
+    let capabilities = crate::app::features::Capabilities::for_api(version.max(0) as u32);
+    NshCapabilities {
+        api_level: capabilities.api_level,
+        minimum_api_level: capabilities.minimum_api_level,
+        compiled_api23: capabilities.compiled_api23,
+        compiled_api26: capabilities.compiled_api26,
+        api23: capabilities.api23,
+        api26: capabilities.api26,
+    }
+}
+
 thread_local! {
     static SESSION_BINDER: RefCell<Option<FunctionRef<(), ()>>> = RefCell::default();
 }
@@ -25,7 +76,7 @@ pub(crate) fn nsh_register_session_binder(
     sdk_api_version: i32,
     #[napi(ts_arg_type = "(uiContext: object) => number")] binder: Function<'_, (), ()>,
 ) -> Result<()> {
-    crate::app::features::set_runtime_api_version(sdk_api_version);
+    set_runtime_api_version(sdk_api_version);
     crate::media::webview::register_custom_scheme();
     let reference = binder.create_ref()?;
     SESSION_BINDER.with(|slot| {
@@ -47,9 +98,10 @@ pub(crate) fn bind_session(env: &Env, ui_context: &Object<'_>) -> Result<Arc<Ser
                 .transpose()
         })?
         .ok_or_else(|| Error::from_reason("@nsh/harmonyos session binder is not registered"))?;
-    crate::app::session::clear_pending();
     let arg = ui_context.raw();
     let mut raw_result = std::ptr::null_mut();
+    // SAFETY: all handles belong to this UI-thread environment and remain live
+    // for the synchronous call; raw_result receives its owned N-API value.
     let status = unsafe {
         napi_ohos::sys::napi_call_function(
             env.raw(),
@@ -61,24 +113,17 @@ pub(crate) fn bind_session(env: &Env, ui_context: &Object<'_>) -> Result<Arc<Ser
         )
     };
     if status != napi_ohos::sys::Status::napi_ok {
-        crate::app::session::clear_pending();
         return Err(Error::from_status(Status::from(status)));
     }
-    let session_id = unsafe { u32::from_napi_value(env.raw(), raw_result) }.inspect_err(|_| {
-        crate::app::session::clear_pending();
-    })?;
-    crate::app::session::take_pending_or_get(session_id)
-}
-
-#[napi]
-pub(crate) fn nsh_find_session(window_name: String) -> u32 {
-    crate::app::session::find_by_window_name(&window_name)
+    // SAFETY: a successful call initialized raw_result in this environment;
+    // FromNapiValue checks the binder's session ID before converting it.
+    let session_id = unsafe { u32::from_napi_value(env.raw(), raw_result) }?;
+    crate::app::session::get(session_id)
 }
 
 #[napi]
 pub(crate) fn nsh_create_session(
     init: HostInit,
-    window_name: String,
     platform_window_id: i32,
     #[napi(ts_arg_type = "object")] resource_manager: Unknown<'_>,
     #[napi(ts_arg_type = "(batch: Batch) => void")] apply_batch: Function<
@@ -91,6 +136,11 @@ pub(crate) fn nsh_create_session(
         HostCommand,
         (),
     >,
+    #[napi(ts_arg_type = "(context: TabBarContext) => object")] tab_bar: Function<
+        '_,
+        crate::interop::component::TabBarContext,
+        napi_ohos::bindgen_prelude::ObjectRef,
+    >,
 ) -> Result<u32> {
     if init.sdk_api_version < crate::app::features::MIN_API as i32 {
         return Err(Error::from_reason(format!(
@@ -98,7 +148,7 @@ pub(crate) fn nsh_create_session(
             crate::app::features::MIN_API
         )));
     }
-    crate::app::features::set_runtime_api_version(init.sdk_api_version);
+    set_runtime_api_version(init.sdk_api_version);
     crate::media::webview::register_custom_scheme();
     let resource_manager = ResourceManager::from_napi_value(resource_manager)?;
     let applier = apply_batch.create_ref()?;
@@ -108,11 +158,11 @@ pub(crate) fn nsh_create_session(
         .build()?;
     Services::create(
         init,
-        window_name,
         platform_window_id,
         resource_manager,
         applier,
         command_tsfn,
+        tab_bar.create_ref()?,
     )
 }
 
@@ -122,10 +172,22 @@ pub(crate) fn nsh_close_session(session_id: u32) {
 }
 
 #[napi]
-pub(crate) fn nsh_set_foreground(session_id: u32, foreground: bool) {
+pub(crate) fn nsh_set_lifecycle(session_id: u32, lifecycle: String) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
-        host.set_foreground(foreground);
+        host.update(NshEnvironment {
+            lifecycle: Some(lifecycle),
+            ..Default::default()
+        })?;
     }
+    Ok(())
+}
+
+#[napi]
+pub(crate) fn nsh_update_keyboard(session_id: u32, duration: f64) -> Result<()> {
+    crate::app::session::get(session_id)?.update(NshEnvironment {
+        keyboard_duration: Some(duration),
+        ..Default::default()
+    })
 }
 
 #[napi]
@@ -134,15 +196,20 @@ pub(crate) fn nsh_update_config(
     color_mode: i32,
     font_size_scale: f64,
     language: String,
+    rtl: bool,
     device_type: Option<String>,
+    pixel_ratio: Option<f64>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
-        host.update(crate::app::session::environment_from_config(
+        let mut environment = crate::app::session::environment_from_config(
             color_mode,
             font_size_scale,
             language,
             device_type.as_deref(),
-        ))?;
+            rtl,
+        );
+        environment.pixel_ratio = pixel_ratio;
+        host.update(environment)?;
     }
     Ok(())
 }
@@ -156,7 +223,7 @@ pub(crate) fn nsh_update_accessibility(
     if let Ok(host) = crate::app::session::get(session_id) {
         host.update(NshEnvironment {
             screen_reader,
-            reduce_motion: reduce_motion.filter(|_| crate::get_capabilities().api23),
+            reduce_motion,
             ..Default::default()
         })?;
     }
@@ -189,13 +256,22 @@ pub(crate) fn nsh_open_url_result(session_id: u32, open_id: u32, opened: bool) {
 }
 
 #[napi]
-pub(crate) fn nsh_pick_images_result(session_id: u32, pick_id: u32, paths: Vec<String>) {
+pub(crate) fn nsh_pick_images_result(
+    session_id: u32,
+    pick_id: u32,
+    files: Vec<crate::services::system::PickedDescriptor>,
+) {
+    let files = files
+        .into_iter()
+        .take(nsh_core::picker::MAX_PICKED as usize)
+        .filter_map(|file| {
+            file.retain()
+                .map_err(|error| log::warn!("OHOS picked file: {error}"))
+                .ok()
+        })
+        .collect();
     if let Ok(host) = crate::app::session::get(session_id) {
-        host.complete_pick_images(pick_id, paths);
-    } else {
-        for path in &paths {
-            let _ = std::fs::remove_file(path);
-        }
+        host.complete_pick(pick_id, files);
     }
 }
 
@@ -209,12 +285,18 @@ pub(crate) fn nsh_report_host_error(session_id: u32, message: String) {
 #[napi]
 pub(crate) fn on_back_press_intercept(
     env: Env,
-    #[napi(ts_arg_type = "import('@ohos.arkui.UIContext').UIContext")] ui_context: Option<
-        Object<'_>,
-    >,
+    #[napi(ts_arg_type = "import('@ohos.arkui.UIContext').UIContext")] ui_context: Object<'_>,
 ) -> bool {
-    if let Some(ui_context) = ui_context {
-        return bind_session(&env, &ui_context).is_ok_and(|host| host.handle_back());
+    bind_session(&env, &ui_context).is_ok_and(|host| host.handle_back())
+}
+
+#[napi]
+pub(crate) fn nsh_service_event(
+    session_id: u32,
+    key: u32,
+    value: crate::services::system::SystemEvent,
+) {
+    if let Ok(host) = crate::app::session::get(session_id) {
+        host.system.complete(key, value);
     }
-    crate::app::session::handle_back_any()
 }

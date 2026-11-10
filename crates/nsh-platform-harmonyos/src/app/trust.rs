@@ -15,7 +15,7 @@ use napi_ohos::{
 
 use crate::services::assets::AssetDirectory;
 
-const MAX_PACKAGE: u64 = 256 << 20;
+const MAX_PACKAGE: usize = 256 << 20;
 type DirectoryLocks = Vec<(PathBuf, Weak<Mutex<()>>)>;
 static DIRECTORIES: LazyLock<Mutex<DirectoryLocks>> = LazyLock::new(Mutex::default);
 
@@ -65,6 +65,10 @@ impl NshPackage {
             .unwrap()
             .take()
             .ok_or_else(|| Error::from_reason("the package already ran"))
+    }
+
+    pub(crate) fn restore(&self, prepared: Prepared) {
+        *self.prepared.lock().unwrap() = Some(prepared);
     }
 }
 
@@ -153,10 +157,10 @@ impl NshTrust {
         blocking(move || {
             let file = std::fs::File::open(PathBuf::from(path)).map_err(error)?;
             let mut bytes = Vec::new();
-            file.take(MAX_PACKAGE + 1)
+            file.take(MAX_PACKAGE as u64 + 1)
                 .read_to_end(&mut bytes)
                 .map_err(error)?;
-            if bytes.len() as u64 > MAX_PACKAGE {
+            if bytes.len() > MAX_PACKAGE {
                 return Err(error("package exceeds 256 MiB"));
             }
             Self::prepare(&directory_lock, &store, &assets, &bytes)
@@ -164,8 +168,7 @@ impl NshTrust {
         .await
     }
 
-    /// Verifies a signed HAP rawfile using the Ability resource manager bound to `uiContext`
-    /// (or an active host session when `uiContext` is omitted).
+    /// Verifies a signed HAP rawfile using `uiContext`, or the sole active NSH session when omitted.
     #[napi(ts_return_type = "Promise<NshPackage>")]
     pub fn open_resource<'env>(
         &self,
@@ -176,11 +179,7 @@ impl NshTrust {
         >,
     ) -> Result<PromiseRaw<'env, NshPackage>> {
         crate::app::session::resource_name(&name)?;
-        let host = if let Some(ui_context) = ui_context {
-            crate::app::entry::bind_session(env, &ui_context)?
-        } else {
-            crate::app::session::any_active()?
-        };
+        let host = crate::app::session::resolve_context(env, ui_context.as_ref())?;
         let permit = host.reserve_load()?;
         let store = self.store.clone();
         let assets = self.assets.clone();
@@ -188,7 +187,7 @@ impl NshTrust {
         env.spawn_future(async move {
             blocking(move || {
                 let _permit = permit;
-                let bytes = host.resource(&name)?;
+                let bytes = host.resource_with_limit(&name, MAX_PACKAGE)?;
                 Self::prepare(&directory_lock, &store, &assets, &bytes)
             })
             .await

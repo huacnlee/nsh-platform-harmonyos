@@ -1,5 +1,64 @@
 //! Finite capture bounds in surface units, including projected native overflow.
-use nsh_core::{Filter, Matrix, ViewStyle};
+use nsh_core::{Filter, Matrix, Points, Size, ViewStyle};
+
+/// Bound allocations uniformly; logical boxes never change with resolution.
+pub(crate) fn target_size(width: f32, height: f32, scale: f32) -> (u32, u32, f32) {
+    if !width.is_finite()
+        || !height.is_finite()
+        || !scale.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || scale <= 0.0
+    {
+        return (0, 0, 0.0);
+    }
+    let raw_w = (f64::from(width) * f64::from(scale)).ceil().max(1.0);
+    let raw_h = (f64::from(height) * f64::from(scale)).ceil().max(1.0);
+    let ratio = (4096.0 / raw_w.max(raw_h)).min(1.0);
+    let w = (raw_w * ratio).round().clamp(1.0, 4096.0) as u32;
+    let h = (raw_h * ratio).round().clamp(1.0, 4096.0) as u32;
+    (w, h, scale * ratio as f32)
+}
+
+/// Logical coverage of a picture, independent of its pixel resolution.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Coverage {
+    pub(crate) box_size: Size<Points>,
+    pub(crate) insets: [f32; 4],
+}
+impl Coverage {
+    pub(crate) fn shader(box_size: Size<Points>, overflow: f32) -> Self {
+        Self {
+            box_size,
+            insets: [overflow.max(0.0); 4],
+        }
+    }
+    pub(crate) fn size(self) -> (f32, f32) {
+        (
+            self.box_size.width.0 + self.insets[0] + self.insets[2],
+            self.box_size.height.0 + self.insets[1] + self.insets[3],
+        )
+    }
+    pub(crate) fn pixels(self, scale: f32) -> (u32, u32, f32) {
+        let (width, height) = self.size();
+        target_size(width, height, scale)
+    }
+    /// Where the source picture lies in a destination pixel grid.
+    pub(crate) fn destination(self, source: Self, size: (u32, u32)) -> [i32; 4] {
+        let (width, height) = self.size();
+        let sx = size.0 as f32 / width;
+        let sy = size.1 as f32 / height;
+        let left = self.insets[0] - source.insets[0];
+        let top = self.insets[1] - source.insets[1];
+        let (sw, sh) = source.size();
+        [
+            (left * sx).round() as i32,
+            (top * sy).round() as i32,
+            ((left + sw) * sx).round() as i32,
+            ((top + sh) * sy).round() as i32,
+        ]
+    }
+}
 
 pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
     radius.max(0.0) * scale * 0.5
@@ -8,7 +67,8 @@ pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
 pub(crate) fn requires_scene(style: &ViewStyle) -> bool {
     style.blend_mode == nsh_core::BlendMode::PlusDarker
         || style.effects.as_ref().is_some_and(|effects| {
-            effects.backdrop_filters.len() > 1
+            !effects.mask_images.is_empty()
+                || effects.backdrop_filters.len() > 1
                 || effects
                     .backdrop_filters
                     .iter()
@@ -38,6 +98,21 @@ impl Bounds {
             c + dx + pad,
             d + dy + pad,
         ]));
+    }
+    pub(crate) fn shaders(
+        mut self,
+        fill_overflow: f32,
+        layers: &[(
+            nsh_core::NodeId,
+            std::sync::Arc<nsh_core::shader::ShaderLayer>,
+        )],
+    ) -> Self {
+        let overflow = layers
+            .iter()
+            .map(|(_, layer)| layer.overflow.0.max(0.0))
+            .fold(fill_overflow.max(0.0), f32::max);
+        self.extend(0.0, 0.0, overflow);
+        self
     }
     pub(crate) fn own(mut self, style: &ViewStyle) -> Self {
         let border = self;
@@ -125,6 +200,92 @@ mod tests {
     use nsh_core::{Color, Points, TransformKind};
 
     use super::*;
+    #[test]
+    fn shader_capture_uses_maximum_nonnegative_overflow() {
+        use nsh_core::shader::{Shader, ShaderLayer};
+        let shader =
+            Shader::compile("fn shade(uv: vec2f) -> vec4f { return vec4f(uv, 0.0, 1.0); }")
+                .unwrap();
+        let layer = |overflow| {
+            std::sync::Arc::new(
+                ShaderLayer::new(shader.clone(), &[], &mut Vec::new())
+                    .with_overflow(Points(overflow)),
+            )
+        };
+        let layers = [(2, layer(6.0)), (4, layer(12.0)), (6, layer(-5.0))];
+        assert_eq!(
+            Bounds::new(100.0, 50.0).shaders(0.0, &layers).0,
+            [-12.0, -12.0, 112.0, 62.0]
+        );
+        assert_eq!(
+            Bounds::new(100.0, 50.0).shaders(0.0, &[]).0,
+            [0.0, 0.0, 100.0, 50.0]
+        );
+        // Fills live in Shaders, separately from the effect stack. Native
+        // texture export and the CSS scene must keep their overflow too.
+        assert_eq!(
+            Bounds::new(100.0, 50.0).shaders(10.0, &[]).0,
+            [-10.0, -10.0, 110.0, 60.0]
+        );
+        assert_eq!(
+            Bounds::new(100.0, 50.0).shaders(20.0, &layers).0,
+            [-20.0, -20.0, 120.0, 70.0]
+        );
+    }
+    #[test]
+    fn oversized_targets_keep_the_box_and_aspect_ratio() {
+        let coverage = Coverage::shader(Size::new(Points(3000.0), Points(1500.0)), 100.0);
+        let (w, h, scale) = coverage.pixels(3.0);
+        assert_eq!((w, h), (4096, 2176));
+        assert!((scale - 1.28).abs() < 0.0001);
+        assert_eq!(w as f32 / h as f32, 3200.0 / 1700.0);
+        let words = nsh_core::shader::builtins(
+            coverage.box_size,
+            0.0,
+            scale,
+            nsh_core::geometry::Percentage(0.0),
+            Points(100.0),
+        );
+        assert_eq!(
+            [f32::from_bits(words[0]), f32::from_bits(words[1])],
+            [3000.0, 1500.0]
+        );
+        assert_eq!(f32::from_bits(words[3]), scale);
+        let (w, h, scale) = target_size(1.0, 10000.0, 1.0);
+        assert_eq!((w, h), (1, 4096));
+        assert!((scale - 0.4096).abs() < 0.0001);
+        assert_eq!(target_size(0.0, 100.0, 3.0), (0, 0, 0.0));
+        assert_eq!(target_size(100.0, 100.0, f32::INFINITY), (0, 0, 0.0));
+    }
+    #[test]
+    fn asymmetric_capture_reframes_around_the_view_box() {
+        let box_size = Size::new(Points(100.0), Points(50.0));
+        let capture = Coverage {
+            box_size,
+            insets: [3.0, 7.0, 21.0, 11.0],
+        };
+        let shader = Coverage::shader(box_size, 10.0);
+        // Source origin at (-3, -7), shader origin at (-10, -10), at 2 px/pt.
+        assert_eq!(shader.destination(capture, (240, 140)), [14, 6, 262, 142]);
+        assert_eq!(capture.destination(shader, (248, 136)), [-14, -6, 226, 134]);
+        let first = nsh_core::shader::builtins(
+            capture.box_size,
+            0.0,
+            2.0,
+            nsh_core::geometry::Percentage(0.0),
+            Points(10.0),
+        );
+        let second = nsh_core::shader::builtins(
+            shader.box_size,
+            0.0,
+            2.0,
+            nsh_core::geometry::Percentage(0.0),
+            Points(10.0),
+        );
+        assert_eq!(first, second);
+        assert_eq!(f32::from_bits(second[0]), 100.0);
+        assert_eq!(f32::from_bits(second[1]), 50.0);
+    }
     #[test]
     fn scene_requirements_follow_the_current_style() {
         let mut style = ViewStyle {

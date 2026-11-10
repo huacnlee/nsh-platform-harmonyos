@@ -1,15 +1,14 @@
-//! Native window filtering; mounted bindings decide consumption before JS runs.
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex, OnceLock, Weak},
-};
+//! Focus-scoped ArkUI key events; mounted bindings decide consumption before JS runs.
+use std::sync::{Arc, Mutex};
 
 use nsh_core::{
     NodeId,
     keymap::{Key, KeyMatch, Keymap, Keystroke, Modifiers},
 };
-use ohos_arkui_binding::event::KeyCode as N;
-use ohos_window_manager_binding::{Input_KeyEvent, KeyEventRef, Window};
+use ohos_arkui_binding::{
+    component::attribute::{ArkUICommonAttribute, ArkUIEvent},
+    event::{KeyCode as N, KeyEvent, KeyEventType},
+};
 
 impl crate::render::node::Node {
     pub(crate) fn dismiss_keyboard(&self) -> crate::render::node::Result<()> {
@@ -55,125 +54,58 @@ pub(crate) struct Snapshot {
 struct Held {
     keys: Vec<(N, bool)>,
 }
-static LIFECYCLE: Mutex<()> = Mutex::new(());
-
+/// Per-window modifier bookkeeping, with no window-global native registration.
 pub(crate) struct KeyboardWindow {
     id: i32,
-    route: Arc<WindowRoute>,
+    held: Mutex<Held>,
 }
 impl KeyboardWindow {
     pub(crate) fn id(&self) -> i32 {
         self.id
     }
     pub(crate) fn clear(&self) {
-        self.route.held.lock().unwrap().keys.clear();
+        self.held.lock().unwrap().keys.clear();
     }
     pub(crate) fn modifiers(&self) -> Modifiers {
-        self.route.held.lock().unwrap().modifiers()
+        self.held.lock().unwrap().modifiers()
     }
-    pub(crate) fn new(
-        id: i32,
-        host: std::sync::Weak<crate::app::session::Services>,
-    ) -> napi_ohos::Result<Self> {
-        // Native filter registration is serialized independently of callback routing.
-        let _lifecycle = LIFECYCLE.lock().unwrap();
-        let route = Arc::new(WindowRoute {
-            host,
-            held: Mutex::new(Held::default()),
-        });
-        let first = {
-            let mut routes = routes().lock().unwrap();
-            let entries = routes.entry(id).or_default();
-            entries.retain(|entry| entry.strong_count() > 0);
-            let first = entries.is_empty();
-            entries.push(Arc::downgrade(&route));
-            first
-        };
-        if first && let Err(error) = Window::from_id(id).register_key_event_filter(filter) {
-            routes().lock().unwrap().remove(&id);
-            return Err(napi_ohos::Error::from_reason(error.to_string()));
-        }
-        Ok(Self { id, route })
-    }
-}
-struct WindowRoute {
-    host: Weak<crate::app::session::Services>,
-    held: Mutex<Held>,
-}
-static ROUTES: OnceLock<Mutex<BTreeMap<i32, Vec<Weak<WindowRoute>>>>> = OnceLock::new();
-fn routes() -> &'static Mutex<BTreeMap<i32, Vec<Weak<WindowRoute>>>> {
-    ROUTES.get_or_init(Mutex::default)
-}
-impl Drop for KeyboardWindow {
-    fn drop(&mut self) {
-        let _lifecycle = LIFECYCLE.lock().unwrap();
-        let empty = {
-            let mut routes = routes().lock().unwrap();
-            if let Some(entries) = routes.get_mut(&self.id) {
-                entries.retain(|entry| {
-                    entry.strong_count() > 0 && !entry.ptr_eq(&Arc::downgrade(&self.route))
-                });
-                if entries.is_empty() {
-                    routes.remove(&self.id);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if empty && let Err(error) = Window::from_id(self.id).unregister_key_event_filter() {
-            log::error!("OHOS key filter retirement: {error}");
+    pub(crate) fn new(id: i32) -> Self {
+        Self {
+            id,
+            held: Mutex::default(),
         }
     }
-}
-unsafe extern "C" fn filter(raw: *mut Input_KeyEvent) -> bool {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // SAFETY: the SDK owns the key event until this synchronous callback returns.
-        let Some(event) = (unsafe { KeyEventRef::from_raw(raw) }) else {
-            return false;
+
+    pub(crate) fn event(
+        &self,
+        event: KeyEvent<'_>,
+        route: &crate::app::runtime::Dispatcher,
+    ) -> bool {
+        let action = match event.event_type() {
+            KeyEventType::Down => 1,
+            KeyEventType::Up => 2,
+            _ => return false,
         };
-        let routes = {
-            routes()
-                .lock()
-                .unwrap()
-                .get(&event.window_id())
-                .map(|entries| entries.iter().filter_map(Weak::upgrade).collect::<Vec<_>>())
-                .unwrap_or_default()
-        };
-        let mut consumed = false;
-        for route in routes.into_iter().rev() {
-            consumed |= route.event(&event, !consumed);
-        }
-        consumed
-    }))
-    .unwrap_or(false)
-}
-impl WindowRoute {
-    fn event(&self, event: &KeyEventRef<'_>, deliver: bool) -> bool {
-        if self.held.lock().unwrap().cancel(event.action()) {
-            return false;
-        }
-        let Some(code) = N::try_from_raw(event.key_code()) else {
-            return false;
-        };
-        let Some(host) = self.host.upgrade() else {
-            return false;
-        };
-        if !host.is_foreground() {
-            self.held.lock().unwrap().keys.clear();
-            return false;
-        }
-        let route = host.keyboard_route();
+        let code = event.key_code();
         let mut held = self.held.lock().unwrap();
-        held.event(event.action(), code, |stroke, repeat| {
-            if !deliver {
-                return false;
+        // Focus may have entered while modifiers were held in the host. Read the
+        // event's pressed set instead of depending on keydowns outside our tree.
+        let mut pressed = [0; 64];
+        if let Ok(count) = event.pressed_keys(&mut pressed) {
+            let keys = &pressed[..count.min(pressed.len())];
+            held.keys.retain(|(key, _)| {
+                *key == code || keys.iter().any(|raw| N::try_from_raw(*raw) == Some(*key))
+            });
+            for raw in keys {
+                if let Some(key) = N::try_from_raw(*raw)
+                    && key != code
+                    && !held.keys.iter().any(|(old, _)| *old == key)
+                {
+                    held.keys.push((key, false));
+                }
             }
-            let Some(route) = route.as_ref() else {
-                return false;
-            };
+        }
+        held.event(action, code, |stroke, repeat| {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.focused.is_none()
                 && let Some(id) = snapshot.selection
@@ -223,7 +155,7 @@ impl WindowRoute {
                         return true;
                     }
                     drop(snapshot);
-                    return host.handle_back();
+                    return back(route);
                 }
                 if snapshot.focused.is_none()
                     && ((stroke.key == Key::Left
@@ -240,12 +172,41 @@ impl WindowRoute {
                                 }))
                 {
                     drop(snapshot);
-                    return host.handle_back();
+                    return back(route);
                 }
             }
             false
         })
     }
+}
+
+fn back(route: &crate::app::runtime::Dispatcher) -> bool {
+    if route.wants_back.load(std::sync::atomic::Ordering::Acquire) {
+        route.send(crate::app::runtime::Message::Back);
+        true
+    } else {
+        false
+    }
+}
+
+/// Root and native dialog boundaries receive bubbling keys only from their own
+/// focus subtree. ArkUI retires the handler with its node on the UI thread.
+pub(crate) fn install(
+    owner: &std::rc::Rc<crate::render::node::Node>,
+) -> crate::render::node::Result<()> {
+    owner.native.borrow().set_focusable(true)?;
+    let weak = std::rc::Rc::downgrade(owner);
+    owner.native.borrow_mut().on_key_event(move |event| {
+        if let Some(owner) = weak.upgrade()
+            && let Some(event) = event.key_event()
+            && let Some(route) = owner.dispatcher.upgrade()
+            && owner.host.key_event(event, &route)
+        {
+            event.set_consumed(true);
+            event.stop_propagation(true);
+        }
+    });
+    Ok(())
 }
 
 impl Held {
@@ -258,7 +219,7 @@ impl Held {
         }
     }
     fn cancel(&mut self, action: i32) -> bool {
-        if action == KeyEventRef::ACTION_CANCEL {
+        if action == 0 {
             self.keys.clear();
             true
         } else {
@@ -273,10 +234,10 @@ impl Held {
             .keys
             .iter()
             .position(|(held_code, _)| *held_code == code);
-        if action == KeyEventRef::ACTION_UP {
+        if action == 2 {
             return old.is_some_and(|index| self.keys.swap_remove(index).1);
         }
-        if action != KeyEventRef::ACTION_DOWN {
+        if action != 1 {
             return false;
         }
         let modifiers = self.modifiers();
@@ -382,36 +343,34 @@ mod tests {
     #[test]
     fn repeat_and_consumed_release_survive_callback_borrowing() {
         let mut held = Held::default();
-        assert!(held.event(KeyEventRef::ACTION_DOWN, N::A, |_, repeat| {
+        assert!(held.event(1, N::A, |_, repeat| {
             assert!(!repeat);
             true
         }));
-        assert!(!held.event(KeyEventRef::ACTION_DOWN, N::A, |_, repeat| {
+        assert!(!held.event(1, N::A, |_, repeat| {
             assert!(repeat);
             false
         }));
-        assert!(held.event(KeyEventRef::ACTION_UP, N::A, |_, _| panic!(
-            "up must not dispatch"
-        )));
-        assert!(!held.event(KeyEventRef::ACTION_UP, N::A, |_, _| false));
+        assert!(held.event(2, N::A, |_, _| panic!("up must not dispatch")));
+        assert!(!held.event(2, N::A, |_, _| false));
     }
     #[test]
     fn cancellation_does_not_require_a_decodable_key_code() {
         let mut held = Held::default();
-        held.event(KeyEventRef::ACTION_DOWN, N::CtrlLeft, |_, _| false);
-        assert!(held.cancel(KeyEventRef::ACTION_CANCEL));
+        held.event(1, N::CtrlLeft, |_, _| false);
+        assert!(held.cancel(0));
         assert!(held.keys.is_empty());
     }
     #[test]
     fn modifier_state_and_cancel_are_native_only() {
         let mut held = Held::default();
-        held.event(KeyEventRef::ACTION_DOWN, N::CtrlLeft, |_, _| false);
-        held.event(KeyEventRef::ACTION_DOWN, N::C, |stroke, _| {
+        held.event(1, N::CtrlLeft, |_, _| false);
+        held.event(1, N::C, |stroke, _| {
             assert!(stroke.modifiers.ctrl);
             false
         });
-        held.event(KeyEventRef::ACTION_CANCEL, N::C, |_, _| false);
-        held.event(KeyEventRef::ACTION_DOWN, N::C, |stroke, _| {
+        held.event(0, N::C, |_, _| false);
+        held.event(1, N::C, |stroke, _| {
             assert!(!stroke.modifiers.ctrl);
             false
         });

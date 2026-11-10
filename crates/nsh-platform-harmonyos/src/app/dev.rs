@@ -190,6 +190,7 @@ fn error(e: impl std::fmt::Display) -> Error {
 pub(crate) struct Overlay {
     parent: std::rc::Weak<std::cell::RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     node: crate::render::node::NativeNode,
+    connection: crate::render::node::NativeNode,
     title: crate::render::node::NativeNode,
     actions: crate::render::node::NativeNode,
     copy: crate::render::node::NativeNode,
@@ -218,7 +219,30 @@ impl Overlay {
             },
         };
         let node = Column::new().map_err(error)?.into_node();
+        let connection = Text::new().map_err(error)?.into_node();
         let build = || -> crate::render::node::Result<std::rc::Rc<Self>> {
+            connection
+                .borrow()
+                .set_length_metric_unit(LengthMetricUnit::Vp)?;
+            connection.borrow().id("nsh-dev-connection")?;
+            connection
+                .borrow()
+                .set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+            connection.borrow().set_string_attribute(
+                A::TextContent,
+                "Development server disconnected · reconnecting…",
+            )?;
+            connection
+                .borrow()
+                .set_u32_attribute(A::FontColor, 0xffffffff)?;
+            connection.borrow().set_f32_attribute(A::FontSize, 12.0)?;
+            connection.borrow().set_i32_attribute(A::TextMaxLines, 1)?;
+            connection
+                .borrow()
+                .set_attribute(A::Padding, vec![4.0_f32, 8.0, 4.0, 8.0].into())?;
+            connection.borrow().background_color(0xff353535)?;
+            connection.borrow().z_index(i32::MAX - 1)?;
+            connection.borrow().set_i32_attribute(A::Visibility, 1)?;
             let title = Text::new()?.into_node();
             node.borrow_mut().add_child(title.clone())?;
             let actions = Row::new()?.into_node();
@@ -294,6 +318,7 @@ impl Overlay {
             let overlay = std::rc::Rc::new(Self {
                 parent: std::rc::Rc::downgrade(parent),
                 node: node.clone(),
+                connection: connection.clone(),
                 title,
                 actions,
                 copy,
@@ -319,13 +344,23 @@ impl Overlay {
             });
             overlay.hide();
             // Engine roots always mount at index zero; this remains the last child.
+            parent.borrow_mut().add_child(connection.clone())?;
             parent.borrow_mut().add_child(node.clone())?;
             Ok(overlay)
         };
         match build() {
             Ok(overlay) => Ok(overlay),
             Err(failure) => {
-                crate::render::node::callback(|| node.borrow_mut().dispose().map_err(Into::into));
+                for child in [&connection, &node] {
+                    crate::render::node::callback(|| {
+                        child.borrow().remove_from_parent()?;
+                        parent
+                            .borrow_mut()
+                            .children_mut()
+                            .retain(|n| !std::rc::Rc::ptr_eq(n, child));
+                        child.borrow_mut().dispose().map_err(Into::into)
+                    });
+                }
                 Err(error(failure))
             }
         }
@@ -342,6 +377,7 @@ impl Overlay {
         let status = 24.0_f32.min(height * 0.18);
         for (node, w, h) in [
             (&self.node, width, height),
+            (&self.connection, width, 28.0_f32.min(height)),
             (&self.title, width, title),
             (&self.actions, width, actions),
             (&self.copy, width * 0.5, actions),
@@ -359,6 +395,20 @@ impl Overlay {
         // An unconstrained text height lets native Scroll measure every wrapped line.
         self.text.borrow().width(width)?;
         Ok(())
+    }
+    pub(crate) fn connection(&self, disconnected: bool) {
+        use ohos_arkui_binding::{
+            component::attribute::ArkUICommonAttribute,
+            types::attribute::ArkUINodeAttributeType as A,
+        };
+        crate::render::node::callback(|| {
+            if self.connection.borrow().is_owned() {
+                self.connection
+                    .borrow()
+                    .set_i32_attribute(A::Visibility, i32::from(!disconnected))?;
+            }
+            Ok(())
+        });
     }
     pub(crate) fn show(&self, message: &str) {
         use ohos_arkui_binding::{
@@ -438,6 +488,14 @@ impl Overlay {
         self.hide();
         let close = || -> crate::render::node::Result<()> {
             if let Some(parent) = self.parent.upgrade() {
+                if self.connection.borrow().is_owned() {
+                    self.connection.borrow().remove_from_parent()?;
+                    parent
+                        .borrow_mut()
+                        .children_mut()
+                        .retain(|child| !std::rc::Rc::ptr_eq(child, &self.connection));
+                    self.connection.borrow_mut().dispose()?;
+                }
                 let index = parent
                     .borrow()
                     .children()

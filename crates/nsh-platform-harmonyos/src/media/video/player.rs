@@ -23,6 +23,7 @@ use crate::{
         session::Services,
     },
     render::node::{Node, Result},
+    services::assets::StreamAssets,
 };
 
 struct Callbacks {
@@ -57,6 +58,9 @@ struct Playback {
     initialized: bool,
     prepared: bool,
     applied_rate: f32,
+    // The current binding exposes no renderer-info or interrupt-mode setter.
+    // Retain the requested session with its player generation for that boundary.
+    audio_session: nsh_core::AudioSession,
 }
 pub(super) struct Worker {
     host: Arc<Services>,
@@ -64,7 +68,7 @@ pub(super) struct Worker {
     control: EngineControl,
     node: u32,
     token: u64,
-    assets: Arc<dyn crate::services::assets::StreamAssets>,
+    assets: Arc<dyn StreamAssets>,
     access: Arc<nsh_engine::Access>,
     agent: ureq::Agent,
     active: Arc<AtomicBool>,
@@ -121,7 +125,7 @@ impl Worker {
             window: None,
             playback: None,
             generation: 0,
-            ui_ready: owner.host.has_ui_context(),
+            ui_ready: owner.host.check().is_ok(),
             failed: false,
             notice_send,
             notices,
@@ -364,6 +368,10 @@ impl Worker {
             initialized: false,
             prepared: false,
             applied_rate: 1.0,
+            audio_session: self
+                .props
+                .as_ref()
+                .map_or_default(|props| props.audio_session),
         };
         let configured = (|| {
             // SAFETY: immutable callback generation and Box storage survive until
@@ -421,6 +429,9 @@ impl Worker {
         let Some(playback) = self.playback.as_mut().filter(|p| p.prepared) else {
             return Ok(());
         };
+        if playback.audio_session != props.audio_session {
+            playback.audio_session = props.audio_session;
+        }
         playback
             .player
             .volume(

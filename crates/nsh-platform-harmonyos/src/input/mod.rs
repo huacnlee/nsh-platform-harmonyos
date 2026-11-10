@@ -1,3 +1,4 @@
+pub(crate) mod cursor;
 pub(crate) mod editor;
 pub(crate) mod editor_state;
 pub(crate) mod events;

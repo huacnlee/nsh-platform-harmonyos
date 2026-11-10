@@ -38,7 +38,7 @@ impl Plane {
             || !self
                 .owner
                 .upgrade()
-                .is_some_and(|owner| owner.host.has_ui_context())
+                .is_some_and(|owner| owner.host.check().is_ok())
         {
             return Ok(None);
         }
@@ -53,7 +53,6 @@ impl Plane {
             .borrow()
             .set_length_metric_unit(LengthMetricUnit::Vp)?;
         let target = NativeAttachment::for_subtree(&outer, widget)?;
-        crate::interop::texture_input::TextureInput::install(owner, &outer, widget, true);
         let composite = Composite::overlay(owner, target.id())?;
         let plane = Rc::new(Self {
             outer,
@@ -77,8 +76,8 @@ impl Plane {
                 if let (Some(plane), Some(owner)) = (weak.upgrade(), node.upgrade()) {
                     let frame = owner.frame.get();
                     event.set_measured_size(
-                        (frame.width * owner.scale).round() as i32,
-                        (frame.height * owner.scale).round() as i32,
+                        (frame.width * owner.scale.get()).round() as i32,
+                        (frame.height * owner.scale.get()).round() as i32,
                     )?;
                     if let Some(result) = plane.with_child(|child| {
                         crate::render::layout::ChildMeasure::new(event).child(child)
@@ -122,7 +121,7 @@ impl Plane {
         Ok(id)
     }
     pub(crate) fn update(&self, owner: &Node) -> Result<()> {
-        if self.closed.get() || !owner.host.has_ui_context() {
+        if self.closed.get() || owner.host.check().is_err() {
             return Ok(());
         }
         if !self.context_live.get() {
@@ -149,6 +148,16 @@ impl Plane {
             .is_some_and(|previous| previous.texture_surface != texture_surface)
         {
             self.replace_target(owner)?;
+        }
+        if let Some(route) = self.route.borrow().as_ref() {
+            route.texture(
+                texture_surface.is_some()
+                    || self
+                        .settings
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|previous| previous.texture_surface.is_some()),
+            );
         }
         let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
             return Ok(());

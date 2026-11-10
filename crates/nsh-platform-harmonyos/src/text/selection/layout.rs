@@ -12,8 +12,7 @@ pub(crate) struct Region {
     pub(crate) rtl: bool,
 }
 struct Cluster {
-    byte: usize,
-    word: Range<usize>,
+    utf16: u32,
     regions: Range<usize>,
 }
 pub(crate) struct Layout {
@@ -39,16 +38,10 @@ impl Layout {
         }
         let mut clusters = Vec::new();
         let mut regions = Vec::new();
-        let mut words = text.split_word_bound_indices();
-        let mut word = 0..0;
         let mut utf16 = 0;
-        for (byte, grapheme) in text.grapheme_indices(true) {
+        for grapheme in text.graphemes(true) {
             if clusters.len() == MAX_CLUSTERS {
                 return None;
-            }
-            while byte >= word.end {
-                let (start, value) = words.next()?;
-                word = start..start + value.len();
             }
             let start = regions.len();
             let end = utf16 + grapheme.encode_utf16().count();
@@ -71,8 +64,7 @@ impl Layout {
                 }
             }
             clusters.push(Cluster {
-                byte,
-                word: word.clone(),
+                utf16: utf16 as u32,
                 regions: start..regions.len(),
             });
             utf16 = end;
@@ -88,19 +80,28 @@ impl Layout {
             + self.clusters.capacity() * std::mem::size_of::<Cluster>()
             + self.regions.capacity() * std::mem::size_of::<Region>()
     }
+    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.clusters.len()
     }
-    fn byte(&self, boundary: usize) -> usize {
+    pub(crate) fn utf16(&self, boundary: usize) -> u32 {
         self.clusters
             .get(boundary)
-            .map_or(self.text.len(), |cluster| cluster.byte)
+            .map_or_else(|| self.text.encode_utf16().count() as u32, |c| c.utf16)
     }
-    pub(crate) fn copy(&self, range: Range<usize>) -> String {
-        self.text[self.byte(range.start)..self.byte(range.end)]
-            .chars()
-            .filter(|&c| c != '\u{fffc}')
-            .collect()
+    pub(crate) fn clusters(&self, range: Range<u32>) -> Range<usize> {
+        let start = self.clusters.partition_point(|c| c.utf16 < range.start);
+        let end = self.clusters.partition_point(|c| c.utf16 < range.end);
+        start..end
+    }
+    #[cfg(test)]
+    fn copy(&self, range: Range<usize>) -> String {
+        self.text
+            .graphemes(true)
+            .skip(range.start)
+            .take(range.len())
+            .collect::<String>()
+            .replace('\u{fffc}', "")
     }
     pub(crate) fn rectangles(&self, range: Range<usize>) -> impl Iterator<Item = Region> + '_ {
         self.clusters[range]
@@ -131,14 +132,6 @@ impl Layout {
         }
         rectangles.truncate(write);
         geometry.handles = self.handles(range);
-    }
-    pub(crate) fn word(&self, point: (f32, f32)) -> Option<Range<usize>> {
-        let (index, _) = self.nearest(point)?;
-        let word = &self.clusters[index].word;
-        Some(
-            self.clusters.partition_point(|c| c.byte < word.start)
-                ..self.clusters.partition_point(|c| c.byte < word.end),
-        )
     }
     pub(crate) fn boundary(&self, point: (f32, f32)) -> Option<usize> {
         let (index, region) = self.nearest(point)?;
@@ -194,6 +187,16 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn core_utf16_ranges_map_to_owned_grapheme_geometry() {
+        let l = layout("a👩‍💻e\u{301}中", false);
+        assert_eq!(
+            (0..=l.len()).map(|i| l.utf16(i)).collect::<Vec<_>>(),
+            [0, 1, 6, 8, 9]
+        );
+        assert_eq!(l.clusters(1..8), 1..3);
+        assert_eq!(l.copy(l.clusters(1..8)), "👩‍💻e\u{301}");
+    }
     fn layout(text: &str, rtl: bool) -> Layout {
         Layout::new(Arc::from(text), 1000.0, 20.0, |range| {
             vec![Region {
@@ -229,7 +232,6 @@ mod tests {
         assert_eq!(l.len(), 8);
         assert_eq!(l.copy(3..4), "👩🏽‍💻");
         assert_eq!(l.copy(5..8), "e\u{301}!");
-        assert_eq!(l.word((5.0, 10.0)), Some(0..2));
     }
     #[test]
     fn bidi_edges_follow_visual_run_and_hidden_text_has_no_hit_boxes() {
@@ -247,7 +249,7 @@ mod tests {
             }]
         })
         .unwrap();
-        assert_eq!(clipped.word((900.0, 10.0)), Some(0..2));
+        assert_eq!(clipped.boundary((900.0, 10.0)), Some(1));
         assert_eq!(clipped.copy(0..2), "ab");
         assert_eq!(clipped.rectangles(0..2).count(), 1);
     }

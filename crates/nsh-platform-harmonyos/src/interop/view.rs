@@ -14,6 +14,7 @@ use ohos_arkui_binding::{
 };
 
 use crate::{
+    accessibility::value::owns_semantics,
     interop::{
         attachment::NativeAttachment,
         sdk::{MenuItem, ViewOptions, ViewRoute},
@@ -30,6 +31,8 @@ pub(crate) struct Wrapper {
     owner: std::rc::Weak<Node>,
     settings: std::cell::RefCell<Option<ViewOptions>>,
     pub(crate) composite: std::cell::RefCell<Option<crate::render::composition::worker::Composite>>,
+    retiring: Cell<u8>,
+    lingering: std::cell::RefCell<Vec<crate::render::composition::worker::Composite>>,
     /// The accessibility mode and grouping last given the wrapped node
     /// (`None`: to give again, after the node's own props reset them).
     semantics: Cell<Option<(i32, bool)>>,
@@ -37,6 +40,98 @@ pub(crate) struct Wrapper {
     measured: Cell<Option<(f32, f32)>>,
 }
 impl Wrapper {
+    pub(crate) fn retiring_export(&self) -> bool {
+        self.retiring.get() == 1
+    }
+    fn retire_composite(owner: std::rc::Weak<Node>, remaining: u8) {
+        let Some(node) = owner.upgrade() else {
+            return;
+        };
+        let Some((outer, retiring, closed)) = node
+            .wrapper
+            .borrow()
+            .as_ref()
+            .map(|w| (w.outer.clone(), w.retiring.get(), w.closed.get()))
+        else {
+            return;
+        };
+        if closed || retiring == 0 {
+            return;
+        }
+        if node.needs_texture() {
+            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                wrapper.retiring.set(0);
+            }
+            return;
+        }
+        if remaining == 2 {
+            callback(|| {
+                node.composite_dirty.set(true);
+                if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                    wrapper.retiring.set(2);
+                    if let Some(composite) = wrapper.composite.borrow().as_ref() {
+                        let _ = composite.update(&node);
+                    }
+                }
+                Ok(())
+            });
+        }
+        if remaining > 0 {
+            let _ = outer.borrow().post_frame_callback(move |_, _| {
+                Self::retire_composite(owner, remaining - 1);
+            });
+            return;
+        }
+        callback(|| {
+            let retired = node.wrapper.borrow().as_ref().and_then(|wrapper| {
+                wrapper.retiring.set(0);
+                wrapper.composite.borrow_mut().take()
+            });
+            if let Some(old) = retired {
+                node.composite_dirty.set(true);
+                let _ = old.update(&node);
+                if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                    wrapper.lingering.borrow_mut().push(old);
+                    Self::retire_lingering(Rc::downgrade(&node), 6);
+                    wrapper.outer.borrow().reset_attribute(
+                        ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
+                    )?;
+                    wrapper.outer.borrow().opacity(1.0)?;
+                    wrapper.outer.borrow().set_i32_attribute(
+                        ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
+                        0,
+                    )?;
+                    wrapper
+                        .outer
+                        .borrow()
+                        .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                }
+                node.schedule_subtree_paint(4)?;
+                node.update_wrapper()?;
+                node.restore_style()?;
+                node.flush_arkui()?;
+            }
+            Ok(())
+        });
+    }
+    fn retire_lingering(owner: std::rc::Weak<Node>, remaining: u8) {
+        let Some(node) = owner.upgrade() else {
+            return;
+        };
+        let Some(outer) = node.wrapper.borrow().as_ref().map(|w| w.outer.clone()) else {
+            return;
+        };
+        if remaining == 0 {
+            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+                wrapper.lingering.borrow_mut().clear();
+                let _ = wrapper.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender);
+            }
+            return;
+        }
+        let _ = outer.borrow().post_frame_callback(move |_, _| {
+            Self::retire_lingering(owner, remaining - 1);
+        });
+    }
     pub(crate) fn invalidate_context(&self) {
         self.settings.borrow_mut().take();
         self.route.borrow_mut().take();
@@ -58,14 +153,14 @@ impl Wrapper {
         if !self.context_live.get() {
             let id = self.replace_target(owner)?;
             if self.composite.borrow_mut().take().is_some() {
-                *self.composite.borrow_mut() =
-                    Some(crate::render::composition::worker::Composite::new(
-                        &self
-                            .owner
-                            .upgrade()
-                            .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
-                        id,
-                    )?);
+                let composite = crate::render::composition::worker::Composite::new(
+                    &self
+                        .owner
+                        .upgrade()
+                        .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
+                    id,
+                )?;
+                *self.composite.borrow_mut() = Some(composite);
             }
             self.context_live.set(true);
         }
@@ -80,7 +175,7 @@ impl Wrapper {
             || !self
                 .owner
                 .upgrade()
-                .is_some_and(|owner| owner.host.has_ui_context())
+                .is_some_and(|owner| owner.host.check().is_ok())
         {
             return Ok(None);
         }
@@ -107,6 +202,11 @@ impl Wrapper {
     fn new(owner: &Rc<Node>) -> Result<Self> {
         let outer = Custom::new()?.into_node();
         let setup = || -> Result<NativeAttachment> {
+            // Header slots are siblings of the native bar, whose z-index is 1.
+            // Preserve their chrome ordering when export adds an outer node.
+            if owner.kind == nsh_core::ViewKind::HeaderItem {
+                outer.borrow().z_index(2)?;
+            }
             outer
                 .borrow()
                 .set_length_metric_unit(LengthMetricUnit::Vp)?;
@@ -122,26 +222,24 @@ impl Wrapper {
                 return Err(error);
             }
         };
-        crate::interop::texture_input::TextureInput::install(owner, &outer, &owner.native, false);
         let route = ViewRoute::new(target.id(), Rc::downgrade(owner), &owner.native);
         let weak = Rc::downgrade(owner);
         outer.borrow_mut().on_custom_draw(move |event| {
-            if let Some(owner) = weak.upgrade()
-                && let Some(wrapper) = owner.wrapper.borrow().as_ref()
-                && let Some(raw) = event
-                    .draw_context_in_draw()
-                    .and_then(|context| context.canvas())
-            {
-                // SAFETY: ArkUI owns this canvas until this draw callback returns.
-                let canvas = unsafe { ohos_drawing_binding::Canvas::from_raw_borrowed(raw) };
-                if owner.scene_active() {
+            callback(|| {
+                if let Some(owner) = weak.upgrade()
+                    && owner.scene_root.get()
+                    && let Some(raw) = event
+                        .draw_context_in_draw()
+                        .and_then(|context| context.canvas())
+                {
+                    // SAFETY: ArkUI owns this canvas until this draw callback returns.
+                    let canvas = unsafe { ohos_drawing_binding::Canvas::from_raw_borrowed(raw) };
                     if let Some(scene) = owner.scene.borrow().as_ref() {
                         scene.draw(owner.id, &canvas);
                     }
-                } else if let Some(composite) = wrapper.composite.borrow().as_ref() {
-                    composite.draw(&canvas);
                 }
-            }
+                Ok(())
+            });
         });
         let weak = Rc::downgrade(owner);
         outer.borrow_mut().on_custom_measure(move |event| {
@@ -155,8 +253,8 @@ impl Wrapper {
                         owner.set_frame(raw)?;
                     }
                     let frame = owner.frame.get();
-                    let mut width = (frame.width * owner.scale).round() as i32;
-                    let mut height = (frame.height * owner.scale).round() as i32;
+                    let mut width = (frame.width * owner.scale.get()).round() as i32;
+                    let mut height = (frame.height * owner.scale.get()).round() as i32;
                     if !owner.clips_children() && !owner.children.borrow().is_empty() {
                         width = width.max(1);
                         height = height.max(1);
@@ -168,6 +266,14 @@ impl Wrapper {
                         })?
                     {
                         result?;
+                    }
+                    if let Some(wrapper) = owner.wrapper.borrow().as_ref() {
+                        if let Some(composite) = wrapper.composite.borrow().as_ref() {
+                            composite.measure(event)?;
+                        }
+                        for composite in wrapper.lingering.borrow().iter() {
+                            composite.measure(event)?;
+                        }
                     }
                 }
                 Ok(())
@@ -188,12 +294,22 @@ impl Wrapper {
                             .map_or((0.0, 0.0), |composite| composite.origin());
                         event.layout_child(
                             node,
-                            (x * owner.scale).round() as i32,
-                            (y * owner.scale).round() as i32,
+                            (x * owner.scale.get()).round() as i32,
+                            (y * owner.scale.get()).round() as i32,
                         )
                     })?
                 {
                     result?;
+                }
+                if let Some(owner) = weak.upgrade()
+                    && let Some(wrapper) = owner.wrapper.borrow().as_ref()
+                {
+                    if let Some(composite) = wrapper.composite.borrow().as_ref() {
+                        composite.layout(event)?;
+                    }
+                    for composite in wrapper.lingering.borrow().iter() {
+                        composite.layout(event)?;
+                    }
                 }
                 Ok(())
             })
@@ -207,13 +323,15 @@ impl Wrapper {
             owner: Rc::downgrade(owner),
             settings: std::cell::RefCell::default(),
             composite: std::cell::RefCell::default(),
+            retiring: Cell::new(0),
+            lingering: std::cell::RefCell::default(),
             semantics: Cell::new(None),
             measured: Cell::new(None),
         })
     }
     /// Sends the ArkTS view its settings; whether they changed.
     fn update(&self, owner: &Node) -> Result<bool> {
-        if self.closed.get() || !owner.host.has_ui_context() {
+        if self.closed.get() || owner.host.check().is_err() {
             return Ok(false);
         }
         self.ensure_context(owner)?;
@@ -229,6 +347,16 @@ impl Wrapper {
             .is_some_and(|previous| previous.texture_surface != texture_surface)
         {
             self.replace_target(owner)?;
+        }
+        if let Some(route) = self.route.borrow().as_ref() {
+            route.texture(
+                texture_surface.is_some()
+                    || self
+                        .settings
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|previous| previous.texture_surface.is_some()),
+            );
         }
         let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
             return Ok(false);
@@ -262,9 +390,9 @@ impl Wrapper {
             role: role(spec.role).to_owned(),
             checked: spec.state.checked.map(|value| value == Checked::True),
             selected: spec.state.selected,
-            api23: crate::get_capabilities().api23,
-            api26: crate::get_capabilities().api26,
-            actions: if crate::get_capabilities().api26 {
+            api23: cfg!(feature = "api-23"),
+            api26: cfg!(feature = "api-26"),
+            actions: if cfg!(feature = "api-26") {
                 spec.actions
                     .iter()
                     .take(16)
@@ -289,15 +417,29 @@ impl Wrapper {
     }
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
         self.closed.set(true);
+        self.retiring.set(0);
         self.route.borrow_mut().take();
         if let Some(old) = self.target.borrow_mut().take() {
             owner.view_remove(old);
         }
         self.composite.borrow_mut().take();
+        self.lingering.borrow_mut().clear();
         Ok(())
     }
 }
 impl Node {
+    pub(crate) fn needs_texture(&self) -> bool {
+        let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
+            effects
+                .filters
+                .iter()
+                .any(|filter| !matches!(filter, nsh_core::Filter::Blur(_)))
+        });
+        self.navigation_capture.get()
+            || self.scene_active() && self.has_native_paint()
+            || non_blur_filter
+            || !self.shader_layers.borrow().is_empty()
+    }
     pub(crate) fn wrapper_owns_semantics(&self) -> bool {
         self.wrapper.borrow().is_some() && owns_semantics(&self.accessibility_state.spec.borrow())
     }
@@ -334,7 +476,7 @@ impl Node {
             return Ok(());
         }
         let spec = self.accessibility_state.spec.borrow();
-        if crate::get_capabilities().api26 && spec.actions.len() > 16 {
+        if cfg!(feature = "api-26") && spec.actions.len() > 16 {
             log::warn!("OHOS accessibility: showing the first 16 custom actions");
         }
         let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
@@ -343,11 +485,15 @@ impl Node {
                 .iter()
                 .any(|filter| !matches!(filter, nsh_core::Filter::Blur(_)))
         });
-        let needed = self.kind == nsh_core::ViewKind::Modal
+        // Establish the root's layout host before it has scroll descendants.
+        // Adding it around an already laid-out tree resets native scroll offsets.
+        let needed = self.id == nsh_core::ROOT_ID
+            || self.kind == nsh_core::ViewKind::Modal
             || self.scene_active() && self.has_native_paint()
             || self.selectable()
             || owns_semantics(&spec)
-            || non_blur_filter;
+            || non_blur_filter
+            || !self.shader_layers.borrow().is_empty();
         drop(spec);
         if needed && self.wrapper.borrow().is_none() {
             self.enable_layout();
@@ -392,44 +538,52 @@ impl Node {
             #[cfg(feature = "api-23")]
             self.accessibility_provider.clear();
         }
-        let needs_texture = self.scene_active() && self.has_native_paint() || non_blur_filter;
-        if !needs_texture
-            && let Some(wrapper) = self.wrapper.borrow().as_ref()
-            && wrapper.composite.borrow_mut().take().is_some()
-        {
-            wrapper.outer.borrow().reset_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
-            )?;
-            wrapper.outer.borrow().opacity(1.0)?;
-            wrapper.outer.borrow().set_i32_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
-                0,
-            )?;
-        }
-        if needs_texture
-            && let Some(wrapper) = self.wrapper.borrow().as_ref()
-            && wrapper.composite.borrow().is_none()
-        {
-            let composite = crate::render::composition::worker::Composite::new(
-                self,
-                wrapper
-                    .target
-                    .borrow()
-                    .as_ref()
-                    .ok_or(crate::render::node::Error::Unsupported(
-                        "wrapper target retired",
-                    ))?
-                    .id(),
-            )?;
-            self.native.borrow().reset_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
-            )?;
-            self.native.borrow().opacity(1.0)?;
-            self.native.borrow().set_i32_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
-                0,
-            )?;
-            *wrapper.composite.borrow_mut() = Some(composite);
+        let needs_texture = self.needs_texture();
+        if !needs_texture {
+            let start_retirement = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                if wrapper.composite.borrow().is_some() && wrapper.retiring.get() == 0 {
+                    wrapper.retiring.set(1);
+                    true
+                } else {
+                    false
+                }
+            });
+            if start_retirement {
+                self.composite_dirty.set(true);
+                self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                if let Some(wrapper) = self.wrapper.borrow().as_ref() {
+                    wrapper
+                        .outer
+                        .borrow()
+                        .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                }
+                Wrapper::retire_composite(Rc::downgrade(self), 3);
+            }
+        } else if let Some(wrapper) = self.wrapper.borrow().as_ref() {
+            wrapper.retiring.set(0);
+            if wrapper.composite.borrow().is_none() {
+                wrapper.lingering.borrow_mut().clear();
+                let composite = crate::render::composition::worker::Composite::new(
+                    self,
+                    wrapper
+                        .target
+                        .borrow()
+                        .as_ref()
+                        .ok_or(crate::render::node::Error::Unsupported(
+                            "wrapper target retired",
+                        ))?
+                        .id(),
+                )?;
+                self.native.borrow().reset_attribute(
+                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
+                )?;
+                self.native.borrow().opacity(1.0)?;
+                self.native.borrow().set_i32_attribute(
+                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
+                    0,
+                )?;
+                *wrapper.composite.borrow_mut() = Some(composite);
+            }
         }
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
             let spec = self.accessibility_state.spec.borrow();
@@ -476,8 +630,7 @@ impl Node {
             .filter(|wrapper| !wrapper.closed.get())
         {
             let composite = if let Some(composite) = wrapper.composite.borrow().as_ref() {
-                composite.update(self)?;
-                true
+                composite.update(self)?
             } else {
                 false
             };
@@ -488,14 +641,16 @@ impl Node {
             // may have changed.
             let frame = self.frame.get();
             let size = Some((frame.width, frame.height));
+            let resized = wrapper.measured.replace(size) != size;
             let modal = self.modal.borrow().is_some();
-            if changed || composite || modal || wrapper.measured.replace(size) != size {
+            if changed || composite || modal || resized {
                 wrapper
                     .outer
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             }
         }
+        self.composite_dirty.set(false);
         Ok(())
     }
     /// The wrapped node's own props rewrote its test ID and accessibility
@@ -509,30 +664,54 @@ impl Node {
         self.wrapper
             .borrow()
             .as_ref()
-            .filter(|wrapper| wrapper.composite.borrow().is_some())
+            .filter(|wrapper| {
+                wrapper.composite.borrow().is_some()
+                    && !wrapper
+                        .settings
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|s| s.texture_surface.is_none())
+            })
             .map_or_else(|| self.native.clone(), |wrapper| wrapper.outer.clone())
     }
     pub(crate) fn composite_ready(&self, generation: u32) -> Result<()> {
+        let mut initialized = false;
         if let Some(scroll) = self.scroll.borrow().as_ref()
             && let Some(plane) = scroll.overlay.borrow().as_ref()
         {
             plane.ready(self, generation)?;
         }
-        if let Some(wrapper) = self.wrapper.borrow().as_ref()
-            && let Some(composite) = wrapper
+        if let Some(wrapper) = self.wrapper.borrow().as_ref() {
+            for composite in wrapper
+                .lingering
+                .borrow()
+                .iter()
+                .filter(|composite| composite.generation == generation)
+            {
+                composite.ready();
+            }
+            if let Some(composite) = wrapper
                 .composite
                 .borrow()
                 .as_ref()
                 .filter(|composite| composite.generation == generation)
-        {
-            composite.ready();
-            wrapper
-                .outer
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+            {
+                initialized = composite.ready();
+                if composite.needs_shader_frame() {
+                    self.animator.request_frame();
+                }
+                wrapper
+                    .outer
+                    .borrow()
+                    .mark_dirty(NodeDirtyFlag::NeedRender)?;
+            }
         }
-        self.update_wrapper()?;
-        self.invalidate_scene();
+        if initialized {
+            self.restore_style()?;
+            self.update_wrapper()?;
+            self.invalidate_scene();
+            self.schedule_subtree_paint(4)?;
+        }
         Ok(())
     }
 }
@@ -553,15 +732,4 @@ fn role(role: R) -> &'static str {
         R::Menuitem => "menuitem",
         _ => "text",
     }
-}
-
-fn owns_semantics(spec: &nsh_core::Accessibility) -> bool {
-    spec.state.checked.is_some()
-        || crate::get_capabilities().api26
-            && spec.actions.iter().any(|action| {
-                !matches!(
-                    action.name.as_ref(),
-                    "activate" | "longpress" | "copy" | "cut" | "paste" | "increment" | "decrement"
-                )
-            })
 }

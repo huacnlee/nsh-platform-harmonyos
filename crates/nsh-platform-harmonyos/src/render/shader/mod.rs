@@ -1,225 +1,57 @@
-//! Shader layers: each shader view has a native surface first among its
-//! children (an XComponent, `surface.rs`), and a thread of the surface's own
-//! (`nsh-shader`) renders the view's frames straight into its window with
-//! wgpu (`gpu.rs`). RenderService composites the window as it does a
-//! video's; nothing is read back or drawn again on the UI thread.
-//!
-//! wgpu has only its GLES backend on OHOS, where rendering waits for the GPU
-//! on the calling thread, so the UI thread only sends the worker what changed
-//! ([`Command`]: layers, animated slots, sizes, whether a view is in sight,
-//! its window). The worker renders on the surface's own VSync (the rate the
-//! app's window asked for) while a view in sight has a frame due, and blocks
-//! for a command otherwise. A view that goes keeps its XComponent until the
-//! worker has dropped its surface of the window, which `Message::Shader`
-//! reports ([`Shared::retired`]).
+//! UI ownership of shader fills and effects. All GPU programs and windows run
+//! on the surface's GLES compositor worker; the UI only sends changed state.
 
-mod gpu;
-mod surface;
+mod effects;
+pub(crate) mod navigation;
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::{Rc, Weak},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    time::{Duration, Instant},
+    sync::Arc,
+    time::Duration,
 };
 
 use nsh_core::{NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_arkui_binding::{
     component::attribute::ArkUICommonAttribute, types::advanced::NodeDirtyFlag,
 };
-use ohos_native_window_binding::NativeWindow;
 use ohos_vsync_binding::Vsync;
 use rustc_hash::FxHashMap;
 
 use super::{
+    composition::{
+        fill::{Command, Key},
+        surface,
+        worker::Worker,
+    },
     geometry::Size,
     node::{NativeNode, Node, Result, callback},
 };
-use crate::app::runtime::{Dispatcher, Message};
-
-/// What the UI thread tells the worker, in order.
-enum Command {
-    Layer(NodeId, Arc<ShaderLayer>),
-    Slot(NodeId, u16, AnimationValue),
-    /// Its size in points and its scale (pixels per point).
-    Size(NodeId, Size, f32),
-    /// Whether it may show: out of sight it renders nothing.
-    Shown(NodeId, bool),
-    /// The native window of its XComponent (`None`: not one yet).
-    Window(NodeId, Option<NativeWindow>),
-    /// The window at this address went.
-    WindowGone(NodeId, usize),
-    /// It went: the worker drops it, then reports it ([`Shared::retired`]).
-    Remove(NodeId),
-    /// Look again at what is due: the window's VSync came back (the app
-    /// returned to the foreground).
-    Wake,
-}
-
-/// What the worker hands the UI thread.
-#[derive(Default)]
-struct Shared {
-    /// Views whose surfaces the worker has dropped, in the order removed.
-    retired: Mutex<Vec<NodeId>>,
-    /// `Message::Shader` is on its way: posted once until it is handled.
-    posted: AtomicBool,
-}
-
-/// The surface's shader thread. Dropping it ends the thread once it has
-/// handled what was sent; the GPU device is dropped there, never on the UI
-/// thread.
-struct Worker {
-    send: mpsc::Sender<Command>,
-    shared: Arc<Shared>,
-}
-
-impl Worker {
-    fn spawn(dispatcher: std::sync::Weak<Dispatcher>, vsync: Arc<Vsync>) -> Option<Worker> {
-        let (send, receive) = mpsc::channel();
-        let shared = Arc::new(Shared::default());
-        let worker_shared = shared.clone();
-        match std::thread::Builder::new()
-            .name("nsh-shader".into())
-            .spawn(move || run(&receive, &worker_shared, &dispatcher, &vsync))
-        {
-            Ok(_) => Some(Worker { send, shared }),
-            Err(error) => {
-                log::warn!("shaders: no shader thread ({error}); shader views draw nothing");
-                None
-            }
-        }
-    }
-
-    fn send(&self, command: Command) {
-        let _ = self.send.send(command);
-    }
-}
-
-/// The worker's loop: the commands sent, then a frame of every view due,
-/// once per frame of the surface's VSync while one is; it blocks for a
-/// command while none is.
-fn run(
-    receive: &mpsc::Receiver<Command>,
-    shared: &Shared,
-    dispatcher: &std::sync::Weak<Dispatcher>,
-    vsync: &Vsync,
-) {
-    let (tick, ticks) = mpsc::sync_channel::<()>(1);
-    let mut gpu: Option<Option<gpu::Gpu>> = None;
-    let mut views: FxHashMap<NodeId, gpu::View> = FxHashMap::default();
-    let mut due = false;
-    loop {
-        let first = if due {
-            match receive.try_recv() {
-                Ok(command) => Some(command),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => return,
-            }
-        } else {
-            match receive.recv() {
-                Ok(command) => Some(command),
-                Err(_) => return,
-            }
-        };
-        let mut retired = Vec::new();
-        for command in first.into_iter().chain(receive.try_iter()) {
-            match command {
-                Command::Layer(id, layer) => {
-                    gpu.get_or_insert_with(gpu::Gpu::new);
-                    views.entry(id).or_default().set_layer(layer);
-                }
-                Command::Slot(id, slot, value) => {
-                    if let Some(view) = views.get_mut(&id) {
-                        view.set_slot(slot, value);
-                    }
-                }
-                Command::Size(id, size, scale) => {
-                    if let Some(view) = views.get_mut(&id) {
-                        view.set_size(size.into(), scale);
-                    }
-                }
-                Command::Shown(id, shown) => {
-                    if let Some(view) = views.get_mut(&id) {
-                        view.shown = shown;
-                    }
-                }
-                Command::Window(id, window) => {
-                    if let (Some(view), Some(Some(gpu))) = (views.get_mut(&id), &gpu) {
-                        view.set_window(gpu, window);
-                    }
-                }
-                Command::WindowGone(id, raw) => {
-                    // A window made since keeps drawing.
-                    if let (Some(view), Some(Some(gpu))) = (views.get_mut(&id), &gpu)
-                        && view.window() == Some(raw)
-                    {
-                        view.set_window(gpu, None);
-                    }
-                }
-                Command::Remove(id) => {
-                    views.remove(&id);
-                    retired.push(id);
-                }
-                Command::Wake => {}
-            }
-        }
-        if !retired.is_empty() {
-            shared.retired.lock().unwrap().extend(retired);
-            if !shared.posted.swap(true, Ordering::AcqRel)
-                && let Some(dispatcher) = dispatcher.upgrade()
-            {
-                dispatcher.send(Message::Shader);
-            }
-        }
-        let Some(Some(gpu)) = &mut gpu else {
-            due = false;
-            continue;
-        };
-        let now = Instant::now();
-        due = false;
-        for view in views.values_mut() {
-            if view.due() {
-                view.render(gpu, now);
-                due |= view.due();
-            }
-        }
-        if due {
-            // The next frame of the app's window; a VSync that cannot be asked
-            // (the window went) leaves the loop to the next command.
-            let tick = tick.clone();
-            let status = vsync.request_frame_once(move |_| {
-                let _ = tick.try_send(());
-            });
-            if status != 0 || ticks.recv_timeout(Duration::from_millis(100)).is_err() {
-                due = false;
-            }
-        }
-    }
-}
+use crate::app::frame_rate::FrameRate;
 
 /// The shader views of a surface, on the UI thread.
 pub(crate) struct Shaders {
+    effects: effects::Effects,
     /// The surface's VSync, which paces the worker.
-    vsync: Arc<Vsync>,
-    /// Made with the first shader (`None` inside when no thread starts).
-    worker: RefCell<Option<Option<Worker>>>,
+    rate: Arc<FrameRate>,
+    worker: RefCell<Option<Rc<Worker>>>,
+    generation: Cell<u32>,
+    visibility_generation: Cell<u64>,
+    visibility: RefCell<FxHashMap<NodeId, (u64, bool, bool)>>,
     views: RefCell<FxHashMap<NodeId, State>>,
-    /// Views that went, oldest first, until the worker has let go of their
-    /// windows (an id can come back meanwhile: they are told apart by
-    /// order).
-    retiring: RefCell<Vec<(NodeId, Retiring)>>,
+    /// A generation distinguishes windows retired before an id is reused.
+    retiring: RefCell<Vec<(Key, Retiring)>>,
 }
 
 struct State {
+    key: Key,
     owner: Weak<Node>,
+    parent: NativeNode,
     surface: surface::Surface,
     /// What the worker was last told: the size and scale, whether it shows.
     size: Option<(Size, f32)>,
     shown: Option<bool>,
+    overflow: f32,
 }
 
 /// A view's surface kept after it went, with the view's native node it is
@@ -230,10 +62,44 @@ struct Retiring {
 }
 
 impl Shaders {
+    pub(crate) fn invalidate_visibility(&self) {
+        self.visibility_generation
+            .set(self.visibility_generation.get().wrapping_add(1));
+    }
+    fn visibility(&self, node: &Rc<Node>) -> (bool, bool) {
+        let generation = self.visibility_generation.get();
+        if let Some(&(old, attached, shown)) = self.visibility.borrow().get(&node.id)
+            && old == generation
+        {
+            return (attached, shown);
+        }
+        let mut at = Some(node.clone());
+        let mut attached = false;
+        while let Some(node) = at {
+            if node.id == nsh_core::ROOT_ID {
+                attached = true;
+                break;
+            }
+            at = node.parent_node.borrow().upgrade();
+        }
+        let shown = attached && in_sight_uncached(node);
+        self.visibility
+            .borrow_mut()
+            .insert(node.id, (generation, attached, shown));
+        (attached, shown)
+    }
+    pub(crate) fn frame_rate(&self) -> Arc<FrameRate> {
+        self.rate.clone()
+    }
+
     pub(crate) fn new(vsync: Arc<Vsync>) -> Shaders {
         Shaders {
-            vsync,
+            effects: effects::Effects::default(),
+            rate: FrameRate::new(vsync),
             worker: RefCell::default(),
+            generation: Cell::new(0),
+            visibility_generation: Cell::new(1),
+            visibility: RefCell::default(),
             views: RefCell::default(),
             retiring: RefCell::default(),
         }
@@ -244,33 +110,79 @@ impl Shaders {
             self.remove(owner.id);
             return Ok(());
         };
-        let mut worker = self.worker.borrow_mut();
-        let Some(worker) = worker
-            .get_or_insert_with(|| Worker::spawn(owner.dispatcher.clone(), self.vsync.clone()))
-            .as_ref()
-        else {
-            return Ok(());
-        };
-        worker.send(Command::Layer(owner.id, layer));
+        if layer.role != nsh_core::shader::ShaderRole::Fill {
+            if self.views.borrow().contains_key(&owner.id) {
+                self.remove(owner.id);
+            }
+            return self.effects.set(owner, layer);
+        }
+        self.effects.remove(owner.id)?;
+        if !self.views.borrow().contains_key(&owner.id)
+            && self.views.borrow().len() >= super::composition::worker::MAX_LAYERS
+        {
+            return Err(super::node::Error::Unsupported(
+                "shader fill layer budget exceeded",
+            ));
+        }
+        let worker = Worker::for_owner(owner)?;
+        *self.worker.borrow_mut() = Some(worker.clone());
+        let key = self
+            .views
+            .borrow()
+            .get(&owner.id)
+            .map(|state| state.key)
+            .unwrap_or_else(|| {
+                let generation = self.generation.get().wrapping_add(1).max(1);
+                self.generation.set(generation);
+                Key {
+                    id: owner.id,
+                    generation,
+                }
+            });
+        let overflow = layer.overflow.0.max(0.0);
+        worker.fill(Command::Layer(key, layer));
         if !self.views.borrow().contains_key(&owner.id) {
-            let surface = surface::Surface::new(owner.id, worker.send.clone())?;
+            let surface = match surface::Surface::new(
+                format!("nsh-shader-{}-{}", key.id, key.generation),
+                worker.fill_window(key),
+                true,
+            ) {
+                Ok(surface) => surface,
+                Err(error) => {
+                    worker.fill(Command::Remove(key));
+                    return Err(error);
+                }
+            };
             // Under the app's children, after the other platform-owned ones.
             let index = owner.child_index(0);
-            owner
+            if let Err(error) = owner
                 .native
                 .borrow_mut()
-                .insert_child(surface.native.clone(), index)?;
+                .insert_child(surface.native.clone(), index)
+            {
+                worker.fill(Command::Remove(key));
+                callback(|| surface.dispose(None));
+                return Err(error.into());
+            }
             self.views.borrow_mut().insert(
                 owner.id,
                 State {
+                    key,
                     owner: Rc::downgrade(owner),
+                    parent: owner.native.clone(),
                     surface,
                     size: None,
                     shown: None,
+                    overflow,
                 },
             );
             owner.enable_layout();
         }
+        if let Some(state) = self.views.borrow_mut().get_mut(&owner.id) {
+            state.overflow = overflow;
+            state.surface.native.borrow().set_clip(overflow <= 0.0)?;
+        }
+        owner.invalidate_composites();
         owner.animator.request_frame();
         Ok(())
     }
@@ -278,8 +190,34 @@ impl Shaders {
     pub(crate) fn contains(&self, id: NodeId) -> bool {
         self.views.borrow().contains_key(&id)
     }
+    pub(crate) fn root(&self, root: &Rc<Node>) {
+        self.effects.root(root);
+    }
+    pub(crate) fn transition(&self, id: NodeId, duration: Duration) {
+        self.effects.transition(id, duration);
+    }
+    pub(crate) fn begin_navigation(
+        &self,
+        owner: &Rc<Node>,
+        lower: Option<Rc<Node>>,
+        backwards: bool,
+    ) -> Result<Option<Rc<navigation::Navigation>>> {
+        self.effects.begin_navigation(owner, lower, backwards)
+    }
+    pub(crate) fn navigation_complete(&self, key: navigation::Key) {
+        self.effects.navigation_complete(key);
+    }
+    pub(crate) fn end_navigation(&self, id: NodeId) -> Result<()> {
+        self.effects.remove(id)
+    }
 
     /// The native node of `id`'s surface, which its view lays out.
+    pub(crate) fn overflow(&self, id: NodeId) -> f32 {
+        self.views
+            .borrow()
+            .get(&id)
+            .map_or(0.0, |state| state.overflow)
+    }
     pub(crate) fn native(&self, id: NodeId) -> Option<NativeNode> {
         self.views
             .borrow()
@@ -288,32 +226,34 @@ impl Shaders {
     }
 
     pub(crate) fn remove(&self, id: NodeId) {
+        self.visibility.borrow_mut().remove(&id);
+        callback(|| self.effects.remove(id));
         let Some(state) = self.views.borrow_mut().remove(&id) else {
             return;
         };
-        let parent = state.owner.upgrade().map(|owner| owner.native.clone());
-        let worker = self.worker.borrow();
-        match (worker.as_ref().and_then(Option::as_ref), parent) {
-            (Some(worker), Some(parent)) => {
-                worker.send(Command::Remove(id));
-                self.retiring.borrow_mut().push((
-                    id,
-                    Retiring {
-                        surface: state.surface,
-                        parent,
-                    },
-                ));
-            }
-            // The worker never drew into it.
-            (_, parent) => callback(|| state.surface.dispose(parent.as_ref())),
+        if let Some(owner) = state.owner.upgrade() {
+            owner.invalidate_composites();
+        }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.fill(Command::Remove(state.key));
+            self.retiring.borrow_mut().push((
+                state.key,
+                Retiring {
+                    surface: state.surface,
+                    parent: state.parent,
+                },
+            ));
+        } else {
+            callback(|| state.surface.dispose(Some(&state.parent)));
         }
     }
 
     pub(crate) fn slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
-        if self.views.borrow().contains_key(&id)
-            && let Some(Some(worker)) = self.worker.borrow().as_ref()
+        self.effects.slot(id, slot, value);
+        if let Some(state) = self.views.borrow().get(&id)
+            && let Some(worker) = self.worker.borrow().as_ref()
         {
-            worker.send(Command::Slot(id, slot, value));
+            worker.fill(Command::Slot(state.key, slot, value));
         }
     }
 
@@ -321,44 +261,53 @@ impl Shaders {
     /// sight, size) and gives each surface its view's box. The worker keeps
     /// its own pace, so this never asks for another frame.
     pub(crate) fn frame(&self) -> Result<bool> {
+        let effects_due = self.effects.frame()?;
         let worker = self.worker.borrow();
-        let Some(Some(worker)) = worker.as_ref() else {
-            return Ok(false);
+        let Some(worker) = worker.as_ref() else {
+            return Ok(effects_due);
         };
         let mut views = self.views.borrow_mut();
-        for (&id, state) in views.iter_mut() {
+        for state in views.values_mut() {
             let Some(owner) = state.owner.upgrade() else {
                 continue;
             };
             let shown = in_sight(&owner);
             if state.shown != Some(shown) {
                 state.shown = Some(shown);
-                worker.send(Command::Shown(id, shown));
+                worker.fill(Command::Shown(state.key, shown));
             }
             let frame = owner.frame.get();
-            let size = (Size::new(frame.width, frame.height), owner.scale);
+            let size = (Size::new(frame.width, frame.height), owner.scale.get());
             if state.size != Some(size) {
                 state.size = Some(size);
-                worker.send(Command::Size(id, size.0, size.1));
+                worker.fill(Command::Size(state.key, size.0, size.1));
             }
-            if state
-                .surface
-                .place((frame.width, frame.height), owner.border_radii())?
-            {
+            if state.surface.place(
+                (
+                    frame.width + 2.0 * state.overflow,
+                    frame.height + 2.0 * state.overflow,
+                ),
+                if state.overflow > 0.0 {
+                    [0.0; 4]
+                } else {
+                    owner.border_radii()
+                },
+            )? {
                 owner
                     .native
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             }
         }
-        Ok(false)
+        Ok(effects_due)
     }
 
     /// The app came back to the foreground: a VSync that stopped while it was
     /// away left the worker waiting for a command.
     pub(crate) fn wake(&self) {
-        if let Some(Some(worker)) = self.worker.borrow().as_ref() {
-            worker.send(Command::Wake);
+        self.effects.wake();
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.wake();
         }
     }
 
@@ -368,15 +317,21 @@ impl Shaders {
         self.frame().map(|_| ())
     }
 
+    pub(crate) fn close(&self) -> Result<()> {
+        let ids: Vec<_> = self.views.borrow().keys().copied().collect();
+        for id in ids {
+            self.remove(id);
+        }
+        self.collect()
+    }
     /// `Message::Shader`: releases the surfaces of views the worker has let
     /// go of.
     pub(crate) fn collect(&self) -> Result<()> {
         let worker = self.worker.borrow();
-        let Some(Some(worker)) = worker.as_ref() else {
+        let Some(worker) = worker.as_ref() else {
             return Ok(());
         };
-        worker.shared.posted.store(false, Ordering::Release);
-        let retired = std::mem::take(&mut *worker.shared.retired.lock().unwrap());
+        let retired = worker.take_retired_fills();
         let mut retiring = self.retiring.borrow_mut();
         for id in retired {
             let Some(at) = retiring.iter().position(|(r, _)| *r == id) else {
@@ -402,6 +357,9 @@ impl Shaders {
 /// surface's root and within every scroll view around it, which clip their
 /// content (a row scrolled away, a card below the fold).
 fn in_sight(node: &Rc<Node>) -> bool {
+    node.shaders.visibility(node).1
+}
+fn in_sight_uncached(node: &Rc<Node>) -> bool {
     if !node.visible_in_tree() {
         return false;
     }

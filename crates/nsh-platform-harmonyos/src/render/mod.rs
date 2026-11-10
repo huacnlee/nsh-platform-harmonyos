@@ -3,6 +3,7 @@ pub(crate) mod arkui;
 pub(crate) mod canvas;
 pub(crate) mod composition;
 pub(crate) mod decor;
+pub(crate) mod frame_clock;
 pub(crate) mod geometry;
 pub(crate) mod layout;
 pub(crate) mod mount;

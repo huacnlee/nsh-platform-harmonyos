@@ -32,6 +32,8 @@ pub(crate) struct EditorSettings {
     pub caret_color: u32,
     pub selection_color: u32,
     pub editable: bool,
+    pub auto_correct: bool,
+    pub report_paste: bool,
     pub scrollbar_visible: bool,
     pub hit_test: u32,
     pub align: u32,
@@ -57,20 +59,25 @@ pub(crate) struct EditorAccessibility {
     pub disabled: bool,
 }
 
-/// Focus and selection operations ordered after this batch's state updates.
-#[derive(Clone, Debug, PartialEq)]
+/// Focus, selection and scrolling operations ordered after this batch's state updates.
+#[derive(Clone, Debug, Default, PartialEq)]
 #[napi(object)]
 pub(crate) struct EditorCommand {
     pub target_id: u32,
     pub kind: String,
     pub start: u32,
     pub end: u32,
+    pub x: f64,
+    pub y: f64,
+    pub animated: bool,
 }
 
 #[derive(Default)]
 #[napi(object)]
 pub(crate) struct EditorEvent {
     pub kind: String,
+    pub x: f64,
+    pub y: f64,
     pub text: String,
     pub count: u32,
     pub start: u32,
@@ -150,6 +157,8 @@ pub(crate) struct ViewOptions {
 #[derive(Clone, Debug, PartialEq)]
 #[napi(object)]
 pub(crate) struct WebSettings {
+    pub shared_cookies: bool,
+    pub clear_cookies: bool,
     pub target_id: u32,
     pub url: Option<String>,
     pub html: Option<String>,
@@ -160,14 +169,26 @@ pub(crate) struct WebSettings {
     pub user_agent: Option<String>,
     pub injected_javascript: Option<String>,
     pub document_start_script: String,
+    pub download_directory: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
+#[napi(object)]
+pub(crate) struct WebHeader {
+    pub header_key: String,
+    pub header_value: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
 #[napi(object)]
 pub(crate) struct WebCommand {
     pub target_id: u32,
     pub kind: String,
+    pub url: Option<String>,
+    pub headers: Option<Vec<WebHeader>>,
     pub script: Option<String>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
 }
 
 #[napi(object)]
@@ -181,12 +202,23 @@ pub(crate) struct WebEvent {
     pub can_go_forward: bool,
     pub message: Option<String>,
     pub code: Option<i32>,
+    pub download: Option<WebDownload>,
+}
+
+#[napi(object)]
+pub(crate) struct WebDownload {
+    pub state: String,
+    pub id: String,
+    pub filename: String,
+    pub path: String,
+    pub bytes: f64,
 }
 
 // Only weak routes live here. Nodes, native targets and engines retain their own lifetime.
 struct ViewRegistration {
     owner: Weak<Node>,
     inner: std::rc::Weak<std::cell::RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
+    export: std::rc::Rc<super::texture_export::Export>,
 }
 thread_local! {
     static VIEWS: RefCell<FxHashMap<u32, ViewRegistration>> = RefCell::default();
@@ -196,23 +228,34 @@ thread_local! {
 pub(crate) struct ViewRoute {
     id: u32,
     owner: Weak<Node>,
+    export: std::rc::Rc<super::texture_export::Export>,
 }
 impl ViewRoute {
     pub(crate) fn new(id: u32, owner: Weak<Node>, inner: &NativeNode) -> Self {
+        let export = std::rc::Rc::new(super::texture_export::Export::default());
         VIEWS.with(|views| {
             views.borrow_mut().insert(
                 id,
                 ViewRegistration {
                     owner: owner.clone(),
                     inner: std::rc::Rc::downgrade(inner),
+                    export: export.clone(),
                 },
             )
         });
-        Self { id, owner }
+        Self { id, owner, export }
+    }
+    pub(crate) fn texture(&self, enabled: bool) {
+        // A route is replaced at each export boundary. Subsequent style updates
+        // may precede its deferred ArkTS attachment; they must not disarm repair.
+        if enabled {
+            self.export.enabled.set(true);
+        }
     }
 }
 impl Drop for ViewRoute {
     fn drop(&mut self) {
+        self.export.restore();
         VIEWS.with(|views| {
             let mut views = views.borrow_mut();
             if views
@@ -290,18 +333,36 @@ pub(crate) fn nsh_attach_native_subtree(
     #[napi(ts_arg_type = "FrameNode")] content: Object<'_>,
     #[napi(ts_arg_type = "NodeContent")] slot: Object<'_>,
 ) -> Result<()> {
-    let (_owner, inner) = VIEWS
+    let (owner, inner, export) = VIEWS
         .with(|views| {
-            views
-                .borrow()
-                .get(&target_id)
-                .and_then(|route| route.owner.upgrade().zip(route.inner.upgrade()))
+            views.borrow().get(&target_id).and_then(|route| {
+                route
+                    .owner
+                    .upgrade()
+                    .zip(route.inner.upgrade())
+                    .map(|(owner, inner)| (owner, inner, route.export.clone()))
+            })
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
     ohos_arkui_binding::common::node_registry::register(&inner.borrow(), inner.clone())
         .and_then(|()| inner.borrow().add_event_receiver())
         .map_err(|error| Error::from_reason(error.to_string()))?;
-    NativeAttachment::attach_subtree(&env, target_id, &content, &slot)
+    export
+        .prepare(&owner, &inner)
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    if let Err(error) = NativeAttachment::attach_subtree(&env, target_id, &content, &slot) {
+        export.restore();
+        return Err(error);
+    }
+    export
+        .after_attach(&inner)
+        .map_err(|error| Error::from_reason(error.to_string()))?;
+    // Reparenting into or out of a texture export changes the render target
+    // across the attachment and surface-export frames. ArkUI's retained custom
+    // draw recordings must be rebuilt once the destination pipeline is live.
+    owner
+        .schedule_subtree_paint(4)
+        .map_err(|error| Error::from_reason(error.to_string()))
 }
 
 #[napi]
@@ -389,4 +450,9 @@ pub(crate) fn nsh_web_navigate(target_id: u32, url: String) -> Result<bool> {
 #[napi]
 pub(crate) fn nsh_web_event(event: WebEvent) -> Result<bool> {
     crate::media::webview::on_event(event)
+}
+
+#[napi]
+pub(crate) fn nsh_web_download_allowed(target_id: u32, url: String) -> napi_ohos::Result<bool> {
+    crate::media::webview::download_allowed(target_id, &url)
 }

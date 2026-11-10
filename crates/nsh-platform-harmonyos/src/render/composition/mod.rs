@@ -1,8 +1,13 @@
 pub(crate) mod blend;
 pub(crate) mod draw;
+pub(crate) mod fill;
 pub(crate) mod filter;
 mod frame_wake;
 pub(crate) mod geometry;
+mod gles;
+mod presentation;
+pub(crate) mod raster;
 pub(crate) mod readback;
 pub(crate) mod scene;
+pub(crate) mod surface;
 pub(crate) mod worker;

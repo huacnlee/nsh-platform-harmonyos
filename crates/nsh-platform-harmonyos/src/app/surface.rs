@@ -81,6 +81,7 @@ pub(crate) enum Message {
         version: (u64, u64),
     },
     Size(i32, i32),
+    Layout,
     Window(bool),
     Visible(bool),
     HostCall(nsh_engine::HostCall),
@@ -164,6 +165,7 @@ struct State {
     components: Components,
     host_handlers: FxHashMap<String, Rc<HostHandler>>,
     open_url_handler: Option<Rc<OpenUrlHandler>>,
+    pending_urls: Vec<String>,
     errors: Errors,
     phase: SurfacePhase,
     size: (i32, i32),
@@ -200,6 +202,7 @@ impl State {
         // a new token, so queued replies from the old client cannot replace it.
         if let Some(overlay) = &self.overlay {
             overlay.hide();
+            overlay.connection(false);
         }
     }
     #[cfg(feature = "dev")]
@@ -235,16 +238,34 @@ impl State {
             return Ok(());
         }
         match event {
-            DevEvent::Connected => log::info!("OHOS dev server connected"),
-            DevEvent::Disconnected => log::info!("OHOS dev server disconnected"),
+            DevEvent::Connected => {
+                log::info!("OHOS dev server connected");
+                if let Some(overlay) = &self.overlay {
+                    overlay.connection(false);
+                }
+            }
+            DevEvent::Disconnected => {
+                log::info!("OHOS dev server disconnected");
+                if let Some(overlay) = &self.overlay {
+                    overlay.connection(true);
+                }
+            }
             DevEvent::Testing
             | DevEvent::Step { .. }
             | DevEvent::TestSetup { .. }
             | DevEvent::Fetch { .. } => {}
             DevEvent::Root => {
-                self.errors.report(
-                    "The app is of Rust only, and this host was not built with its root.".into(),
-                );
+                if let Some(root) = crate::linked::root() {
+                    let config = self.config()?;
+                    let app = App::new(root, config.assets.clone());
+                    self.next_load()?;
+                    self.accept_app(env, app)?;
+                } else {
+                    self.errors.report(
+                        "The app is of Rust only, and this host was not built with its root."
+                            .into(),
+                    );
+                }
             }
             DevEvent::Building => {}
             DevEvent::BuildFailed(message) | DevEvent::CannotRun { message, .. } => {
@@ -385,6 +406,9 @@ impl State {
         )?;
         runtime.set_attached(self.attached)?;
         runtime.set_visible(self.visible)?;
+        for url in std::mem::take(&mut self.pending_urls) {
+            runtime.open_url_scheme(url)?;
+        }
         self.phase = SurfacePhase::Running(runtime);
         Ok(())
     }
@@ -396,6 +420,59 @@ impl State {
             return Err(Error::from_reason("surface viewport exceeds 16384 vp"));
         }
         Ok(Size::new(width, height))
+    }
+    fn dispatch(state: &RefCell<Self>, env: Env, message: Message) -> Result<()> {
+        if matches!(message, Message::HostCall(_) | Message::OpenUrl(_)) {
+            let state = state.borrow();
+            if state.disposed.get()
+                || matches!(state.phase, SurfacePhase::Closing(_) | SurfacePhase::Closed)
+            {
+                return Ok(());
+            }
+        }
+        // Host code may synchronously send, change params or stop this surface.
+        // Keep only the function reference alive across the call into ArkTS.
+        match message {
+            Message::HostCall(mut call) => {
+                let handler = state.borrow().host_handlers.get(call.name()).cloned();
+                if let Some(handler) = handler {
+                    let name = call.name().to_owned();
+                    let data = call.take_data();
+                    let is_post = call.is_post();
+                    let call_slot = Arc::new(std::sync::Mutex::new(Some(call)));
+                    let reply = NshHostReply {
+                        call: call_slot.clone(),
+                        is_post,
+                    };
+                    let callback = handler.borrow_back(&env)?;
+                    if let Err(error) = callback.call((data, reply).into()) {
+                        log::error!("OHOS host handler {name}: {error}");
+                        if let Some(call) = call_slot.lock().unwrap().take() {
+                            call.reject(error.to_string());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Message::OpenUrl(request) => {
+                let handler = state.borrow().open_url_handler.clone();
+                let handled = if let Some(handler) = handler {
+                    let callback = handler.borrow_back(&env)?;
+                    match callback.call(request.url().to_owned()) {
+                        Ok(handled) => handled,
+                        Err(error) => {
+                            log::error!("OHOS openUrl handler: {error}");
+                            false
+                        }
+                    }
+                } else {
+                    false
+                };
+                request.answer(handled);
+                Ok(())
+            }
+            message => state.borrow_mut().receive(env, message),
+        }
     }
     fn receive(&mut self, env: Env, message: Message) -> Result<()> {
         if matches!(message, Message::Dispose) {
@@ -440,6 +517,12 @@ impl State {
                 }
                 Ok(())
             }
+            Message::Layout => {
+                if let Some(runtime) = self.phase.runtime() {
+                    runtime.layout_changed()?;
+                }
+                Ok(())
+            }
             Message::Size(width, height) => {
                 self.size = (width, height);
                 let size = self.logical_size()?;
@@ -471,42 +554,7 @@ impl State {
                 // like an iOS UIView. Only stop/dispose/Ability destruction ends it.
                 self.start(env)
             }
-            Message::HostCall(mut call) => {
-                if let Some(handler) = self.host_handlers.get(call.name()).cloned() {
-                    let name = call.name().to_owned();
-                    let data = call.take_data();
-                    let is_post = call.is_post();
-                    let call_slot = Arc::new(std::sync::Mutex::new(Some(call)));
-                    let reply = NshHostReply {
-                        call: call_slot.clone(),
-                        is_post,
-                    };
-                    let callback = handler.borrow_back(&env)?;
-                    if let Err(error) = callback.call((data, reply).into()) {
-                        log::error!("OHOS host handler {name}: {error}");
-                        if let Some(call) = call_slot.lock().unwrap().take() {
-                            call.reject(error.to_string());
-                        }
-                    }
-                }
-                Ok(())
-            }
-            Message::OpenUrl(request) => {
-                let handled = if let Some(handler) = self.open_url_handler.clone() {
-                    let callback = handler.borrow_back(&env)?;
-                    match callback.call(request.url().to_owned()) {
-                        Ok(handled) => handled,
-                        Err(error) => {
-                            log::error!("OHOS openUrl handler: {error}");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                request.answer(handled);
-                Ok(())
-            }
+            Message::HostCall(_) | Message::OpenUrl(_) => unreachable!(),
             Message::Dispose => unreachable!(),
         }
     }
@@ -564,6 +612,7 @@ impl State {
         self.components.clear();
         self.host_handlers.clear();
         self.open_url_handler = None;
+        self.pending_urls.clear();
         self.errors.dispose();
         let content = self.content.as_mut().expect("live surface content");
         content.clear_window_callback().map_err(native_error)?;
@@ -646,6 +695,7 @@ impl NshSurface {
             components: components.clone(),
             host_handlers: FxHashMap::default(),
             open_url_handler: None,
+            pending_urls: Vec::new(),
             errors: errors.clone(),
             phase: SurfacePhase::Empty,
             size: (0, 0),
@@ -681,9 +731,15 @@ impl NshSurface {
                 wake.build_threadsafe_function::<Message>()
                     .callee_handled::<false>()
                     .build_callback(move |ctx| {
-                        let mut state = ui_state.borrow_mut();
-                        if let Err(error) = state.receive(ctx.env, ctx.value) {
-                            state.errors.report(error.to_string());
+                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            if let Err(error) = State::dispatch(&ui_state, ctx.env, ctx.value) {
+                                let errors = ui_state.borrow().errors.clone();
+                                errors.report(error.to_string());
+                            }
+                        }))
+                        .is_err()
+                        {
+                            log::error!("panic in OHOS surface TSFN callback");
                         }
                         Ok(())
                     })?,
@@ -753,6 +809,7 @@ impl NshSurface {
                 },
             );
             let children = Rc::downgrade(&viewport);
+            let layout_queue = Arc::downgrade(&queue);
             viewport.borrow_mut().on_custom_layout(move |event| {
                 callback(|| {
                     event.set_layout_position(0, 0)?;
@@ -760,6 +817,9 @@ impl NshSurface {
                         for child in parent.borrow().children() {
                             event.layout_child(&child.borrow(), 0, 0)?;
                         }
+                    }
+                    if let Some(queue) = layout_queue.upgrade() {
+                        queue.call(Message::Layout, ThreadsafeFunctionCallMode::NonBlocking);
                     }
                     Ok(())
                 })
@@ -825,59 +885,29 @@ impl NshSurface {
     pub fn run_package(&self, env: Env, package: &crate::app::trust::NshPackage) -> Result<()> {
         let host = self.host()?;
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        state.check()?;
         if state.phase.runtime().is_some_and(Runtime::is_busy) {
             return Err(reentry("engine callback"));
         }
-        let prepared = package.take()?;
         state.next_load()?;
+        let prepared = package.take()?;
         #[cfg(feature = "dev")]
         state.disconnect_dev();
         let result = state.accept_app(
             env,
             App::new(
-                prepared.bundle,
+                prepared.bundle.clone(),
                 Arc::new(crate::services::assets::HostAssets::new(
                     host,
-                    Some(prepared.assets),
+                    Some(prepared.assets.clone()),
                 )),
             ),
         );
         if let Err(error) = &result {
+            package.restore(prepared);
             self.errors.report(error.to_string());
         }
         result
-    }
-
-    /// Starts the app linked into this library: an app written in Rust,
-    /// whose root the runner links (`nsh package --target harmonyos`).
-    /// Its assets come from this surface's `assetDirectory` or the HAP's
-    /// `rawfile/assets`.
-    #[napi]
-    pub fn run_app(&self, env: Env) -> Result<()> {
-        let root = crate::linked::root().ok_or_else(|| {
-            Error::from_reason(
-                "no Rust app is linked into this library: load a TSX app's bundle with loadResource",
-            )
-        })?;
-        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
-        if state.phase.runtime().is_some_and(Runtime::is_busy) {
-            return Err(reentry("engine callback"));
-        }
-        state.next_load()?;
-        #[cfg(feature = "dev")]
-        state.disconnect_dev();
-        let assets = state.config()?.assets.clone();
-        let result = state.accept_app(env, App::new(root, assets));
-        if let Err(error) = &result {
-            self.errors.report(error.to_string());
-        }
-        result
-    }
-
-    /// Whether a Rust app is linked into this library (`runApp`).
-    #[napi(getter)]
-    pub fn has_app(&self) -> bool {
-        crate::linked::has_root()
     }
 
     /// Reads a source or precompiled HAP resource and its companion capabilities.
@@ -893,7 +923,7 @@ impl NshSurface {
         let host = self.host()?;
         crate::app::session::resource_name(&name)?;
         let permit = host.reserve_load()?;
-        let (token, generation, has_override) = {
+        let (token, generation) = {
             let mut state = self.state.try_borrow_mut().map_err(reentry)?;
             #[cfg(feature = "dev")]
             state.disconnect_dev();
@@ -901,9 +931,8 @@ impl NshSurface {
                 runtime.close()?;
             }
             let token = state.next_load()?;
-            let has_override = state.config()?.policy.granted.is_some();
             state.phase = SurfacePhase::Loading { token };
-            (token, state.generation.clone(), has_override)
+            (token, state.generation.clone())
         };
         let chunks = crate::app::chunks::ResourceChunks::new(host.clone(), &name);
         let entry_chunks_loader = chunks.clone();
@@ -928,49 +957,9 @@ impl NshSurface {
                             .map_err(|_| Error::from_reason("source resource must be UTF-8"))?,
                     )
                 };
-                let app_json = name.rsplit_once('/').map_or_else(
-                    || "app.json".to_owned(),
-                    |(parent, _)| format!("{parent}/app.json"),
-                );
-                let mut manifest_specs = Vec::new();
-                if let Ok(bytes) = host.resource(&app_json)
-                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                {
-                    if let Some(id) = value.get("id").and_then(serde_json::Value::as_str) {
-                        bundle.app_id = Some(id.to_owned());
-                    }
-                    if let Some(specs) = value
-                        .get("entryChunks")
-                        .and_then(serde_json::Value::as_array)
-                    {
-                        manifest_specs.extend(
-                            specs
-                                .iter()
-                                .filter_map(serde_json::Value::as_str)
-                                .map(str::to_owned),
-                        );
-                    }
-                }
-                let initial_chunks = entry_chunks_loader
-                    .collect_entry_chunks(&bundle, &manifest_specs)
+                entry_chunks_loader
+                    .preload(&mut bundle)
                     .map_err(Error::from_reason)?;
-                if !initial_chunks.is_empty() {
-                    bundle = bundle.with_chunks(initial_chunks);
-                }
-                if !has_override {
-                    let companion = name.rsplit_once('/').map_or_else(
-                        || "capabilities.json".to_owned(),
-                        |(parent, _)| format!("{parent}/capabilities.json"),
-                    );
-                    if let Ok(bytes) = host.resource(&companion) {
-                        let value = serde_json::from_slice(&bytes)
-                            .map_err(|e| Error::from_reason(e.to_string()))?;
-                        bundle.policy.declared = Some(
-                            nsh_engine::Capabilities::from_json(&value)
-                                .map_err(Error::from_reason)?,
-                        );
-                    }
-                }
                 Ok(bundle)
             })
             .await
@@ -1007,6 +996,22 @@ impl NshSurface {
             }
         }
         promise
+    }
+
+    /// Starts the Rust app linked into this binary (`nsh_platform_harmonyos::app!`).
+    #[napi]
+    pub fn run_app(&self, env: Env) -> Result<()> {
+        self.check()?;
+        let root = crate::linked::root().ok_or_else(|| {
+            Error::from_reason("this binary was not built with a linked Rust app")
+        })?;
+        self.load_root(env, root)
+    }
+
+    /// Whether this binary was built with a linked Rust app (`runApp()`).
+    #[napi(getter)]
+    pub fn has_app(&self) -> bool {
+        crate::linked::has_root()
     }
 
     /// Stops the app and cancels pending loads, retaining this view and its factories.
@@ -1191,6 +1196,50 @@ impl NshSurface {
         Ok(())
     }
 
+    /// Hands `url`, one the embedding Ability was opened with (its launch `Want.uri`
+    /// or `onNewWant`), to the running app's `UrlScheme.on("open")` listeners (`nsh`).
+    /// While no app runs, the next one loaded gets it.
+    #[napi]
+    pub fn open_url(&self, url: String) -> Result<()> {
+        self.check()?;
+        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        if let Some(runtime) = state.phase.runtime() {
+            runtime.open_url_scheme(url)?;
+        } else {
+            if state.pending_urls.len() >= nsh_core::url_scheme::MAX_PENDING {
+                state.pending_urls.remove(0);
+            }
+            state.pending_urls.push(url);
+        }
+        Ok(())
+    }
+
+    /// Sets this app's storage directory for subsequent loads; omitted follows filesDir.
+    #[napi]
+    pub fn set_storage_directory(&self, path: Option<String>) -> Result<()> {
+        self.check()?;
+        let path = crate::app::options::directory(path)?;
+        self.state
+            .try_borrow_mut()
+            .map_err(reentry)?
+            .config_mut()?
+            .storage = path;
+        Ok(())
+    }
+
+    /// Sets disk cache options for subsequent loads; omitted restores the host's defaults.
+    #[napi]
+    pub fn set_cache_options(
+        &self,
+        options: Option<crate::app::options::NshCacheOptions>,
+    ) -> Result<()> {
+        self.check()?;
+        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        let config = state.config_mut()?;
+        config.cache = options.unwrap_or_default().resolve(&config.host)?;
+        Ok(())
+    }
+
     /// Applies the embedding app's theme overrides (a shadcn/ui `cssVars` theme JSON string,
     /// or `null`/`undefined` to restore the app's own theme), taking effect immediately and
     /// for all subsequent loads on this surface.
@@ -1240,7 +1289,8 @@ impl NshSurface {
         #[napi(ts_arg_type = "(id: number) => object")] factory: FunctionRef<u32, ObjectRef>,
     ) -> Result<()> {
         self.check()?;
-        self.components.register(name, factory);
+        crate::interop::component::check_name(&name)?;
+        self.components.register(name, factory)?;
         Ok(())
     }
 
@@ -1248,7 +1298,8 @@ impl NshSurface {
     #[napi]
     pub fn unregister_component(&self, name: String) -> Result<()> {
         self.check()?;
-        self.components.unregister(&name);
+        crate::interop::component::check_name(&name)?;
+        self.components.unregister(&name)?;
         Ok(())
     }
 
@@ -1344,6 +1395,18 @@ impl NshSurface {
     }
 }
 impl NshSurface {
+    /// Loads a Rust root on the same engine, lifecycle and native surface as TSX.
+    /// Call from the window's UI thread; assets use this surface's host resources.
+    pub fn load_root(&self, env: Env, root: nsh_core::element::Root) -> Result<()> {
+        self.check()?;
+        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        #[cfg(feature = "dev")]
+        state.disconnect_dev();
+        state.next_load()?;
+        let assets = state.config()?.assets.clone();
+        state.accept_app(env, App::rust(root, assets))
+    }
+
     fn host(&self) -> Result<Arc<crate::app::session::Services>> {
         if self.disposed.get() {
             return Err(Error::from_reason("surface is disposed"));

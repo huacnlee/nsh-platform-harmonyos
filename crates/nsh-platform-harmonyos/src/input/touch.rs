@@ -41,7 +41,6 @@ struct BackSwipe {
 struct SelectionDrag {
     owner: Weak<Node>,
     finger: u32,
-    anchor: usize,
     start: (f32, f32),
     moved: bool,
     pointer: Option<(f32, f32)>,
@@ -159,7 +158,7 @@ impl Touches {
     }
 
     pub(crate) fn input(&mut self, root: &Rc<Node>, input: &ArkUIInputEvent) -> Result<()> {
-        self.record_down(root.scale, input);
+        self.record_down(root.scale.get(), input);
         self.timestamp = input.event_time() as f64 / 1_000_000.0;
         let phase = match input.action {
             UIInputAction::Down => TouchPhase::Start,
@@ -213,8 +212,8 @@ impl Touches {
                 input.pointer_window_y_by_index(i),
             );
             let page = (
-                window.0 - origin.x as f32 / root.scale,
-                window.1 - origin.y as f32 / root.scale,
+                window.0 - origin.x as f32 / root.scale.get(),
+                window.1 - origin.y as f32 / root.scale.get(),
             );
             if phase == TouchPhase::Start && changed == Some(id) {
                 let Some(node) = hit(root, local, &nsh_core::Matrix::IDENTITY)? else {
@@ -346,12 +345,7 @@ impl Touches {
     pub(crate) fn press_allowed(&self, id: nsh_core::NodeId) -> bool {
         !self.suppressed_presses.contains(&id)
     }
-    pub(crate) fn selection_started(
-        &mut self,
-        owner: &Rc<Node>,
-        range: std::ops::Range<usize>,
-        point: (f32, f32),
-    ) -> Result<()> {
+    pub(crate) fn selection_started(&mut self, owner: &Rc<Node>, point: (f32, f32)) -> Result<()> {
         let Some(finger) = self.primary else {
             return Ok(());
         };
@@ -359,7 +353,6 @@ impl Touches {
         self.selection = Some(SelectionDrag {
             owner: Rc::downgrade(owner),
             finger,
-            anchor: range.start,
             start: point,
             moved: false,
             pointer: None,
@@ -443,13 +436,12 @@ impl Touches {
                 if owner.visible_in_tree()
                     && let Some(point) = point
                 {
-                    if let Some(anchor) = owner.selection_handle(point) {
+                    if owner.selection_handle(point)? {
                         let blocked = self.claim_selection(&owner)?;
                         owner.selection_menu_show(false)?;
                         self.selection = Some(SelectionDrag {
                             owner: Rc::downgrade(&owner),
                             finger: changed.unwrap_or(0),
-                            anchor,
                             start: point,
                             moved: true,
                             pointer: Some(local),
@@ -459,11 +451,12 @@ impl Touches {
                         owner.animator.track_selection(root);
                         return Ok(true);
                     }
-                    if hit(root, local, &nsh_core::Matrix::IDENTITY)?
-                        .is_some_and(|n| n.id == owner.id)
+                    if let Some(hit) = hit(root, local, &nsh_core::Matrix::IDENTITY)?
+                        && hit.selection.range.get().is_some()
                     {
-                        owner.selection_clear()?;
-                        return Ok(false);
+                        self.suppressed_presses.push(hit.id);
+                        owner.selection_menu_show(!owner.selection.menu.get())?;
+                        return Ok(true);
                     }
                 }
                 root.clear_text_selection()?;
@@ -496,7 +489,7 @@ impl Touches {
                     owner.selection_menu_show(false)?;
                 }
                 if drag.moved && phase == TouchPhase::Move {
-                    owner.selection_extend(drag.anchor, point)?;
+                    owner.selection_extend(point)?;
                     owner.animator.track_selection(root);
                 }
             }
@@ -523,7 +516,7 @@ impl Touches {
             self.selection = None;
             return Ok(false);
         };
-        if !owner.visible_in_tree() || owner.selection.range.get().is_none() {
+        if !owner.visible_in_tree() || !owner.has_selection() {
             drag.unblock()?;
             self.selection = None;
             return Ok(false);
@@ -554,7 +547,7 @@ impl Touches {
             .input_in_root(root)?
             .and_then(|matrix| crate::render::geometry::local_point(&matrix.0, pointer))
         {
-            owner.selection_extend(drag.anchor, point)?;
+            owner.selection_extend(point)?;
         }
         Ok(scrolling)
     }
@@ -566,7 +559,10 @@ impl Touches {
         changed: Option<u32>,
         count: u32,
     ) -> Result<bool> {
-        if phase == TouchPhase::Start && count == 1 {
+        if phase == TouchPhase::Start
+            && count == 1
+            && !root.interaction.mask().contains(EventKind::BackPress)
+        {
             self.suppressed_presses.clear();
             let local = (input.pointer_x_by_index(0), input.pointer_y_by_index(0));
             let target = hit(root, local, &nsh_core::Matrix::IDENTITY)?;
@@ -760,7 +756,7 @@ fn block(node: &Rc<Node>, blocked: bool) -> Result<()> {
     Ok(())
 }
 fn hit(root: &Rc<Node>, point: (f32, f32), world: &nsh_core::Matrix) -> Result<Option<Rc<Node>>> {
-    if !root.visible_in_tree() {
+    if !root.input_visible() {
         return Ok(None);
     }
     let pointer = root.interaction.pointer_events();
@@ -783,6 +779,7 @@ fn hit(root: &Rc<Node>, point: (f32, f32), world: &nsh_core::Matrix) -> Result<O
         nsh_core::input::laid_out(root.kind, root.id),
     );
     if pointer != PointerEvents::BoxOnly && area.children {
+        let plane = root.input_children_transform()?;
         // Sticky cells are raised above their siblings in the native tree.
         for priority in [true, false] {
             for child in root
@@ -794,7 +791,7 @@ fn hit(root: &Rc<Node>, point: (f32, f32), world: &nsh_core::Matrix) -> Result<O
                 .filter(|child| child.kind != nsh_core::ViewKind::Modal)
             {
                 if child.input_priority() == priority {
-                    let matrix = child.input_to_parent(root)?.mul(world);
+                    let matrix = child.input_in_plane(&plane)?.mul(world);
                     if let Some(node) = hit(&child, point, &matrix)? {
                         return Ok(Some(node));
                     }

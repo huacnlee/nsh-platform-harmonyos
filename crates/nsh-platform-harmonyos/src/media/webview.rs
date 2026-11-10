@@ -22,13 +22,13 @@ use crate::{
     app::session::Services,
     interop::{
         attachment::NativeAttachment,
-        sdk::{WebCommand, WebEvent, WebSettings},
+        sdk::{WebCommand, WebEvent, WebHeader, WebSettings},
     },
     render::{
         geometry::Size,
         node::{Error, NativeNode, Node, Result},
     },
-    services::executor::Executor,
+    services::{assets::StreamAssets, executor::Executor},
 };
 
 const SCHEME: &str = "nsh-asset";
@@ -80,7 +80,7 @@ fn send_response(handle: &ResourceHandle, status: u16, mime_type: &str, body: &[
 struct Route {
     node: Weak<Node>,
     access: Arc<Access>,
-    assets: Arc<dyn crate::services::assets::StreamAssets>,
+    assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
     proxy: RefCell<Option<WebProxy>>,
 }
@@ -98,6 +98,13 @@ impl Drop for RouteRegistration {
     }
 }
 
+#[derive(PartialEq)]
+struct DocumentSettings {
+    javascript: bool,
+    shared_cookies: bool,
+    script: Option<Arc<str>>,
+}
+
 pub(crate) struct WebView {
     node: Weak<Node>,
     native: NativeNode,
@@ -106,7 +113,7 @@ pub(crate) struct WebView {
     frame: Cell<Size>,
     props: RefCell<Option<WebProps>>,
     applied_source: RefCell<Option<WebSource>>,
-    applied_document: RefCell<Option<(bool, Option<Arc<str>>)>>,
+    applied_document: RefCell<Option<DocumentSettings>>,
     load_generation: Cell<u32>,
     ready: Cell<bool>,
     closed: Cell<bool>,
@@ -122,7 +129,7 @@ impl WebView {
         owner.native.borrow_mut().insert_child(native.clone(), 0)?;
         let mut target = None;
         let mut route = None;
-        if owner.host.has_ui_context() {
+        if owner.host.check().is_ok() {
             let attachment = NativeAttachment::new(&native)?;
             let id = attachment.id();
             ROUTES.with(|routes| {
@@ -141,7 +148,7 @@ impl WebView {
             target = Some(attachment);
         }
         Ok(Self {
-            ready: Cell::new(owner.host.has_ui_context()),
+            ready: Cell::new(owner.host.check().is_ok()),
             node,
             native,
             target: RefCell::new(target),
@@ -214,36 +221,43 @@ impl WebView {
                 target_id,
                 kind: "reload".into(),
                 script: None,
+                ..Default::default()
             },
             Command::GoBack => WebCommand {
                 target_id,
                 kind: "go-back".into(),
                 script: None,
+                ..Default::default()
             },
             Command::GoForward => WebCommand {
                 target_id,
                 kind: "go-forward".into(),
                 script: None,
+                ..Default::default()
             },
             Command::StopLoading => WebCommand {
                 target_id,
                 kind: "stop-loading".into(),
                 script: None,
+                ..Default::default()
             },
             Command::Focus => WebCommand {
                 target_id,
                 kind: "focus".into(),
                 script: None,
+                ..Default::default()
             },
             Command::Blur => WebCommand {
                 target_id,
                 kind: "evaluate".into(),
                 script: Some("document.activeElement?.blur();".into()),
+                ..Default::default()
             },
             Command::InjectJavaScript(script) => WebCommand {
                 target_id,
                 kind: "evaluate".into(),
                 script: Some(script),
+                ..Default::default()
             },
             Command::PostMessage(data) => {
                 let literal = serde_json::to_string(&data).expect("string literal");
@@ -253,9 +267,73 @@ impl WebView {
                     script: Some(format!(
                         "window.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));document.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));"
                     )),
+                    ..Default::default()
                 }
             }
-            _ => return Ok(()),
+            Command::Load(load) => {
+                if !node.access.allows_webviews()
+                    || (!load.src.starts_with("asset:/") && !node.access.allows_webview(&load.src))
+                {
+                    node.control.dispatch_event(
+                        node.id,
+                        EventKind::Error,
+                        EventPayload::Map(vec![(
+                            "message",
+                            PayloadValue::Str("WebView source is not granted".into()),
+                        )]),
+                    );
+                    return Ok(());
+                }
+                WebCommand {
+                    target_id,
+                    kind: "load".into(),
+                    url: Some(asset_url(&load.src)),
+                    headers: Some(
+                        load.headers
+                            .into_iter()
+                            .map(|(header_key, header_value)| WebHeader {
+                                header_key,
+                                header_value,
+                            })
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }
+            }
+            Command::SendInput(input) => {
+                use nsh_core::{WebInput, WebKey};
+                let mut command = WebCommand {
+                    target_id,
+                    ..Default::default()
+                };
+                match input {
+                    WebInput::Click { x, y } => {
+                        command.kind = "input-click".into();
+                        command.x = Some(f64::from(x.0));
+                        command.y = Some(f64::from(y.0));
+                    }
+                    WebInput::Text(text) => {
+                        command.kind = "input-text".into();
+                        command.script = Some(text);
+                    }
+                    WebInput::Key(key) => {
+                        command.kind = "input-key".into();
+                        command.script = Some(
+                            match key {
+                                WebKey::Enter => "Enter",
+                                WebKey::Tab => "Tab",
+                                WebKey::Escape => "Escape",
+                                WebKey::Backspace => "Backspace",
+                                _ => return Err(Error::Unsupported("WebView input key")),
+                            }
+                            .into(),
+                        );
+                    }
+                    _ => return Err(Error::Unsupported("WebView input")),
+                }
+                command
+            }
+            _ => return Err(Error::Unsupported("WebView command")),
         };
         node.web_command(web_command);
         Ok(())
@@ -324,13 +402,22 @@ impl WebView {
             );
             return Ok(());
         }
-        let document = (props.javascript_enabled, props.injected_js_before.clone());
+        let shared_cookies = !props.incognito;
+        let document = DocumentSettings {
+            javascript: props.javascript_enabled,
+            shared_cookies,
+            script: props.injected_js_before.clone(),
+        };
         let document_changed = self
             .applied_document
             .borrow()
             .as_ref()
             .is_some_and(|old| old != &document);
-        let target_id = if document_changed || self.target.borrow().is_none() {
+        let new_document = document_changed || self.target.borrow().is_none();
+        // The initial native target can already exist when the first props
+        // arrive. Its private store still needs clearing before navigation.
+        let first_document = self.applied_document.borrow().is_none();
+        let target_id = if new_document {
             self.replace_target(node)?
         } else {
             self.target.borrow().as_ref().unwrap().id()
@@ -358,6 +445,8 @@ impl WebView {
             .map_or_else(|| BRIDGE.to_owned(), |script| format!("{BRIDGE}\n{script}"));
         node.web_update(WebSettings {
             target_id,
+            shared_cookies,
+            clear_cookies: !shared_cookies && (first_document || new_document),
             url,
             html,
             html_base_url,
@@ -367,6 +456,12 @@ impl WebView {
             user_agent: props.user_agent.as_deref().map(str::to_owned),
             injected_javascript: props.injected_js.as_deref().map(str::to_owned),
             document_start_script,
+            download_directory: node
+                .host
+                .data_directory()
+                .join("downloads")
+                .display()
+                .to_string(),
         });
         Ok(())
     }
@@ -404,7 +499,7 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
 
 fn install_asset_protocol(
     native_tag: &str,
-    assets: Arc<dyn crate::services::assets::StreamAssets>,
+    assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
 ) -> napi_ohos::Result<()> {
     let handler = CustomProtocolHandler::new();
@@ -479,6 +574,21 @@ pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> 
     })
 }
 
+pub(crate) fn download_allowed(target_id: u32, url: &str) -> napi_ohos::Result<bool> {
+    NativeAttachment::dispatch(target_id, || {
+        let Some(route) = ROUTES.with(|routes| routes.borrow().get(&target_id).cloned()) else {
+            return false;
+        };
+        let Some(node) = route.node.upgrade() else {
+            return false;
+        };
+        node.interaction.mask().contains(EventKind::Download)
+            && (route.access.allows_webview(url)
+                || (route.access.allows_webviews()
+                    && (url.starts_with("data:") || url.starts_with("blob:"))))
+    })
+}
+
 pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
     NativeAttachment::dispatch(event.target_id, || {
         let Some(route) = ROUTES.with(|routes| routes.borrow().get(&event.target_id).cloned())
@@ -526,6 +636,26 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                     },
                     EventPayload::None,
                 );
+            }
+            "download" => {
+                if let Some(download) = event.download {
+                    node.control.dispatch_event(
+                        node.id,
+                        EventKind::Download,
+                        EventPayload::Map(vec![
+                            ("state", PayloadValue::Str(download.state)),
+                            ("id", PayloadValue::Str(download.id)),
+                            ("url", PayloadValue::Str(event.url)),
+                            ("filename", PayloadValue::Str(download.filename)),
+                            ("path", PayloadValue::Str(download.path)),
+                            ("bytes", PayloadValue::Number(download.bytes)),
+                            (
+                                "message",
+                                PayloadValue::Str(event.message.unwrap_or_default()),
+                            ),
+                        ]),
+                    );
+                }
             }
             "error" => {
                 node.control.dispatch_event(

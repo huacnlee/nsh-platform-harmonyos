@@ -2,6 +2,10 @@
 use nsh_core::{BoxShadow, ViewStyle};
 
 /// The native shadow caster is the border box, without CSS spread or custom corners.
+pub(crate) fn visible_shadow(layer: &BoxShadow, inset: bool) -> bool {
+    layer.inset == inset && layer.is_visible()
+}
+
 pub(crate) fn native_box_shadow(style: &ViewStyle) -> Option<BoxShadow> {
     if style.continuous_corners || style.background_color.0 & 0xff != 0xff {
         return None;
@@ -161,6 +165,25 @@ mod tests {
             PaintBounds::shadows(&inset, 56.0, 56.0, 3.25),
             PaintBounds::default()
         );
+    }
+    #[test]
+    fn zero_blur_inset_ring_is_visible() {
+        let layer = BoxShadow {
+            inset: true,
+            blur: Points(0.0),
+            spread: Points(2.0),
+            color: Color(0x3388ffff),
+            ..Default::default()
+        };
+        assert!(visible_shadow(&layer, true));
+        assert!(!visible_shadow(&layer, false));
+        assert!(!visible_shadow(
+            &BoxShadow {
+                color: Color::TRANSPARENT,
+                ..layer
+            },
+            true
+        ));
     }
     #[test]
     fn native_blur_matches_css_sigma_at_each_density() {

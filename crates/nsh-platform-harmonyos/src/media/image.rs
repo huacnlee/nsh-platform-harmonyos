@@ -3,18 +3,19 @@
 
 use std::{
     cell::{Cell, RefCell},
-    io::Read,
     rc::{Rc, Weak as UiWeak},
     sync::{
         Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
 };
 
 use nsh_core::{
     EventKind, EventPayload, ImageData, ImageOptions, ImageSource, PayloadValue, ResizeMode,
-    image::{CacheHeaders, DiskCache, Fetched},
+    image::{
+        DiskCache, Lease, MemoryCache, budget,
+        loader::{self, Context, Location, Priority, Ticket},
+    },
 };
 use nsh_engine::{Access, Assets};
 use ohos_arkui_binding::{
@@ -38,7 +39,6 @@ use crate::{
 };
 
 const MAX_DATA: usize = 16 << 20;
-const CACHE: usize = 32 << 20;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Target {
@@ -63,26 +63,37 @@ pub(crate) struct Progress {
     pub(crate) loaded: u64,
     pub(crate) total: u64,
 }
-pub(crate) struct Data {
+pub(crate) struct Decoded {
     bytes: Arc<[u8]>,
     svg: Option<nsh_core::svg::Raster>,
     width: u32,
     height: u32,
 }
-#[derive(Default)]
-struct Cache {
-    entries: FxHashMap<String, (Arc<Data>, u64)>,
-    bytes: usize,
-    clock: u64,
+pub(crate) struct Data {
+    decoded: Arc<Decoded>,
+    _lease: Lease,
+}
+impl std::ops::Deref for Data {
+    type Target = Decoded;
+    fn deref(&self) -> &Decoded {
+        &self.decoded
+    }
+}
+struct Loading {
+    request: crate::media::request::Request<Target>,
+    ticket: Mutex<Option<Ticket>>,
+}
+impl std::ops::Deref for Loading {
+    type Target = crate::media::request::Request<Target>;
+    fn deref(&self) -> &Self::Target {
+        &self.request
+    }
 }
 pub(crate) struct Loader {
-    assets: Arc<dyn Assets>,
-    access: Access,
+    context: Mutex<Context>,
     dispatcher: Weak<Dispatcher>,
-    agent: ureq::Agent,
-    cache: Mutex<Cache>,
-    disk_cache: Mutex<Option<DiskCache>>,
-    pending: Mutex<FxHashMap<String, Arc<crate::media::request::Request<Target>>>>,
+    cache: MemoryCache<String, Arc<Decoded>>,
+    pending: Mutex<FxHashMap<String, Arc<Loading>>>,
 }
 impl Data {
     pub(crate) fn decoded_bytes(&self) -> usize {
@@ -91,11 +102,6 @@ impl Data {
         } else {
             self.width as usize * self.height as usize * 4
         }
-    }
-    fn resident_bytes(&self) -> usize {
-        self.bytes
-            .len()
-            .saturating_add(self.svg.as_ref().map_or(0, |svg| svg.pixels.len()))
     }
     pub(crate) fn bitmap(&self) -> std::result::Result<ohos_drawing_binding::Bitmap, String> {
         if let Some(svg) = &self.svg {
@@ -142,25 +148,21 @@ impl Loader {
         access: Access,
         dispatcher: Weak<Dispatcher>,
     ) -> Arc<Self> {
+        let access = Arc::new(access);
         Arc::new(Self {
-            assets,
-            access,
+            context: Mutex::new(Context {
+                read_asset: Some(Arc::new(move |uri| assets.read(uri))),
+                access,
+                transport: Some(transport()),
+                ..Default::default()
+            }),
             dispatcher,
-            agent: ureq::Agent::config_builder()
-                .http_status_as_error(false)
-                .max_redirects(0)
-                .max_redirects_will_error(false)
-                .timeout_connect(Some(Duration::from_secs(30)))
-                .timeout_recv_response(Some(Duration::from_secs(60)))
-                .build()
-                .into(),
-            cache: Mutex::default(),
-            disk_cache: Mutex::default(),
+            cache: MemoryCache::new(budget()),
             pending: Mutex::default(),
         })
     }
     pub(crate) fn set_disk_cache(&self, cache: Option<DiskCache>) {
-        *self.disk_cache.lock().expect("disk cache") = cache;
+        self.context.lock().expect("image context").disk = cache;
     }
     pub(crate) fn load(
         self: &Arc<Self>,
@@ -186,30 +188,92 @@ impl Loader {
                     }
                 }
             }
-            let request = Arc::new(crate::media::request::Request::new(
-                target,
-                cancelled.clone(),
-            ));
+            let request = Arc::new(Loading {
+                request: crate::media::request::Request::new(target, cancelled.clone()),
+                ticket: Mutex::default(),
+            });
             pending.insert(uri.clone(), request.clone());
             request
         };
-        let loader = self.clone();
-        let loading = request.clone();
-        let key = uri.clone();
-        if let Err(error) = crate::services::executor::Executor::images().and_then(|pool| {
-            pool.submit(move || {
-                let data = loader.read(&uri, inline, &loading);
-                loader.finish(&uri, &loading, data);
-            })
-        }) {
-            self.finish(&key, &request, Err(error.to_string()));
+        let context = self.context.lock().expect("image context").clone();
+        if inline.is_none() && !context.access.allows_media(&uri) {
+            self.finish(
+                &uri,
+                &request,
+                Err("image URL is not granted by capabilities.network".into()),
+            );
+            return cancelled;
         }
+        if let Some((decoded, lease)) = self.cache.get(&uri) {
+            self.finish(
+                &uri,
+                &request,
+                Ok(Arc::new(Data {
+                    decoded,
+                    _lease: lease,
+                })),
+            );
+            return cancelled;
+        }
+        let location = inline
+            .map(|bytes| Location::Memory(uri.clone().into(), bytes))
+            .or_else(|| context.resolve(&uri));
+        let Some(location) = location else {
+            self.finish(&uri, &request, Err("unsupported image URI".into()));
+            return cancelled;
+        };
+        let decode_uri = uri.clone();
+        let progress_loader = self.clone();
+        let progress_request = request.clone();
+        let progress = Arc::new(move |loaded, total| {
+            if progress_request.cancelled() {
+                progress_request.ticket.lock().expect("image ticket").take();
+                // Also retire the platform's waiters: a cancelled shared read has no completion.
+                progress_loader.finish(&uri, &progress_request, Err("cancelled".into()));
+                return;
+            }
+            if let Some(dispatcher) = progress_loader.dispatcher.upgrade() {
+                for waiter in progress_request
+                    .waiters
+                    .lock()
+                    .expect("image waiters")
+                    .iter()
+                {
+                    if !waiter.cancelled.load(Ordering::Relaxed) {
+                        dispatcher.image_progress(Progress {
+                            target: waiter.target,
+                            loaded,
+                            total,
+                        });
+                    }
+                }
+            }
+        });
+        let decode_loader = self.clone();
+        let decode_request = request.clone();
+        let uri = decode_uri;
+        let ticket = loader::loader().read(
+            location,
+            &context,
+            Priority::Normal,
+            Some(progress),
+            Box::new(move |bytes| {
+                loader::loader()
+                    .decode(Priority::Normal, move || {
+                        let result = bytes
+                            .and_then(|bytes| decode_loader.decode(&uri, bytes, &decode_request));
+                        decode_loader.finish(&uri, &decode_request, result);
+                    })
+                    .detach();
+            }),
+        );
+        *request.ticket.lock().expect("image ticket") = Some(ticket);
         cancelled
     }
     fn finish(
         &self,
         uri: &str,
-        request: &Arc<crate::media::request::Request<Target>>,
+        request: &Arc<Loading>,
         data: std::result::Result<Arc<Data>, String>,
     ) {
         let mut pending = self.pending.lock().expect("pending images");
@@ -232,57 +296,15 @@ impl Loader {
             }
         }
     }
-    fn read(
+    fn decode(
         &self,
         uri: &str,
-        inline: Option<ImageData>,
-        request: &crate::media::request::Request<Target>,
+        bytes: ImageData,
+        request: &Loading,
     ) -> std::result::Result<Arc<Data>, String> {
-        {
-            let mut cache = self.cache.lock().expect("image cache");
-            cache.clock += 1;
-            let clock = cache.clock;
-            if let Some((data, used)) = cache.entries.get_mut(uri) {
-                *used = clock;
-                return Ok(data.clone());
-            }
-        }
-        if inline.is_none() && !self.access.allows_media(uri) {
-            return Err("image URL is not granted by capabilities.network".into());
-        }
         if request.cancelled() {
             return Err("cancelled".into());
         }
-        let bytes = if let Some(inline) = inline {
-            if inline.len() > MAX_DATA {
-                return Err("image exceeds 16 MiB".into());
-            }
-            inline.to_vec()
-        } else if uri.starts_with("asset:") {
-            self.assets.read(uri)?
-        } else if uri.starts_with("data:") {
-            let (_, bytes) = nsh_core::image::decode_data_uri(uri)?;
-            if bytes.len() > MAX_DATA {
-                return Err("image exceeds 16 MiB".into());
-            }
-            bytes
-        } else if uri.starts_with("http://") || uri.starts_with("https://") {
-            let disk_cache = self.disk_cache.lock().expect("disk cache").clone();
-            match disk_cache {
-                Some(cache) => cache
-                    .load(uri, |headers| self.download(uri, headers, request))?
-                    .to_vec(),
-                None => {
-                    let fetched = self.download(uri, &[], request)?;
-                    if !(200..300).contains(&fetched.status) {
-                        return Err(format!("image HTTP status {}", fetched.status));
-                    }
-                    fetched.body
-                }
-            }
-        } else {
-            return Err("images require asset:/, data: or HTTP(S) URIs".into());
-        };
         if bytes.len() > MAX_DATA {
             return Err("image exceeds 16 MiB".into());
         }
@@ -313,133 +335,26 @@ impl Loader {
             }
             (None, width, height)
         };
-        let data = Arc::new(Data {
-            bytes: bytes.into(),
+        let decoded = Arc::new(Decoded {
+            bytes: bytes.to_vec().into(),
             svg,
             width,
             height,
         });
-        let resident = data.resident_bytes();
-        if resident <= CACHE / 2 {
-            let mut cache = self.cache.lock().expect("image cache");
-            cache.clock += 1;
-            let clock = cache.clock;
-            cache.bytes += resident;
-            if let Some((old, _)) = cache.entries.insert(uri.to_owned(), (data.clone(), clock)) {
-                cache.bytes -= old.resident_bytes();
-            }
-            while cache.bytes > CACHE {
-                let key = cache
-                    .entries
-                    .iter()
-                    .min_by_key(|(_, (_, used))| *used)
-                    .map(|(key, _)| key.clone())
-                    .expect("nonempty cache");
-                let (old, _) = cache.entries.remove(&key).expect("cached image");
-                cache.bytes -= old.resident_bytes();
-            }
-        }
-        Ok(data)
-    }
-    fn download(
-        &self,
-        uri: &str,
-        headers: &[(&'static str, String)],
-        request: &crate::media::request::Request<Target>,
-    ) -> std::result::Result<Fetched, String> {
-        let mut url = uri.to_owned();
-        let proxy = crate::services::net::SystemProxy::read().map_err(|error| error.to_string())?;
-        let mut response = None;
-        for hop in 0..=20 {
-            if request.cancelled() {
-                return Err("cancelled".into());
-            }
-            let mut req = self.agent.get(&url);
-            for (name, value) in headers {
-                req = req.header(*name, value);
-            }
-            let current = req
-                .config()
-                .proxy(proxy.value())
-                .build()
-                .call()
-                .map_err(|e| e.to_string())?;
-            let status = current.status().as_u16();
-            if matches!(status, 301 | 302 | 303 | 307 | 308)
-                && let Some(location) = current.headers().get("location")
-            {
-                if hop == 20 {
-                    return Err("too many image redirects".into());
-                }
-                url = self
-                    .access
-                    .media_redirect(&url, location.to_str().map_err(|e| e.to_string())?)?;
-            } else {
-                response = Some(current);
-                break;
-            }
-        }
-        let mut response = response.ok_or("no image response")?;
-        let status = response.status().as_u16();
-        let cache_headers = CacheHeaders::from_lookup(|name| {
-            let values: Vec<&str> = response
-                .headers()
-                .get_all(name)
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .collect();
-            (!values.is_empty()).then(|| values.join(", "))
-        });
-        if status >= 300 {
-            return Ok(Fetched::new(status, cache_headers, Vec::new()));
-        }
-        let total = response
-            .headers()
-            .get("content-length")
-            .and_then(|n| n.to_str().ok())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or_default();
-        if total > MAX_DATA as u64 {
-            return Err("image exceeds 16 MiB".into());
-        }
-        let mut reader = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_DATA as u64 + 1)
-            .reader();
-        let mut bytes = Vec::new();
-        let mut buffer = [0; 64 << 10];
-        let mut progress = Instant::now();
-        loop {
-            if request.cancelled() {
-                return Err("cancelled".into());
-            }
-            let size = reader.read(&mut buffer).map_err(|e| e.to_string())?;
-            if size == 0 {
-                break;
-            }
-            if bytes.len() + size > MAX_DATA {
-                return Err("image exceeds 16 MiB".into());
-            }
-            bytes.extend_from_slice(&buffer[..size]);
-            if progress.elapsed() >= Duration::from_millis(100) {
-                if let Some(dispatcher) = self.dispatcher.upgrade() {
-                    for waiter in request.waiters.lock().expect("image waiters").iter() {
-                        if !waiter.cancelled.load(Ordering::Relaxed) {
-                            dispatcher.image_progress(Progress {
-                                target: waiter.target,
-                                loaded: bytes.len() as u64,
-                                total,
-                            });
-                        }
-                    }
-                }
-                progress = Instant::now();
-            }
-        }
-        Ok(Fetched::new(status, cache_headers, bytes))
+        let cost = decoded.bytes.len().saturating_add(
+            decoded
+                .svg
+                .as_ref()
+                .map_or(width as usize * height as usize * 4, |svg| svg.pixels.len()),
+        );
+        let lease = self.cache.insert(uri.to_owned(), decoded.clone(), cost);
+        Ok(Arc::new(Data {
+            decoded,
+            _lease: lease,
+        }))
     }
 }
+
 struct NativeImage {
     descriptor: ohos_arkui_binding::api::attribute_option::DrawableDescriptor,
     _pixels: Vec<ohos_image_native_binding::PixelMap>,
@@ -507,7 +422,7 @@ impl NativeImage {
                 descriptor.set_animation_duration(total_ms);
                 descriptor.set_animation_iteration(-1);
                 #[cfg(feature = "api-23")]
-                if crate::get_capabilities().api23 {
+                {
                     let _ = descriptor.set_animation_frame_durations(&mut frame_durations);
                     let _ = descriptor.set_animation_auto_play(1);
                 }
@@ -692,13 +607,9 @@ impl ImageView {
         self.fade_ms.set(options.fade_ms.unwrap_or(0.0).max(0.0));
         self.native.borrow().set_f32_attribute(A::Opacity, 1.0)?;
         if self.blur.replace(options.blur_radius.0) != options.blur_radius.0 {
-            self.native.borrow().set_f32_attribute(
-                A::Blur,
-                crate::render::composition::geometry::blur_sigma(
-                    options.blur_radius.0,
-                    self.owner.upgrade().map_or(1.0, |node| node.scale),
-                ),
-            )?;
+            self.native
+                .borrow()
+                .set_f32_attribute(A::Blur, options.blur_radius.0.max(0.0))?;
         }
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
@@ -838,4 +749,108 @@ pub(crate) fn info(
         EventKind::ImageInfo,
         EventPayload::Map(values),
     );
+}
+
+struct OhosTransport(ureq::Agent);
+
+pub(crate) fn transport() -> Arc<dyn loader::Transport> {
+    static TRANSPORT: std::sync::OnceLock<Arc<OhosTransport>> = std::sync::OnceLock::new();
+    TRANSPORT
+        .get_or_init(|| {
+            Arc::new(OhosTransport(
+                ureq::Agent::config_builder()
+                    .http_status_as_error(false)
+                    .max_redirects(0)
+                    .max_redirects_will_error(false)
+                    .timeout_global(Some(loader::TIMEOUT))
+                    .build()
+                    .into(),
+            ))
+        })
+        .clone()
+}
+
+impl loader::Transport for OhosTransport {
+    fn get(&self, get: loader::Get<'_>) -> std::result::Result<nsh_core::image::Fetched, String> {
+        use std::io::Read as _;
+
+        use nsh_core::image::{
+            CacheHeaders, Fetched,
+            loader::{MAX_BYTES, MAX_REDIRECTS, TIMEOUT, redirect},
+        };
+        let proxy = crate::services::net::SystemProxy::read().map_err(|error| error.to_string())?;
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut url = get.url.to_owned();
+        for hop in 0..=MAX_REDIRECTS {
+            if get.cancelled.load(Ordering::Relaxed) {
+                return Err("cancelled".into());
+            }
+            let mut request = self.0.get(&url);
+            for (name, value) in get.headers {
+                request = request.header(*name, value);
+            }
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .ok_or("image request timed out")?;
+            let mut response = request
+                .config()
+                .proxy(proxy.value())
+                .timeout_global(Some(remaining))
+                .build()
+                .call()
+                .map_err(|error| error.to_string())?;
+            let status = response.status().as_u16();
+            if matches!(status, 301 | 302 | 303 | 307 | 308) {
+                if hop == MAX_REDIRECTS {
+                    return Err("too many image redirects".into());
+                }
+                let location = response
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .ok_or("image redirect without a Location")?;
+                url = redirect(get.access, &url, location)?;
+                continue;
+            }
+            let headers = CacheHeaders::from_lookup(|name| {
+                let values: Vec<_> = response
+                    .headers()
+                    .get_all(name)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .collect();
+                (!values.is_empty()).then(|| values.join(", "))
+            });
+            if status >= 300 {
+                return Ok(Fetched::new(status, headers, Vec::new()));
+            }
+            let total = response.body().content_length().unwrap_or(0);
+            if total > MAX_BYTES {
+                return Err("image exceeds loader byte limit".into());
+            }
+            let mut reader = response
+                .body_mut()
+                .with_config()
+                .limit(MAX_BYTES + 1)
+                .reader();
+            let mut bytes = Vec::new();
+            let mut chunk = [0; 64 << 10];
+            loop {
+                if get.cancelled.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                let count = reader.read(&mut chunk).map_err(|error| error.to_string())?;
+                if count == 0 {
+                    break;
+                }
+                if bytes.len() as u64 + count as u64 > MAX_BYTES {
+                    return Err("image exceeds loader byte limit".into());
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                (get.progress)(bytes.len() as u64, total);
+            }
+            return Ok(Fetched::new(status, headers, bytes));
+        }
+        Err("no image response".into())
+    }
 }

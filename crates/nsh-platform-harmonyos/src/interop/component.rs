@@ -36,6 +36,42 @@ pub struct NshNativeProperty {
     pub removed: bool,
 }
 type Factory = FunctionRef<u32, ObjectRef>;
+pub(crate) type TabFactory = FunctionRef<TabBarContext, ObjectRef>;
+
+/// Native callback ownership for the system tab bar, scoped to its surface load.
+#[napi]
+pub(crate) struct TabBarContext {
+    context: Context,
+}
+#[napi]
+#[allow(unreachable_pub)] // Node-API requires public methods on its internal callback object.
+impl TabBarContext {
+    /// Reports the native selection while the component remains mounted.
+    #[napi]
+    pub fn change(&self, index: u32) {
+        if self.context.active.get() {
+            self.context.control.dispatch_event(
+                self.context.node,
+                nsh_core::EventKind::NativeEvent,
+                nsh_core::EventPayload::Native {
+                    name: "change".into(),
+                    data: index.into(),
+                },
+            );
+        }
+    }
+    /// Supplies the tab bar's intrinsic height in vp.
+    #[napi]
+    pub fn height(&self, height: f64) {
+        if self.context.active.get() && height.is_finite() && (0.0..=16384.0).contains(&height) {
+            self.context.control.set_component_size(
+                self.context.node,
+                nsh_core::Size::new(nsh_core::Points::ZERO, nsh_core::Points(height as f32)),
+            );
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Context {
     pub(crate) node: NodeId,
@@ -51,14 +87,18 @@ pub(crate) struct Registry {
 #[derive(Clone, Default)]
 pub(crate) struct Components(Rc<RefCell<Registry>>);
 impl Components {
-    pub(crate) fn register(&self, name: String, factory: Factory) {
+    pub(crate) fn register(&self, name: String, factory: Factory) -> napi_ohos::Result<()> {
+        check_name(&name)?;
         self.0
             .borrow_mut()
             .factories
             .insert(name.into(), Rc::new(factory));
+        Ok(())
     }
-    pub(crate) fn unregister(&self, name: &str) {
+    pub(crate) fn unregister(&self, name: &str) -> napi_ohos::Result<()> {
+        check_name(name)?;
         self.0.borrow_mut().factories.remove(name);
+        Ok(())
     }
     pub(crate) fn clear(&self) {
         self.0.borrow_mut().factories.clear();
@@ -78,13 +118,15 @@ impl Components {
         name: &str,
         node: NodeId,
         control: EngineControl,
+        host: &crate::app::session::Services,
     ) -> Result<Option<Instance>> {
         let (factory, handle, context) = {
             let mut registry = self.0.borrow_mut();
-            let Some(factory) = registry.factories.get(name).cloned() else {
+            let factory = registry.factories.get(name).cloned();
+            if factory.is_none() && name != nsh_core::platform::TAB_BAR_COMPONENT {
                 log::warn!("OHOS native component is not registered: {name}");
                 return Ok(None);
-            };
+            }
             registry.next = registry.next.checked_add(1).ok_or_else(|| {
                 napi_ohos::Error::from_reason("native component handles exhausted")
             })?;
@@ -102,9 +144,15 @@ impl Components {
         let registration = Registration {
             components: self.clone(),
             handle,
-            context,
+            context: context.clone(),
         };
-        let value = factory.borrow_back(&env)?.call(handle)?;
+        let value = if let Some(factory) = factory {
+            factory.borrow_back(&env)?.call(handle)?
+        } else {
+            host.tab_bar_factory()?
+                .borrow_back(&env)?
+                .call(TabBarContext { context })?
+        };
         let retained = RetainedObject {
             value: Some(value),
             env,
@@ -262,4 +310,13 @@ impl Drop for Instance {
             }
         }
     }
+}
+
+pub(crate) fn check_name(name: &str) -> napi_ohos::Result<()> {
+    if name.starts_with("Nsh") {
+        return Err(napi_ohos::Error::from_reason(
+            "Component names starting with 'Nsh' are reserved",
+        ));
+    }
+    Ok(())
 }

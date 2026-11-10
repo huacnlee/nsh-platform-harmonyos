@@ -47,7 +47,40 @@ pub(crate) fn spoken_value(accessibility: &Accessibility) -> Option<String> {
     if accessibility.state.busy {
         parts.push("busy".into());
     }
+    if accessibility.state.has_popup {
+        // Use the app's localized popup action, never a built-in control label.
+        if let Some(label) = accessibility
+            .actions
+            .iter()
+            .find(|action| action.name.as_ref() == "activate")
+            .and_then(|action| action.label.as_deref())
+            .filter(|label| !label.is_empty())
+        {
+            parts.push(label.to_owned());
+        }
+    }
     (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+pub(crate) fn owns_semantics(spec: &Accessibility) -> bool {
+    wrapper_semantics(spec, cfg!(feature = "api-23"), cfg!(feature = "api-26"))
+}
+
+fn wrapper_semantics(spec: &Accessibility, api23: bool, api26: bool) -> bool {
+    spec.state.checked.is_some()
+        || !api23
+            && (spec.state.selected
+                || spec
+                    .actions
+                    .iter()
+                    .any(|action| matches!(action.name.as_ref(), "increment" | "decrement")))
+        || api26
+            && spec.actions.iter().any(|action| {
+                !matches!(
+                    action.name.as_ref(),
+                    "activate" | "longpress" | "copy" | "cut" | "paste" | "increment" | "decrement"
+                )
+            })
 }
 
 #[cfg(test)]
@@ -55,6 +88,38 @@ mod tests {
     use nsh_core::{AccessibilityState, AccessibilityValue};
 
     use super::*;
+
+    #[test]
+    fn api20_selected_and_adjustable_nodes_keep_wrapper_semantics() {
+        let mut spec = Accessibility::default();
+        assert!(!owns_semantics(&spec));
+        spec.state.selected = true;
+        assert!(wrapper_semantics(&spec, false, false));
+        assert!(!wrapper_semantics(&spec, true, false));
+        spec.state.selected = false;
+        spec.actions.push(nsh_core::AccessibilityActionDef {
+            name: "increment".into(),
+            label: None,
+        });
+        assert!(wrapper_semantics(&spec, false, false));
+        assert!(!wrapper_semantics(&spec, true, false));
+    }
+
+    #[test]
+    fn popup_action_uses_the_apps_label_and_clears_with_state() {
+        let mut spec = Accessibility::default();
+        spec.state.has_popup = true;
+        spec.actions.push(nsh_core::AccessibilityActionDef {
+            name: "activate".into(),
+            label: Some("Choose a date".into()),
+        });
+        assert_eq!(spoken_value(&spec).as_deref(), Some("Choose a date"));
+        spec.state.has_popup = false;
+        assert_eq!(spoken_value(&spec), None);
+        spec.state.has_popup = true;
+        spec.actions.clear();
+        assert_eq!(spoken_value(&spec), None);
+    }
 
     #[test]
     fn explicit_value_keeps_mixed_expanded_and_busy_states() {

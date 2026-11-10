@@ -1,16 +1,13 @@
 //! Streaming HTTP transport behind `fetch`, on ureq (rustls with the webpki roots):
-//! bounded workers streaming both ways.
+//! per-surface admission and dedicated readers for open streams.
 //!
 //! Matches the Linux transport (`nsh-platform-linux/src/net.rs`).
 //! Rust TLS keeps the same bounded redirects and streaming behavior as the
 //! desktop transport. Each request reads the system proxy through the network
 //! connection binding, including bypass rules. Cookie-store integration is separate.
-//! Adapted from `nsh-cli`'s stack for `nsh trace` (`crates/nsh-cli/src/net.rs`);
-//! sharing it would mean a new public item in a crate both depend on. The
-//! differences: no events at all after `cancel` (the engine would ignore
-//! them anyway), `redirected` compares normalized URLs, and only connecting
-//! and the response head have deadlines, so long-lived bodies (event
-//! streams, large downloads) are not cut off.
+//! OHOS owns worker admission and per-request native proxy lookup. Requests
+//! stream in both directions; cancellation suppresses subsequent events, and
+//! only connection and response-head waits have deadlines, preserving streams.
 //!
 //! HTTP error statuses are responses, not failures. A request thread
 //! blocked in a read or write is not interrupted by `cancel` or `pause`: it
@@ -19,7 +16,8 @@
 use std::{
     io::Read,
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
         mpsc::{Receiver, Sender, channel},
     },
     time::Duration,
@@ -59,11 +57,9 @@ impl SystemProxy {
     }
 }
 
-/// The network of every engine: one connection pool for the process, as a
-/// system HTTP stack would share it.
+/// Each engine owns its connection reuse and admission budget.
 pub(crate) fn network() -> Arc<dyn Network> {
-    static NETWORK: OnceLock<Arc<UreqNetwork>> = OnceLock::new();
-    NETWORK.get_or_init(|| Arc::new(UreqNetwork::new())).clone()
+    Arc::new(UreqNetwork::new())
 }
 
 /// `fetch` on two ureq agents: one follows redirects, one hands on the 3xx
@@ -71,6 +67,7 @@ pub(crate) fn network() -> Arc<dyn Network> {
 struct UreqNetwork {
     follow: Agent,
     manual: Agent,
+    requests: Arc<AtomicUsize>,
 }
 
 impl UreqNetwork {
@@ -88,6 +85,7 @@ impl UreqNetwork {
         Self {
             follow: agent(MAX_REDIRECTS),
             manual: agent(0),
+            requests: Arc::default(),
         }
     }
 }
@@ -111,16 +109,29 @@ impl Network for UreqNetwork {
             sink: Arc::new(Mutex::new(events)),
             control: control.clone(),
         };
-        let spawned = crate::services::executor::Executor::fetch().and_then(|pool| {
-            pool.submit({
-                let events = events.clone();
-                move || {
-                    if let Err(e) = run(&agent, request, body_rx, &events) {
-                        events.send(FetchEvent::Failed(e.to_string()));
-                    }
-                }
+        let spawned = self
+            .requests
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < 32).then_some(count + 1)
             })
-        });
+            .map_err(|_| "too many concurrent requests on this surface".to_owned())
+            .and_then(|_| {
+                let permit = RequestPermit(self.requests.clone());
+                let streaming_upload = matches!(request.body, HttpBody::Stream);
+                let run = {
+                    let events = events.clone();
+                    move || {
+                        if let Err(e) = run(&agent, request, body_rx, &events, permit) {
+                            events.send(FetchEvent::Failed(e.to_string()));
+                        }
+                    }
+                };
+                if streaming_upload {
+                    crate::services::executor::Executor::stream(run)
+                } else {
+                    crate::services::executor::Executor::fetch()?.submit(run)
+                }
+            });
         if let Err(e) = spawned {
             events.send(FetchEvent::Failed(format!("cannot start the request: {e}")));
         }
@@ -128,6 +139,13 @@ impl Network for UreqNetwork {
             control,
             body: body_tx,
         })
+    }
+}
+
+struct RequestPermit(Arc<AtomicUsize>);
+impl Drop for RequestPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -256,6 +274,7 @@ fn run(
     request: HttpRequest,
     body: Option<Receiver<Option<Vec<u8>>>>,
     events: &Events,
+    permit: RequestPermit,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if events.control.cancelled() {
         return Ok(());
@@ -270,7 +289,7 @@ fn run(
     for (name, value) in &request.headers {
         builder = builder.header(name, value);
     }
-    let mut response = match (request.body, body) {
+    let response = match (request.body, body) {
         (HttpBody::Bytes(bytes), _) => builder
             .body(bytes)?
             .with_agent(agent)
@@ -323,6 +342,18 @@ fn run(
         redirected,
         headers,
     }));
+    let events = events.clone();
+    crate::services::executor::Executor::stream(move || {
+        let _permit = permit;
+        if let Err(error) = read_response(response, &events) {
+            events.send(FetchEvent::Failed(error.to_string()));
+        }
+    })
+    .map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+fn read_response(mut response: http::Response<ureq::Body>, events: &Events) -> std::io::Result<()> {
     let mut reader = response.body_mut().with_config().limit(u64::MAX).reader();
     let mut buf = vec![0; CHUNK];
     loop {

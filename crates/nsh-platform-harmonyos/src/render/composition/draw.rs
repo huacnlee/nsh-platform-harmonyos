@@ -11,6 +11,9 @@ use crate::render::{
 
 pub(crate) struct PaintNode {
     pub(crate) source: Option<Key>,
+    pub(crate) shaders: bool,
+    pub(crate) shader_backdrop: bool,
+    pub(crate) capture: bool,
     pub(crate) overlay: Option<Key>,
     pub(crate) transform: Transform,
     pub(crate) size: Size,
@@ -35,29 +38,34 @@ pub(crate) struct Frame {
     pub(crate) image: Image,
 }
 
-struct Renderer<'a, F> {
-    source: F,
-    images: std::marker::PhantomData<&'a Image>,
+pub(super) trait Sources {
+    fn image(&self, key: Key) -> Option<(&Image, f32)>;
+    fn shade(
+        &mut self,
+        key: Key,
+        image: Image,
+        backdrop: Option<Image>,
+        scale: f32,
+    ) -> Result<Image, String>;
+}
+struct Renderer<'a, S> {
+    source: &'a mut S,
     scale: f32,
     pixels: u64,
 }
 const MAX_PIXELS: u64 = 67_108_864;
 impl Plan {
-    pub(crate) fn render<'a>(
-        &self,
-        source: impl Fn(Key) -> Option<&'a Image>,
-    ) -> Result<Option<Vec<Frame>>, String> {
-        fn ready<'a>(node: &PaintNode, source: &impl Fn(Key) -> Option<&'a Image>) -> bool {
-            node.source.is_none_or(|key| source(key).is_some())
-                && node.overlay.is_none_or(|key| source(key).is_some())
+    pub(super) fn render(&self, source: &mut impl Sources) -> Result<Option<Vec<Frame>>, String> {
+        fn ready(node: &PaintNode, source: &impl Sources) -> bool {
+            node.source.is_none_or(|key| source.image(key).is_some())
+                && node.overlay.is_none_or(|key| source.image(key).is_some())
                 && node.children.iter().all(|child| ready(child, source))
         }
-        if !self.roots.iter().all(|root| ready(&root.node, &source)) {
+        if !self.roots.iter().all(|root| ready(&root.node, source)) {
             return Ok(None);
         }
         let mut renderer = Renderer {
             source,
-            images: std::marker::PhantomData,
             scale: self.scale,
             pixels: 0,
         };
@@ -81,7 +89,7 @@ impl Plan {
         Ok(Some(frames))
     }
 }
-impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
+impl<S: Sources> Renderer<'_, S> {
     fn reserve(&mut self, pixels: u64) -> Result<(), String> {
         self.pixels = self
             .pixels
@@ -108,9 +116,13 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
         destination.concat(&pixel_matrix(node.transform, self.scale));
         let effects = node.style.effects.as_ref();
         let filters = effects.map_or(&[][..], |effects| effects.filters.as_slice());
+        let masks = effects.map_or(&[][..], |effects| effects.mask_images.as_slice());
         let backdrop = effects.map_or(&[][..], |effects| effects.backdrop_filters.as_slice());
         // These are precisely the properties that establish a backdrop root.
-        let grouped = node.opacity < 1.0
+        let grouped = node.shaders
+            || node.capture
+            || !masks.is_empty()
+            || node.opacity < 1.0
             || !filters.is_empty()
             || !backdrop.is_empty()
             || node.style.blend_mode != BlendMode::Normal;
@@ -127,7 +139,8 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
                 Canvas::with_bitmap(Bitmap::new(width, height, BitmapFormat::default()));
             layer.clear(0);
             layer.translate(-left, -top);
-            if !backdrop.is_empty() {
+            let mut shader_backdrop = None;
+            if !backdrop.is_empty() || node.shader_backdrop {
                 let matrix = destination.total_matrix();
                 if let Some(inverse) = matrix.inverted() {
                     let prefix =
@@ -137,13 +150,19 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
                     prefix.translate(-left, -top);
                     prefix.concat(&inverse);
                     prefix.draw_bitmap(destination.bitmap().unwrap(), 0.0, 0.0);
-                    let prefix = Image::copy(prefix.bitmap().unwrap(), left, top)
-                        .backdrop(backdrop, self.scale)
-                        .map_err(str::to_owned)?;
-                    layer.save();
-                    self.clip(node, &layer);
-                    layer.draw_bitmap(&prefix.bitmap, prefix.x, prefix.y);
-                    layer.restore();
+                    let prefix = Image::copy(prefix.bitmap().unwrap(), left, top);
+                    if node.shader_backdrop {
+                        shader_backdrop = Some(Image::copy(&prefix.bitmap, prefix.x, prefix.y));
+                    }
+                    if !backdrop.is_empty() {
+                        let prefix = prefix
+                            .backdrop(backdrop, self.scale)
+                            .map_err(str::to_owned)?;
+                        layer.save();
+                        self.clip(node, &layer);
+                        layer.draw_bitmap(&prefix.bitmap, prefix.x, prefix.y);
+                        layer.restore();
+                    }
                     self.pixels -= pixels;
                 }
             }
@@ -151,6 +170,38 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
             let image = Image::copy(layer.bitmap().unwrap(), left, top)
                 .filtered(filters, self.scale)
                 .map_err(str::to_owned)?;
+            let image = if masks.is_empty() {
+                image
+            } else {
+                let canvas = Canvas::with_bitmap(image.bitmap);
+                let mut blend = Brush::new();
+                blend.set_blend_mode(ohos_drawing_binding::BlendMode::DstIn);
+                // All mask layers compose together before their alpha masks
+                // the filtered group; no pixels persist between scene frames.
+                canvas.save_layer(None, Some(&blend));
+                canvas.translate(-image.x, -image.y);
+                canvas.scale(self.scale, self.scale);
+                for mask in masks.iter().rev() {
+                    let brush = crate::render::decor::gradient(mask, node.size);
+                    canvas.attach_brush(&brush);
+                    canvas.draw_rect(&ohos_drawing_binding::Rect::new(
+                        0.0,
+                        0.0,
+                        node.size.width,
+                        node.size.height,
+                    ));
+                    canvas.detach_brush();
+                }
+                canvas.restore();
+                Image::copy(canvas.bitmap().unwrap(), image.x, image.y)
+            };
+            let image = if (node.shaders || node.capture)
+                && let Some(key) = node.source
+            {
+                self.source.shade(key, image, shader_backdrop, self.scale)?
+            } else {
+                image
+            };
             self.draw_group(&image, destination, node.opacity, node.style.blend_mode)?;
             self.pixels -= pixels;
         } else {
@@ -177,8 +228,11 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
         canvas: &mut Canvas,
         depth: usize,
     ) -> Result<(), String> {
-        if let Some(image) = node.source.and_then(&self.source) {
+        if let Some((image, scale)) = node.source.and_then(|key| self.source.image(key)) {
+            canvas.save();
+            canvas.scale(self.scale / scale, self.scale / scale);
             canvas.draw_bitmap(&image.bitmap, image.x, image.y);
+            canvas.restore();
         }
         canvas.save();
         if node.clip {
@@ -187,8 +241,11 @@ impl<'a, F: Fn(Key) -> Option<&'a Image>> Renderer<'a, F> {
         for child in &node.children {
             self.node(child, canvas, depth + 1)?;
         }
-        if let Some(image) = node.overlay.and_then(&self.source) {
+        if let Some((image, scale)) = node.overlay.and_then(|key| self.source.image(key)) {
+            canvas.save();
+            canvas.scale(self.scale / scale, self.scale / scale);
             canvas.draw_bitmap(&image.bitmap, image.x, image.y);
+            canvas.restore();
         }
         canvas.restore();
         crate::render::decor::Decoration::default().outline(

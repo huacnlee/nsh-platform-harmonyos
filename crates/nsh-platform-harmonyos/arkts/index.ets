@@ -1,6 +1,7 @@
 import "./src/main/ets/NshHost";
 
 export {
+  NshCacheOptions,
   NshCapabilities,
   NshEnvironment,
   NshHostReply,

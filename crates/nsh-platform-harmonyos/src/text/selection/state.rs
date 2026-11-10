@@ -3,6 +3,7 @@ use std::cell::{Cell, RefCell};
 
 #[derive(Default)]
 pub(crate) struct State {
+    pub(crate) handles: Cell<[bool; 2]>,
     pub(crate) range: Cell<Option<(usize, usize)>>,
     pub(crate) menu: Cell<bool>,
     pub(crate) generation: Cell<u32>,
@@ -14,8 +15,8 @@ impl State {
             .set(self.generation.get().wrapping_add(1).max(1));
     }
     /// Lifting the long-press contact keeps the callbacks of its visible menu valid.
-    pub(crate) fn open_menu(&self) -> bool {
-        if self.range.get().is_none() || self.menu.replace(true) {
+    pub(crate) fn open_menu(&self, selected: bool) -> bool {
+        if !selected || self.menu.replace(true) {
             return false;
         }
         self.invalidate_menu();
@@ -29,14 +30,14 @@ mod tests {
     #[test]
     fn a_visible_menu_keeps_its_generation_until_dismissed_or_selection_changes() {
         let state = State::default();
-        assert!(!state.open_menu());
+        assert!(!state.open_menu(state.range.get().is_some()));
         state.range.set(Some((0, 5)));
-        assert!(state.open_menu());
+        assert!(state.open_menu(state.range.get().is_some()));
         let shown = state.generation.get();
-        assert!(!state.open_menu());
+        assert!(!state.open_menu(state.range.get().is_some()));
         assert_eq!(state.generation.get(), shown);
         state.menu.set(false);
-        assert!(state.open_menu());
+        assert!(state.open_menu(state.range.get().is_some()));
         assert_ne!(state.generation.get(), shown);
         let reopened = state.generation.get();
         state.invalidate_menu();

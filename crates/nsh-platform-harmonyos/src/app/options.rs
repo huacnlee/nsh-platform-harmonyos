@@ -11,6 +11,12 @@ use crate::{app::environment::NshEnvironment, services::assets::AssetDirectory};
 pub struct NshOptions {
     /// Directory containing the build's `assets/` contents.
     pub asset_directory: Option<String>,
+    /// Override this app's storage directory, from the next load.
+    pub storage_directory: Option<String>,
+    /// Disk cache policy, from the next load.
+    pub cache_options: Option<NshCacheOptions>,
+    /// Allow explicit status-bar and fullscreen-video requests to manage window bars. Default true.
+    pub manages_status_bar: Option<bool>,
     /// System observations available before the app starts.
     pub environment: Option<NshEnvironment>,
     /// Interpreter stack ceiling in bytes (64 KiB through 4 MiB).
@@ -31,6 +37,59 @@ pub struct NshOptions {
     pub load_budget_ms: Option<u32>,
 }
 
+/// Disk caches use the host's cache directory unless a directory or `disabled`
+/// is supplied. Each app keeps its own directory under the cache root.
+#[napi(object)]
+#[derive(Clone, Default, PartialEq)]
+pub struct NshCacheOptions {
+    /// Absolute cache root; omitted follows the host's cache directory.
+    pub directory: Option<String>,
+    /// Disable disk caching. Default false.
+    pub disabled: Option<bool>,
+    /// Maximum downloaded image size per app, in MiB; zero disables image caching.
+    pub images_max_megabytes: Option<u32>,
+}
+impl NshCacheOptions {
+    pub(crate) fn resolve(
+        self,
+        host: &crate::app::session::Services,
+    ) -> napi_ohos::Result<nsh_engine::CacheOptions> {
+        let directory = directory(self.directory)?;
+        if self.disabled == Some(true) && directory.is_some() {
+            return Err(napi_ohos::Error::from_reason(
+                "disabled cache cannot have a directory",
+            ));
+        }
+        let location = if self.disabled == Some(true) {
+            nsh_engine::CacheLocation::Off
+        } else {
+            nsh_engine::CacheLocation::Dir(directory.unwrap_or_else(|| host.cache_directory()))
+        };
+        let mut cache = nsh_engine::CacheOptions::at(location);
+        if let Some(size) = self.images_max_megabytes {
+            cache.images = if size == 0 {
+                nsh_engine::CachePolicy::Off
+            } else {
+                nsh_engine::CachePolicy::MaxSize(nsh_core::ByteSize::mib(size as u64))
+            };
+        }
+        Ok(cache)
+    }
+}
+pub(crate) fn directory(value: Option<String>) -> napi_ohos::Result<Option<std::path::PathBuf>> {
+    value
+        .map(|value| {
+            let path = std::path::PathBuf::from(value);
+            if !path.is_absolute() || path.as_os_str().as_encoded_bytes().contains(&0) {
+                return Err(napi_ohos::Error::from_reason(
+                    "directory must be an absolute path",
+                ));
+            }
+            Ok(path)
+        })
+        .transpose()
+}
+
 pub(crate) struct Config {
     pub(crate) host: Arc<crate::app::session::Services>,
     pub(crate) assets: Arc<dyn crate::services::assets::StreamAssets>,
@@ -39,20 +98,23 @@ pub(crate) struct Config {
     pub(crate) environment: NshEnvironment,
     pub(crate) channel: nsh_engine::HostChannel,
     pub(crate) host_tokens: Option<nsh_engine::Tokens>,
+    pub(crate) storage: Option<std::path::PathBuf>,
+    pub(crate) cache: nsh_engine::CacheOptions,
+    pub(crate) manages_status_bar: bool,
 }
 impl Config {
     pub(crate) fn new(
         host: Arc<crate::app::session::Services>,
         options: NshOptions,
     ) -> napi_ohos::Result<Self> {
-        let directory = options
+        let asset_directory = options
             .asset_directory
             .as_deref()
             .map(AssetDirectory::new)
             .transpose()
             .map_err(napi_ohos::Error::from_reason)?;
         let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
-            crate::services::assets::HostAssets::new(host.clone(), directory),
+            crate::services::assets::HostAssets::new(host.clone(), asset_directory),
         );
         let mut policy = nsh_engine::Policy::default();
         if let Some(grants) = &options.capabilities {
@@ -122,7 +184,12 @@ impl Config {
         environment
             .clone()
             .apply(nsh_engine::Environment::default())?;
+        let storage = directory(options.storage_directory)?;
+        let cache = options.cache_options.unwrap_or_default().resolve(&host)?;
         Ok(Self {
+            storage,
+            cache,
+            manages_status_bar: options.manages_status_bar.unwrap_or(true),
             host,
             assets,
             policy,
