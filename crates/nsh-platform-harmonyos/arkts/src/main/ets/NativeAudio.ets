@@ -47,6 +47,12 @@ function mapPoolRate(rate: number): audio.AudioRendererRate | undefined {
 }
 
 function fitsSoundPool(metadata: media.AVMetadata, duration: number, sampleRate: number): boolean {
+  // A short sound fits the pool's 1 MB decoded limit even at the worst common
+  // format (96 kHz stereo 32-bit float), and metadata may omit the track keys.
+  // Longer sounds need the metadata's actual rate and channels.
+  if (Number.isFinite(duration) && duration > 0 && duration <= 1000) {
+    return true;
+  }
   // SoundPool silently truncates decoded data at 1 MB. Unknown channel counts
   // or sample rates stay on AVPlayer; the reported stereo budget is no proof.
   if (!Number.isFinite(sampleRate) || sampleRate <= 0 ||
@@ -741,7 +747,13 @@ export class NativeAudio {
         } else if (state === "prepared") {
           const durationMs = Math.max(0, p.duration);
           this.releaseProbe(entry).catch(() => {});
-          this.soundLoaded(entry, durationMs, 44100, maxDurationMs, false, reply);
+          // AVMetadataExtractor is not available on every device (the
+          // avmetadatahelper service may be missing). SoundPool truncates
+          // decoded data at 1 MB; a sound of at most 1 s is safe even at the
+          // worst common decoded format (96 kHz stereo 32-bit), so try the
+          // pool and fall back to AVPlayer if its load fails.
+          const poolEligible = durationMs > 0 && durationMs <= 1000;
+          this.soundLoaded(entry, durationMs, 44100, maxDurationMs, poolEligible, reply);
         }
       });
       p.on("error", (err: BusinessError) => {
