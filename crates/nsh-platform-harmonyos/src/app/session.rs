@@ -1136,7 +1136,10 @@ pub(crate) fn environment_from_config(
             .map(str::to_owned),
         locale: (!language.is_empty()).then_some(language),
         languages: languages.filter(|list| !list.is_empty()),
-        time_zone: time_zone.filter(|tz| !tz.is_empty()),
+        // Drop identifiers this NSH does not know so the rest of the update applies.
+        // NshEnvironment::apply stays strict for explicit JS setEnvironment overrides.
+        time_zone: time_zone
+            .filter(|tz| !tz.is_empty() && nsh_core::platform::TimeZone::parse(tz).is_some()),
         regional_locale: regional_locale.filter(|tag| !tag.is_empty()),
         hour_cycle,
         ..NshEnvironment::default()
