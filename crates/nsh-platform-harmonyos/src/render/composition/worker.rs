@@ -1232,6 +1232,20 @@ impl Composite {
     pub(crate) fn surface(&self) -> Option<String> {
         self.surface.borrow().clone()
     }
+    pub(crate) fn is_ready(&self, owner: &Node) -> bool {
+        if owner.scene_active() {
+            owner
+                .scene
+                .borrow()
+                .as_ref()
+                .is_some_and(|scene| scene.has_output())
+        } else {
+            self.presentation
+                .borrow()
+                .as_ref()
+                .is_some_and(super::presentation::Presentation::is_revealed)
+        }
+    }
     pub(crate) fn ready(&self) -> bool {
         let surface = self.shared.state.lock().unwrap().surface.take();
         let initialized = surface.is_some();
@@ -1259,9 +1273,9 @@ impl Composite {
                         .and_then(|()| layer.reveal())
                 };
                 match result {
-                    Ok(()) => {
+                    Ok(revealed) => {
                         drop(presentation);
-                        return initialized;
+                        return initialized || revealed;
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
                 }

@@ -42,6 +42,9 @@ impl Scene {
             requirements: RefCell::default(),
         }
     }
+    pub(crate) fn has_output(&self) -> bool {
+        self.bitmaps.borrow().iter().any(Option::is_some)
+    }
     pub(crate) fn require(&self, node: &Rc<Node>) {
         let required = requires_scene(&node.style.borrow())
             || node.id != nsh_core::ROOT_ID
@@ -209,6 +212,7 @@ impl Scene {
             return Ok(());
         }
         if let Some(frames) = frames {
+            let was_empty = !self.has_output();
             let mut bitmaps = self.bitmaps.borrow_mut();
             let max_id = frames
                 .iter()
@@ -239,10 +243,21 @@ impl Scene {
                     bitmaps[idx] = None;
                 }
             }
+            let has_output = bitmaps.iter().any(Option::is_some);
+            drop(bitmaps);
             for root in self.roots.borrow().iter().filter_map(Weak::upgrade) {
                 root.mounted()
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedRender)?;
+            }
+            if was_empty
+                && has_output
+                && let Some(root) = self.root.upgrade()
+            {
+                let composites = root.composite_nodes.borrow().clone();
+                for node in composites.into_iter().filter_map(|w| w.upgrade()) {
+                    node.update_wrapper()?;
+                }
             }
         }
         Ok(())

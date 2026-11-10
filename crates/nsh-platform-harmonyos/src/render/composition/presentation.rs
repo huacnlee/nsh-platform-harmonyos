@@ -49,12 +49,17 @@ impl Presentation {
         Ok(layer)
     }
 
-    pub(super) fn reveal(&mut self) -> Result<()> {
+    pub(super) fn is_revealed(&self) -> bool {
+        self.revealed
+    }
+
+    pub(super) fn reveal(&mut self) -> Result<bool> {
         if !self.revealed {
             self.surface.native.borrow().opacity(1.0)?;
             self.revealed = true;
+            return Ok(true);
         }
-        Ok(())
+        Ok(false)
     }
 
     pub(super) fn hide(&self) {

@@ -138,6 +138,7 @@ pub(crate) struct ViewOptions {
     pub hue: f64,
     pub texture_surface: Option<String>,
     pub texture_insets: Option<TextureInsets>,
+    pub texture_ready: bool,
     pub test_id: Option<String>,
     pub semantic: bool,
     pub clickable: bool,

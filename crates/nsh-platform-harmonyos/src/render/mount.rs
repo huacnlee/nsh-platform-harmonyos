@@ -145,7 +145,7 @@ impl Mounter {
         if let Some(scene) = self.scene.borrow().as_ref() {
             scene.ready()?;
         }
-        Ok(())
+        self.flush_arkui()
     }
     pub(crate) fn composite_ready(&self, id: NodeId, generation: u32) -> Result<()> {
         if let Some(worker) = self.compositor.borrow().as_ref() {

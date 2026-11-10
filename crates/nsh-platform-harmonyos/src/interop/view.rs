@@ -370,6 +370,11 @@ impl Wrapper {
                 .as_ref()
                 .map(|composite| composite.insets()),
             texture_surface,
+            texture_ready: self
+                .composite
+                .borrow()
+                .as_ref()
+                .is_some_and(|composite| composite.is_ready(owner)),
             target_id,
             test_id: owner.interaction.test_id(),
             width: frame.width as f64,

@@ -357,6 +357,7 @@ export interface ViewOptions {
   hue: number
   textureSurface?: string
   textureInsets?: TextureInsets
+  textureReady: boolean
   testId?: string
   semantic: boolean
   clickable: boolean

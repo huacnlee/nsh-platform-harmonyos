@@ -28,6 +28,7 @@ interface ViewMenu {
 export interface Settings {
   textureSurface?: string | null;
   textureInsets?: TextureInsets | null;
+  textureReady?: boolean;
   targetId: number;
   testId?: string | null;
   width: number;
@@ -332,6 +333,7 @@ class ViewEntry {
   private disposePending: boolean = false;
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
+  private backdropTimer?: number;
   private pointerPosting: PointerPosting;
   private retirement: NativeRetirement = new NativeRetirement();
   constructor(
@@ -377,7 +379,24 @@ class ViewEntry {
     } catch (_) {}
     return undefined;
   }
+  private clearBackdropTimer(): void {
+    if (this.backdropTimer !== undefined) {
+      clearTimeout(this.backdropTimer);
+      this.backdropTimer = undefined;
+    }
+  }
+  private scheduleBackdropRelease(delayMs: number): void {
+    if (!this.state.backdrop) {
+      return;
+    }
+    this.clearBackdropTimer();
+    this.backdropTimer = setTimeout((): void => {
+      this.backdropTimer = undefined;
+      this.releaseBackdrop();
+    }, delayMs);
+  }
   releaseBackdrop(): void {
+    this.clearBackdropTimer();
     const backdrop = this.state.backdrop;
     if (!backdrop) {
       return;
@@ -420,9 +439,7 @@ class ViewEntry {
         throw new Error("Native wrapper attachment was rejected");
       }
       if (this.state.backdrop) {
-        setTimeout((): void => {
-          this.releaseBackdrop();
-        }, 180);
+        this.scheduleBackdropRelease(this.settings.textureReady === true ? 60 : 2000);
       }
       this.syncMenu();
     } catch (error) {
@@ -441,6 +458,9 @@ class ViewEntry {
       throw new Error("Native wrapper target cannot change");
     }
     this.state.settings = settings;
+    if (this.state.backdrop && settings.textureReady === true) {
+      this.scheduleBackdropRelease(60);
+    }
     const params: ViewParameters = { entry: this, settings: settings };
     this.sdkBusy = true;
     try {
