@@ -18,12 +18,17 @@ nsh-engine = { version = "0.4", default-features = false }
 nsh-base = { version = "0.4", default-features = false }
 nsh-package = "0.4"
 nsh-dev = "0.4"
+nsh-testing = { version = "0.4", default-features = false }
+serde = { version = "1", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png"] }
+ctrlc = { version = "3", features = ["termination"] }
 
 anyhow = "1"
 base64 = "0.22"
 getrandom = "0.3"
 log = "0.4"
 percent-encoding = "2.3"
+quick-xml = { version = "0.42", features = ["serialize"] }
 rustc-hash = "2.1"
 serde_json = "1"
 thiserror = "2"
@@ -73,6 +78,8 @@ opt-level = 3
 # extension points (longbridge/nsh#1393) are on `main` and not in a release yet.
 # To build against a local checkout, give each a `path = "<checkout>/crates/<name>"`.
 [patch.crates-io]
+nsh-testing = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
+nsh-bundler = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
 nsh-core = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
 nsh-engine = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }
 nsh-base = { git = "https://github.com/longbridge/nsh", rev = "c5214aaf4bbdf33bc1d59e9595e009b6aa54d702" }

@@ -23,6 +23,10 @@ pub(crate) struct Step {
 }
 
 impl Live {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_finishing(&self, now: f64) -> bool {
+        self.inner.deadline(now).is_some()
+    }
     pub(crate) fn text_color(&self) -> Option<nsh_core::Color> {
         self.text_color
     }

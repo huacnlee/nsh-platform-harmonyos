@@ -74,6 +74,10 @@ pub(crate) struct Scroller {
 }
 
 impl Scroller {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_animating(&self) -> bool {
+        self.phase.get() != 0 || self.zoom_motion.get().is_some()
+    }
     pub(crate) fn mounted(&self) -> NativeNode {
         self.overlay
             .borrow()

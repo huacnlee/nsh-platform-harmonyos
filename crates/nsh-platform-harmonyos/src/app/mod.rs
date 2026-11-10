@@ -9,6 +9,8 @@ pub(crate) mod options;
 pub(crate) mod runtime;
 pub(crate) mod session;
 pub(crate) mod surface;
+#[cfg(feature = "dev")]
+pub(crate) mod testing;
 pub(crate) mod trust;
 
 pub use crate::scroll::NshScrollHandle;

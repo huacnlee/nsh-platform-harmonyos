@@ -387,6 +387,7 @@ function editorContent(entry: EditorEntry) {
 
 // Failed retirement cannot release a BuilderNode still borrowed by native code.
 const quarantinedEditors: Set<EditorEntry> = new Set();
+let activeEditor: EditorEntry | undefined;
 
 interface EditMenuParams {
   entry: EditorEntry;
@@ -659,6 +660,7 @@ class EditorEntry {
   private appearedPending: boolean = false;
   private disposePending: boolean = false;
   private focusedOnce: boolean = false;
+  private focusRequested: boolean = false;
   private context: NshRuntimeContext;
   private sizePending: boolean = false;
   private contentWidth: number = -1;
@@ -681,6 +683,8 @@ class EditorEntry {
     this.settings = settings;
     this.text = settings.text;
     this.count = settings.count;
+    this.selStart = settings.text.length;
+    this.selEnd = settings.text.length;
     this.node = new BuilderNode<[EditorEntry]>(context.getUIContext());
   }
   create(): void {
@@ -723,7 +727,15 @@ class EditorEntry {
       throw new Error("Editor replacement requires a new generation");
     }
     if (settings.count === this.count) {
+      const prevLen = this.text.length;
       this.text = settings.text;
+      if (this.selStart >= prevLen && this.selEnd >= prevLen) {
+        this.selStart = this.text.length;
+        this.selEnd = this.text.length;
+      } else {
+        this.selStart = Math.min(this.selStart, this.text.length);
+        this.selEnd = Math.min(Math.max(this.selStart, this.selEnd), this.text.length);
+      }
     }
     this.settings = settings;
     this.refresh();
@@ -747,8 +759,8 @@ class EditorEntry {
   // Both soft and hardware editing use these SDK callbacks. The native key
   // event path handles shortcuts/KeyDown independently and never emits KeyPress.
   editKey(key: string): void {
-    for (const character of key === "Backspace" ? [key] : Array.from(key)) {
-      this.emit("key", character);
+    for (const character of key === "Backspace" || key === "Enter" ? [key] : Array.from(key)) {
+      this.emit("key", character === "\n" ? "Enter" : character);
     }
   }
   canEdit(): boolean {
@@ -975,6 +987,13 @@ class EditorEntry {
   markMenuInteraction(): void {
     this.menuInteracting = true;
   }
+  blurFromOther(): void {
+    if (!this.focused || this.closed) {
+      return;
+    }
+    this.menuInteracting = false;
+    this.emit("blur");
+  }
   emit(
     kind: string,
     text = "",
@@ -1008,12 +1027,19 @@ class EditorEntry {
     }
     if (kind === "focus") {
       this.menuInteracting = false;
-    }
-    if (kind === "focus" || kind === "blur") {
-      this.focused = kind === "focus";
-      if (!this.focused) {
-        this.closeEditMenu();
+      if (activeEditor && activeEditor !== this) {
+        activeEditor.blurFromOther();
       }
+      activeEditor = this;
+      this.focused = true;
+      this.caretIndex = -1;
+      this.scheduleSize();
+    } else if (kind === "blur") {
+      if (activeEditor === this) {
+        activeEditor = undefined;
+      }
+      this.focused = false;
+      this.closeEditMenu();
       this.caretIndex = -1;
       this.scheduleSize();
     }
@@ -1034,8 +1060,12 @@ class EditorEntry {
     if (this.sdkBusy || !this.attached || this.closed || !this.context.isActive()) {
       return;
     }
-    if (this.appearedPending && !this.focusedOnce && this.settings.autoFocus) {
+    if (
+      this.appearedPending &&
+      ((!this.focusedOnce && this.settings.autoFocus) || this.focusRequested)
+    ) {
       this.focusedOnce = true;
+      this.focusRequested = false;
       try {
         this.context
           .getUIContext()
@@ -1046,13 +1076,18 @@ class EditorEntry {
   }
   command(command: EditorCommand): void {
     if (command.kind === "focus") {
+      this.focusRequested = true;
       try {
         this.context
           .getUIContext()
           .getFocusController()
           .requestFocus(`nsh-editor-${this.settings.targetId}`);
       } catch {}
+      if (!this.focused) {
+        this.emit("focus");
+      }
     } else if (command.kind === "blur") {
+      this.focusRequested = false;
       try {
         if (this.settings.multiline && !this.settings.secure) {
           this.area.stopEditing();
@@ -1060,6 +1095,9 @@ class EditorEntry {
           this.line.stopEditing();
         }
       } catch {}
+      if (this.focused) {
+        this.emit("blur");
+      }
     } else if (command.kind === "scroll") {
       if (this.settings.multiline && !this.settings.secure) {
         this.revealCaret = false;
@@ -1076,8 +1114,57 @@ class EditorEntry {
           this.line.setTextSelection(command.start, command.end);
         }
       } catch {}
+    } else if (command.kind === "select-all") {
+      const end = this.text.length;
+      this.selStart = 0;
+      this.selEnd = end;
+      this.updating = true;
+      try {
+        if (this.settings.multiline && !this.settings.secure) {
+          this.area.setTextSelection(0, end);
+        } else {
+          this.line.setTextSelection(0, end);
+        }
+      } catch {} finally {
+        this.updating = false;
+      }
+      this.selection(0, end);
     } else if (command.kind === "insert") {
       this.insertText(command.text ?? "");
+    } else if (command.kind === "type") {
+      if (!this.canEdit() || this.closed) {
+        return;
+      }
+      let typed = command.text ?? "";
+      if (digitsOnly(this.settings.keyboard)) {
+        typed = typed.replace(/\D/g, "");
+      }
+      if (typed.length > 0) {
+        this.editKey(typed);
+        this.insertText(typed);
+      }
+    } else if (command.kind === "backspace") {
+      this.deleteBackward();
+    } else if (command.kind === "return-newline") {
+      if (!this.canEdit() || this.closed) {
+        return;
+      }
+      this.editKey("Enter");
+      this.insertText("\n");
+    } else if (command.kind === "return") {
+      this.submit();
+      if (this.settings.blurOnSubmit) {
+        try {
+          if (this.settings.multiline && !this.settings.secure) {
+            this.area.stopEditing();
+          } else {
+            this.line.stopEditing();
+          }
+        } catch {}
+        if (this.focused) {
+          this.emit("blur");
+        }
+      }
     } else if (command.kind === "open-edit-menu") {
       this.openEditMenu(command.x, command.y, command.width, command.height, command.actions ?? []);
     } else if (command.kind === "close-edit-menu") {
@@ -1092,33 +1179,17 @@ class EditorEntry {
     }
     const controller: TextContentControllerBase =
       this.settings.multiline && !this.settings.secure ? this.area : this.line;
-    let start = Math.min(this.text.length, this.selStart);
-    let end = Math.min(this.text.length, Math.max(start, this.selEnd));
-    try {
-      const range = controller.getSelection();
-      if (
-        range &&
-        typeof range.start === "number" &&
-        typeof range.end === "number" &&
-        range.start >= 0 &&
-        range.end >= range.start
-      ) {
-        start = Math.min(this.text.length, range.start);
-        end = Math.min(this.text.length, range.end);
-      } else {
-        const caret = controller.getCaretOffset();
-        if (caret && typeof caret.index === "number" && caret.index >= 0) {
-          start = Math.min(this.text.length, caret.index);
-          end = start;
-        }
-      }
-    } catch {}
+    const start = Math.min(this.text.length, this.selStart);
+    const end = Math.min(this.text.length, Math.max(start, this.selEnd));
     const maxLen = this.settings.maxLength;
     const room =
       maxLen != null ? Math.max(0, maxLen - (this.text.length - (end - start))) : inserted.length;
     const clipped = inserted.slice(0, room);
     const next = this.text.slice(0, start) + clipped + this.text.slice(end);
     const caret = start + clipped.length;
+    this.selStart = caret;
+    this.selEnd = caret;
+    this.updating = true;
     try {
       if (end > start) {
         controller.deleteText({ start, end });
@@ -1126,20 +1197,59 @@ class EditorEntry {
       if (clipped.length > 0) {
         controller.addText(clipped, { offset: start });
       }
-    } catch {}
-    if (this.text !== next) {
-      this.change(next);
-    }
-    this.selStart = caret;
-    this.selEnd = caret;
-    try {
       if (this.settings.multiline && !this.settings.secure) {
         this.area.setTextSelection(caret, caret);
       } else {
         this.line.setTextSelection(caret, caret);
       }
-    } catch {}
+    } catch {} finally {
+      this.updating = false;
+    }
+    if (this.text !== next) {
+      this.text = next;
+      this.emit("change", next);
+    }
     this.selection(caret, caret);
+    this.refresh();
+  }
+  deleteBackward(): void {
+    if (!this.canEdit() || this.closed) {
+      return;
+    }
+    this.editKey("Backspace");
+    const controller: TextContentControllerBase =
+      this.settings.multiline && !this.settings.secure ? this.area : this.line;
+    const start = Math.min(this.text.length, this.selStart);
+    const end = Math.min(this.text.length, Math.max(start, this.selEnd));
+    let delStart = start;
+    if (end === start && start > 0) {
+      const before = Array.from(this.text.slice(0, start));
+      const popped = before.pop() ?? "";
+      delStart = start - popped.length;
+    }
+    if (end === delStart) {
+      return;
+    }
+    const next = this.text.slice(0, delStart) + this.text.slice(end);
+    this.selStart = delStart;
+    this.selEnd = delStart;
+    this.updating = true;
+    try {
+      controller.deleteText({ start: delStart, end });
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(delStart, delStart);
+      } else {
+        this.line.setTextSelection(delStart, delStart);
+      }
+    } catch {} finally {
+      this.updating = false;
+    }
+    if (this.text !== next) {
+      this.text = next;
+      this.emit("change", next);
+    }
+    this.selection(delStart, delStart);
+    this.refresh();
   }
   chooseEditAction(action: string): void {
     this.menuInteracting = false;
@@ -1268,6 +1378,9 @@ class EditorEntry {
   dispose(cleanup: NshRuntimeContext = this.context): void {
     if (this.disposed) {
       return;
+    }
+    if (activeEditor === this) {
+      activeEditor = undefined;
     }
     this.closed = true;
     try {

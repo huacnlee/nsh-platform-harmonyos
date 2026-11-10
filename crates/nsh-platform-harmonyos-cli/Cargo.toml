@@ -15,4 +15,13 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+quick-xml.workspace = true
 serde_json.workspace = true
+serde.workspace = true
+nsh-core.workspace = true
+nsh-engine = { workspace = true, features = ["js"] }
+nsh-base.workspace = true
+nsh-dev = { workspace = true, features = ["server"] }
+nsh-testing = { workspace = true, features = ["bundle", "agent"] }
+image.workspace = true
+ctrlc.workspace = true

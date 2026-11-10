@@ -198,6 +198,7 @@ impl State {
     #[cfg(feature = "dev")]
     fn disconnect_dev(&mut self) {
         self.dev = None;
+        self.errors.testing(None);
         self.errors.overlay(None);
         // Dropping the client disconnects its worker. The next connection gets
         // a new token, so queued replies from the old client cannot replace it.
@@ -251,10 +252,163 @@ impl State {
                     overlay.connection(true);
                 }
             }
-            DevEvent::Testing
-            | DevEvent::Step { .. }
-            | DevEvent::TestSetup { .. }
-            | DevEvent::Fetch { .. } => {}
+            DevEvent::Testing => {
+                let testing =
+                    crate::app::testing::Session::new(&self.config()?.host.cache_directory())?;
+                self.errors.testing(Some(&testing.model));
+                self.dev.as_mut().unwrap().testing = Some(testing);
+            }
+            DevEvent::TestSetup {
+                storage,
+                trace,
+                environment,
+            } => {
+                let dev = self.dev.as_ref().unwrap();
+                if let Some(testing) = &dev.testing {
+                    let client = Arc::downgrade(&dev.client);
+                    testing.model.set_up(
+                        storage,
+                        trace,
+                        environment,
+                        Arc::new(move |outgoing| {
+                            if let Some(client) = client.upgrade() {
+                                use nsh_testing::agent::Outgoing;
+                                match outgoing {
+                                    Outgoing::Fetch(id, request) => client.fetch(id, request),
+                                    Outgoing::Cancel(id) => client.fetch_cancel(id),
+                                    Outgoing::Trace(items) => client.trace(items),
+                                }
+                            }
+                        }),
+                    );
+                }
+            }
+            DevEvent::Fetch { id, reply } => {
+                if let Some(testing) = &self.dev.as_ref().unwrap().testing {
+                    testing.model.fetch_reply(id, reply);
+                }
+            }
+            DevEvent::Step { id, step } => {
+                use nsh_dev::protocol::{SceneQuery, StepOutcome, TestStep};
+                if matches!(step, TestStep::Quit) {
+                    let client = self.dev.as_ref().unwrap().client.clone();
+                    let runtime = self.phase.take_runtime();
+                    let closed = runtime.as_ref().map(Runtime::test_close).transpose()?;
+                    drop(runtime);
+                    self.dev.as_mut().unwrap().testing = None;
+                    // Joining the engine must never hold the ArkUI thread. Reply
+                    // after its filesystem users have retired, before hdc stops us.
+                    std::thread::spawn(move || {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(10);
+                        while closed
+                            .as_ref()
+                            .is_some_and(|closed| !closed.load(Ordering::Acquire))
+                            && std::time::Instant::now() < deadline
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                        let outcome = if closed
+                            .as_ref()
+                            .is_some_and(|closed| !closed.load(Ordering::Acquire))
+                        {
+                            StepOutcome::Failed {
+                                message: "the test engine did not stop".into(),
+                            }
+                        } else {
+                            StepOutcome::Done {
+                                value: serde_json::Value::Null,
+                            }
+                        };
+                        client.step_done(id, outcome);
+                    });
+                    return Ok(());
+                }
+                let result = (|| -> std::result::Result<serde_json::Value, String> {
+                    let testing = self
+                        .dev
+                        .as_ref()
+                        .unwrap()
+                        .testing
+                        .as_ref()
+                        .ok_or("the surface runs no test session")?;
+                    if let Some(answer) = nsh_testing::agent::answer(&testing.model, &step) {
+                        return answer;
+                    }
+                    match step {
+                        TestStep::Scene {
+                            query: SceneQuery::Viewport,
+                        } => {
+                            let size = self.logical_size().map_err(|e| e.to_string())?;
+                            Ok(serde_json::json!([size.width, size.height]))
+                        }
+                        TestStep::Scene { query } => self
+                            .phase
+                            .runtime()
+                            .ok_or("the test app has not started")?
+                            .test_query(query),
+                        TestStep::Type { text, .. } => {
+                            self.phase
+                                .runtime()
+                                .ok_or("the test app has not started")?
+                                .test_type(&text)?;
+                            Ok(serde_json::Value::Null)
+                        }
+                        TestStep::PressKey { keys } => {
+                            self.phase
+                                .runtime()
+                                .ok_or("the test app has not started")?
+                                .test_key(&keys)?;
+                            Ok(serde_json::Value::Null)
+                        }
+                        TestStep::Paste {
+                            text,
+                            html,
+                            files,
+                            uris,
+                            ..
+                        } => {
+                            let mut content = nsh_core::PasteEvent::new(text);
+                            content.html = html;
+                            content.files = files
+                                .into_iter()
+                                .map(|f| nsh_core::PastedFile::new(f.name, f.mime, f.data))
+                                .collect();
+                            content.uris = uris;
+                            self.phase
+                                .runtime()
+                                .ok_or("the test app has not started")?
+                                .test_paste(content)?;
+                            Ok(serde_json::Value::Null)
+                        }
+                        TestStep::SetColorScheme { dark } => {
+                            let changes = NshEnvironment {
+                                color_scheme: Some(if dark { "dark" } else { "light" }.into()),
+                                ..Default::default()
+                            };
+                            self.config_mut()
+                                .map_err(|e| e.to_string())?
+                                .environment
+                                .merge(changes.clone());
+                            self.phase
+                                .runtime()
+                                .ok_or("the test app has not started")?
+                                .set_environment(changes)
+                                .map_err(|e| e.to_string())?;
+                            Ok(serde_json::Value::Null)
+                        }
+                        _ => Err(
+                            "this surface answers scene queries; test input is injected by hdc"
+                                .into(),
+                        ),
+                    }
+                })();
+                let outcome = match result {
+                    Ok(value) => StepOutcome::Done { value },
+                    Err(message) => StepOutcome::Failed { message },
+                };
+                self.dev.as_ref().unwrap().client.step_done(id, outcome);
+            }
             DevEvent::Root => {
                 if let Some(root) = crate::linked::root() {
                     let config = self.config()?;
@@ -373,6 +527,10 @@ impl State {
         }
         let granted = self.config()?.policy.granted.clone();
         app.owner = self.queue.clone();
+        #[cfg(feature = "dev")]
+        {
+            app.testing = self.dev.as_ref().and_then(|dev| dev.testing.clone());
+        }
         app.grant(granted);
         self.phase = SurfacePhase::Staged(Box::new(app));
         self.errors.clear();

@@ -44,6 +44,12 @@ Features:
 - **Commits and frames** (`src/render/`): the engine submits each `MountBatch` through a N-API threadsafe function to
   the ArkUI UI thread. Per-surface `NativeVSync` callbacks drive animations on the UI thread; idle surfaces request no
   frames.
+- **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
+  CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
+  observes mount batches and provides selectors, storage, network mocks and the manual clock. ArkUI answers native
+  geometry queries on its UI thread; the CLI injects system input through hdc (`uitest` / `uinput`) and captures the
+  marked surface. A separate `.nshtest` bundle and per-open data directories isolate tests from the normal app.
+  Quit retires the engine before removing its files; the CLI stops the host and removes its reverse forward.
 - **Shaders** (`src/render/shader/`): wgpu runs on GLES only, which waits for the GPU on the calling thread, so each
   shader view renders into a native surface of its own (an XComponent first among its children) from a thread of the
   surface's (`nsh-shader`), paced by the surface's `NativeVSync`, skipping views out of sight; nothing is read back

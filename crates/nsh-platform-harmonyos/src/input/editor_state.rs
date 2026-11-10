@@ -48,6 +48,11 @@ impl State {
         self.focused = focused;
         changed
     }
+
+    #[cfg(feature = "dev")]
+    pub(crate) fn is_focused(&self) -> bool {
+        self.focused
+    }
 }
 
 /// Selection offsets use UTF-16; never split a surrogate pair in a native command.

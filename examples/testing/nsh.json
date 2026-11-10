@@ -1,0 +1,5 @@
+{
+  "name": "NSH device tests",
+  "id": "com.example.nsh.testing",
+  "capabilities": { "network": { "hosts": ["api.test"] } }
+}

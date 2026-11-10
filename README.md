@@ -56,6 +56,38 @@ In the app, the platform is `platform.name === "harmonyos"` (TSX) or `platform_n
 `platform.os` is `"android"`: HarmonyOS is not one of NSH's operating systems, and it runs apps as Android does
 (a system back gesture, a mobile idiom), so `android={{…}}` props and `platform.select({ android })` apply here too.
 
+## Device tests
+
+```sh
+nsh test examples/counter-tsx --target harmonyos --device <ID>
+nsh test examples/counter --target harmonyos --device <ID>
+nsh test examples/testing --target harmonyos --device <ID> --junit .nsh/results.xml
+```
+
+The same `*.test.tsx` / `*.test.ts` files importing `nsh/test` run on the device.
+`--filter NAME` selects test names; `--trace` prints mount batches. A test file or
+directory may be selected, including nested test directories. Given an app's
+entry, steps are read from standard input, with `app` and `expect` available.
+
+The CLI builds a host with the `dev` feature and the separate bundle ID
+`<app-id>.nshtest`, installs it once, and creates a fresh connection, storage,
+filesystem and cache for each `open`. Generated projects, reports and failure
+screenshots are under the app's `.nsh/harmonyos/test/`. For a Huawei phone,
+configure signing in that directory's `project/` for the test bundle ID; an
+OpenHarmony host can use the SDK's debug keys as above. Emulators that accept
+unsigned HAPs do not need signing configuration.
+
+Tests require a foreground, unlocked device with `uitest`, `uinput`, and a
+configured input method with its first-run prompts completed. They use system
+input; one test run owns the selected device and one app can be open at a
+time. With multiple devices, `--device` is required. NSH's model resolves selectors
+and assertions; UITest supplies the surface's screen rectangle and screenshots.
+Touches account for pixel density and the surface's screen offset. Input command
+errors and timeouts fail the test; interrupts stop the host and remove that
+session's reverse forward. Desktop window sizing, mouse and paste operations are
+not supported. An unqualified `nsh test` still runs headless; this command runs
+TypeScript tests, while Rust unit tests remain `cargo test` on the computer.
+
 ## Publishing to HarmonyOS phones
 
 HarmonyOS NEXT (5.0 and later) is built on OpenHarmony: ArkUI's C API, N-API, the NDK and the

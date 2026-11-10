@@ -38,6 +38,10 @@ pub(crate) struct Modal {
     overlay: RefCell<Option<crate::app::session::Overlay>>,
 }
 impl Modal {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_animating(&self) -> bool {
+        self.transition.borrow().is_some()
+    }
     pub(crate) fn new(owner: Weak<Node>) -> Result<Rc<Self>> {
         let dialog = Dialog::new()?;
         dialog.custom_style(true)?;

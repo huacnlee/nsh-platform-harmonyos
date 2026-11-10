@@ -1,5 +1,7 @@
 //! UI ownership of shader effects; native texture exports retain live input.
 
+#[cfg(feature = "dev")]
+use std::time::Instant;
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
@@ -28,6 +30,8 @@ struct State {
     layer: Arc<ShaderLayer>,
     active: Cell<bool>,
     navigation: Option<Rc<super::navigation::Navigation>>,
+    #[cfg(feature = "dev")]
+    transition_until: Cell<Option<Instant>>,
 }
 
 impl Effects {
@@ -80,6 +84,8 @@ impl Effects {
                 layer: layer.clone(),
                 active: Cell::new(true),
                 navigation,
+                #[cfg(feature = "dev")]
+                transition_until: Cell::new(None),
             },
         );
         {
@@ -242,19 +248,37 @@ impl Effects {
     }
 
     pub(super) fn transition(&self, id: NodeId, duration: Duration) {
-        let target = self
-            .views
-            .borrow()
-            .get(&id)
-            .and_then(|state| state.target.upgrade());
-        if let Some(target) = target
-            && !target.platform.get().reduce_motion
+        let views = self.views.borrow();
+        let Some(state) = views.get(&id) else {
+            return;
+        };
+        let Some(target) = state.target.upgrade() else {
+            return;
+        };
+        if !target.platform.get().reduce_motion
             && let Some(wrapper) = target.wrapper.borrow().as_ref()
             && let Some(composite) = wrapper.composite.borrow().as_ref()
         {
+            #[cfg(feature = "dev")]
+            if !duration.is_zero() {
+                state.transition_until.set(Some(Instant::now() + duration));
+            }
             composite.shader_transition(id, duration);
+            drop(views);
             target.animator.request_frame();
         }
+    }
+
+    #[cfg(feature = "dev")]
+    pub(super) fn animating(&self) -> bool {
+        let now = Instant::now();
+        self.views.borrow().values().any(|state| {
+            state.navigation.as_ref().is_some_and(|nav| nav.running())
+                || state
+                    .transition_until
+                    .get()
+                    .is_some_and(|until| now < until)
+        })
     }
 
     pub(super) fn frame(&self) -> Result<bool> {

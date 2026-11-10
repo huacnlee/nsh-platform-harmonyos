@@ -23,6 +23,8 @@ use crate::{
     },
 };
 struct Alert {
+    #[cfg(feature = "dev")]
+    buttons: Vec<(String, NativeNode)>,
     id: u32,
     dialog: Dialog,
     root: NativeNode,
@@ -49,6 +51,36 @@ pub(crate) struct Dialogs {
     overlay: Option<crate::app::session::Overlay>,
 }
 impl Dialogs {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_point(
+        &self,
+        button: Option<&str>,
+        origin: (i32, i32),
+        scale: f32,
+    ) -> std::result::Result<Option<[f32; 2]>, String> {
+        let alert = self.alerts.front().ok_or("no dialog is open")?;
+        let Some(label) = button else {
+            return if alert.cancelable {
+                Ok(None)
+            } else {
+                Err("the dialog cannot be dismissed without choosing a button".into())
+            };
+        };
+        let (_, node) = alert
+            .buttons
+            .iter()
+            .find(|(text, _)| text == label)
+            .ok_or_else(|| format!("no dialog button {label:?}"))?;
+        let node = node.borrow();
+        let position = node
+            .layout_position_in_screen()
+            .map_err(|e| e.to_string())?;
+        let size = node.layout_size().map_err(|e| e.to_string())?;
+        Ok(Some([
+            (position.x as f32 - origin.0 as f32 + size.width as f32 * 0.5) / scale,
+            (position.y as f32 - origin.1 as f32 + size.height as f32 * 0.5) / scale,
+        ]))
+    }
     pub(crate) fn new(context: Rc<UiContext>) -> Self {
         Self {
             context,
@@ -138,6 +170,8 @@ impl Dialogs {
         }
         let mut ordered: Vec<_> = request.buttons.iter().enumerate().collect();
         ordered.sort_by_key(|(_, button)| button.style == DialogButtonStyle::Cancel);
+        #[cfg(feature = "dev")]
+        let mut test_buttons = Vec::new();
         for (index, button) in ordered {
             if request.sheet && button.style == DialogButtonStyle::Cancel {
                 let gap = Column::new()?.into_node();
@@ -171,6 +205,8 @@ impl Dialogs {
                     });
                 }
             });
+            #[cfg(feature = "dev")]
+            test_buttons.push((button.text.to_string(), node.clone()));
             column.borrow_mut().add_child(node)?;
             height += action_height;
         }
@@ -198,6 +234,8 @@ impl Dialogs {
             true
         })?;
         self.alerts.push_back(Alert {
+            #[cfg(feature = "dev")]
+            buttons: test_buttons,
             id,
             dialog,
             root,

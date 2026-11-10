@@ -20,7 +20,8 @@ use crate::app::{
 mod presentation;
 
 pub(crate) struct Session {
-    _client: Arc<DevClient>,
+    pub(crate) client: Arc<DevClient>,
+    pub(crate) testing: Option<Arc<crate::app::testing::Session>>,
     pub(crate) latest: Option<((u64, u64), Bundle)>,
     pub(crate) running: Option<(u64, u64)>,
     pub(crate) origin: String,
@@ -55,8 +56,11 @@ impl Session {
                     device: "HarmonyOS".into(),
                     platform: HostPlatform::Android,
                     bytecode_version: nsh_engine::BYTECODE_VERSION.into(),
-                    ui_sets: vec!["nsh/base".into()],
-                    tests: false,
+                    ui_sets: crate::ui_sets()
+                        .iter()
+                        .filter_map(|set| set.specifier().map(str::to_owned))
+                        .collect(),
+                    tests: true,
                 },
                 move |event| {
                     if let Some(queue) = callback_queue.upgrade() {
@@ -71,7 +75,8 @@ impl Session {
         );
         CLIENTS.lock().unwrap().push(Arc::downgrade(&client));
         Ok(Self {
-            _client: client,
+            client,
+            testing: None,
             latest: None,
             running: None,
             origin: origin.to_string(),

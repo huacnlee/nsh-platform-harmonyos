@@ -39,6 +39,50 @@ pub(crate) struct Input {
     hit_test: Cell<u32>,
 }
 impl Input {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_text(&self) -> String {
+        self.state.borrow().text.clone()
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn is_focused(&self) -> bool {
+        self.state.borrow().is_focused()
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_type(&self, text: &str) {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
+            && let Some(target_id) = self.target_id()
+        {
+            owner.editor_command(EditorCommand {
+                target_id,
+                kind: "type".into(),
+                text: Some(text.to_owned()),
+                ..Default::default()
+            });
+        }
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_key(&self, kind: &str) {
+        let command =
+            if kind == "return" && self.config.borrow().submit() == SubmitBehavior::Newline {
+                "return-newline"
+            } else {
+                kind
+            };
+        self.command(command, 0, 0);
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_paste(&self, content: nsh_core::PasteEvent) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
+            let text = content.text.clone();
+            let report_only =
+                self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report;
+            owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(content)));
+            if !report_only && self.config.borrow().editable && !text.is_empty() {
+                self.insert_text(text)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn new(owner: Weak<Node>) -> Result<Rc<Self>> {
         let node = owner.upgrade().ok_or(Error::InvalidNode(0))?;
         let target = NativeAttachment::new(&node.native)?;
@@ -236,7 +280,11 @@ impl Input {
                     ("height", PayloadValue::Number(event.height)),
                 ]),
             ),
-            "key" if event.text == "Backspace" || event.text.chars().count() == 1 => {
+            "key"
+                if event.text == "Backspace"
+                    || event.text == "Enter"
+                    || event.text.chars().count() == 1 =>
+            {
                 self.key(&owner, &event.text)
             }
             _ => {}

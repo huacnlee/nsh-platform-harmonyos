@@ -33,11 +33,17 @@ struct ErrorState {
     callback: Option<ErrorCallback>,
     #[cfg(feature = "dev")]
     overlay: Option<std::rc::Weak<crate::app::dev::Overlay>>,
+    #[cfg(feature = "dev")]
+    testing: Option<std::sync::Weak<nsh_testing::agent::Model>>,
 }
 impl Errors {
     pub(crate) fn report(&self, message: String) {
         log::error!("OHOS surface: {message}");
         let mut errors = self.0.borrow_mut();
+        #[cfg(feature = "dev")]
+        if let Some(model) = errors.testing.as_ref().and_then(std::sync::Weak::upgrade) {
+            model.error(message.clone());
+        }
         errors.last = message.clone();
         #[cfg(feature = "dev")]
         if let Some(overlay) = errors.overlay.as_ref().and_then(std::rc::Weak::upgrade) {
@@ -61,6 +67,10 @@ impl Errors {
         }
     }
     #[cfg(feature = "dev")]
+    pub(crate) fn testing(&self, model: Option<&Arc<nsh_testing::agent::Model>>) {
+        self.0.borrow_mut().testing = model.map(Arc::downgrade);
+    }
+    #[cfg(feature = "dev")]
     pub(crate) fn overlay(&self, overlay: Option<&Rc<crate::app::dev::Overlay>>) {
         self.0.borrow_mut().overlay = overlay.map(Rc::downgrade);
     }
@@ -82,6 +92,7 @@ impl Errors {
         #[cfg(feature = "dev")]
         {
             state.overlay = None;
+            state.testing = None;
         }
     }
 }
@@ -250,6 +261,10 @@ fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
 }
 
 struct State {
+    #[cfg(feature = "dev")]
+    testing: Option<Arc<crate::app::testing::Session>>,
+    #[cfg(feature = "dev")]
+    test_closed: Arc<std::sync::atomic::AtomicBool>,
     self_ref: std::rc::Weak<RefCell<Self>>,
     parent: std::rc::Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     engine: Option<Engine>,
@@ -410,6 +425,12 @@ impl State {
                 self.mounter.as_ref().unwrap().image_progress(progress)
             }
             Message::Batch(batch) => {
+                #[cfg(feature = "dev")]
+                if let Some(testing) = &self.testing {
+                    // Scene queries also run on this UI thread, after the
+                    // native batch below finishes. No batch clone is needed.
+                    testing.model.apply(&batch);
+                }
                 self.pulse_frame_rate_vote();
                 let mounter = self
                     .mounter
@@ -418,6 +439,10 @@ impl State {
                 let result = mounter.apply(batch);
                 self.retire()?;
                 if let Err(error) = result {
+                    #[cfg(feature = "dev")]
+                    if let Some(testing) = &self.testing {
+                        testing.model.error(error.to_string());
+                    }
                     if matches!(error, crate::render::node::Error::Tree(_)) {
                         // Root creation is the only fatal mount item. Stale
                         // references and detach failures are logged by the mounter.
@@ -670,7 +695,18 @@ impl State {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
         if let Some(engine) = self.engine.take() {
-            std::thread::spawn(move || drop(engine));
+            #[cfg(feature = "dev")]
+            let testing = self.testing.take();
+            #[cfg(feature = "dev")]
+            let closed = self.test_closed.clone();
+            std::thread::spawn(move || {
+                drop(engine);
+                #[cfg(feature = "dev")]
+                {
+                    drop(testing);
+                    closed.store(true, std::sync::atomic::Ordering::Release);
+                }
+            });
         }
         if let Some(mounter) = &mut self.mounter {
             mounter.host.system.retire(&mounter.host, &self.dispatcher);
@@ -684,7 +720,13 @@ impl State {
 impl Drop for State {
     fn drop(&mut self) {
         if let Some(engine) = self.engine.take() {
-            std::thread::spawn(move || drop(engine));
+            #[cfg(feature = "dev")]
+            let testing = self.testing.take();
+            std::thread::spawn(move || {
+                drop(engine);
+                #[cfg(feature = "dev")]
+                drop(testing);
+            });
         }
         self.mounter.take();
     }
@@ -695,6 +737,8 @@ pub(crate) struct Runtime {
     _dispatcher: Arc<Dispatcher>,
 }
 pub(crate) struct App {
+    #[cfg(feature = "dev")]
+    pub(crate) testing: Option<Arc<crate::app::testing::Session>>,
     pub(crate) owner: std::sync::Weak<crate::app::surface::Queue>,
     pub(crate) app: nsh_engine::App,
     pub(crate) assets: Arc<dyn crate::services::assets::StreamAssets>,
@@ -714,6 +758,8 @@ impl App {
         assets: Arc<dyn crate::services::assets::StreamAssets>,
     ) -> Self {
         Self {
+            #[cfg(feature = "dev")]
+            testing: None,
             owner: std::sync::Weak::new(),
             app: app.into(),
             assets,
@@ -772,6 +818,10 @@ impl Runtime {
         let shader_vsync = vsync.clone();
         let state = Rc::new_cyclic(|weak| {
             RefCell::new(State {
+                #[cfg(feature = "dev")]
+                testing: app.testing.clone(),
+                #[cfg(feature = "dev")]
+                test_closed: Arc::default(),
                 self_ref: weak.clone(),
                 parent: Rc::downgrade(&parent),
                 engine: None,
@@ -852,7 +902,8 @@ impl Runtime {
         );
         let access = Arc::new(access);
         let assets = app.assets.clone();
-        let engine_config = EngineConfig {
+        #[allow(unused_mut)]
+        let mut engine_config = EngineConfig {
             app: app.app,
             viewport: size.into(),
             trace: false,
@@ -882,6 +933,14 @@ impl Runtime {
             audio: None,
             windows: None,
         };
+        #[cfg(feature = "dev")]
+        if let Some(testing) = &app.testing {
+            engine_config.data_dir = Some(testing.directory.clone());
+            engine_config.cache = nsh_engine::CacheOptions::at(nsh_engine::CacheLocation::Dir(
+                testing.directory.join("cache"),
+            ));
+            testing.model.set_up_engine(&mut engine_config);
+        }
         let host_tokens = config.host_tokens.clone();
         let host_fonts = config.fonts.clone();
         let fonts = crate::text::fonts::Fonts::new();
@@ -908,6 +967,10 @@ impl Runtime {
         .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
         images.set_disk_cache(engine.image_cache());
         let control = engine.control();
+        #[cfg(feature = "dev")]
+        if let Some(testing) = &app.testing {
+            testing.model.engine_started(control.clone());
+        }
         let context = Rc::new(crate::render::mount::UiContext {
             theme: RefCell::default(),
             cursor: Default::default(),
@@ -955,6 +1018,53 @@ impl Runtime {
         // A rejected route must still close the engine and detach its root.
         config.host.attach(Arc::downgrade(&runtime._dispatcher))?;
         Ok(runtime)
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_close(&self) -> napi_ohos::Result<Arc<std::sync::atomic::AtomicBool>> {
+        self.close()?;
+        Ok(self.state.borrow().test_closed.clone())
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_query(
+        &self,
+        query: nsh_dev::protocol::SceneQuery,
+    ) -> std::result::Result<serde_json::Value, String> {
+        let state = self.state.try_borrow().map_err(|e| e.to_string())?;
+        state
+            .mounter
+            .as_ref()
+            .ok_or("the test app has no mounted views")?
+            .test_query(query)
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_type(&self, text: &str) -> std::result::Result<(), String> {
+        let state = self.state.try_borrow().map_err(|e| e.to_string())?;
+        state
+            .mounter
+            .as_ref()
+            .ok_or("the test app has no mounted views")?
+            .test_type(text)
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_key(&self, kind: &str) -> std::result::Result<(), String> {
+        let state = self.state.try_borrow().map_err(|e| e.to_string())?;
+        state
+            .mounter
+            .as_ref()
+            .ok_or("the test app has no mounted views")?
+            .test_key(kind)
+    }
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_paste(
+        &self,
+        content: nsh_core::PasteEvent,
+    ) -> std::result::Result<(), String> {
+        let state = self.state.try_borrow().map_err(|e| e.to_string())?;
+        state
+            .mounter
+            .as_ref()
+            .ok_or("the test app has no mounted views")?
+            .test_paste(content)
     }
     pub(crate) fn resize(&self, size: Size) -> napi_ohos::Result<()> {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;

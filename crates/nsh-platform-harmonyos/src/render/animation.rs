@@ -39,6 +39,18 @@ pub(crate) struct Animator {
 }
 
 impl Animator {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_animating(&self) -> bool {
+        self.state.borrow().graph.is_finishing()
+            || self.motion.borrow().iter().any(|node| {
+                node.upgrade().is_some_and(|node| {
+                    node.live
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|live| live.test_finishing(self.frame_time.get()))
+                })
+            })
+    }
     pub(crate) fn new(
         control: EngineControl,
         dispatcher: std::sync::Weak<crate::app::runtime::Dispatcher>,

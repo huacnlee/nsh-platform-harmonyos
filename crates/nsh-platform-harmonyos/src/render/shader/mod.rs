@@ -91,6 +91,10 @@ impl Shaders {
     pub(crate) fn frame_rate(&self) -> Arc<FrameRate> {
         self.rate.clone()
     }
+    #[cfg(feature = "dev")]
+    pub(crate) fn animating(&self) -> bool {
+        self.effects.animating()
+    }
 
     pub(crate) fn new(vsync: Arc<Vsync>) -> Shaders {
         Shaders {

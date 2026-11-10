@@ -90,6 +90,11 @@ pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::R
                 .map(|m| workspace_patches(&m))
                 .filter(|p| !p.is_empty())
                 .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned());
+            let patches = if dev {
+                testing_patches(&patches, &manifest)?
+            } else {
+                patches
+            };
             (
                 format!(
                     "nsh_rust_app = {{ package = {package:?}, path = {:?} }}\n",
@@ -137,6 +142,46 @@ pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::R
          fn main() {\n    napi_build_ohos::setup();\n}\n",
     )?;
     Ok(())
+}
+
+/// The agent must use the same core/engine as the app, including when its
+/// generated workspace points to a local NSH checkout instead of crates.io.
+fn testing_patches(patches: &str, app_manifest: &str) -> anyhow::Result<String> {
+    let mut in_crates_io = false;
+    for line in patches.lines() {
+        if line.starts_with('[') {
+            in_crates_io = line.trim() == "[patch.crates-io]";
+        }
+        if in_crates_io && line.trim_start().starts_with("nsh-testing =") {
+            return Ok(patches.to_owned());
+        }
+    }
+    let patch = match value(app_manifest, "nsh-core", "path") {
+        Some(core) => format!(
+            "nsh-testing = {{ path = {:?} }}",
+            Path::new(core).with_file_name("nsh-testing")
+        ),
+        None => crate::embedded::NSH_PATCH
+            .lines()
+            .find(|line| line.starts_with("nsh-testing ="))
+            .context("the backend has no pinned nsh-testing dependency")?
+            .to_owned(),
+    };
+    let mut result = String::new();
+    let mut inserted = false;
+    for line in patches.lines() {
+        result.push_str(line);
+        result.push('\n');
+        if line.trim() == "[patch.crates-io]" {
+            result.push_str(&patch);
+            result.push('\n');
+            inserted = true;
+        }
+    }
+    if !inserted {
+        result.push_str(&format!("\n[patch.crates-io]\n{patch}\n"));
+    }
+    Ok(result)
 }
 
 /// Builds the runner in `dir` with the NDK; the library's path.
@@ -232,6 +277,11 @@ mod tests {
         assert!(!manifest.contains("features = [\"dev\"]"));
         let lib = fs::read_to_string(dir.join("runner/lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
+
+        write(&dir.join("runner-dev"), Some(&app), true).unwrap();
+        let dev_manifest = fs::read_to_string(dir.join("runner-dev/Cargo.toml")).unwrap();
+        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        assert!(dev_manifest.contains("nsh-testing = { path = \"/src/nsh/crates/nsh-testing\" }"));
 
         write(&dir.join("tsx"), None, true).unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx/Cargo.toml")).unwrap();

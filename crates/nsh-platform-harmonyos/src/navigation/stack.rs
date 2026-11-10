@@ -45,6 +45,10 @@ pub(crate) struct Screen {
     insets: Cell<Option<EdgeInsets>>,
 }
 impl Screen {
+    #[cfg(feature = "dev")]
+    pub(crate) fn test_animating(&self) -> bool {
+        self.motion.borrow().is_some()
+    }
     pub(crate) fn header(&self) -> &NativeNode {
         &self.header
     }

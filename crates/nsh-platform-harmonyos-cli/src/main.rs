@@ -25,6 +25,7 @@ mod project;
 mod runner;
 mod sdk;
 mod sign;
+mod test;
 
 use std::{
     env,
@@ -43,6 +44,7 @@ Usage (through nsh, which finds this program on PATH):
   nsh package [APP] --target harmonyos [--out DIR] [--runtime-os OS]
   nsh run [APP] --target harmonyos [--device ID] [--release]
   nsh dev [APP] --target harmonyos [--device ID] [--port PORT] [--release]
+  nsh test [PATH] --target harmonyos [--device ID] [--filter NAME] [--junit FILE]
 
 Commands:
   package   Build the app into a DevEco Studio project (default: .nsh/out/harmonyos),
@@ -51,7 +53,7 @@ Commands:
             (hdc) and start it
   dev       Build it with the development client, install and start it on a device,
             forward the dev server port (`hdc rport`) and run `nsh dev --server-only`
-  test      Not on this platform: `nsh test` runs the app's tests headless
+  test      Run the app's tests on an hdc device or emulator, using native input
 
 Options:
   -o, --out DIR          Where `package` writes the project
@@ -61,6 +63,9 @@ Options:
       --release          Build the native library optimized (`package` always does)
       --debug            Build it unoptimized (faster to build)
       --no-hap           Write the project only, without building the HAP
+      --filter NAME      Run only tests whose names contain NAME
+      --trace            Print test mount batches and timings
+      --junit FILE       Also write test results as JUnit XML
   -v, --verbose          Show cargo's and hvigor's output
   -h, --help             Show this help
   -V, --version          Show the version
@@ -83,6 +88,7 @@ struct Options {
     release: Option<bool>,
     hap: bool,
     verbose: bool,
+    test: test::Options,
 }
 
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
@@ -90,35 +96,51 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
         hap: true,
         ..Options::default()
     };
-    let mut args = args.into_iter().map(|a| a.to_string_lossy().into_owned());
+    let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
-        match arg.as_str() {
-            "-h" | "--help" => options.command = "help".into(),
-            "-V" | "--version" => options.command = "version".into(),
-            "-v" | "--verbose" => options.verbose = true,
-            "-o" | "--out" => options.out = Some(value(&arg)?.into()),
-            "--runtime-os" => options.runtime_os = project::RuntimeOs::parse(&value(&arg)?)?,
-            "--device" => options.device = Some(value(&arg)?),
-            "--port" => {
+        match arg.to_str() {
+            Some("-h" | "--help") => options.command = "help".into(),
+            Some("-V" | "--version") => options.command = "version".into(),
+            Some("-v" | "--verbose") => options.verbose = true,
+            Some("-o" | "--out") => options.out = Some(value("--out")?.into()),
+            Some("--runtime-os") => {
+                options.runtime_os = project::RuntimeOs::parse(
+                    value("--runtime-os")?
+                        .to_str()
+                        .context("--runtime-os must be UTF-8")?,
+                )?
+            }
+            Some("--device") => options.device = Some(text_arg(value("--device")?, "--device")?),
+            Some("--port") => {
                 options.port = Some(
-                    value(&arg)?
+                    text_arg(value("--port")?, "--port")?
                         .parse()
                         .context("--port must be a port number")?,
                 );
             }
-            "--release" => options.release = Some(true),
-            "--debug" => options.release = Some(false),
-            "--no-hap" => options.hap = false,
-            flag if flag.starts_with('-') => {
+            Some("--release") => options.release = Some(true),
+            Some("--debug") => options.release = Some(false),
+            Some("--no-hap") => options.hap = false,
+            Some("--filter") => {
+                options.test.filter = Some(text_arg(value("--filter")?, "--filter")?)
+            }
+            Some("--trace") => options.test.trace = true,
+            Some("--junit") => options.test.junit = Some(value("--junit")?.into()),
+            Some(flag) if flag.starts_with('-') => {
                 bail!("{flag} is not an option of the harmonyos target\n\n{USAGE}")
             }
-            _ if options.command.is_empty() => options.command = arg,
+            _ if options.command.is_empty() => options.command = text_arg(arg, "command")?,
             _ if options.app.is_none() => options.app = Some(arg.into()),
-            _ => bail!("unexpected argument {arg}\n\n{USAGE}"),
+            _ => bail!("unexpected argument {arg:?}\n\n{USAGE}"),
         }
     }
     Ok(options)
+}
+
+fn text_arg(arg: OsString, name: &str) -> anyhow::Result<String> {
+    arg.into_string()
+        .map_err(|_| anyhow::anyhow!("{name} must be UTF-8"))
 }
 
 fn main() -> ExitCode {
@@ -133,6 +155,12 @@ fn main() -> ExitCode {
 
 fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
     let options = options?;
+    if options.command != "test"
+        && options.command != "help"
+        && options.test != test::Options::default()
+    {
+        bail!("--filter, --trace and --junit are options of test");
+    }
     match options.command.as_str() {
         "" | "help" => println!("{USAGE}"),
         "version" => println!("nsh-platform-harmonyos {}", env!("CARGO_PKG_VERSION")),
@@ -211,10 +239,7 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
                 )?;
             }
         }
-        "test" => bail!(
-            "the harmonyos target runs no tests itself: `nsh test` runs the app's tests \
-             headless, on NSH's engine, as this platform runs it"
-        ),
+        "test" => test::Runner::new(&options)?.run()?,
         // Maintainers: regenerates the ArkTS declarations of the library's
         // N-API exports (`arkts/src/main/cpp/types/…/Index.d.ts`).
         "typedefs" => typedefs(options.verbose)?,
@@ -267,7 +292,8 @@ fn package(
 ) -> anyhow::Result<Packaged> {
     let config = project::AppConfig::read(app)?;
     let ndk = sdk::Ndk::find()?;
-    let build = app.join(".nsh/harmonyos/build");
+    let work = app.join(".nsh/harmonyos");
+    let build = work.join("build");
     // NSH bundles a TSX app, or writes its generated workspace with a Rust
     // app's root (`rust-app`).
     let mut nsh_build = Command::new(nsh());
@@ -283,7 +309,7 @@ fn package(
     }
     let rust_app = app.join(".nsh/rust/rust-app");
     let is_rust = is_rust_app(app) && rust_app.join("Cargo.toml").is_file();
-    let runner = app.join(".nsh/harmonyos/runner");
+    let runner = work.join("runner");
     runner::write(&runner, is_rust.then_some(rust_app.as_path()), dev)?;
     let library = runner::build(&runner, &ndk, release, options.verbose)?;
     project::write(
@@ -304,7 +330,7 @@ fn package(
 }
 
 /// Whether the app's root is a Rust component (`nsh.json` `"root"`).
-fn is_rust_app(app: &Path) -> bool {
+pub(crate) fn is_rust_app(app: &Path) -> bool {
     fs::read_to_string(app.join("nsh.json"))
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
@@ -716,6 +742,25 @@ mod tests {
 
     fn args(line: &str) -> Vec<OsString> {
         line.split_whitespace().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn device_test_arguments_are_forwarded_without_changing_paths() {
+        let options = parse(args(
+            "test examples/counter --device dev --filter counts --trace --junit report.xml",
+        ))
+        .unwrap();
+        assert_eq!(options.test.filter.as_deref(), Some("counts"));
+        assert_eq!(options.test.junit, Some("report.xml".into()));
+        assert!(options.test.trace);
+        assert!(parse(args("test --filter")).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let path = OsString::from_vec(vec![b'a', 0xff]);
+            let parsed = parse([OsString::from("test"), path.clone()]).unwrap();
+            assert_eq!(parsed.app, Some(PathBuf::from(path)));
+        }
     }
 
     #[test]

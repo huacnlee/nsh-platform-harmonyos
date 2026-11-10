@@ -1,6 +1,9 @@
 //! Applies each engine commit on the ArkUI thread. Deleted boxes stay alive
 //! until a native frame and a subsequent event-loop turn have completed.
 
+#[cfg(feature = "dev")]
+mod testing;
+
 use std::{collections::VecDeque, rc::Rc, sync::Arc};
 
 use nsh_core::{Command, MountBatch, MountItem, NodeId, ViewKind};

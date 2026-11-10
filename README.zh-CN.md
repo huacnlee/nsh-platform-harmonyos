@@ -52,6 +52,29 @@ nsh run my-app --target harmonyos                  # 构建 HAP，安装到 hdc 
 `"android"`：NSH 的操作系统列表里没有 HarmonyOS，而它运行应用的方式和 Android 一样（系统返回手势、移动端形态），所以
 `android={{…}}` 属性和 `platform.select({ android })` 在这里同样生效。
 
+## 设备测试
+
+```sh
+nsh test examples/counter-tsx --target harmonyos --device <ID>
+nsh test examples/counter --target harmonyos --device <ID>
+nsh test examples/testing --target harmonyos --device <ID> --junit .nsh/results.xml
+```
+
+直接复用导入 `nsh/test` 的 `*.test.tsx` / `*.test.ts` 用例。可以指定文件或目录，
+`--filter NAME` 按名称筛选，`--trace` 输出挂载批次。指定应用入口时，从标准输入读取步骤，
+可直接使用 `app` 和 `expect`。
+
+CLI 构建启用 `dev` 特性的独立测试宿主，包名为 `<app-id>.nshtest`，每次运行安装一次。
+每个 `open` 都有独立连接、存储、文件目录和缓存。生成工程、测试产物和失败截图保存在应用的
+`.nsh/harmonyos/test/` 下。华为真机需要在其中的 `project/` 为测试包名单独配置签名；
+OpenHarmony 可使用前述 SDK 调试签名。允许安装未签名 HAP 的模拟器无需配置签名。
+
+测试需要解锁并保持前台的设备，设备应提供 `uitest` 和 `uinput`，并先完成输入法的首次启动提示。
+同一设备由一个测试进程独占，同一时间只允许打开一个应用。连接多台设备时必须指定 `--device`。选择器和断言使用 NSH 的模型，
+UITest 提供根视图屏幕位置和截图，输入坐标会换算密度及窗口偏移。输入命令失败或超时会使测试失败；
+中断时停止宿主并移除本次端口转发。桌面窗口尺寸、鼠标及粘贴操作暂不支持。
+不带 `--target` 的 `nsh test` 仍运行无界面测试；设备命令执行 TypeScript 用例，Rust 单测继续在电脑上运行 `cargo test`。
+
 ## 发布到鸿蒙手机
 
 HarmonyOS NEXT（5.0 起）建立在 OpenHarmony 之上，两者的 ArkUI C API、N-API、NDK 和 `aarch64-unknown-linux-ohos` ABI 都一样。所以用
