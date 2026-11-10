@@ -367,8 +367,8 @@ fn package(
     let ndk = sdk::Ndk::find()?;
     let work = join_all(app, [".nsh", "harmonyos"]);
     let build = work.join("build");
-    // NSH bundles a TSX app, or writes its generated workspace with a Rust
-    // app's root (`rust-app`).
+    // NSH bundles a TSX app (and describes its crates into the generated
+    // workspace), or writes the workspace with a Rust app's root (`rust-app`).
     let mut nsh_build = Command::new(nsh());
     nsh_build.arg("build").arg(app).arg("--out").arg(&build);
     if release {
@@ -380,10 +380,24 @@ fn package(
     if !status.success() {
         bail!("nsh build failed");
     }
-    let rust_app = join_all(app, [".nsh", "rust", "rust-app"]);
-    let is_rust = is_rust_app(app) && rust_app.join("Cargo.toml").is_file();
+    let workspace = join_all(app, [".nsh", "rust"]);
+    let rust_app = workspace.join("rust-app");
+    let crates;
+    let linked = if is_rust_app(app) && rust_app.join("Cargo.toml").is_file() {
+        runner::App::Rust(&rust_app)
+    } else {
+        crates = app_crates(app)?;
+        if crates.is_empty() {
+            runner::App::Tsx
+        } else {
+            runner::App::TsxWithCrates {
+                crates: &crates,
+                workspace: &workspace,
+            }
+        }
+    };
     let runner = work.join("runner");
-    runner::write(&runner, is_rust.then_some(rust_app.as_path()), dev)?;
+    runner::write(&runner, linked, dev)?;
     let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
     project::write(
         out,
@@ -409,6 +423,36 @@ pub(crate) fn is_rust_app(app: &Path) -> bool {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .is_some_and(|json| json["root"].is_string())
+}
+
+/// The app's Rust crates (`nsh.json` `"rust"`: a directory or a list of
+/// them, relative to the app), for a TSX app whose crates export UI sets.
+fn app_crates(app: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    let text = fs::read_to_string(app.join("nsh.json")).context("reading nsh.json")?;
+    let json: serde_json::Value = serde_json::from_str(&text).context("nsh.json")?;
+    crates_of(app, &json["rust"])
+}
+
+fn crates_of(app: &Path, rust: &serde_json::Value) -> anyhow::Result<Vec<PathBuf>> {
+    let dirs: Vec<&str> = match rust {
+        serde_json::Value::Null => Vec::new(),
+        serde_json::Value::String(dir) => vec![dir],
+        serde_json::Value::Array(dirs) => dirs
+            .iter()
+            .map(|d| {
+                d.as_str()
+                    .context("nsh.json \"rust\" entries must be crate directory paths")
+            })
+            .collect::<anyhow::Result<_>>()?,
+        _ => bail!("nsh.json \"rust\" must be a crate directory or an array of them"),
+    };
+    dirs.into_iter()
+        .map(|dir| {
+            let path = app.join(dir);
+            path.canonicalize()
+                .with_context(|| format!("nsh.json \"rust\": no crate at {}", path.display()))
+        })
+        .collect()
 }
 
 fn no_deveco(out: &Path) {
@@ -863,6 +907,31 @@ mod tests {
             let parsed = parse([OsString::from("test"), path.clone()]).unwrap();
             assert_eq!(parsed.app, Some(PathBuf::from(path)));
         }
+    }
+
+    #[test]
+    fn the_app_s_rust_crates() {
+        let app = std::env::temp_dir().join(format!("nsh-hm-app-{}", std::process::id()));
+        fs::create_dir_all(join_all(&app, ["native", "charts"])).unwrap();
+        let app = app.canonicalize().unwrap();
+        let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
+        assert_eq!(
+            crates_of(&app, &json(r#"{"rust": "."}"#)["rust"]).unwrap(),
+            vec![app.clone()]
+        );
+        assert_eq!(
+            crates_of(
+                &app,
+                &json(r#"{"rust": ["native", "native/charts"]}"#)["rust"]
+            )
+            .unwrap(),
+            vec![app.join("native"), join_all(&app, ["native", "charts"])]
+        );
+        assert!(crates_of(&app, &json("{}")["rust"]).unwrap().is_empty());
+        assert!(crates_of(&app, &json(r#"{"rust": "missing"}"#)["rust"]).is_err());
+        assert!(crates_of(&app, &json(r#"{"rust": 123}"#)["rust"]).is_err());
+        assert!(crates_of(&app, &json(r#"{"rust": [1]}"#)["rust"]).is_err());
+        fs::remove_dir_all(&app).unwrap();
     }
 
     #[test]

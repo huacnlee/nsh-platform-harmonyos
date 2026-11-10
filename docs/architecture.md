@@ -29,7 +29,10 @@ Features:
 - **The linked app**: the runner, a `cdylib` named `nsh_platform_harmonyos` (the N-API module registers under the
   backend's crate name, which the library's name must match), defines `__nsh_platform_harmonyos_app` with the
   backend's `app!` macro (`linked.rs`): the UI sets and, for an app written in Rust, its root from NSH's generated
-  `nsh_rust_app`. `NshSurface.runApp()` starts it; the UI sets serve TSX bundles too.
+  `nsh_rust_app`. `NshSurface.runApp()` starts it; the UI sets serve TSX bundles too. A TSX app with Rust crates of
+  its own (`nsh.json` `"rust"` without `"root"`) has no `nsh_rust_app`: the runner depends on each crate by path and
+  serves `nsh/base`'s UI set, then each crate's `#[native_module]` `registry()` (`app!(sets = [..])`), while the
+  bundle is a raw file of the HAP as for any TSX app.
 - **Mount items** this backend does not apply yet (shader transitions, `NavShader`, `ShaderInput`) and the opt-in ones
   it does not ask for (`TreeOrder`, `ProjectStates`) are skipped (`render/mount.rs`).
 - **Streaming assets**: the video player and web views read large files through `services::assets::StreamAssets`,
