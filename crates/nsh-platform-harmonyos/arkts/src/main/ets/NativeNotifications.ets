@@ -81,9 +81,12 @@ export class NativeNotifications {
     await notification.publish({
       id: this.id(name),
       label: name,
+      // API 20 OTHER_TYPES is LEVEL_MIN: no status bar icon, banner, or sound.
+      // Silent is quieter than iOS/Android, which still show an icon. Per-notification
+      // notificationFlags can mute a visible slot only when writable at API 23.
       notificationSlotType: silent
         ? notification.SlotType.OTHER_TYPES
-        : notification.SlotType.SOCIAL_COMMUNICATION,
+        : notification.SlotType.SERVICE_INFORMATION,
       content: {
         notificationContentType: notification.ContentType.NOTIFICATION_CONTENT_BASIC_TEXT,
         normal: { title, text: body },
