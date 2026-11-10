@@ -678,21 +678,13 @@ impl System {
                 event,
             }
         } else {
-            if !request.answer && value.error.is_none() {
-                return;
-            }
             if let Some(error) = value.error.as_deref() {
                 route.send(Message::Error(format!("system service: {error}")));
             }
-            let mut fields = Vec::new();
-            if request.answer {
-                fields.push(("id", PayloadValue::Number(f64::from(request.id))));
-            }
-            value.append_fields(&mut fields);
-            if fields.is_empty() {
+            let Some(payload) = request.map_payload(value) else {
                 return;
-            }
-            EventPayload::Map(fields)
+            };
+            payload
         };
         route.send(Message::HostEvent(request.kind, payload));
     }
@@ -715,6 +707,19 @@ impl System {
                 ..Default::default()
             });
         }
+    }
+}
+
+#[cfg(target_env = "ohos")]
+impl<R> Request<R> {
+    fn map_payload(&self, value: SystemEvent) -> Option<EventPayload> {
+        let mut fields = Vec::new();
+        if self.answer {
+            fields.push(("id", PayloadValue::Number(f64::from(self.id))));
+        }
+        // Answer-less notification listeners still deliver press replies.
+        value.append_fields(&mut fields);
+        (!fields.is_empty()).then_some(EventPayload::Map(fields))
     }
 }
 
@@ -943,6 +948,35 @@ pub(crate) fn read_picked(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_env = "ohos")]
+    #[test]
+    fn answer_less_notification_listener_delivers_presses_and_skips_empty_replies() {
+        let request = Request::<()> {
+            route: std::sync::Weak::new(),
+            kind: EventKind::Notification,
+            id: 0,
+            stream: true,
+            answer: false,
+            paste: None,
+        };
+        let payload = request.map_payload(SystemEvent {
+            pressed: Some("reminder".into()),
+            ..Default::default()
+        });
+        let Some(EventPayload::Map(fields)) = payload else {
+            panic!("notification press was dropped");
+        };
+        assert!(matches!(
+            fields.as_slice(),
+            [("pressed", PayloadValue::Str(name))] if name == "reminder"
+        ));
+        assert!(request.map_payload(SystemEvent::default()).is_none());
+        let payload = request.map_payload(SystemEvent {
+            error: Some("failed".into()),
+            ..Default::default()
+        });
+        assert!(matches!(payload, Some(EventPayload::Map(_))));
+    }
     #[cfg(unix)]
     #[test]
     fn retained_descriptor_survives_sdk_close_and_keeps_original_name() {
