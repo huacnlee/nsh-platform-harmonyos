@@ -836,6 +836,8 @@ class EditorEntry {
     this.emit("edit-action", action);
   }
   private openEditMenu(x: number, y: number, actions: string[]): void {
+    // TODO: Localize the English-only labels and verify the menu anchor on a
+    // device at a non-1 density, including an editor near a screen edge.
     this.closeEditMenu();
     if (this.closed || !this.context.isActive() || actions.length === 0) {
       return;

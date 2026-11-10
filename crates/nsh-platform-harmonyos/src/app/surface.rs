@@ -1026,6 +1026,8 @@ impl NshSurface {
                         bundle,
                         package_assets.unwrap_or_else(|| config.assets.clone()),
                     );
+                    // Downloaded packages run without the resource chunk loader,
+                    // so their lazy import() chunks are not loaded yet.
                     if !is_package {
                         app.chunks = Some(chunks);
                     }

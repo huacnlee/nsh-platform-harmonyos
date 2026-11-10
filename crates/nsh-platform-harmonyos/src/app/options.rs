@@ -10,6 +10,7 @@ use crate::{app::environment::NshEnvironment, services::assets::AssetDirectory};
 #[derive(Clone, Default, PartialEq)]
 pub struct NshOptions {
     /// Directory containing the build's `assets/` contents.
+    /// Setting it also disables downloaded-package updates.
     pub asset_directory: Option<String>,
     /// Override this app's storage directory, from the next load.
     pub storage_directory: Option<String>,
