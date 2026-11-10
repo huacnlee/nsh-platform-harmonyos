@@ -1,9 +1,9 @@
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
+import { uiAppearance } from "@kit.ArkUI";
 import pasteboard from "@ohos.pasteboard";
 import image from "@ohos.multimedia.image";
 import util from "@ohos.util";
-import i18n from "@ohos.i18n";
 
 export interface EditorSettings {
   targetId: number;
@@ -446,23 +446,55 @@ async function extractPasteData(data: pasteboard.PasteData): Promise<ExtractedPa
   return { text, html, files, image: imgUri };
 }
 
-function editActionLabel(action: string): string {
-  let zh = false;
-  try {
-    zh = i18n.System.getSystemLanguage().startsWith("zh");
-  } catch {}
+// The system's own text selection menu labels, so every language the platform
+// supports is covered and the wording matches the menu a native text view shows.
+function editActionLabel(action: string): ResourceStr {
   switch (action) {
     case "cut":
-      return zh ? "剪切" : "Cut";
+      return $r("sys.string.general_cut");
     case "copy":
-      return zh ? "复制" : "Copy";
+      return $r("sys.string.general_copy");
     case "paste":
-      return zh ? "粘贴" : "Paste";
+      return $r("sys.string.general_paste");
     case "selectAll":
-      return zh ? "全选" : "Select All";
+      return $r("sys.string.general_select_all");
     default:
       return action;
   }
+}
+
+// The system keeps a separate resource for each dark color, so the menu picks
+// the pair that matches the appearance the system is showing (API 20).
+function darkMode(): boolean {
+  try {
+    return uiAppearance.getDarkMode() === uiAppearance.DarkMode.ALWAYS_DARK;
+  } catch {
+    return false;
+  }
+}
+
+function menuBackgroundColor(): ResourceColor {
+  return darkMode()
+    ? $r("sys.color.ohos_id_color_card_bg_dark")
+    : $r("sys.color.ohos_id_color_card_bg");
+}
+
+function menuTextColor(): ResourceColor {
+  return darkMode()
+    ? $r("sys.color.ohos_id_color_text_primary_dark")
+    : $r("sys.color.ohos_id_color_text_primary");
+}
+
+function menuDividerColor(): ResourceColor {
+  return darkMode()
+    ? $r("sys.color.ohos_id_color_component_normal_dark")
+    : $r("sys.color.ohos_id_color_component_normal");
+}
+
+function menuShadowColor(): ResourceColor {
+  return darkMode()
+    ? $r("sys.color.ohos_id_color_mask_thin_dark")
+    : $r("sys.color.ohos_id_color_mask_thin");
 }
 
 @Component
@@ -513,7 +545,7 @@ struct EditMenuView {
             Divider()
               .vertical(true)
               .height(16)
-              .color("#22000000")
+              .color(menuDividerColor())
               .strokeWidth(0.5);
           }
           if (action === "paste") {
@@ -522,9 +554,10 @@ struct EditMenuView {
               buttonType: ButtonType.Capsule,
             })
               .fontSize(14)
-              .fontColor("#182431")
+              .fontColor(menuTextColor())
+              .iconColor(menuTextColor())
               .fontWeight(FontWeight.Regular)
-              .backgroundColor("#FFFFFF")
+              .backgroundColor(menuBackgroundColor())
               .padding({ left: 12, right: 12, top: 8, bottom: 8 })
               .onClick((_event: ClickEvent, result: PasteButtonOnClickResult): void => {
                 if (result === PasteButtonOnClickResult.SUCCESS) {
@@ -534,7 +567,7 @@ struct EditMenuView {
           } else {
             Text(editActionLabel(action))
               .fontSize(14)
-              .fontColor("#182431")
+              .fontColor(menuTextColor())
               .padding({ left: 12, right: 12, top: 8, bottom: 8 })
               .focusable(false)
               .onClick((): void => {
@@ -545,11 +578,15 @@ struct EditMenuView {
         (action: string): string => action,
       )
     }
-    .backgroundColor("#FFFFFF")
+    .backgroundColor(menuBackgroundColor())
     .borderRadius(18)
+    .border({
+      width: 0.5,
+      color: menuDividerColor(),
+    })
     .shadow({
       radius: 16,
-      color: "#33000000",
+      color: menuShadowColor(),
       offsetX: 0,
       offsetY: 4,
     })
