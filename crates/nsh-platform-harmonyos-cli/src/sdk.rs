@@ -44,6 +44,14 @@ fn candidates() -> Vec<PathBuf> {
             out.push(home.join("Library/OpenHarmony/Sdk"));
             out.push(home.join("Library/Huawei/Sdk"));
             out.push(home.join("command-line-tools/sdk"));
+            if let Ok(entries) = fs::read_dir(home.join(".meat/ide")) {
+                let mut apps: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                apps.sort();
+                apps.reverse();
+                for app in apps {
+                    out.push(app.join("Contents/sdk"));
+                }
+            }
         }
     } else if cfg!(windows) {
         if let Some(local) = env::var_os("LOCALAPPDATA").map(PathBuf::from) {
@@ -268,6 +276,14 @@ impl DevEco {
             if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
                 roots.push(home.join("Applications/DevEco-Studio.app/Contents"));
                 roots.push(home.join("command-line-tools"));
+                if let Ok(entries) = fs::read_dir(home.join(".meat/ide")) {
+                    let mut apps: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+                    apps.sort();
+                    apps.reverse();
+                    for app in apps {
+                        roots.push(app.join("Contents"));
+                    }
+                }
             }
         } else if cfg!(windows) {
             roots.push(r"C:\Program Files\Huawei\DevEco Studio".into());
@@ -300,6 +316,7 @@ impl DevEco {
             .find(|p| p.is_file());
             let sdk = env::var_os("DEVECO_SDK_HOME")
                 .map(PathBuf::from)
+                .filter(|p| p.is_dir())
                 .or_else(|| Some(root.join("sdk")).filter(|p| p.is_dir()));
             let node = [root.join("tools/node/bin"), root.join("tool/node/bin")]
                 .into_iter()

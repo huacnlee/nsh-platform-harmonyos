@@ -25,6 +25,38 @@ pub(crate) struct AppConfig {
     pub(crate) build: u64,
     /// `"icon"`: a PNG, relative to the app.
     pub(crate) icon: Option<PathBuf>,
+    /// `"schemes"`: URL schemes that open the app (`myapp://...`).
+    pub(crate) schemes: Vec<String>,
+    /// Whether the app may recognize speech (`ohos.permission.MICROPHONE`).
+    pub(crate) speech: bool,
+}
+
+const RESERVED_SCHEMES: &[&str] = &[
+    "http",
+    "https",
+    "ws",
+    "wss",
+    "file",
+    "ftp",
+    "mailto",
+    "tel",
+    "sms",
+    "javascript",
+    "vbscript",
+    "data",
+    "blob",
+    "about",
+    "asset",
+    "content",
+    "intent",
+    "nsh",
+];
+
+fn valid_scheme(scheme: &str) -> bool {
+    let mut chars = scheme.chars();
+    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
+    valid && !RESERVED_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str())
 }
 
 impl AppConfig {
@@ -47,6 +79,21 @@ impl AppConfig {
             Value::String(s) => s.parse().ok(),
             _ => None,
         };
+        let mut schemes = Vec::new();
+        if let Some(list) = json["schemes"].as_array() {
+            for item in list.iter().filter_map(Value::as_str) {
+                if valid_scheme(item) {
+                    let lower = item.to_ascii_lowercase();
+                    if !schemes.contains(&lower) {
+                        schemes.push(lower);
+                    }
+                }
+            }
+        }
+        let speech = match json.get("capabilities") {
+            None => true,
+            Some(capabilities) => capabilities.get("speech") == Some(&Value::Bool(true)),
+        };
         AppConfig {
             name: json["name"]
                 .as_str()
@@ -63,6 +110,8 @@ impl AppConfig {
                     icon.extension()
                         .is_some_and(|e| e.eq_ignore_ascii_case("png"))
                 }),
+            schemes,
+            speech,
         }
     }
 }
@@ -178,6 +227,36 @@ fn json_text(value: &str) -> String {
     quoted[1..quoted.len() - 1].to_owned()
 }
 
+fn request_permissions(speech: bool) -> String {
+    if speech {
+        "[\n      {\n        \"name\": \"ohos.permission.INTERNET\"\n      },\n      {\n        \"name\": \"ohos.permission.VIBRATE\"\n      },\n      {\n        \"name\": \"ohos.permission.MICROPHONE\",\n        \"reason\": \"$string:nsh_microphone_reason\",\n        \"usedScene\": {\n          \"abilities\": [\n            \"EntryAbility\"\n          ],\n          \"when\": \"inuse\"\n        }\n      }\n    ]"
+            .to_owned()
+    } else {
+        "[\n      {\n        \"name\": \"ohos.permission.INTERNET\"\n      },\n      {\n        \"name\": \"ohos.permission.VIBRATE\"\n      }\n    ]"
+            .to_owned()
+    }
+}
+
+fn ability_skills(schemes: &[String]) -> String {
+    let home = "          {\n            \"entities\": [\n              \"entity.system.home\"\n            ],\n            \"actions\": [\n              \"action.system.home\"\n            ]\n          }";
+    if schemes.is_empty() {
+        return format!("[\n{home}\n        ]");
+    }
+    let uris = schemes
+        .iter()
+        .map(|s| {
+            format!(
+                "              {{\n                \"scheme\": \"{}\"\n              }}",
+                json_text(s)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!(
+        "[\n{home},\n          {{\n            \"entities\": [\n              \"entity.system.browsable\"\n            ],\n            \"actions\": [\n              \"ohos.want.action.viewData\"\n            ],\n            \"uris\": [\n{uris}\n            ]\n          }}\n        ]"
+    )
+}
+
 /// Writes the project to `out`.
 pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> anyhow::Result<()> {
     if config.id.split('.').count() < 3 {
@@ -204,10 +283,8 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         ("{{runtimeOS}}", runtime_os.to_owned()),
         ("{{signingConfigs}}", signing),
         ("{{productSigning}}", product_signing),
-        (
-            "{{requestPermissions}}",
-            "[\n      {\n        \"name\": \"ohos.permission.INTERNET\"\n      }\n    ]".to_owned(),
-        ),
+        ("{{requestPermissions}}", request_permissions(config.speech)),
+        ("{{skills}}", ability_skills(&config.schemes)),
     ];
 
     // What a previous package wrote and this one replaces as a whole.
@@ -313,18 +390,34 @@ mod tests {
 
     #[test]
     fn reads_nsh_json() {
-        let json = serde_json::json!({ "name": "Counter", "id": "com.example.counter", "version": "2.1.0", "build": 7, "icon": "icon.png" });
+        let json = serde_json::json!({
+            "name": "Counter",
+            "id": "com.example.counter",
+            "version": "2.1.0",
+            "build": 7,
+            "icon": "icon.png",
+            "schemes": ["MyApp", "https", "my-app.2+x", "myapp"],
+            "capabilities": { "speech": false }
+        });
         let config = AppConfig::from_json(Path::new("/apps/counter"), &json);
         assert_eq!(config.name, "Counter");
         assert_eq!(config.id, "com.example.counter");
         assert_eq!(config.version, "2.1.0");
         assert_eq!(config.build, 7);
         assert_eq!(config.icon, Some(PathBuf::from("/apps/counter/icon.png")));
+        assert_eq!(config.schemes, vec!["myapp", "my-app.2+x"]);
+        assert!(!config.speech);
         let bare = AppConfig::from_json(Path::new("/apps/counter"), &serde_json::json!({}));
         assert_eq!(
-            (bare.name.as_str(), bare.id.as_str(), bare.build),
-            ("counter", "com.example.counter", 1)
+            (
+                bare.name.as_str(),
+                bare.id.as_str(),
+                bare.build,
+                bare.speech
+            ),
+            ("counter", "com.example.counter", 1, true)
         );
+        assert!(bare.schemes.is_empty());
     }
 
     #[test]
@@ -382,7 +475,11 @@ mod tests {
         fs::write(&library, b"\x7fELF").unwrap();
         let config = AppConfig::from_json(
             Path::new("/apps/counter"),
-            &serde_json::json!({ "name": "Counter \"1\"", "id": "com.example.counter" }),
+            &serde_json::json!({
+                "name": "Counter \"1\"",
+                "id": "com.example.counter",
+                "schemes": ["counterapp"]
+            }),
         );
         let out = dir.join("project");
         let contents = Contents {
@@ -405,6 +502,10 @@ mod tests {
         assert!(profile.contains("\"targetSdkVersion\": \"6.0.0(20)\","));
         let module = fs::read_to_string(out.join("entry/src/main/module.json5")).unwrap();
         assert!(module.contains("\"default\","), "{module}");
+        assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");
+        assert!(module.contains("ohos.want.action.viewData"), "{module}");
+        assert!(module.contains("\"scheme\": \"counterapp\""), "{module}");
+        assert!(!module.contains("{{"), "{module}");
         assert!(profile.contains("\"signingConfigs\": []"));
         assert!(!profile.contains("{{"), "{profile}");
         assert!(

@@ -22,7 +22,8 @@ pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 /// The backend this CLI was built with: `NSH_HARMONYOS_SOURCE` (a checkout)
 /// when set, else the checkout it was built in when it is still there, else
 /// this version's tag of the repository.
-fn backend() -> String {
+fn backend(dev: bool) -> String {
+    let features = if dev { ", features = [\"dev\"]" } else { "" };
     let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
         .map(PathBuf::from)
         .or_else(|| {
@@ -37,11 +38,11 @@ fn backend() -> String {
         });
     match checkout {
         Some(dir) => format!(
-            "{{ package = \"nsh-platform-harmonyos\", path = {:?} }}",
+            "{{ package = \"nsh-platform-harmonyos\", path = {:?}{features} }}",
             dir.join("crates/nsh-platform-harmonyos").to_string_lossy()
         ),
         None => format!(
-            "{{ package = \"nsh-platform-harmonyos\", git = \"https://github.com/huacnlee/nsh-platform-harmonyos\", tag = \"v{}\" }}",
+            "{{ package = \"nsh-platform-harmonyos\", git = \"https://github.com/huacnlee/nsh-platform-harmonyos\", tag = \"v{}\"{features} }}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -76,7 +77,7 @@ fn workspace_patches(workspace_manifest: &str) -> String {
 /// Writes the runner crate in `dir`: for NSH's generated crate `rust_app`
 /// (an app written in Rust), or for a TSX app (`None`), whose bundle the
 /// HAP carries as a raw file.
-pub(crate) fn write(dir: &Path, rust_app: Option<&Path>) -> anyhow::Result<()> {
+pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::Result<()> {
     let (app_dependency, patch, lib) = match rust_app {
         Some(rust_app) => {
             let manifest = fs::read_to_string(rust_app.join("Cargo.toml"))
@@ -120,7 +121,7 @@ pub(crate) fn write(dir: &Path, rust_app: Option<&Path>) -> anyhow::Result<()> {
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\
              {patch}\n[workspace]\n",
-            backend(),
+            backend(dev),
         ),
     )?;
     fs::write(
@@ -222,16 +223,19 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        write(&dir.join("runner"), Some(&app)).unwrap();
+        write(&dir.join("runner"), Some(&app), false).unwrap();
         let manifest = fs::read_to_string(dir.join("runner/Cargo.toml")).unwrap();
         assert!(manifest.contains("nsh_rust_app = { package = \"counter-rust-app\", path = "));
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
         assert!(manifest.contains("crate-type = [\"cdylib\"]"));
         assert!(manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"));
+        assert!(!manifest.contains("features = [\"dev\"]"));
         let lib = fs::read_to_string(dir.join("runner/lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
 
-        write(&dir.join("tsx"), None).unwrap();
+        write(&dir.join("tsx"), None, true).unwrap();
+        let tsx_manifest = fs::read_to_string(dir.join("tsx/Cargo.toml")).unwrap();
+        assert!(tsx_manifest.contains("features = [\"dev\"]"));
         let lib = fs::read_to_string(dir.join("tsx/lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
         fs::remove_dir_all(&dir).unwrap();

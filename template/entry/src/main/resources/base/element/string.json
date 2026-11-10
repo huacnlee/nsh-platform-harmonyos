@@ -1,0 +1,8 @@
+{
+  "string": [
+    {
+      "name": "nsh_microphone_reason",
+      "value": "Recognize speech in the Native Shell app."
+    }
+  ]
+}

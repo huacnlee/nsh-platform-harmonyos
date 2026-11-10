@@ -42,18 +42,22 @@ nsh-platform-harmonyos: run Native Shell apps on HarmonyOS and OpenHarmony
 Usage (through nsh, which finds this program on PATH):
   nsh package [APP] --target harmonyos [--out DIR] [--runtime-os OS]
   nsh run [APP] --target harmonyos [--device ID] [--release]
+  nsh dev [APP] --target harmonyos [--device ID] [--port PORT] [--release]
 
 Commands:
   package   Build the app into a DevEco Studio project (default: .nsh/out/harmonyos),
             and its HAP when DevEco Studio's tools are installed
-  run, dev  Build it into .nsh/harmonyos/project, install the HAP on a device
+  run       Build it into .nsh/harmonyos/project, install the HAP on a device
             (hdc) and start it
+  dev       Build it with the development client, install and start it on a device,
+            forward the dev server port (`hdc rport`) and run `nsh dev --server-only`
   test      Not on this platform: `nsh test` runs the app's tests headless
 
 Options:
   -o, --out DIR          Where `package` writes the project
       --runtime-os OS    harmonyos (default: Huawei's devices, AppGallery) or openharmony
       --device ID        The device `hdc` installs on (hdc list targets)
+      --port PORT        Dev server port for `dev` (default: first free from 8790)
       --release          Build the native library optimized (`package` always does)
       --debug            Build it unoptimized (faster to build)
       --no-hap           Write the project only, without building the HAP
@@ -75,6 +79,7 @@ struct Options {
     out: Option<PathBuf>,
     runtime_os: project::RuntimeOs,
     device: Option<String>,
+    port: Option<u16>,
     release: Option<bool>,
     hap: bool,
     verbose: bool,
@@ -95,6 +100,13 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
             "-o" | "--out" => options.out = Some(value(&arg)?.into()),
             "--runtime-os" => options.runtime_os = project::RuntimeOs::parse(&value(&arg)?)?,
             "--device" => options.device = Some(value(&arg)?),
+            "--port" => {
+                options.port = Some(
+                    value(&arg)?
+                        .parse()
+                        .context("--port must be a port number")?,
+                );
+            }
             "--release" => options.release = Some(true),
             "--debug" => options.release = Some(false),
             "--no-hap" => options.hap = false,
@@ -130,7 +142,7 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
                 Some(out) => out.clone(),
                 None => app.join(".nsh/out/harmonyos"),
             };
-            let config = package(&app, &out, options.release.unwrap_or(true), &options)?;
+            let config = package(&app, &out, options.release.unwrap_or(true), false, &options)?;
             println!("✓ wrote the DevEco Studio project to {}", out.display());
             let mut signed = config.signed;
             if options.hap {
@@ -151,10 +163,11 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
             }
         }
         "run" | "dev" => {
+            let is_dev = options.command == "dev";
             let app = app_dir(&options)?;
             let out = app.join(".nsh/harmonyos/project");
             let release = options.release.unwrap_or(false);
-            let config = package(&app, &out, release, &options)?;
+            let config = package(&app, &out, release, is_dev, &options)?;
             let Some(deveco) = sdk::DevEco::find() else {
                 no_deveco(&out);
                 bail!(
@@ -171,7 +184,26 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
                     out.display()
                 );
             }
-            install(&deveco, &built.path, &config.id, options.device.as_deref())?;
+            if is_dev {
+                let port = options.port.unwrap_or_else(free_dev_port);
+                dev(
+                    &deveco,
+                    &app,
+                    &built.path,
+                    &config.id,
+                    options.device.as_deref(),
+                    port,
+                    release,
+                )?;
+            } else {
+                install(
+                    &deveco,
+                    &built.path,
+                    &config.id,
+                    options.device.as_deref(),
+                    None,
+                )?;
+            }
         }
         "test" => bail!(
             "the harmonyos target runs no tests itself: `nsh test` runs the app's tests \
@@ -220,7 +252,13 @@ struct Packaged {
     signed: bool,
 }
 
-fn package(app: &Path, out: &Path, release: bool, options: &Options) -> anyhow::Result<Packaged> {
+fn package(
+    app: &Path,
+    out: &Path,
+    release: bool,
+    dev: bool,
+    options: &Options,
+) -> anyhow::Result<Packaged> {
     let config = project::AppConfig::read(app)?;
     let ndk = sdk::Ndk::find()?;
     let build = app.join(".nsh/harmonyos/build");
@@ -240,7 +278,7 @@ fn package(app: &Path, out: &Path, release: bool, options: &Options) -> anyhow::
     let rust_app = app.join(".nsh/rust/rust-app");
     let is_rust = is_rust_app(app) && rust_app.join("Cargo.toml").is_file();
     let runner = app.join(".nsh/harmonyos/runner");
-    runner::write(&runner, is_rust.then_some(rust_app.as_path()))?;
+    runner::write(&runner, is_rust.then_some(rust_app.as_path()), dev)?;
     let library = runner::build(&runner, &ndk, release, options.verbose)?;
     project::write(
         out,
@@ -430,6 +468,7 @@ fn install(
     hap: &Path,
     bundle: &str,
     device: Option<&str>,
+    dev_url: Option<&str>,
 ) -> anyhow::Result<()> {
     let hdc = deveco
         .hdc()
@@ -456,14 +495,82 @@ fn install(
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    let status = hdc_command()
-        .args(["shell", "aa", "start", "-a", "EntryAbility", "-b", bundle])
-        .status()
-        .context("running hdc")?;
+    let mut start = hdc_command();
+    start.args(["shell", "aa", "start", "-a", "EntryAbility", "-b", bundle]);
+    if let Some(url) = dev_url {
+        start.args(["--ps", "nsh.devUrl", url]);
+    }
+    let status = start.status().context("running hdc")?;
     if !status.success() {
         bail!("hdc could not start {bundle}");
     }
     println!("✓ {bundle} is running (hdc hilog shows its log)");
+    Ok(())
+}
+
+fn free_dev_port() -> u16 {
+    (8790..=8890)
+        .find(|&port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+        .unwrap_or(8790)
+}
+
+/// Installs the development HAP, forwards `port` from the device to this
+/// machine (`hdc rport`), launches the ability with `nsh.devUrl`, and runs
+/// `nsh dev --server-only`.
+fn dev(
+    deveco: &sdk::DevEco,
+    app: &Path,
+    hap: &Path,
+    bundle: &str,
+    device: Option<&str>,
+    port: u16,
+    release: bool,
+) -> anyhow::Result<()> {
+    let hdc = deveco
+        .hdc()
+        .context("hdc was not found: it comes with DevEco Studio's SDK (toolchains)")?;
+    let hdc_command = || {
+        let mut cmd = Command::new(&hdc);
+        if let Some(device) = device {
+            cmd.args(["-t", device]);
+        }
+        cmd
+    };
+    let node = format!("tcp:{port}");
+    let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+    let rport = hdc_command()
+        .args(["rport", &node, &node])
+        .output()
+        .context("running hdc rport")?;
+    let rport_text = String::from_utf8_lossy(&rport.stdout);
+    if !rport.status.success() || rport_text.contains("[Fail]") {
+        bail!(
+            "hdc could not forward port {port}: {}{}",
+            rport_text.trim(),
+            String::from_utf8_lossy(&rport.stderr).trim()
+        );
+    }
+    let dev_url = format!("ws://127.0.0.1:{port}/ws");
+    if let Err(err) = install(deveco, hap, bundle, device, Some(&dev_url)) {
+        let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+        return Err(err);
+    }
+    let mut server = Command::new(nsh());
+    server
+        .arg("dev")
+        .arg(app)
+        .arg("--server-only")
+        .arg("--port")
+        .arg(port.to_string());
+    if release {
+        server.arg("--release");
+    }
+    let status = server.status().context("running nsh dev --server-only");
+    let _ = hdc_command().args(["fport", "rm", &node, &node]).output();
+    let status = status?;
+    if !status.success() {
+        bail!("nsh dev exited with {status}");
+    }
     Ok(())
 }
 
@@ -611,6 +718,9 @@ mod tests {
         let run = parse(args("run --device 127.0.0.1:5555 --no-hap")).unwrap();
         assert_eq!(run.device.as_deref(), Some("127.0.0.1:5555"));
         assert!(!run.hap);
+        let dev = parse(args("dev examples/counter --port 8791")).unwrap();
+        assert_eq!(dev.command, "dev");
+        assert_eq!(dev.port, Some(8791));
     }
 
     #[test]
