@@ -49,6 +49,7 @@ pub(crate) struct Snapshot {
     pub(crate) focused: Option<NodeId>,
     pub(crate) input: Option<NodeId>,
     pub(crate) selection: Option<NodeId>,
+    pub(crate) composing: bool,
 }
 #[derive(Default)]
 struct Held {
@@ -107,6 +108,9 @@ impl KeyboardWindow {
         }
         held.event(action, code, |stroke, repeat| {
             let snapshot = route.keyboard.lock().unwrap();
+            if snapshot.composing {
+                return false;
+            }
             if snapshot.focused.is_none()
                 && let Some(id) = snapshot.selection
             {
@@ -196,7 +200,7 @@ pub(crate) fn install(
 ) -> crate::render::node::Result<()> {
     owner.native.borrow().set_focusable(true)?;
     let weak = std::rc::Rc::downgrade(owner);
-    owner.native.borrow_mut().on_key_event(move |event| {
+    owner.native.borrow_mut().on_key_pre_ime(move |event| {
         if let Some(owner) = weak.upgrade()
             && let Some(event) = event.key_event()
             && let Some(route) = owner.dispatcher.upgrade()
@@ -204,7 +208,9 @@ pub(crate) fn install(
         {
             event.set_consumed(true);
             event.stop_propagation(true);
+            return Some(true);
         }
+        Some(false)
     });
     Ok(())
 }

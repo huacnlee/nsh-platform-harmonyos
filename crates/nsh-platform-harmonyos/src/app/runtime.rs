@@ -101,6 +101,9 @@ pub(crate) enum Message {
     InputPaste {
         id: nsh_core::NodeId,
         text: String,
+        html: Option<String>,
+        files: Option<String>,
+        image: Option<String>,
         report_only: bool,
     },
     DialogResult {
@@ -361,12 +364,18 @@ impl State {
             Message::InputPaste {
                 id,
                 text,
+                html,
+                files,
+                image,
                 report_only,
-            } => self
-                .mounter
-                .as_ref()
-                .unwrap()
-                .input_paste(id, text, report_only)?,
+            } => self.mounter.as_ref().unwrap().input_paste(
+                id,
+                text,
+                html,
+                files,
+                image,
+                report_only,
+            )?,
             Message::ReconcileNavigation => {
                 self.mounter.as_mut().unwrap().reconcile_navigation()?;
             }

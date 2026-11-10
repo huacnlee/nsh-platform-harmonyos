@@ -69,6 +69,8 @@ pub(crate) struct EditorCommand {
     pub end: u32,
     pub x: f64,
     pub y: f64,
+    pub width: f64,
+    pub height: f64,
     pub animated: bool,
     pub text: Option<String>,
     pub actions: Option<Vec<String>>,
@@ -86,6 +88,9 @@ pub(crate) struct EditorEvent {
     pub end: u32,
     pub width: f64,
     pub height: f64,
+    pub html: Option<String>,
+    pub files: Option<String>,
+    pub image: Option<String>,
 }
 
 #[napi(object)]

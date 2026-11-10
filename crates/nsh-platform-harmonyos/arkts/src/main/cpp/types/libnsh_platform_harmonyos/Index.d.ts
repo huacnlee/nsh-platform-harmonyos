@@ -43,6 +43,8 @@ export interface EditorCommand {
   end: number
   x: number
   y: number
+  width: number
+  height: number
   animated: boolean
   text?: string
   actions?: Array<string>
@@ -58,6 +60,9 @@ export interface EditorEvent {
   end: number
   width: number
   height: number
+  html?: string
+  files?: string
+  image?: string
 }
 
 export interface EditorReceipt {
@@ -331,6 +336,7 @@ export interface SystemEvent {
   pressed?: string
   has?: boolean
   text?: string
+  html?: string
   uri?: string
   width?: number
   height?: number

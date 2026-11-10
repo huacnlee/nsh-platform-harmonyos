@@ -224,8 +224,7 @@ impl System {
                 paste: Some((node_id, report_only)),
             },
             SystemCommand {
-                op: "clipboard-read".into(),
-                has_only: Some(false),
+                op: "clipboard-paste".into(),
                 ..Default::default()
             },
         )
@@ -612,10 +611,17 @@ impl System {
             return;
         };
         if let Some((node_id, report_only)) = request.paste {
-            if let Some(text) = value.text.filter(|t| !t.is_empty()) {
+            let text = value.text.unwrap_or_default();
+            let html = value.html.filter(|s| !s.is_empty());
+            let files = value.files.filter(|s| !s.is_empty());
+            let image = value.uri.filter(|s| !s.is_empty());
+            if !text.is_empty() || html.is_some() || files.is_some() || image.is_some() {
                 route.send(Message::InputPaste {
                     id: node_id,
                     text,
+                    html,
+                    files,
+                    image,
                     report_only,
                 });
             }
@@ -821,6 +827,7 @@ pub(crate) struct SystemEvent {
     pub pressed: Option<String>,
     pub has: Option<bool>,
     pub text: Option<String>,
+    pub html: Option<String>,
     pub uri: Option<String>,
     pub width: Option<f64>,
     pub height: Option<f64>,

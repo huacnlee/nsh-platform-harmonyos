@@ -8,6 +8,7 @@ import { UIContext } from "@ohos.arkui.UIContext";
 export interface ClipboardReply extends SystemReply {
   has?: boolean;
   text?: string;
+  html?: string;
   uri?: string;
   width?: number;
   height?: number;
@@ -154,7 +155,7 @@ export class NativeClipboard {
         : op === "clipboard-files"
           ? pasteboard.MIMETYPE_TEXT_URI
           : pasteboard.MIMETYPE_TEXT_PLAIN;
-    const has = board.hasDataType(type);
+    const has = op === "clipboard-paste" ? board.hasDataSync() : board.hasDataType(type);
     if (hasOnly || !has) {
       return { has };
     }
@@ -168,7 +169,47 @@ export class NativeClipboard {
         }
         this.reading = key;
         const data = await this.read();
-        if (op === "clipboard-read") {
+        if (op === "clipboard-paste") {
+          const text = data.getPrimaryText() ?? "";
+          let html: string | undefined;
+          try {
+            const primaryHtml = data.getPrimaryHtml();
+            if (primaryHtml && primaryHtml.length > 0) {
+              html = primaryHtml;
+            }
+          } catch {}
+          const files: string[] = [];
+          for (let i = 0; i < data.getRecordCount(); i++) {
+            const rec = data.getRecord(i);
+            if (!html && rec.htmlText && rec.htmlText.length > 0) {
+              html = rec.htmlText;
+            }
+            if (rec.uri?.startsWith("file:")) {
+              files.push(rec.uri);
+            }
+          }
+          let uri: string | undefined;
+          const pixels = data.getPrimaryPixelMap();
+          if (pixels) {
+            const packer = image.createImagePacker();
+            try {
+              const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
+              if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
+                uri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
+              }
+            } finally {
+              packer.release();
+              pixels.release();
+            }
+          }
+          reply = {
+            has: text.length > 0 || html !== undefined || files.length > 0 || uri !== undefined,
+            text,
+            html,
+            files: files.length > 0 ? files.join("\n") : undefined,
+            uri,
+          };
+        } else if (op === "clipboard-read") {
           reply = { has: data.hasType(type), text: data.getPrimaryText() ?? "" };
         } else if (op === "clipboard-files") {
           const files: string[] = [];

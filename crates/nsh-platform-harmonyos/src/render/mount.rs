@@ -1618,11 +1618,19 @@ impl Mounter {
         Ok(())
     }
 
-    pub(crate) fn input_paste(&self, id: NodeId, text: String, report_only: bool) -> Result<()> {
+    pub(crate) fn input_paste(
+        &self,
+        id: NodeId,
+        text: String,
+        html: Option<String>,
+        files: Option<String>,
+        image: Option<String>,
+        report_only: bool,
+    ) -> Result<()> {
         if let Some(node) = self.slots.get(id as usize).and_then(Option::as_ref)
             && let Some(input) = node.input.borrow().as_ref()
         {
-            input.complete_paste(text, report_only)?;
+            input.complete_paste(text, html, files, image, report_only)?;
         }
         Ok(())
     }

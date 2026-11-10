@@ -105,7 +105,12 @@ impl Input {
         match event.kind.as_str() {
             "paste" => owner.emit(
                 EventKind::Paste,
-                EventPayload::Paste(Box::new(nsh_core::PasteEvent::new(event.text))),
+                EventPayload::Paste(Box::new(build_paste_event(
+                    event.text,
+                    event.html,
+                    event.files,
+                    event.image,
+                ))),
             ),
             "edit-action" => {
                 if event.text == "paste" {
@@ -140,6 +145,9 @@ impl Input {
             }
             "composition" => {
                 let composing = !event.text.is_empty();
+                if let Some(route) = owner.dispatcher.upgrade() {
+                    route.keyboard.lock().unwrap().composing = composing;
+                }
                 owner.emit(
                     EventKind::CompositionChange,
                     EventPayload::Map(vec![
@@ -195,6 +203,9 @@ impl Input {
                 owner.emit(EventKind::Focus, EventPayload::None);
             }
             "blur" => {
+                if let Some(route) = owner.dispatcher.upgrade() {
+                    route.keyboard.lock().unwrap().composing = false;
+                }
                 if self.state.borrow_mut().focus(false) {
                     owner.emit(EventKind::Blur, EventPayload::None);
                 }
@@ -466,12 +477,17 @@ impl Input {
         }
         Ok(())
     }
-    pub(crate) fn complete_paste(&self, text: String, report_only: bool) -> Result<()> {
+    pub(crate) fn complete_paste(
+        &self,
+        text: String,
+        html: Option<String>,
+        files: Option<String>,
+        image: Option<String>,
+        report_only: bool,
+    ) -> Result<()> {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
-            owner.emit(
-                EventKind::Paste,
-                EventPayload::Paste(Box::new(nsh_core::PasteEvent::new(text.clone()))),
-            );
+            let paste = build_paste_event(text.clone(), html, files, image);
+            owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
             if !report_only && self.config.borrow().editable && !text.is_empty() {
                 self.insert_text(text)?;
             }
@@ -486,11 +502,32 @@ impl Input {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(target_id) = self.target_id()
         {
+            let mut surface = owner.clone();
+            loop {
+                let Some(parent) = surface.parent_node.borrow().upgrade() else {
+                    break;
+                };
+                surface = parent;
+            }
+            let scale = owner.scale.get().max(1.0);
+            let (origin_x, origin_y) = surface
+                .native
+                .borrow()
+                .layout_position_in_window()
+                .map(|pos| {
+                    (
+                        pos.x as f64 / f64::from(scale),
+                        pos.y as f64 / f64::from(scale),
+                    )
+                })
+                .unwrap_or((0.0, 0.0));
             owner.editor_command(EditorCommand {
                 target_id,
                 kind: "open-edit-menu".into(),
-                x: f64::from(bounds.origin.x.0 + bounds.size.width.0 * 0.5),
-                y: f64::from(bounds.origin.y.0),
+                x: origin_x + f64::from(bounds.origin.x.0),
+                y: origin_y + f64::from(bounds.origin.y.0),
+                width: f64::from(bounds.size.width.0),
+                height: f64::from(bounds.size.height.0),
                 actions: Some(
                     actions
                         .into_iter()
@@ -521,6 +558,9 @@ impl Input {
     fn retire(&self) -> Result<()> {
         self.route.borrow_mut().take();
         if let Some(owner) = self.owner.upgrade() {
+            if let Some(route) = owner.dispatcher.upgrade() {
+                route.keyboard.lock().unwrap().composing = false;
+            }
             // The pending batch retains the old target until SDK retirement is acknowledged.
             if let Some(old) = self.target.borrow_mut().take() {
                 owner.editor_remove(old);
@@ -538,6 +578,37 @@ impl Input {
     pub(crate) fn suspend(&self) -> Result<()> {
         self.focus(false)
     }
+}
+
+fn build_paste_event(
+    text: String,
+    html: Option<String>,
+    files: Option<String>,
+    image: Option<String>,
+) -> nsh_core::PasteEvent {
+    let mut paste = nsh_core::PasteEvent::new(text);
+    paste.html = html.unwrap_or_default();
+    if let Some(files) = files {
+        paste.uris = files
+            .lines()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
+    }
+    if let Some(image) = image {
+        let encoded = image
+            .strip_prefix("data:image/png;base64,")
+            .or_else(|| image.split_once(";base64,").map(|(_, b64)| b64))
+            .unwrap_or(image.as_str());
+        if let Ok(bytes) =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
+            && !bytes.is_empty()
+        {
+            paste.files.push(nsh_core::PastedFile::image(bytes));
+        }
+    }
+    paste
 }
 
 fn content_type(fill: nsh_core::AutoFill) -> Option<&'static str> {

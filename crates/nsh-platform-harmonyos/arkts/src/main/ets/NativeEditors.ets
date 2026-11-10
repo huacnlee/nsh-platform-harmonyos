@@ -1,6 +1,9 @@
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import pasteboard from "@ohos.pasteboard";
+import image from "@ohos.multimedia.image";
+import util from "@ohos.util";
+import i18n from "@ohos.i18n";
 
 export interface EditorSettings {
   targetId: number;
@@ -50,6 +53,8 @@ export interface EditorCommand {
   end: number;
   x: number;
   y: number;
+  width: number;
+  height: number;
   animated: boolean;
   text?: string | null;
   actions?: string[] | null;
@@ -64,6 +69,9 @@ export interface EditorEventPayload {
   readonly height: number;
   readonly x: number;
   readonly y: number;
+  readonly html?: string | null;
+  readonly files?: string | null;
+  readonly image?: string | null;
 }
 export interface EditorReceipt {
   accepted: boolean;
@@ -202,6 +210,9 @@ class EditorEvent implements EditorEventPayload {
   readonly height: number;
   readonly x: number;
   readonly y: number;
+  readonly html?: string | null;
+  readonly files?: string | null;
+  readonly image?: string | null;
   constructor(
     entry: EditorEntry,
     kind: string,
@@ -212,6 +223,9 @@ class EditorEvent implements EditorEventPayload {
     height = 0,
     x = 0,
     y = 0,
+    html?: string | null,
+    files?: string | null,
+    image?: string | null,
   ) {
     this.kind = kind;
     this.text = text;
@@ -222,6 +236,9 @@ class EditorEvent implements EditorEventPayload {
     this.height = height;
     this.x = x;
     this.y = y;
+    this.html = html;
+    this.files = files;
+    this.image = image;
   }
 }
 
@@ -280,13 +297,40 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
   }
 }
 
+class EditorSystemMenu implements EditMenuOptions {
+  private readonly entry: EditorEntry;
+  constructor(entry: EditorEntry) {
+    this.entry = entry;
+  }
+  onCreateMenu(menuItems: Array<TextMenuItem>): Array<TextMenuItem> {
+    return menuItems.filter(
+      (item: TextMenuItem): boolean =>
+        item.id.equals(TextMenuItemId.CUT) ||
+        item.id.equals(TextMenuItemId.COPY) ||
+        item.id.equals(TextMenuItemId.PASTE) ||
+        item.id.equals(TextMenuItemId.SELECT_ALL),
+    );
+  }
+  onMenuItemClick(_menuItem: TextMenuItem, _range: TextRange): boolean {
+    // The system performs Cut, Copy, Paste and Select All natively; the
+    // native input reports the result through onChange/onPaste.
+    return false;
+  }
+}
+
 @Builder
 function editorContent(entry: EditorEntry) {
   if (entry.settings.multiline && !entry.settings.secure) {
     Scroll(entry.scroller) {
-      TextArea({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.area })
+      TextArea({
+        text: entry.text,
+        placeholder: entry.settings.placeholder,
+        controller: entry.area,
+      })
         .id(`nsh-editor-${entry.settings.targetId}`)
         .attributeModifier(new EditorModifier(entry))
+        .editMenuOptions(new EditorSystemMenu(entry))
+        .onKeyPreIme((): boolean => false)
         .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
         .onFocus(() => entry.emit("focus"))
         .onBlur(() => entry.emit("blur"))
@@ -305,18 +349,20 @@ function editorContent(entry: EditorEntry) {
           entry.editKey("Backspace");
           return true;
         })
-        .onAppear(() => entry.appeared());
+        .onAppear(() => entry.appeared())
     }
-      .width(entry.settings.width)
-      .height(entry.settings.height)
-      .scrollable(ScrollDirection.Vertical)
-      .scrollBar(entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
-      .clip(true)
-      .onDidScroll(() => entry.scrolled());
+    .width(entry.settings.width)
+    .height(entry.settings.height)
+    .scrollable(ScrollDirection.Vertical)
+    .scrollBar(entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
+    .clip(true)
+    .onDidScroll(() => entry.scrolled());
   } else {
     TextInput({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.line })
       .id(`nsh-editor-${entry.settings.targetId}`)
       .attributeModifier(new EditorModifier(entry))
+      .editMenuOptions(new EditorSystemMenu(entry))
+      .onKeyPreIme((): boolean => false)
       .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
       .onFocus(() => entry.emit("focus"))
       .onBlur(() => entry.emit("blur"))
@@ -344,19 +390,76 @@ const quarantinedEditors: Set<EditorEntry> = new Set();
 
 interface EditMenuParams {
   entry: EditorEntry;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
   actions: string[];
 }
 
+interface ExtractedPasteData {
+  text: string;
+  html?: string;
+  files?: string;
+  image?: string;
+}
+
+async function extractPasteData(data: pasteboard.PasteData): Promise<ExtractedPasteData> {
+  const text = data.getPrimaryText() ?? "";
+  let html: string | undefined;
+  try {
+    const primaryHtml = data.getPrimaryHtml();
+    if (primaryHtml && primaryHtml.length > 0) {
+      html = primaryHtml;
+    }
+  } catch {}
+  const uris: string[] = [];
+  try {
+    const count = data.getRecordCount();
+    for (let i = 0; i < count; i++) {
+      const record = data.getRecord(i);
+      if (!html && record.htmlText && record.htmlText.length > 0) {
+        html = record.htmlText;
+      }
+      if (record.uri && record.uri.startsWith("file:")) {
+        uris.push(record.uri);
+      }
+    }
+  } catch {}
+  const files = uris.length > 0 ? uris.join("\n") : undefined;
+  let imgUri: string | undefined;
+  try {
+    const pixels = data.getPrimaryPixelMap();
+    if (pixels) {
+      const packer = image.createImagePacker();
+      try {
+        const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
+        if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
+          imgUri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
+        }
+      } finally {
+        packer.release();
+        pixels.release();
+      }
+    }
+  } catch {}
+  return { text, html, files, image: imgUri };
+}
+
 function editActionLabel(action: string): string {
+  let zh = false;
+  try {
+    zh = i18n.System.getSystemLanguage().startsWith("zh");
+  } catch {}
   switch (action) {
     case "cut":
-      return "Cut";
+      return zh ? "剪切" : "Cut";
     case "copy":
-      return "Copy";
+      return zh ? "复制" : "Copy";
     case "paste":
-      return "Paste";
+      return zh ? "粘贴" : "Paste";
     case "selectAll":
-      return "Select All";
+      return zh ? "全选" : "Select All";
     default:
       return action;
   }
@@ -365,25 +468,131 @@ function editActionLabel(action: string): string {
 @Component
 struct EditMenuView {
   entry!: EditorEntry;
+  @Prop x: number = 0;
+  @Prop y: number = 0;
+  @Prop selWidth: number = 0;
+  @Prop selHeight: number = 0;
   @Prop actions: string[] = [];
+  @State private menuW: number = 0;
+  @State private menuH: number = 36;
+  @State private overlayOriginX: number = 0;
+  @State private overlayOriginY: number = 0;
+
+  private posX(): number {
+    const centerX = this.x + this.selWidth * 0.5;
+    if (this.menuW <= 0) {
+      return Math.max(8, centerX - 80 - this.overlayOriginX);
+    }
+    let winW = 360;
+    try {
+      let cur = this.entry.node.getFrameNode();
+      while (cur?.getParent()) {
+        cur = cur.getParent();
+      }
+      const size = cur?.getMeasuredSize();
+      if (size && size.width > 0) {
+        winW = this.getUIContext().px2vp(size.width);
+      }
+    } catch {}
+    const left = Math.max(8, Math.min(winW - this.menuW - 8, centerX - this.menuW * 0.5));
+    return left - this.overlayOriginX;
+  }
+
+  private posY(): number {
+    const above = this.y - this.menuH - 10;
+    const targetY = above >= 48 ? above : this.y + Math.max(this.selHeight, 20) + 26;
+    return targetY - this.overlayOriginY;
+  }
+
   build() {
-    Menu() {
+    Row() {
       ForEach(
         this.actions,
-        (action: string) => {
-          MenuItem({ content: editActionLabel(action) }).onClick((): void => {
-            this.entry.chooseEditAction(action);
-          });
+        (action: string, index: number) => {
+          if (index > 0) {
+            Divider()
+              .vertical(true)
+              .height(16)
+              .color("#22000000")
+              .strokeWidth(0.5);
+          }
+          if (action === "paste") {
+            PasteButton({
+              text: PasteDescription.PASTE,
+              buttonType: ButtonType.Capsule,
+            })
+              .fontSize(14)
+              .fontColor("#182431")
+              .fontWeight(FontWeight.Regular)
+              .backgroundColor("#FFFFFF")
+              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+              .onClick((_event: ClickEvent, result: PasteButtonOnClickResult): void => {
+                if (result === PasteButtonOnClickResult.SUCCESS) {
+                  this.entry.chooseEditAction("paste");
+                }
+              });
+          } else {
+            Text(editActionLabel(action))
+              .fontSize(14)
+              .fontColor("#182431")
+              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+              .focusable(false)
+              .onClick((): void => {
+                this.entry.chooseEditAction(action);
+              });
+          }
         },
         (action: string): string => action,
-      );
-    }.padding(8);
+      )
+    }
+    .backgroundColor("#FFFFFF")
+    .borderRadius(18)
+    .shadow({
+      radius: 16,
+      color: "#33000000",
+      offsetX: 0,
+      offsetY: 4,
+    })
+    .focusable(false)
+    .onTouch((event: TouchEvent): void => {
+      if (event.type === TouchType.Down) {
+        this.entry.markMenuInteraction();
+      }
+    })
+    .onAreaChange((_old: Area, area: Area): void => {
+      const w = Number(area.width);
+      const h = Number(area.height);
+      const gx = Number(area.globalPosition.x);
+      const gy = Number(area.globalPosition.y);
+      const lx = Number(area.position.x);
+      const ly = Number(area.position.y);
+      if (w > 0) {
+        this.menuW = w;
+      }
+      if (h > 0) {
+        this.menuH = h;
+      }
+      if (Number.isFinite(gx) && Number.isFinite(lx)) {
+        this.overlayOriginX = gx - lx;
+      }
+      if (Number.isFinite(gy) && Number.isFinite(ly)) {
+        this.overlayOriginY = gy - ly;
+      }
+    })
+    .position({ x: this.posX(), y: this.posY() });
   }
 }
 
 @Builder
 function editMenuBuilder(params: EditMenuParams) {
-  EditMenuView({ entry: params.entry, actions: params.actions });
+  EditMenuView({
+    entry: params.entry,
+    x: params.x,
+    y: params.y,
+    selWidth: params.width,
+    selHeight: params.height,
+    actions: params.actions,
+  });
 }
 
 class EditorSizeCallback extends FrameCallback {
@@ -429,6 +638,7 @@ class EditorEntry {
   private selEnd: number = 0;
   private pendingScroll?: EditorCommand;
   private editMenuContent?: ComponentContent<EditMenuParams>;
+  private menuInteracting: boolean = false;
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
     this.context = context;
     this.settings = settings;
@@ -505,7 +715,9 @@ class EditorEntry {
     }
   }
   canEdit(): boolean {
-    return this.updating || (this.settings.editable && this.settings.accessibility?.disabled !== true);
+    return (
+      this.updating || (this.settings.editable && this.settings.accessibility?.disabled !== true)
+    );
   }
   editorHeight(): number {
     return this.settings.multiline && !this.settings.secure
@@ -513,8 +725,52 @@ class EditorEntry {
       : this.settings.height;
   }
   paste(text: string, event: PasteEvent): void {
+    if (!this.canEdit() || this.settings.reportPaste) {
+      event.preventDefault?.();
+    }
+    if (this.settings.reportPaste) {
+      try {
+        pasteboard
+          .getSystemPasteboard()
+          .getData()
+          .then((data: pasteboard.PasteData): void => {
+            if (this.closed || !this.context.isActive()) {
+              return;
+            }
+            if (data.getRecordCount() === 0) {
+              this.emit("paste", text);
+              return;
+            }
+            extractPasteData(data)
+              .then((rich: ExtractedPasteData): void => {
+                if (this.closed || !this.context.isActive()) {
+                  return;
+                }
+                this.emit(
+                  "paste",
+                  rich.text.length > 0 ? rich.text : text,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  rich.html,
+                  rich.files,
+                  rich.image,
+                );
+              })
+              .catch((): void => {
+                this.emit("paste", text);
+              });
+          })
+          .catch((): void => {
+            this.emit("paste", text);
+          });
+        return;
+      } catch {}
+    }
     this.emit("paste", text);
-    if (!this.canEdit() || this.settings.reportPaste) event.preventDefault?.();
   }
   selection(start: number, end: number): void {
     this.selStart = Math.max(0, start);
@@ -526,9 +782,16 @@ class EditorEntry {
   scrolled(): void {
     if (this.settings.multiline && !this.settings.secure) {
       const offset = this.scroller.currentOffset();
-      this.emit("scroll", "", 0, 0,
+      this.emit(
+        "scroll",
+        "",
+        0,
+        0,
         Math.max(this.settings.width, this.contentWidth),
-        Math.max(this.settings.height, this.contentHeight), offset.xOffset, offset.yOffset);
+        Math.max(this.settings.height, this.contentHeight),
+        offset.xOffset,
+        offset.yOffset,
+      );
     }
     this.scheduleSize();
   }
@@ -623,16 +886,21 @@ class EditorEntry {
     if (this.pendingScroll !== undefined) {
       const command = this.pendingScroll;
       this.pendingScroll = undefined;
-      this.scroller.scrollTo({ xOffset: command.x, yOffset: command.y, animation: command.animated });
+      this.scroller.scrollTo({
+        xOffset: command.x,
+        yOffset: command.y,
+        animation: command.animated,
+      });
       this.scrolled();
     }
     if (this.focused) {
-      const controller: TextContentControllerBase = this.settings.multiline && !this.settings.secure
-        ? this.area : this.line;
+      const controller: TextContentControllerBase =
+        this.settings.multiline && !this.settings.secure ? this.area : this.line;
       const caret = controller.getCaretOffset();
-      const lineHeight = height > 0
-        ? height / Math.max(1, controller.getTextContentLineCount())
-        : this.settings.fontSize * 1.2;
+      const lineHeight =
+        height > 0
+          ? height / Math.max(1, controller.getTextContentLineCount())
+          : this.settings.fontSize * 1.2;
       let x = ui.px2vp(caret.x);
       let y = ui.px2vp(caret.y);
       if (this.settings.multiline && !this.settings.secure) {
@@ -641,9 +909,11 @@ class EditorEntry {
           const top = offset.yOffset;
           const bottom = top + this.settings.height;
           if (y < top || y + lineHeight > bottom) {
-            this.scroller.scrollTo({ xOffset: 0,
+            this.scroller.scrollTo({
+              xOffset: 0,
               yOffset: Math.max(0, y < top ? y : y + lineHeight - this.settings.height),
-              animation: false });
+              animation: false,
+            });
             offset = this.scroller.currentOffset();
           }
         }
@@ -651,7 +921,12 @@ class EditorEntry {
         y -= offset.yOffset;
       }
       this.revealCaret = false;
-      if (caret.index !== this.caretIndex || x !== this.caretX || y !== this.caretY || lineHeight !== this.caretHeight) {
+      if (
+        caret.index !== this.caretIndex ||
+        x !== this.caretX ||
+        y !== this.caretY ||
+        lineHeight !== this.caretHeight
+      ) {
         this.caretIndex = caret.index;
         this.caretX = x;
         this.caretY = y;
@@ -660,7 +935,22 @@ class EditorEntry {
       }
     }
   }
-  emit(kind: string, text = "", start = 0, end = 0, width = 0, height = 0, x = 0, y = 0): void {
+  markMenuInteraction(): void {
+    this.menuInteracting = true;
+  }
+  emit(
+    kind: string,
+    text = "",
+    start = 0,
+    end = 0,
+    width = 0,
+    height = 0,
+    x = 0,
+    y = 0,
+    html?: string | null,
+    files?: string | null,
+    image?: string | null,
+  ): void {
     if (
       !this.attached ||
       this.closed ||
@@ -668,6 +958,19 @@ class EditorEntry {
       (this.updating && kind !== "focus" && kind !== "blur")
     ) {
       return;
+    }
+    if (kind === "blur" && this.menuInteracting) {
+      this.menuInteracting = false;
+      try {
+        this.context
+          .getUIContext()
+          .getFocusController()
+          .requestFocus(`nsh-editor-${this.settings.targetId}`);
+      } catch {}
+      return;
+    }
+    if (kind === "focus") {
+      this.menuInteracting = false;
     }
     if (kind === "focus" || kind === "blur") {
       this.focused = kind === "focus";
@@ -679,7 +982,7 @@ class EditorEntry {
     }
     const response = this.context.editorEvent(
       this.settings.targetId,
-      new EditorEvent(this, kind, text, start, end, width, height, x, y),
+      new EditorEvent(this, kind, text, start, end, width, height, x, y, html, files, image),
     );
     if (response.accepted) {
       this.count = response.count;
@@ -739,7 +1042,7 @@ class EditorEntry {
     } else if (command.kind === "insert") {
       this.insertText(command.text ?? "");
     } else if (command.kind === "open-edit-menu") {
-      this.openEditMenu(command.x, command.y, command.actions ?? []);
+      this.openEditMenu(command.x, command.y, command.width, command.height, command.actions ?? []);
     } else if (command.kind === "close-edit-menu") {
       this.closeEditMenu();
     } else {
@@ -802,15 +1105,26 @@ class EditorEntry {
     this.selection(caret, caret);
   }
   chooseEditAction(action: string): void {
-    this.closeEditMenu();
+    this.menuInteracting = false;
+    if (!this.focused) {
+      try {
+        this.context
+          .getUIContext()
+          .getFocusController()
+          .requestFocus(`nsh-editor-${this.settings.targetId}`);
+      } catch {}
+    }
     if (this.closed || !this.context.isActive()) {
+      this.closeEditMenu();
       return;
     }
     if (action === "paste") {
       try {
-        pasteboard
-          .getSystemPasteboard()
-          .getData()
+        // Start getData() while PasteButton's temporary security grant is active,
+        // before disposing the overlay ComponentContent.
+        const dataPromise = pasteboard.getSystemPasteboard().getData();
+        this.closeEditMenu();
+        dataPromise
           .then((data: pasteboard.PasteData): void => {
             if (this.closed || !this.context.isActive()) {
               return;
@@ -819,74 +1133,76 @@ class EditorEntry {
               this.emit("edit-action", "paste");
               return;
             }
-            const text = data.getPrimaryText() ?? "";
-            this.emit("paste", text);
-            if (!this.settings.reportPaste && this.canEdit()) {
-              this.insertText(text);
-            }
+            extractPasteData(data)
+              .then((rich: ExtractedPasteData): void => {
+                if (this.closed || !this.context.isActive()) {
+                  return;
+                }
+                this.emit("paste", rich.text, 0, 0, 0, 0, 0, 0, rich.html, rich.files, rich.image);
+                if (!this.settings.reportPaste && this.canEdit() && rich.text.length > 0) {
+                  this.insertText(rich.text);
+                }
+              })
+              .catch((): void => {
+                this.emit("edit-action", "paste");
+              });
           })
           .catch((): void => {
             this.emit("edit-action", "paste");
           });
       } catch {
+        this.closeEditMenu();
         this.emit("edit-action", "paste");
       }
       return;
     }
+    this.closeEditMenu();
     this.emit("edit-action", action);
   }
-  private openEditMenu(x: number, y: number, actions: string[]): void {
-    // TODO: Localize the English-only labels and verify the menu anchor on a
-    // device at a non-1 density, including an editor near a screen edge.
+  private openEditMenu(
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+    actions: string[],
+  ): void {
     this.closeEditMenu();
-    if (this.closed || !this.context.isActive() || actions.length === 0) {
+    if (this.closed || !this.context.isActive()) {
       return;
     }
-    const frame = this.node.getFrameNode();
-    if (!frame) {
+    let hasClip = true;
+    try {
+      hasClip = pasteboard.getSystemPasteboard().hasDataSync();
+    } catch {}
+    const filtered = actions.filter((a: string): boolean => a !== "paste" || hasClip);
+    if (filtered.length === 0) {
       return;
     }
     const ui = this.context.getUIContext();
-    let localX = x;
-    let localY = y;
-    try {
-      const pos = frame.getPositionToWindow();
-      localX = x - pos.x;
-      localY = y - pos.y;
-    } catch {}
     const content = new ComponentContent<EditMenuParams>(
       ui,
       wrapBuilder(editMenuBuilder),
-      { entry: this, actions },
+      {
+        entry: this,
+        x,
+        y,
+        width,
+        height,
+        actions: filtered,
+      },
       { nestingBuilderSupported: true },
     );
     this.editMenuContent = content;
-    ui.getPromptAction()
-      .openMenu(
-        content,
-        { id: frame.getUniqueId() },
-        {
-          placement: Placement.TopLeft,
-          offset: { x: localX, y: -localY },
-          showInSubWindow: false,
-          onDisappear: (): void => {
-            if (this.editMenuContent === content) {
-              this.editMenuContent = undefined;
-            }
-            try {
-              content.dispose();
-            } catch {}
-          },
-        },
-      )
-      .catch((): void => {
-        if (this.editMenuContent === content) {
-          this.editMenuContent = undefined;
-        }
-        try {
-          content.dispose();
-        } catch {}
-      });
+    try {
+      ui.getOverlayManager().addComponentContent(content);
+    } catch {
+      if (this.editMenuContent === content) {
+        this.editMenuContent = undefined;
+      }
+      try {
+        content.dispose();
+      } catch {}
+    }
   }
   private closeEditMenu(): void {
     const content = this.editMenuContent;
@@ -895,20 +1211,11 @@ class EditorEntry {
     }
     this.editMenuContent = undefined;
     try {
-      this.context
-        .getUIContext()
-        .getPromptAction()
-        .closeMenu(content)
-        .finally((): void => {
-          try {
-            content.dispose();
-          } catch {}
-        });
-    } catch {
-      try {
-        content.dispose();
-      } catch {}
-    }
+      this.context.getUIContext().getOverlayManager().removeComponentContent(content);
+    } catch {}
+    try {
+      content.dispose();
+    } catch {}
   }
   private release(): void {
     this.closeEditMenu();

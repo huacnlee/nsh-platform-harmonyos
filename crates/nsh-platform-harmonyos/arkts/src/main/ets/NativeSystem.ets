@@ -10,6 +10,7 @@ import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 export interface SystemReply {
   has?: boolean;
   text?: string;
+  html?: string;
   uri?: string;
   width?: number;
   height?: number;
