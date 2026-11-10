@@ -115,6 +115,10 @@ OHOS_NDK_HOME=… nsh package examples/counter --target harmonyos -v
 
 设置 `NSH_HARMONYOS_SOURCE=<checkout>` 后，CLI 会用这个本地仓库来构建 runner。
 
+## 参与贡献
+
+范围、检查项以及提交和 PR 标题的写法见 [CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ## 许可
 
 Apache-2.0。

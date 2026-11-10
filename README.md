@@ -129,6 +129,10 @@ OHOS_NDK_HOME=… nsh package examples/counter --target harmonyos -v
 
 `NSH_HARMONYOS_SOURCE=<checkout>` makes the CLI build runners on a local checkout of this repository.
 
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the scope, the checks and how to title commits and pull requests.
+
 ## License
 
 Apache-2.0.
