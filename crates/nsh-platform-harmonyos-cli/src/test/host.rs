@@ -138,7 +138,7 @@ impl Hosts {
             agent: Agent::new(scene, Box::new(native.clone())),
             native,
             server,
-            screenshot: self.work.join("artifacts/last.png"),
+            screenshot: crate::paths::join_all(&self.work, ["artifacts", "last.png"]),
             captured: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             _running: running,

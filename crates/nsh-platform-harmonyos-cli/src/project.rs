@@ -12,6 +12,8 @@ use std::{
 use anyhow::{Context as _, bail};
 use serde_json::Value;
 
+use crate::paths::{join_all, join_relative};
+
 /// What the project takes from the app's `nsh.json`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct AppConfig {
@@ -106,7 +108,7 @@ impl AppConfig {
             build: build.unwrap_or(1),
             icon: json["icon"]
                 .as_str()
-                .map(|icon| app.join(icon))
+                .map(|icon| join_relative(app, icon))
                 .filter(|icon| {
                     icon.extension()
                         .is_some_and(|e| e.eq_ignore_ascii_case("png"))
@@ -291,12 +293,12 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
 
     // What a previous package wrote and this one replaces as a whole.
     for stale in [
-        "nsh",
-        "entry/libs",
-        "entry/src/main/resources/rawfile",
-        "AppScope/resources/base/media",
+        &["nsh"][..],
+        &["entry", "libs"],
+        &["entry", "src", "main", "resources", "rawfile"],
+        &["AppScope", "resources", "base", "media"],
     ] {
-        let path = out.join(stale);
+        let path = join_all(out, stale.iter().copied());
         if path.exists() {
             fs::remove_dir_all(&path).with_context(|| format!("removing {}", path.display()))?;
         }
@@ -306,7 +308,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         if *path == "AppScope/resources/base/media/app_icon.svg" && config.icon.is_some() {
             continue;
         }
-        let target = out.join(path);
+        let target = join_relative(out, path);
         let bytes = match std::str::from_utf8(bytes) {
             Ok(text) if text.contains("{{") => {
                 let mut text = text.to_owned();
@@ -320,22 +322,26 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         write_file(&target, &bytes)?;
     }
     if let Some(icon) = &config.icon {
-        let target = out.join("AppScope/resources/base/media/app_icon.png");
+        let target = join_all(
+            out,
+            ["AppScope", "resources", "base", "media", "app_icon.png"],
+        );
         write_file(
             &target,
             &fs::read(icon).with_context(|| format!("reading the icon {}", icon.display()))?,
         )?;
     }
+    let nsh_dir = out.join("nsh");
     for (path, bytes) in crate::embedded::ARKTS {
-        write_file(&out.join("nsh").join(path), bytes)?;
+        write_file(&join_relative(&nsh_dir, path), bytes)?;
     }
 
-    let libs = out.join("entry/libs/arm64-v8a");
+    let libs = join_all(out, ["entry", "libs", "arm64-v8a"]);
     fs::create_dir_all(&libs)?;
     fs::copy(contents.library, libs.join(crate::runner::LIBRARY))
         .with_context(|| format!("copying {}", contents.library.display()))?;
 
-    let rawfile = out.join("entry/src/main/resources/rawfile");
+    let rawfile = join_all(out, ["entry", "src", "main", "resources", "rawfile"]);
     fs::create_dir_all(&rawfile)?;
     for name in ["bundle.js", "app.json", "capabilities.json"] {
         let source = contents.build.join(name);
@@ -392,24 +398,25 @@ mod tests {
 
     #[test]
     fn reads_nsh_json() {
+        let app_root = std::env::temp_dir().join("apps").join("counter");
         let json = serde_json::json!({
             "name": "Counter",
             "id": "com.example.counter",
             "version": "2.1.0",
             "build": 7,
-            "icon": "icon.png",
+            "icon": "assets/icon.png",
             "schemes": ["MyApp", "https", "my-app.2+x", "myapp"],
             "capabilities": { "speech": false }
         });
-        let config = AppConfig::from_json(Path::new("/apps/counter"), &json);
+        let config = AppConfig::from_json(&app_root, &json);
         assert_eq!(config.name, "Counter");
         assert_eq!(config.id, "com.example.counter");
         assert_eq!(config.version, "2.1.0");
         assert_eq!(config.build, 7);
-        assert_eq!(config.icon, Some(PathBuf::from("/apps/counter/icon.png")));
+        assert_eq!(config.icon, Some(app_root.join("assets").join("icon.png")));
         assert_eq!(config.schemes, vec!["myapp", "my-app.2+x"]);
         assert!(!config.speech);
-        let bare = AppConfig::from_json(Path::new("/apps/counter"), &serde_json::json!({}));
+        let bare = AppConfig::from_json(&app_root, &serde_json::json!({}));
         assert_eq!(
             (
                 bare.name.as_str(),
@@ -421,7 +428,7 @@ mod tests {
         );
         assert!(bare.schemes.is_empty());
         let speech = AppConfig::from_json(
-            Path::new("/apps/speech"),
+            &std::env::temp_dir().join("apps").join("speech"),
             &serde_json::json!({ "capabilities": { "speech": true } }),
         );
         assert!(speech.speech);
@@ -477,11 +484,11 @@ mod tests {
         let build = dir.join("build");
         fs::create_dir_all(build.join("assets")).unwrap();
         fs::write(build.join("bundle.js"), "export default 1").unwrap();
-        fs::write(build.join("assets/a.txt"), "a").unwrap();
+        fs::write(build.join("assets").join("a.txt"), "a").unwrap();
         let library = dir.join("lib.so");
         fs::write(&library, b"\x7fELF").unwrap();
         let config = AppConfig::from_json(
-            Path::new("/apps/counter"),
+            &dir.join("counter"),
             &serde_json::json!({
                 "name": "Counter \"1\"",
                 "id": "com.example.counter",
@@ -496,18 +503,22 @@ mod tests {
             compile_api: MIN_API,
         };
         write(&out, &config, &contents).unwrap();
-        let app = fs::read_to_string(out.join("AppScope/app.json5")).unwrap();
+        let app = fs::read_to_string(join_all(&out, ["AppScope", "app.json5"])).unwrap();
         assert!(
             app.contains("\"bundleName\": \"com.example.counter\""),
             "{app}"
         );
-        let strings =
-            fs::read_to_string(out.join("AppScope/resources/base/element/string.json")).unwrap();
+        let strings = fs::read_to_string(join_all(
+            &out,
+            ["AppScope", "resources", "base", "element", "string.json"],
+        ))
+        .unwrap();
         assert!(strings.contains(r#""value": "Counter \"1\"""#), "{strings}");
         let profile = fs::read_to_string(out.join("build-profile.json5")).unwrap();
         assert!(profile.contains("\"runtimeOS\": \"HarmonyOS\""));
         assert!(profile.contains("\"targetSdkVersion\": \"6.0.0(20)\","));
-        let module = fs::read_to_string(out.join("entry/src/main/module.json5")).unwrap();
+        let module =
+            fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap();
         assert!(module.contains("\"default\","), "{module}");
         assert!(!module.contains("ohos.permission.MICROPHONE"), "{module}");
         assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
@@ -517,21 +528,49 @@ mod tests {
         assert!(profile.contains("\"signingConfigs\": []"));
         assert!(!profile.contains("{{"), "{profile}");
         assert!(
-            out.join("entry/libs/arm64-v8a/libnsh_platform_harmonyos.so")
-                .is_file()
+            join_all(
+                &out,
+                ["entry", "libs", "arm64-v8a", "libnsh_platform_harmonyos.so"]
+            )
+            .is_file()
         );
         assert!(
-            out.join("entry/src/main/resources/rawfile/bundle.js")
-                .is_file()
+            join_all(
+                &out,
+                ["entry", "src", "main", "resources", "rawfile", "bundle.js"]
+            )
+            .is_file()
         );
         assert!(
-            out.join("entry/src/main/resources/rawfile/assets/a.txt")
-                .is_file()
+            join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "rawfile",
+                    "assets",
+                    "a.txt"
+                ]
+            )
+            .is_file()
         );
-        assert!(out.join("nsh/index.ets").is_file());
+        assert!(join_all(&out, ["nsh", "index.ets"]).is_file());
         assert!(
-            out.join("nsh/src/main/cpp/types/libnsh_platform_harmonyos/Index.d.ts")
-                .is_file()
+            join_all(
+                &out,
+                [
+                    "nsh",
+                    "src",
+                    "main",
+                    "cpp",
+                    "types",
+                    "libnsh_platform_harmonyos",
+                    "Index.d.ts"
+                ]
+            )
+            .is_file()
         );
 
         // Signing set up in DevEco survives packaging again.
@@ -549,11 +588,12 @@ mod tests {
         assert!(profile.contains("{ \"name\": \"release\", \"material\": {} }"));
 
         let speech = AppConfig::from_json(
-            Path::new("/apps/speech"),
+            &dir.join("speech"),
             &serde_json::json!({ "capabilities": { "speech": true } }),
         );
         write(&out, &speech, &contents).unwrap();
-        let module = fs::read_to_string(out.join("entry/src/main/module.json5")).unwrap();
+        let module =
+            fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap();
         assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");
         assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
         assert!(!module.contains("{{"), "{module}");

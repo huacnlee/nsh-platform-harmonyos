@@ -47,7 +47,12 @@ impl Report {
             let path = work
                 .join("artifacts")
                 .join(format!("failure-{}.png", self.count()));
-            if fs::copy(work.join("artifacts/last.png"), &path).is_ok() {
+            if fs::copy(
+                crate::paths::join_all(work, ["artifacts", "last.png"]),
+                &path,
+            )
+            .is_ok()
+            {
                 eprintln!("screenshot: {}", path.display());
             }
         }
@@ -61,7 +66,7 @@ impl Report {
                 failure,
                 error: false,
             });
-        let _ = fs::remove_file(work.join("artifacts/last.png"));
+        let _ = fs::remove_file(crate::paths::join_all(work, ["artifacts", "last.png"]));
     }
     pub(super) fn error(&mut self, file: &Path, message: &str) {
         eprintln!("✗ {}: {message}", file.display());

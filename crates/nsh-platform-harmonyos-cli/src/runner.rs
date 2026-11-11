@@ -13,7 +13,10 @@ use std::{
 
 use anyhow::{Context as _, bail};
 
-use crate::sdk::{Ndk, TRIPLE};
+use crate::{
+    paths::join_all,
+    sdk::{Ndk, TRIPLE},
+};
 
 /// The library's name: the backend's N-API module is registered under its
 /// crate's name, so the library must carry the same one.
@@ -32,14 +35,11 @@ fn backend(dev: bool) -> String {
                 .and_then(Path::parent)
                 .map(Path::to_path_buf)
         })
-        .filter(|dir| {
-            dir.join("crates/nsh-platform-harmonyos/Cargo.toml")
-                .is_file()
-        });
+        .filter(|dir| join_all(dir, ["crates", "nsh-platform-harmonyos", "Cargo.toml"]).is_file());
     match checkout {
         Some(dir) => format!(
             "{{ package = \"nsh-platform-harmonyos\", path = {:?}{features} }}",
-            dir.join("crates/nsh-platform-harmonyos").to_string_lossy()
+            join_all(&dir, ["crates", "nsh-platform-harmonyos"]).to_string_lossy()
         ),
         None => format!(
             "{{ package = \"nsh-platform-harmonyos\", git = \"https://github.com/huacnlee/nsh-platform-harmonyos\", tag = \"v{}\"{features} }}",
@@ -269,24 +269,28 @@ mod tests {
         )
         .unwrap();
         write(&dir.join("runner"), Some(&app), false).unwrap();
-        let manifest = fs::read_to_string(dir.join("runner/Cargo.toml")).unwrap();
+        let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
         assert!(manifest.contains("nsh_rust_app = { package = \"counter-rust-app\", path = "));
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
         assert!(manifest.contains("crate-type = [\"cdylib\"]"));
         assert!(manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"));
         assert!(!manifest.contains("features = [\"dev\"]"));
-        let lib = fs::read_to_string(dir.join("runner/lib.rs")).unwrap();
+        let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
 
         write(&dir.join("runner-dev"), Some(&app), true).unwrap();
-        let dev_manifest = fs::read_to_string(dir.join("runner-dev/Cargo.toml")).unwrap();
+        let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"dev\"]"));
-        assert!(dev_manifest.contains("nsh-testing = { path = \"/src/nsh/crates/nsh-testing\" }"));
+        let expected_testing = format!(
+            "nsh-testing = {{ path = {:?} }}",
+            Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
+        );
+        assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
 
         write(&dir.join("tsx"), None, true).unwrap();
-        let tsx_manifest = fs::read_to_string(dir.join("tsx/Cargo.toml")).unwrap();
+        let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
         assert!(tsx_manifest.contains("features = [\"dev\"]"));
-        let lib = fs::read_to_string(dir.join("tsx/lib.rs")).unwrap();
+        let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
         fs::remove_dir_all(&dir).unwrap();
     }

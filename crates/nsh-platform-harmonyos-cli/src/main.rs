@@ -21,6 +21,7 @@
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
+mod paths;
 mod project;
 mod runner;
 mod sdk;
@@ -36,6 +37,8 @@ use std::{
 };
 
 use anyhow::{Context as _, bail};
+
+use crate::paths::join_all;
 
 const USAGE: &str = "\
 nsh-platform-harmonyos: run Native Shell apps on HarmonyOS and OpenHarmony
@@ -168,7 +171,7 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
             let app = app_dir(&options)?;
             let out = match &options.out {
                 Some(out) => out.clone(),
-                None => app.join(".nsh/out/harmonyos"),
+                None => join_all(&app, [".nsh", "out", "harmonyos"]),
             };
             let config = package(&app, &out, options.release.unwrap_or(true), false, &options)?;
             println!("✓ wrote the DevEco Studio project to {}", out.display());
@@ -199,7 +202,7 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
                      Rust \"root\" has no bundle. Run it with nsh run --target harmonyos"
                 );
             }
-            let out = app.join(".nsh/harmonyos/project");
+            let out = join_all(&app, [".nsh", "harmonyos", "project"]);
             let release = options.release.unwrap_or(false);
             let config = package(&app, &out, release, is_dev, &options)?;
             let Some(deveco) = sdk::DevEco::find() else {
@@ -292,7 +295,7 @@ fn package(
 ) -> anyhow::Result<Packaged> {
     let config = project::AppConfig::read(app)?;
     let ndk = sdk::Ndk::find()?;
-    let work = app.join(".nsh/harmonyos");
+    let work = join_all(app, [".nsh", "harmonyos"]);
     let build = work.join("build");
     // NSH bundles a TSX app, or writes its generated workspace with a Rust
     // app's root (`rust-app`).
@@ -307,7 +310,7 @@ fn package(
     if !status.success() {
         bail!("nsh build failed");
     }
-    let rust_app = app.join(".nsh/rust/rust-app");
+    let rust_app = join_all(app, [".nsh", "rust", "rust-app"]);
     let is_rust = is_rust_app(app) && rust_app.join("Cargo.toml").is_file();
     let runner = work.join("runner");
     runner::write(&runner, is_rust.then_some(rust_app.as_path()), dev)?;
@@ -407,7 +410,7 @@ fn hap(
     if !cmd.status().context("running hvigor")?.success() {
         bail!("hvigor could not build the HAP (run with -v to see why)");
     }
-    let outputs = project.join("entry/build/default/outputs/default");
+    let outputs = join_all(project, ["entry", "build", "default", "outputs", "default"]);
     let signed = outputs.join("entry-default-signed.hap");
     let unsigned = outputs.join("entry-default-unsigned.hap");
     if config.signed && signed.is_file() {
@@ -425,7 +428,7 @@ fn hap(
         println!("• signing it with the OpenHarmony SDK's debug keys (hap-sign-tool)");
         sign::sign(
             &lib,
-            &project.join("build/signing"),
+            &join_all(project, ["build", "signing"]),
             &config.id,
             &unsigned,
             &signed,
@@ -446,19 +449,37 @@ fn hap(
 /// the ArkTS package and the library's declarations, the package's on the
 /// declarations.
 fn link_packages(project: &Path) -> anyhow::Result<()> {
-    let types = "src/main/cpp/types/libnsh_platform_harmonyos";
+    let types = join_all(
+        project,
+        [
+            "nsh",
+            "src",
+            "main",
+            "cpp",
+            "types",
+            "libnsh_platform_harmonyos",
+        ],
+    );
     for (link, target) in [
-        ("entry/oh_modules/@nsh/harmonyos", "nsh".to_owned()),
         (
-            "entry/oh_modules/libnsh_platform_harmonyos.so",
-            format!("nsh/{types}"),
+            join_all(project, ["entry", "oh_modules", "@nsh", "harmonyos"]),
+            project.join("nsh"),
         ),
         (
-            "nsh/oh_modules/libnsh_platform_harmonyos.so",
-            format!("nsh/{types}"),
+            join_all(
+                project,
+                ["entry", "oh_modules", "libnsh_platform_harmonyos.so"],
+            ),
+            types.clone(),
+        ),
+        (
+            join_all(
+                project,
+                ["nsh", "oh_modules", "libnsh_platform_harmonyos.so"],
+            ),
+            types,
         ),
     ] {
-        let link = project.join(link);
         if let Some(parent) = link.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -468,7 +489,6 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
                 Err(_) => fs::remove_dir_all(&link)?,
             }
         }
-        let target = project.join(target);
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link)
             .with_context(|| format!("linking {}", link.display()))?;
@@ -626,7 +646,7 @@ fn typedefs(verbose: bool) -> anyhow::Result<()> {
         .context("this repository")?
         .to_path_buf();
     let ndk = sdk::Ndk::find()?;
-    let folder = repo.join("target/harmonyos-typedefs");
+    let folder = join_all(&repo, ["target", "harmonyos-typedefs"]);
     if folder.exists() {
         fs::remove_dir_all(&folder)?;
     }
@@ -659,8 +679,19 @@ fn typedefs(verbose: bool) -> anyhow::Result<()> {
         raw.push('\n');
     }
     let declarations = typedefs::format(&raw)?;
-    let target = repo.join(
-        "crates/nsh-platform-harmonyos/arkts/src/main/cpp/types/libnsh_platform_harmonyos/Index.d.ts",
+    let target = join_all(
+        &repo,
+        [
+            "crates",
+            "nsh-platform-harmonyos",
+            "arkts",
+            "src",
+            "main",
+            "cpp",
+            "types",
+            "libnsh_platform_harmonyos",
+            "Index.d.ts",
+        ],
     );
     fs::write(&target, declarations)?;
     println!("✓ wrote {}", target.display());
@@ -819,5 +850,62 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    #[test]
+    fn links_arkts_packages_across_platforms() {
+        let project = env::temp_dir().join(format!("nsh-hm-links-{}", std::process::id()));
+        let types = join_all(
+            &project,
+            [
+                "nsh",
+                "src",
+                "main",
+                "cpp",
+                "types",
+                "libnsh_platform_harmonyos",
+            ],
+        );
+        fs::create_dir_all(&types).unwrap();
+        fs::write(types.join("Index.d.ts"), "export {};\n").unwrap();
+        fs::write(project.join("nsh").join("index.ets"), "export {};\n").unwrap();
+
+        link_packages(&project).unwrap();
+        // Calling a second time replaces existing links/copies cleanly.
+        link_packages(&project).unwrap();
+
+        assert!(
+            join_all(
+                &project,
+                ["entry", "oh_modules", "@nsh", "harmonyos", "index.ets"]
+            )
+            .is_file()
+        );
+        assert!(
+            join_all(
+                &project,
+                [
+                    "entry",
+                    "oh_modules",
+                    "libnsh_platform_harmonyos.so",
+                    "Index.d.ts"
+                ]
+            )
+            .is_file()
+        );
+        assert!(
+            join_all(
+                &project,
+                [
+                    "nsh",
+                    "oh_modules",
+                    "libnsh_platform_harmonyos.so",
+                    "Index.d.ts"
+                ]
+            )
+            .is_file()
+        );
+        assert!(project.join("oh_modules").is_dir());
+        fs::remove_dir_all(project).unwrap();
     }
 }

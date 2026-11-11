@@ -18,6 +18,8 @@ use std::{
     time::Instant,
 };
 
+use crate::paths::join_all;
+
 #[derive(Debug, Default, PartialEq)]
 pub(crate) struct Options {
     pub(crate) filter: Option<String>,
@@ -69,7 +71,7 @@ impl<'a> Runner<'a> {
             self.plan.work.join("artifacts"),
             cancelled.clone(),
         )?;
-        let project = self.plan.app.join(".nsh/harmonyos/project");
+        let project = join_all(&self.plan.app, [".nsh", "harmonyos", "project"]);
         let release = self.options.release.unwrap_or(false);
         let config = crate::package(&self.plan.app, &project, release, true, self.options)?;
         let hap = crate::hap(&deveco, &project, &config, self.options, release)?;
@@ -116,7 +118,7 @@ impl<'a> Runner<'a> {
         let start = Instant::now();
         let mut report = report::Report::default();
         for file in &self.plan.files {
-            let _ = fs::remove_file(self.plan.work.join("artifacts/last.png"));
+            let _ = fs::remove_file(join_all(&self.plan.work, ["artifacts", "last.png"]));
             if cancelled.load(Ordering::Acquire) {
                 report.error(file, "test run interrupted");
                 break;
@@ -157,7 +159,7 @@ impl Plan {
             .find(|dir| dir.join("nsh.json").is_file())
             .context("test input is not inside an NSH app (no nsh.json)")?
             .to_path_buf();
-        let work = app.join(".nsh/harmonyos/test");
+        let work = join_all(&app, [".nsh", "harmonyos", "test"]);
         let mut files = Vec::new();
         if path.is_dir() {
             Self::discover(&path, &mut files)?;
@@ -166,8 +168,9 @@ impl Plan {
         } else {
             let mut steps = String::new();
             io::stdin().read_to_string(&mut steps)?;
-            fs::create_dir_all(work.join("files"))?;
-            let file = work.join(format!("files/steps-{}.test.ts", std::process::id()));
+            let files_dir = work.join("files");
+            fs::create_dir_all(&files_dir)?;
+            let file = files_dir.join(format!("steps-{}.test.ts", std::process::id()));
             let entry =
                 serde_json::to_string(path.to_str().context("test entry path must be UTF-8")?)?;
             fs::write(
@@ -227,15 +230,13 @@ mod tests {
         fs::create_dir_all(root.join("tests")).unwrap();
         fs::create_dir_all(root.join(".nsh")).unwrap();
         fs::write(root.join("nsh.json"), "{}").unwrap();
-        fs::write(root.join("tests/a.test.tsx"), "").unwrap();
-        fs::write(root.join(".nsh/old.test.tsx"), "").unwrap();
+        let test_file = join_all(&root, ["tests", "a.test.tsx"]);
+        fs::write(&test_file, "").unwrap();
+        fs::write(join_all(&root, [".nsh", "old.test.tsx"]), "").unwrap();
         let plan = Plan::read(&root).unwrap();
+        assert_eq!(plan.files, [test_file.canonicalize().unwrap()]);
         assert_eq!(
-            plan.files,
-            [root.join("tests/a.test.tsx").canonicalize().unwrap()]
-        );
-        assert_eq!(
-            Plan::read(&root.join("tests/a.test.tsx")).unwrap().app,
+            Plan::read(&test_file).unwrap().app,
             root.canonicalize().unwrap()
         );
         fs::remove_dir_all(root).unwrap();

@@ -38,13 +38,29 @@ fn files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
     }
 }
 
+fn join_relative(base: &Path, relative: &str) -> PathBuf {
+    let candidate = Path::new(relative);
+    if candidate.is_absolute() {
+        return candidate.to_path_buf();
+    }
+    relative
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .fold(base.to_path_buf(), |path, part| path.join(part))
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.parent().unwrap().parent().unwrap();
     let mut code = String::new();
     for (name, dir) in [
         ("TEMPLATE", repo.join("template")),
-        ("ARKTS", repo.join("crates/nsh-platform-harmonyos/arkts")),
+        (
+            "ARKTS",
+            repo.join("crates")
+                .join("nsh-platform-harmonyos")
+                .join("arkts"),
+        ),
     ] {
         println!("cargo:rerun-if-changed={}", dir.display());
         let mut list = Vec::new();
@@ -77,7 +93,7 @@ fn main() {
             let line = match line.split_once("path = \"") {
                 Some((head, rest)) => {
                     let (path, tail) = rest.split_once('"').unwrap();
-                    let path = repo.join(path);
+                    let path = join_relative(repo, path);
                     let path = path.canonicalize().unwrap_or(path);
                     format!("{head}path = {:?}{tail}", path.display().to_string())
                 }
