@@ -113,8 +113,8 @@ CLI 写出的是标准的 Stage 模型应用：`EntryAbility` 加载 `pages/Inde
 
 ## 状态
 
-- 支持 **Rust** 写的应用（`nsh.json` 里有 `"rust"` 和 `"root"`）和 **TSX** 应用。TSX 应用如果还带着导出组件的 Rust crate（有
-  `"rust"` 没有 `"root"`），暂时还不会被链接进来。
+- 支持 **Rust** 写的应用（`nsh.json` 里有 `"rust"` 和 `"root"`）、**TSX** 应用，以及带着自己 Rust crate 的 TSX 应用（有
+  `"rust"` 没有 `"root"`）：runner 会链接这些 crate 导出的组件、模块和类，供 bundle 导入。
 - 后端覆盖了 NSH 移动端后端的全部能力：视图和装饰、文字、图片、canvas、shader 视图、滚动视图和带下拉刷新的列表、文本输入、手势和 responder
   系统、原生动画图、带鸿蒙标题栏的导航栈、模态和 sheet、弹出层、视频、网页、无障碍、签名包，以及 `nsh dev`（特性 `dev`）。
 - 这里已验证：后端针对 NSH `main` 能为 `aarch64-unknown-linux-ohos` 编译，所有特性组合（默认、`dev`、`api-23`、`api-26`）都通过；
