@@ -1,5 +1,7 @@
 //! Image IO stays off the UI thread. Native ArkUI decodes and presents validated
 //! encoded data; all HTTP redirects pass the shared Rust capability policy.
+//! Pixel buffers (`ImageSrc::rgba`) skip IO and decode: they become PixelMaps
+//! as they are, and never enter the caches.
 
 use std::{
     cell::{Cell, RefCell},
@@ -66,6 +68,8 @@ pub(crate) struct Progress {
 pub(crate) struct Decoded {
     bytes: Arc<[u8]>,
     svg: Option<nsh_core::svg::Raster>,
+    /// A pixel buffer (`ImageSrc::rgba`): shown as it is, never encoded.
+    rgba: Option<ImageData>,
     width: u32,
     height: u32,
 }
@@ -104,6 +108,36 @@ impl Data {
         }
     }
     pub(crate) fn bitmap(&self) -> std::result::Result<ohos_drawing_binding::Bitmap, String> {
+        if let Some(rgba) = &self.rgba {
+            let (width, height, pixels) = rgba.rgba().expect("rgba data keeps its pixels");
+            let mut bitmap = ohos_drawing_binding::Bitmap::new(
+                width,
+                height,
+                ohos_drawing_binding::BitmapFormat::default(),
+            );
+            let output = bitmap.pixels_mut();
+            if output.len() != pixels.len() {
+                return Err("image bitmap allocation failed".into());
+            }
+            // Drawing bitmaps are premultiplied; a pixel buffer is straight.
+            for (dst, src) in output
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(pixels.as_chunks::<4>().0)
+            {
+                let a = u16::from(src[3]);
+                if a == 255 {
+                    dst.copy_from_slice(src);
+                } else {
+                    dst[0] = (u16::from(src[0]) * a / 255) as u8;
+                    dst[1] = (u16::from(src[1]) * a / 255) as u8;
+                    dst[2] = (u16::from(src[2]) * a / 255) as u8;
+                    dst[3] = src[3];
+                }
+            }
+            return Ok(bitmap);
+        }
         if let Some(svg) = &self.svg {
             let mut bitmap = ohos_drawing_binding::Bitmap::new(
                 svg.width,
@@ -171,6 +205,32 @@ impl Loader {
         inline: Option<ImageData>,
     ) -> Arc<AtomicBool> {
         let cancelled = Arc::new(AtomicBool::new(false));
+        // A pixel buffer needs no read or decode, and never enters the
+        // caches: every buffer is a new image, shown as it is.
+        if let Some(data) = inline.as_ref().filter(|data| data.rgba().is_some()) {
+            let (width, height, _) = data.rgba().expect("rgba data keeps its pixels");
+            let result = if u64::from(width) * u64::from(height) > 16_777_216 {
+                Err("image dimensions exceed 16 megapixels".into())
+            } else {
+                Ok(Arc::new(Data {
+                    decoded: Arc::new(Decoded {
+                        bytes: Vec::new().into(),
+                        svg: None,
+                        rgba: Some(data.clone()),
+                        width,
+                        height,
+                    }),
+                    _lease: Lease::none(),
+                }))
+            };
+            if let Some(dispatcher) = self.dispatcher.upgrade() {
+                dispatcher.image(Ready {
+                    target,
+                    data: result,
+                });
+            }
+            return cancelled;
+        }
         let request = {
             let mut pending = self.pending.lock().expect("pending images");
             if let Some(request) = pending.get(&uri) {
@@ -338,6 +398,7 @@ impl Loader {
         let decoded = Arc::new(Decoded {
             bytes: bytes.to_vec().into(),
             svg,
+            rgba: None,
             width,
             height,
         });
@@ -366,6 +427,34 @@ impl NativeImage {
             DecodingOptions, ImageSource, PixelMap, PixelMapInitializationOptions,
             types::{PixelFormat, PixelMapAlphaType},
         };
+        if let Some(rgba) = &data.rgba {
+            let (width, height, pixels) = rgba.rgba().expect("rgba data keeps its pixels");
+            let mut options = PixelMapInitializationOptions::new().map_err(|e| e.to_string())?;
+            options.set_width(width).map_err(|e| e.to_string())?;
+            options.set_height(height).map_err(|e| e.to_string())?;
+            options
+                .set_src_pixel_format(PixelFormat::Rgba8888)
+                .map_err(|e| e.to_string())?;
+            options
+                .set_pixel_format(PixelFormat::Rgba8888)
+                .map_err(|e| e.to_string())?;
+            options
+                .set_alpha_type(PixelMapAlphaType::Unpremultiplied)
+                .map_err(|e| e.to_string())?;
+            options.set_editable(true).map_err(|e| e.to_string())?;
+            let mut pixel_map = PixelMap::create_empty(&mut options).map_err(|e| e.to_string())?;
+            pixel_map.write_pixels(pixels).map_err(|e| e.to_string())?;
+            let descriptor =
+                ohos_arkui_binding::api::attribute_option::DrawableDescriptor::from_pixel_map(
+                    pixel_map.handle(),
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(Self {
+                descriptor,
+                _pixels: vec![pixel_map],
+                _bytes: data.bytes.clone(),
+            });
+        }
         if let Some(svg) = &data.svg {
             let mut options = PixelMapInitializationOptions::new().map_err(|e| e.to_string())?;
             options.set_width(svg.width).map_err(|e| e.to_string())?;

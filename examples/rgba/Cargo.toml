@@ -1,0 +1,14 @@
+[package]
+name = "nsh-app-rgba"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nsh-core = { path = "../../../nsh/crates/nsh-core" }
+nsh-base = { path = "../../../nsh/crates/nsh-base" }
