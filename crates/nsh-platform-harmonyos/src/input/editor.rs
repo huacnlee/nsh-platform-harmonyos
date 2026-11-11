@@ -62,6 +62,41 @@ impl Input {
     }
     #[cfg(feature = "dev")]
     pub(crate) fn test_key(&self, kind: &str) {
+        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
+            && let Some(route) = owner.dispatcher.upgrade()
+        {
+            use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+            let stroke = match kind {
+                "return" => Some(Keystroke {
+                    key: Key::Enter,
+                    modifiers: Modifiers::default(),
+                }),
+                "backspace" => Some(Keystroke {
+                    key: Key::Backspace,
+                    modifiers: Modifiers::default(),
+                }),
+                "select-all" => Some(Keystroke {
+                    key: Key::Char('a'),
+                    modifiers: Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    },
+                }),
+                _ => None,
+            };
+            if let Some(stroke) = stroke {
+                let matched = route.keyboard.lock().unwrap().map.find(stroke, true, false);
+                if let KeyMatch::Fire(id) = matched {
+                    route.send(crate::app::runtime::Message::HostEvent(
+                        EventKind::KeyCommand,
+                        EventPayload::Value(PayloadValue::Number(id as f64)),
+                    ));
+                }
+                if matched.consumed() {
+                    return;
+                }
+            }
+        }
         let command =
             if kind == "return" && self.config.borrow().submit() == SubmitBehavior::Newline {
                 "return-newline"
@@ -286,6 +321,72 @@ impl Input {
                     || event.text.chars().count() == 1 =>
             {
                 self.key(&owner, &event.text)
+            }
+            "delete-to-doc-start" => {
+                if let Some(route) = owner.dispatcher.upgrade() {
+                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+                    let (select_id, delete_id) = {
+                        let snapshot = route.keyboard.lock().unwrap();
+                        (
+                            snapshot.map.find(
+                                Keystroke {
+                                    key: Key::Home,
+                                    modifiers: Modifiers {
+                                        ctrl: true,
+                                        shift: true,
+                                        ..Modifiers::default()
+                                    },
+                                },
+                                true,
+                                false,
+                            ),
+                            snapshot.map.find(
+                                Keystroke {
+                                    key: Key::Backspace,
+                                    modifiers: Modifiers::default(),
+                                },
+                                true,
+                                false,
+                            ),
+                        )
+                    };
+                    if let KeyMatch::Fire(id) = select_id {
+                        route.send(crate::app::runtime::Message::HostEvent(
+                            EventKind::KeyCommand,
+                            EventPayload::Value(PayloadValue::Number(id as f64)),
+                        ));
+                        if let KeyMatch::Fire(del) = delete_id {
+                            route.send(crate::app::runtime::Message::HostEvent(
+                                EventKind::KeyCommand,
+                                EventPayload::Value(PayloadValue::Number(del as f64)),
+                            ));
+                        } else {
+                            self.key(&owner, "Backspace");
+                        }
+                    }
+                }
+            }
+            "undo" => {
+                if let Some(route) = owner.dispatcher.upgrade() {
+                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+                    let matched = route.keyboard.lock().unwrap().map.find(
+                        Keystroke {
+                            key: Key::Char('z'),
+                            modifiers: Modifiers {
+                                ctrl: true,
+                                ..Modifiers::default()
+                            },
+                        },
+                        true,
+                        false,
+                    );
+                    if let KeyMatch::Fire(id) = matched {
+                        route.send(crate::app::runtime::Message::HostEvent(
+                            EventKind::KeyCommand,
+                            EventPayload::Value(PayloadValue::Number(id as f64)),
+                        ));
+                    }
+                }
             }
             _ => {}
         }

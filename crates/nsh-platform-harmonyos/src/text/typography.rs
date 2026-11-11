@@ -109,19 +109,25 @@ impl Paragraph {
                 && self.native.line_count() <= 1)
     }
     fn lines(&self) -> Vec<RawLine> {
+        let text_lines = self.native.text_lines();
         (0..self.native.line_count().min(i32::MAX as usize))
-            .filter_map(|index| self.native.line_metrics(index as i32))
-            .map(|line| RawLine {
-                start: line.start_index as u32,
-                end: line.end_index as u32,
-                x: Points(line.x as f32),
-                y: Points(line.y as f32),
-                width: Points(line.width as f32),
-                height: Points(line.height as f32),
-                ascender: Points(line.ascender as f32),
-                descender: Points(line.descender as f32),
-                cap_height: Points(line.cap_height as f32),
-                x_height: Points(line.x_height as f32),
+            .filter_map(|index| {
+                let line = self.native.line_metrics(index as i32)?;
+                let trailing = text_lines
+                    .get(index)
+                    .map_or(0.0, |l| l.trailing_space_width().max(0.0));
+                Some(RawLine {
+                    start: line.start_index as u32,
+                    end: line.end_index as u32,
+                    x: Points(line.x as f32),
+                    y: Points(line.y as f32),
+                    width: Points((line.width + trailing) as f32),
+                    height: Points(line.height as f32),
+                    ascender: Points(line.ascender as f32),
+                    descender: Points(line.descender as f32),
+                    cap_height: Points(line.cap_height as f32),
+                    x_height: Points(line.x_height as f32),
+                })
             })
             .collect()
     }
@@ -470,8 +476,18 @@ impl TextEngine for OhosTextEngine {
         let shared = prepared.layout(self, target, true);
         let owned = shared.lock().expect("text paragraph");
         let paragraph = &owned.native;
+        let line_width = if prepared.text.ends_with(char::is_whitespace) {
+            owned
+                .lines()
+                .into_iter()
+                .map(|line| f64::from(line.width.0))
+                .fold(paragraph.longest_line(), f64::max)
+                .min(target)
+        } else {
+            paragraph.longest_line()
+        };
         Size::new(
-            Points(paragraph.longest_line().ceil() as f32),
+            Points(line_width.ceil() as f32),
             Points(paragraph.height().ceil() as f32),
         )
     }

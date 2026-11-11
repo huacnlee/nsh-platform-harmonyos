@@ -200,6 +200,24 @@ function contentType(value?: string | null): ContentType | undefined {
   return result;
 }
 
+const SINK_PAD_LEN: number = 64;
+const SINK_PAD_MIN: number = 32;
+const SINK_PAD: string = "\u200b".repeat(SINK_PAD_LEN);
+const SINK_BYTE_LIMIT: number = 256;
+
+function isSinkSettings(s: EditorSettings): boolean {
+  return s.multiline && s.reportPaste && s.hitTest === 3 && s.color === 0 && s.caretColor === 0;
+}
+
+function utf8ByteLength(text: string): number {
+  let bytes = 0;
+  for (const ch of Array.from(text)) {
+    const code = ch.codePointAt(0) ?? 0;
+    bytes += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
 class EditorEvent implements EditorEventPayload {
   readonly kind: string;
   readonly text: string;
@@ -341,12 +359,16 @@ function editorContent(entry: EditorEntry) {
         .onWillChange(() => entry.canEdit())
         .onWillInsert((value: InsertValue): boolean => {
           if (!entry.canEdit()) return false;
-          entry.editKey(value.insertValue);
+          if (!entry.isSink()) {
+            entry.editKey(value.insertValue);
+          }
           return true;
         })
         .onWillDelete((): boolean => {
           if (!entry.canEdit()) return false;
-          entry.editKey("Backspace");
+          if (!entry.isSink() || entry.text.length === 0) {
+            entry.editKey("Backspace");
+          }
           return true;
         })
         .onAppear(() => entry.appeared())
@@ -543,11 +565,7 @@ struct EditMenuView {
         this.actions,
         (action: string, index: number) => {
           if (index > 0) {
-            Divider()
-              .vertical(true)
-              .height(16)
-              .color(menuDividerColor())
-              .strokeWidth(0.5);
+            Divider().vertical(true).height(16).color(menuDividerColor()).strokeWidth(0.5);
           }
           if (action === "paste") {
             PasteButton({
@@ -678,14 +696,28 @@ class EditorEntry {
   private pendingScroll?: EditorCommand;
   private editMenuContent?: ComponentContent<EditMenuParams>;
   private menuInteracting: boolean = false;
+  private rustText: string = "";
+  private rustEmptied: string = "";
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
     this.context = context;
     this.settings = settings;
-    this.text = settings.text;
+    this.rustText = settings.text;
+    this.text = isSinkSettings(settings) && settings.text.length === 0 ? SINK_PAD : settings.text;
     this.count = settings.count;
-    this.selStart = settings.text.length;
-    this.selEnd = settings.text.length;
+    this.selStart = this.text.length;
+    this.selEnd = this.text.length;
     this.node = new BuilderNode<[EditorEntry]>(context.getUIContext());
+  }
+  isSink(): boolean {
+    return isSinkSettings(this.settings);
+  }
+  private pinSinkCaret(): void {
+    const end = this.text.length;
+    this.selStart = end;
+    this.selEnd = end;
+    try {
+      this.area.setTextSelection(end, end);
+    } catch {}
   }
   create(): void {
     this.updating = true;
@@ -726,18 +758,37 @@ class EditorEntry {
     ) {
       throw new Error("Editor replacement requires a new generation");
     }
+    const sink = isSinkSettings(settings);
     if (settings.count === this.count) {
-      const prevLen = this.text.length;
-      this.text = settings.text;
-      if (this.selStart >= prevLen && this.selEnd >= prevLen) {
-        this.selStart = this.text.length;
-        this.selEnd = this.text.length;
+      if (sink) {
+        if (settings.text.length === 0) {
+          if (this.rustText.length > 0) {
+            this.rustEmptied = this.rustText;
+            this.rustText = "";
+          }
+          if (this.preview.length === 0 && this.text.length < SINK_PAD_MIN) {
+            this.text = SINK_PAD;
+          }
+        } else {
+          this.rustText = settings.text;
+          this.rustEmptied = "";
+        }
       } else {
-        this.selStart = Math.min(this.selStart, this.text.length);
-        this.selEnd = Math.min(Math.max(this.selStart, this.selEnd), this.text.length);
+        const prevLen = this.text.length;
+        this.text = settings.text;
+        if (this.selStart >= prevLen && this.selEnd >= prevLen) {
+          this.selStart = this.text.length;
+          this.selEnd = this.text.length;
+        } else {
+          this.selStart = Math.min(this.selStart, this.text.length);
+          this.selEnd = Math.min(Math.max(this.selStart, this.selEnd), this.text.length);
+        }
       }
     }
     this.settings = settings;
+    if (this.isSink() && this.preview.length === 0 && this.text.length === 0) {
+      this.text = SINK_PAD;
+    }
     this.refresh();
   }
   private refresh(): void {
@@ -745,6 +796,9 @@ class EditorEntry {
     this.sdkBusy = true;
     try {
       this.node.update(this);
+      if (this.isSink() && this.focused && this.preview.length === 0) {
+        this.pinSinkCaret();
+      }
     } finally {
       this.updating = false;
       this.sdkBusy = false;
@@ -822,6 +876,17 @@ class EditorEntry {
     this.emit("paste", text);
   }
   selection(start: number, end: number): void {
+    if (this.isSink()) {
+      if (
+        this.focused &&
+        !this.updating &&
+        this.preview.length === 0 &&
+        (start !== this.text.length || end !== this.text.length)
+      ) {
+        this.pinSinkCaret();
+      }
+      return;
+    }
     this.selStart = Math.max(0, start);
     this.selEnd = Math.max(this.selStart, end);
     this.emit("selection", "", start, end);
@@ -850,13 +915,19 @@ class EditorEntry {
     }
     const composed = preview?.value ?? "";
     const start = Math.max(0, preview?.offset ?? 0);
-    // Mark composition before ChangeText can cause a controlled update.
-    if (composed.length > 0 && (composed !== this.preview || start !== this.previewStart)) {
-      this.emit("composition", composed, start, start + composed.length);
-    }
     const wasComposing = this.preview.length > 0;
+    const previewChanged =
+      composed.length > 0 && (composed !== this.preview || start !== this.previewStart);
     this.preview = composed;
     this.previewStart = start;
+    if (this.isSink()) {
+      this.sinkChange(text, composed, start, wasComposing, previewChanged);
+      return;
+    }
+    // Mark composition before ChangeText can cause a controlled update.
+    if (previewChanged) {
+      this.emit("composition", composed, start, start + composed.length);
+    }
     let next = text;
     if (digitsOnly(this.settings.keyboard)) {
       // ArkUI's number input keeps only digits even of the text the app
@@ -895,6 +966,130 @@ class EditorEntry {
     }
     this.revealCaret = true;
     this.scheduleSize();
+  }
+  private sinkChange(
+    text: string,
+    composed: string,
+    start: number,
+    wasComposing: boolean,
+    previewChanged: boolean,
+  ): void {
+    if (this.text !== text) {
+      let prevPad = 0;
+      while (prevPad < this.text.length && this.text.charCodeAt(prevPad) === 0x200b) {
+        prevPad++;
+      }
+      let nextPad = 0;
+      while (nextPad < text.length && text.charCodeAt(nextPad) === 0x200b) {
+        nextPad++;
+      }
+      const prevChars = Array.from(this.text);
+      const nextChars = Array.from(text);
+      let prefix = 0;
+      const limit = Math.min(prevChars.length, nextChars.length);
+      while (prefix < limit && prevChars[prefix] === nextChars[prefix]) {
+        prefix++;
+      }
+      const deleted = prevChars.length - prefix;
+      const rawInserted = nextChars.slice(prefix).join("");
+      let insertedPad = 0;
+      while (insertedPad < rawInserted.length && rawInserted.charCodeAt(insertedPad) === 0x200b) {
+        insertedPad++;
+      }
+      const inserted = rawInserted.replace(/\u200b/g, "");
+      this.text = text;
+      if (wasComposing) {
+        this.emit("composition", "", start, start);
+      }
+      if (nextPad === 0 && prevPad >= SINK_PAD_MIN && deleted >= prevPad) {
+        if (this.rustText.length > 0) {
+          this.emit("change", "");
+          this.rustText = "";
+          this.rustEmptied = "";
+        }
+        this.emit("delete-to-doc-start");
+        if (inserted.length > 0) {
+          this.applySinkDiff(0, inserted);
+        }
+      } else if (deleted === 0 && insertedPad >= SINK_PAD_MIN) {
+        this.emit("undo");
+        if (composed.length === 0) {
+          this.text = SINK_PAD;
+          this.refresh();
+          return;
+        }
+      } else {
+        this.applySinkDiff(deleted, inserted);
+      }
+      if (composed.length > 0) {
+        this.emit("composition", composed, start, start + composed.length);
+      }
+    } else {
+      if (previewChanged) {
+        this.emit("composition", composed, start, start + composed.length);
+      } else if (wasComposing && composed.length === 0) {
+        this.emit("composition", "", start, start);
+      }
+    }
+    if (composed.length === 0) {
+      let pad = 0;
+      while (pad < this.text.length && this.text.charCodeAt(pad) === 0x200b) {
+        pad++;
+      }
+      if (pad < SINK_PAD_MIN) {
+        this.text = SINK_PAD;
+        this.refresh();
+        return;
+      }
+    }
+    this.revealCaret = true;
+    this.scheduleSize();
+  }
+  private applySinkDiff(deleted: number, inserted: string): void {
+    const richEditorSink = !this.settings.scrollbarVisible;
+    if (deleted > 0) {
+      const rustChars = Array.from(this.rustText);
+      const k = rustChars.length;
+      if (k > 0) {
+        if (deleted < k) {
+          const kept = rustChars.slice(0, k - deleted).join("");
+          this.emit("change", kept);
+          if (richEditorSink) {
+            this.emit("change", "");
+            this.rustText = "";
+            this.rustEmptied = "";
+          } else {
+            this.rustText = kept;
+            this.rustEmptied = "";
+          }
+        } else {
+          this.emit("change", "");
+          this.rustText = "";
+          this.rustEmptied = "";
+          const rem = deleted - k;
+          for (let i = 0; i < rem; i++) {
+            this.emit("key", "Backspace");
+          }
+        }
+      } else {
+        for (let i = 0; i < deleted; i++) {
+          this.emit("key", "Backspace");
+        }
+      }
+    }
+    if (inserted.length > 0) {
+      const base = this.rustText.length > 0 ? this.rustText : this.rustEmptied;
+      const sent = base + inserted;
+      this.emit("change", sent);
+      if ((richEditorSink && inserted.includes("\n")) || utf8ByteLength(sent) > SINK_BYTE_LIMIT) {
+        this.emit("change", "");
+        this.rustText = "";
+        this.rustEmptied = "";
+      } else {
+        this.rustText = sent;
+        this.rustEmptied = "";
+      }
+    }
   }
   submit(event?: SubmitEvent): void {
     if (!this.settings.blurOnSubmit) {
@@ -1032,6 +1227,9 @@ class EditorEntry {
       }
       activeEditor = this;
       this.focused = true;
+      if (this.isSink() && this.preview.length === 0) {
+        this.pinSinkCaret();
+      }
       this.caretIndex = -1;
       this.scheduleSize();
     } else if (kind === "blur") {
@@ -1115,6 +1313,10 @@ class EditorEntry {
         }
       } catch {}
     } else if (command.kind === "select-all") {
+      if (this.isSink()) {
+        this.emit("edit-action", "selectAll");
+        return;
+      }
       const end = this.text.length;
       this.selStart = 0;
       this.selEnd = end;
@@ -1177,6 +1379,16 @@ class EditorEntry {
     if (!this.canEdit() || this.closed) {
       return;
     }
+    if (this.isSink()) {
+      if (inserted.length > 0) {
+        this.applySinkDiff(0, inserted);
+        if (this.preview.length === 0 && this.text.length < SINK_PAD_MIN) {
+          this.text = SINK_PAD;
+          this.refresh();
+        }
+      }
+      return;
+    }
     const controller: TextContentControllerBase =
       this.settings.multiline && !this.settings.secure ? this.area : this.line;
     const start = Math.min(this.text.length, this.selStart);
@@ -1214,6 +1426,14 @@ class EditorEntry {
   }
   deleteBackward(): void {
     if (!this.canEdit() || this.closed) {
+      return;
+    }
+    if (this.isSink()) {
+      this.applySinkDiff(1, "");
+      if (this.preview.length === 0 && this.text.length < SINK_PAD_MIN) {
+        this.text = SINK_PAD;
+        this.refresh();
+      }
       return;
     }
     this.editKey("Backspace");
