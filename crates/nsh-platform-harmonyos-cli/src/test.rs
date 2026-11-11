@@ -73,7 +73,15 @@ impl<'a> Runner<'a> {
         )?;
         let project = join_all(&self.plan.app, [".nsh", "harmonyos", "project"]);
         let release = self.options.release.unwrap_or(false);
-        let config = crate::package(&self.plan.app, &project, release, true, self.options)?;
+        let arch = match self.options.arch {
+            Some(arch) => arch,
+            None => device
+                .shell(&["param", "get", "const.product.cpu.abilist"])
+                .ok()
+                .and_then(|out| crate::sdk::parse_device_arch(&out))
+                .unwrap_or(crate::sdk::Arch::Arm64),
+        };
+        let config = crate::package(&self.plan.app, &project, arch, release, true, self.options)?;
         let hap = crate::hap(&deveco, &project, &config, self.options, release)?;
         if cancelled.load(Ordering::Acquire) {
             bail!("test run interrupted");

@@ -1,9 +1,9 @@
 //! The tools this target builds with: the OpenHarmony NDK (the native
-//! library, cross-compiled for `aarch64-unknown-linux-ohos`), and DevEco
-//! Studio's or the command-line tools' `hvigorw`, `ohpm` and `hdc` (the HAP,
-//! signed, installed on a device). Without DevEco, hvigor installed from
-//! npm (`HVIGOR_HOME`) builds an OpenHarmony project with an OpenHarmony
-//! SDK (`OHOS_BASE_SDK_HOME`), and the SDK's own tools sign it.
+//! library, cross-compiled for `arm64-v8a`, `armeabi-v7a` and `x86_64`), and
+//! DevEco Studio's or the command-line tools' `hvigorw`, `ohpm` and `hdc` (the
+//! HAP, signed, installed on a device). Without DevEco, hvigor installed from
+//! npm (`HVIGOR_HOME`) builds an OpenHarmony project with an OpenHarmony SDK
+//! (`OHOS_BASE_SDK_HOME`), and the SDK's own tools sign it.
 
 use std::{
     env, fs,
@@ -15,9 +15,66 @@ use anyhow::bail;
 
 use crate::paths::join_all;
 
-/// The Rust target of HarmonyOS devices (`arm64-v8a`).
-pub(crate) const TRIPLE: &str = "aarch64-unknown-linux-ohos";
-const CLANG_TARGET: &str = "aarch64-linux-ohos";
+/// A native target architecture an OpenHarmony / HarmonyOS HAP can carry
+/// under `libs/<abi>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Arch {
+    #[default]
+    Arm64,
+    Armv7a,
+    X86_64,
+}
+
+impl Arch {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<Arch> {
+        match value.to_ascii_lowercase().as_str() {
+            "arm64" => Ok(Arch::Arm64),
+            "armv7a" => Ok(Arch::Armv7a),
+            "x86_64" => Ok(Arch::X86_64),
+            other => bail!("--arch is arm64, armv7a or x86_64, not {other}"),
+        }
+    }
+
+    /// Directory name under `entry/libs/<abi>`.
+    pub(crate) const fn abi(self) -> &'static str {
+        match self {
+            Arch::Arm64 => "arm64-v8a",
+            Arch::Armv7a => "armeabi-v7a",
+            Arch::X86_64 => "x86_64",
+        }
+    }
+
+    /// Rust target triple for `cargo build --target`.
+    pub(crate) const fn triple(self) -> &'static str {
+        match self {
+            Arch::Arm64 => "aarch64-unknown-linux-ohos",
+            Arch::Armv7a => "armv7-unknown-linux-ohos",
+            Arch::X86_64 => "x86_64-unknown-linux-ohos",
+        }
+    }
+
+    /// Clang `--target` triple in the OpenHarmony NDK sysroot.
+    const fn clang_target(self) -> &'static str {
+        match self {
+            Arch::Arm64 => "aarch64-linux-ohos",
+            Arch::Armv7a => "arm-linux-ohos",
+            Arch::X86_64 => "x86_64-linux-ohos",
+        }
+    }
+
+    /// Target-specific flags matching the OpenHarmony NDK's `<triple>-clang` wrapper.
+    const fn extra_clang_flags(self) -> &'static [&'static str] {
+        match self {
+            Arch::Arm64 | Arch::X86_64 => &[],
+            Arch::Armv7a => &[
+                "-march=armv7-a",
+                "-mfloat-abi=softfp",
+                "-mtune=generic-armv7-a",
+                "-mthumb",
+            ],
+        }
+    }
+}
 
 /// The OpenHarmony NDK: the SDK's `native` directory.
 pub(crate) struct Ndk {
@@ -120,23 +177,31 @@ impl Ndk {
             .find_map(|version| Self::resolve(version, depth - 1))
     }
 
-    /// A cargo command that cross-compiles for [`TRIPLE`] with this NDK.
-    pub(crate) fn cargo(&self) -> Command {
+    /// A cargo command that cross-compiles for `arch` with this NDK.
+    pub(crate) fn cargo(&self, arch: Arch) -> Command {
         let bin = join_all(&self.native, ["llvm", "bin"]);
         let sysroot = self.native.join("sysroot");
         let exe = env::consts::EXE_SUFFIX;
+        let triple_name = arch.triple();
+        let clang_target = arch.clang_target();
         let clang = bin.join(format!("clang{exe}"));
-        let wrapper = bin.join(format!("{TRIPLE}-clang"));
-        let wrapper_xx = bin.join(format!("{TRIPLE}-clang++"));
+        let wrapper = bin.join(format!("{triple_name}-clang"));
+        let wrapper_xx = bin.join(format!("{triple_name}-clang++"));
         let use_wrapper = cfg!(unix) && wrapper.exists() && wrapper_xx.exists();
         let (cc, cxx) = if use_wrapper {
             (wrapper, wrapper_xx)
         } else {
             (clang.clone(), bin.join(format!("clang++{exe}")))
         };
-        let triple = TRIPLE.replace('-', "_");
+        let triple = triple_name.replace('-', "_");
         let sysroot_slash = sysroot.display().to_string().replace('\\', "/");
-        let flags = format!("--target={CLANG_TARGET} --sysroot=\"{sysroot_slash}\" -D__MUSL__");
+        let mut flag_parts = vec![
+            format!("--target={clang_target}"),
+            format!("--sysroot=\"{sysroot_slash}\""),
+            "-D__MUSL__".to_owned(),
+        ];
+        flag_parts.extend(arch.extra_clang_flags().iter().map(|f| (*f).to_owned()));
+        let flags = flag_parts.join(" ");
         let mut cmd = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         // N-API's build script finds the system libraries under
         // `$OHOS_NDK_HOME/native`.
@@ -158,10 +223,13 @@ impl Ndk {
         if !use_wrapper {
             cmd.env(format!("CFLAGS_{triple}"), &flags)
                 .env(format!("CXXFLAGS_{triple}"), &flags);
-            let rustflags = [
-                format!("-Clink-arg=--target={CLANG_TARGET}"),
+            let mut rustflags = vec![
+                format!("-Clink-arg=--target={clang_target}"),
                 format!("-Clink-arg=--sysroot={}", sysroot.display()),
             ];
+            for extra in arch.extra_clang_flags() {
+                rustflags.push(format!("-Clink-arg={extra}"));
+            }
             cmd.env("CARGO_ENCODED_RUSTFLAGS", rustflags.join("\x1f"));
         }
         // bindgen (QuickJS's bindings) loads the NDK's libclang.
@@ -420,4 +488,66 @@ pub(crate) fn signing_lib() -> Option<PathBuf> {
         .iter()
         .all(|f| d.join(f).is_file())
     })
+}
+
+/// Picks the first supported [`Arch`] advertised in a comma-separated
+/// `const.product.cpu.abilist` value from a device or emulator.
+pub(crate) fn parse_device_arch(abilist: &str) -> Option<Arch> {
+    abilist.split(',').find_map(|abi| match abi.trim() {
+        "arm64-v8a" => Some(Arch::Arm64),
+        "armeabi-v7a" => Some(Arch::Armv7a),
+        "x86_64" => Some(Arch::X86_64),
+        _ => None,
+    })
+}
+
+/// Queries the connected device's primary ABI via `hdc` when available.
+pub(crate) fn device_arch(sdk: Option<&Path>, device: Option<&str>) -> Option<Arch> {
+    let hdc = hdc(sdk)?;
+    let mut cmd = Command::new(hdc);
+    if let Some(device) = device {
+        cmd.args(["-t", device]);
+    }
+    let out = cmd
+        .args(["shell", "param", "get", "const.product.cpu.abilist"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    parse_device_arch(&String::from_utf8_lossy(&out.stdout))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_arch_names_and_device_abilists() {
+        assert_eq!(Arch::default(), Arch::Arm64);
+        assert_eq!(Arch::parse("arm64").unwrap(), Arch::Arm64);
+        assert_eq!(Arch::parse("armv7a").unwrap(), Arch::Armv7a);
+        assert_eq!(Arch::parse("x86_64").unwrap(), Arch::X86_64);
+        assert!(Arch::parse("arm64-v8a").is_err());
+        assert!(Arch::parse("arm64,armv7a").is_err());
+        assert!(Arch::parse("mips").is_err());
+
+        let all = [Arch::Arm64, Arch::Armv7a, Arch::X86_64];
+        assert_eq!(all.map(Arch::abi), ["arm64-v8a", "armeabi-v7a", "x86_64"]);
+        assert_eq!(
+            all.map(Arch::triple),
+            [
+                "aarch64-unknown-linux-ohos",
+                "armv7-unknown-linux-ohos",
+                "x86_64-unknown-linux-ohos"
+            ]
+        );
+        assert_eq!(
+            parse_device_arch("arm64-v8a,armeabi-v7a\r\n"),
+            Some(Arch::Arm64)
+        );
+        assert_eq!(parse_device_arch("x86_64\n"), Some(Arch::X86_64));
+        assert_eq!(parse_device_arch("default,armeabi-v7a"), Some(Arch::Armv7a));
+        assert_eq!(parse_device_arch(""), None);
+    }
 }

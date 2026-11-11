@@ -48,6 +48,7 @@ nsh run my-app --target harmonyos                  # builds, installs and starts
 |---|---|
 | `-o, --out DIR` | Where `package` writes the project (default `.nsh/out/harmonyos`) |
 | `--runtime-os harmonyos\|openharmony` | The OS the HAP is for: `harmonyos` (default) for Huawei's devices and AppGallery, `openharmony` for OpenHarmony devices |
+| `--arch arm64\|armv7a\|x86_64` | Native architecture to build (`package`: `arm64`; `run`/`dev`/`test`: the device's) |
 | `--device ID` | The device `hdc` installs on (`hdc list targets`) |
 | `--debug` / `--release` | How the native library is built (`package`: release; `run`: debug) |
 | `--no-hap` | Write the project only |

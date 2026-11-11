@@ -1,8 +1,8 @@
 //! The DevEco project `package` writes: the template (`template/`, embedded
 //! in this program) named from the app's `nsh.json`, the ArkTS package
 //! `@nsh/harmonyos` as the module `nsh`, the native library in
-//! `entry/libs/arm64-v8a`, and a TSX app's bundle and the app's assets as
-//! raw files.
+//! `entry/libs/<abi>`, and a TSX app's bundle and the app's assets as raw
+//! files.
 
 use std::{
     fs,
@@ -12,7 +12,10 @@ use std::{
 use anyhow::{Context as _, bail};
 use serde_json::Value;
 
-use crate::paths::{join_all, join_relative};
+use crate::{
+    paths::{join_all, join_relative},
+    sdk::Arch,
+};
 
 /// What the project takes from the app's `nsh.json`.
 #[derive(Debug, Clone, PartialEq)]
@@ -172,6 +175,8 @@ pub(crate) const MIN_API: u32 = 20;
 
 /// What goes into the project besides the template.
 pub(crate) struct Contents<'a> {
+    /// Target architecture (`entry/libs/<abi>`).
+    pub(crate) arch: Arch,
     /// The native library (`libnsh_platform_harmonyos.so`).
     pub(crate) library: &'a Path,
     /// `nsh build`'s output: a TSX app's `bundle.js`, `app.json`,
@@ -336,7 +341,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         write_file(&join_relative(&nsh_dir, path), bytes)?;
     }
 
-    let libs = join_all(out, ["entry", "libs", "arm64-v8a"]);
+    let libs = join_all(out, ["entry", "libs", contents.arch.abi()]);
     fs::create_dir_all(&libs)?;
     fs::copy(contents.library, libs.join(crate::runner::LIBRARY))
         .with_context(|| format!("copying {}", contents.library.display()))?;
@@ -497,6 +502,7 @@ mod tests {
         );
         let out = dir.join("project");
         let contents = Contents {
+            arch: Arch::Arm64,
             library: &library,
             build: &build,
             runtime_os: RuntimeOs::HarmonyOs,
@@ -534,6 +540,17 @@ mod tests {
             )
             .is_file()
         );
+        for (arch, abi) in [(Arch::Armv7a, "armeabi-v7a"), (Arch::X86_64, "x86_64")] {
+            write(&out, &config, &Contents { arch, ..contents }).unwrap();
+            assert!(
+                join_all(&out, ["entry", "libs", abi, "libnsh_platform_harmonyos.so"]).is_file(),
+                "missing {abi}"
+            );
+            assert!(
+                !join_all(&out, ["entry", "libs", "arm64-v8a"]).exists(),
+                "stale arm64-v8a should be removed when packaging {abi}"
+            );
+        }
         assert!(
             join_all(
                 &out,

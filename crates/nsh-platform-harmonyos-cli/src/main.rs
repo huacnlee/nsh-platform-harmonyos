@@ -44,10 +44,10 @@ const USAGE: &str = "\
 nsh-platform-harmonyos: run Native Shell apps on HarmonyOS and OpenHarmony
 
 Usage (through nsh, which finds this program on PATH):
-  nsh package [APP] --target harmonyos [--out DIR] [--runtime-os OS]
-  nsh run [APP] --target harmonyos [--device ID] [--release]
-  nsh dev [APP] --target harmonyos [--device ID] [--port PORT] [--release]
-  nsh test [PATH] --target harmonyos [--device ID] [--filter NAME] [--junit FILE]
+  nsh package [APP] --target harmonyos [--arch ARCH] [--out DIR] [--runtime-os OS]
+  nsh run [APP] --target harmonyos [--arch ARCH] [--device ID] [--release]
+  nsh dev [APP] --target harmonyos [--arch ARCH] [--device ID] [--port PORT] [--release]
+  nsh test [PATH] --target harmonyos [--arch ARCH] [--device ID] [--filter NAME] [--junit FILE]
 
 Commands:
   package   Build the app into a DevEco Studio project (default: .nsh/out/harmonyos),
@@ -61,6 +61,8 @@ Commands:
 Options:
   -o, --out DIR          Where `package` writes the project
       --runtime-os OS    harmonyos (default: Huawei's devices, AppGallery) or openharmony
+      --arch ARCH        Native architecture to build: arm64 (default for `package`),
+                         armv7a or x86_64 (default for `run`, `dev` and `test`: the device's)
       --device ID        The device `hdc` installs on (hdc list targets)
       --port PORT        Dev server port for `dev` (default: first free from 8790)
       --release          Build the native library optimized (`package` always does)
@@ -86,6 +88,7 @@ struct Options {
     app: Option<PathBuf>,
     out: Option<PathBuf>,
     runtime_os: project::RuntimeOs,
+    arch: Option<sdk::Arch>,
     device: Option<String>,
     port: Option<u16>,
     release: Option<bool>,
@@ -94,27 +97,64 @@ struct Options {
     test: test::Options,
 }
 
+impl Options {
+    /// Architecture `package` builds: `arm64` unless `--arch` names another.
+    fn package_arch(&self) -> sdk::Arch {
+        self.arch.unwrap_or(sdk::Arch::Arm64)
+    }
+}
+
 fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
     let mut options = Options {
         hap: true,
         ..Options::default()
     };
     let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        let mut value = |name: &str| args.next().with_context(|| format!("{name} needs a value"));
-        match arg.to_str() {
-            Some("-h" | "--help") => options.command = "help".into(),
-            Some("-V" | "--version") => options.command = "version".into(),
-            Some("-v" | "--verbose") => options.verbose = true,
+    while let Some(raw_arg) = args.next() {
+        if raw_arg == "--" {
+            continue;
+        }
+        let (flag_str, mut inline): (Option<String>, Option<OsString>) = match raw_arg.to_str() {
+            Some(s) => match s.strip_prefix("--").and_then(|rest| rest.split_once('=')) {
+                Some((flag, val)) => (Some(format!("--{flag}")), Some(OsString::from(val))),
+                None => (Some(s.to_owned()), None),
+            },
+            None => (None, None),
+        };
+        let mut value = |name: &str| match inline.take() {
+            Some(v) => Ok(v),
+            None => args.next().with_context(|| format!("{name} needs a value")),
+        };
+        let no_value = |name: &str, inline: &Option<OsString>| {
+            if inline.is_some() {
+                bail!("{name} takes no value");
+            }
+            Ok(())
+        };
+        match flag_str.as_deref() {
+            Some(flag @ ("-h" | "--help")) => {
+                no_value(flag, &inline)?;
+                options.command = "help".into();
+            }
+            Some(flag @ ("-V" | "--version")) => {
+                no_value(flag, &inline)?;
+                options.command = "version".into();
+            }
+            Some(flag @ ("-v" | "--verbose")) => {
+                no_value(flag, &inline)?;
+                options.verbose = true;
+            }
             Some("-o" | "--out") => options.out = Some(value("--out")?.into()),
             Some("--runtime-os") => {
-                options.runtime_os = project::RuntimeOs::parse(
-                    value("--runtime-os")?
-                        .to_str()
-                        .context("--runtime-os must be UTF-8")?,
-                )?
+                options.runtime_os =
+                    project::RuntimeOs::parse(&text_arg(value("--runtime-os")?, "--runtime-os")?)?;
             }
-            Some("--device") => options.device = Some(text_arg(value("--device")?, "--device")?),
+            Some("--arch") => {
+                options.arch = Some(sdk::Arch::parse(&text_arg(value("--arch")?, "--arch")?)?);
+            }
+            Some("--device") => {
+                options.device = Some(text_arg(value("--device")?, "--device")?);
+            }
             Some("--port") => {
                 options.port = Some(
                     text_arg(value("--port")?, "--port")?
@@ -122,20 +162,34 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
                         .context("--port must be a port number")?,
                 );
             }
-            Some("--release") => options.release = Some(true),
-            Some("--debug") => options.release = Some(false),
-            Some("--no-hap") => options.hap = false,
-            Some("--filter") => {
-                options.test.filter = Some(text_arg(value("--filter")?, "--filter")?)
+            Some("--release") => {
+                no_value("--release", &inline)?;
+                options.release = Some(true);
             }
-            Some("--trace") => options.test.trace = true,
-            Some("--junit") => options.test.junit = Some(value("--junit")?.into()),
+            Some("--debug") => {
+                no_value("--debug", &inline)?;
+                options.release = Some(false);
+            }
+            Some("--no-hap") => {
+                no_value("--no-hap", &inline)?;
+                options.hap = false;
+            }
+            Some("--filter") => {
+                options.test.filter = Some(text_arg(value("--filter")?, "--filter")?);
+            }
+            Some("--trace") => {
+                no_value("--trace", &inline)?;
+                options.test.trace = true;
+            }
+            Some("--junit") => {
+                options.test.junit = Some(value("--junit")?.into());
+            }
             Some(flag) if flag.starts_with('-') => {
                 bail!("{flag} is not an option of the harmonyos target\n\n{USAGE}")
             }
-            _ if options.command.is_empty() => options.command = text_arg(arg, "command")?,
-            _ if options.app.is_none() => options.app = Some(arg.into()),
-            _ => bail!("unexpected argument {arg:?}\n\n{USAGE}"),
+            _ if options.command.is_empty() => options.command = text_arg(raw_arg, "command")?,
+            _ if options.app.is_none() => options.app = Some(raw_arg.into()),
+            _ => bail!("unexpected argument {raw_arg:?}\n\n{USAGE}"),
         }
     }
     Ok(options)
@@ -173,7 +227,14 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
                 Some(out) => out.clone(),
                 None => join_all(&app, [".nsh", "out", "harmonyos"]),
             };
-            let config = package(&app, &out, options.release.unwrap_or(true), false, &options)?;
+            let config = package(
+                &app,
+                &out,
+                options.package_arch(),
+                options.release.unwrap_or(true),
+                false,
+                &options,
+            )?;
             println!("✓ wrote the DevEco Studio project to {}", out.display());
             let mut signed = config.signed;
             if options.hap {
@@ -204,8 +265,16 @@ fn run(options: anyhow::Result<Options>) -> anyhow::Result<()> {
             }
             let out = join_all(&app, [".nsh", "harmonyos", "project"]);
             let release = options.release.unwrap_or(false);
-            let config = package(&app, &out, release, is_dev, &options)?;
-            let Some(deveco) = sdk::DevEco::find() else {
+            let deveco = sdk::DevEco::find();
+            let arch = options.arch.unwrap_or_else(|| {
+                sdk::device_arch(
+                    deveco.as_ref().and_then(|d| d.sdk.as_deref()),
+                    options.device.as_deref(),
+                )
+                .unwrap_or(sdk::Arch::Arm64)
+            });
+            let config = package(&app, &out, arch, release, is_dev, &options)?;
+            let Some(deveco) = deveco else {
                 no_deveco(&out);
                 bail!(
                     "hvigor was not found (DevEco Studio's tools, or HVIGOR_HOME): it builds the HAP"
@@ -289,6 +358,7 @@ struct Packaged {
 fn package(
     app: &Path,
     out: &Path,
+    arch: sdk::Arch,
     release: bool,
     dev: bool,
     options: &Options,
@@ -314,11 +384,12 @@ fn package(
     let is_rust = is_rust_app(app) && rust_app.join("Cargo.toml").is_file();
     let runner = work.join("runner");
     runner::write(&runner, is_rust.then_some(rust_app.as_path()), dev)?;
-    let library = runner::build(&runner, &ndk, release, options.verbose)?;
+    let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
     project::write(
         out,
         &config,
         &project::Contents {
+            arch,
             library: &library,
             build: &build,
             runtime_os: options.runtime_os,
@@ -656,13 +727,13 @@ fn typedefs(verbose: bool) -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_nanos()
         .to_string();
-    let mut cmd = ndk.cargo();
+    let mut cmd = ndk.cargo(sdk::Arch::Arm64);
     cmd.args([
         "check",
         "-p",
         "nsh-platform-harmonyos",
         "--target",
-        sdk::TRIPLE,
+        sdk::Arch::Arm64.triple(),
     ])
     .current_dir(&repo)
     .env("NAPI_TYPE_DEF_TMP_FOLDER", &folder)
@@ -804,10 +875,26 @@ mod tests {
         assert_eq!(options.app, Some("examples/counter".into()));
         assert_eq!(options.out, Some("dist".into()));
         assert_eq!(options.runtime_os, project::RuntimeOs::OpenHarmony);
+        assert_eq!(options.arch, None);
+        assert_eq!(options.package_arch(), sdk::Arch::Arm64);
         assert_eq!(options.release, Some(false));
         assert!(options.verbose && options.hap);
         assert!(parse(args("package --sign")).is_err());
         assert!(parse(args("package --runtime-os android")).is_err());
+        assert!(parse(args("package --arch riscv64")).is_err());
+        assert!(parse(args("package --arch arm64,armv7a")).is_err());
+        assert!(parse(args("package --abi arm64")).is_err());
+        assert!(parse(args("package --target arm64")).is_err());
+
+        let arm64 = parse(args("package --arch arm64")).unwrap();
+        assert_eq!(arm64.package_arch(), sdk::Arch::Arm64);
+
+        let armv7a = parse(args("package --arch armv7a")).unwrap();
+        assert_eq!(armv7a.package_arch(), sdk::Arch::Armv7a);
+
+        let x64 = parse(args("package --arch=x86_64")).unwrap();
+        assert_eq!(x64.package_arch(), sdk::Arch::X86_64);
+
         let run = parse(args("run --device 127.0.0.1:5555 --no-hap")).unwrap();
         assert_eq!(run.device.as_deref(), Some("127.0.0.1:5555"));
         assert!(!run.hap);

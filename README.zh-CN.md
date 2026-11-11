@@ -44,6 +44,7 @@ nsh run my-app --target harmonyos                  # 构建 HAP，安装到 hdc 
 |---|---|
 | `-o, --out DIR` | `package` 写出工程的位置（默认 `.nsh/out/harmonyos`） |
 | `--runtime-os harmonyos\|openharmony` | HAP 面向的系统：`harmonyos`（默认）用于华为设备和应用市场（AppGallery），`openharmony` 用于 OpenHarmony 设备 |
+| `--arch arm64\|armv7a\|x86_64` | 要构建的原生架构（`package` 默认 `arm64`，`run`/`dev`/`test` 默认所连设备架构） |
 | `--device ID` | `hdc` 安装到哪台设备（见 `hdc list targets`） |
 | `--debug` / `--release` | native 库的构建方式（`package` 默认 release，`run` 默认 debug） |
 | `--no-hap` | 只写出工程，不构建 HAP |

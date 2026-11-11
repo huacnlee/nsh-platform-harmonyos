@@ -1,8 +1,8 @@
 //! The runner: a `cdylib` crate the CLI writes in the app's
 //! `.nsh/harmonyos/runner`, linking this platform's backend with the app (an
-//! app written in Rust: NSH's generated `nsh_rust_app`), built for
-//! `aarch64-unknown-linux-ohos` into `libnsh_platform_harmonyos.so`, the
-//! native library the HAP loads.
+//! app written in Rust: NSH's generated `nsh_rust_app`), built for the target
+//! OHOS ABI (`arm64-v8a` by default, or `armeabi-v7a` / `x86_64`) into
+//! `libnsh_platform_harmonyos.so`, the native library the HAP loads.
 
 use std::{
     fs,
@@ -15,7 +15,7 @@ use anyhow::{Context as _, bail};
 
 use crate::{
     paths::join_all,
-    sdk::{Ndk, TRIPLE},
+    sdk::{Arch, Ndk},
 };
 
 /// The library's name: the backend's N-API module is registered under its
@@ -184,22 +184,25 @@ fn testing_patches(patches: &str, app_manifest: &str) -> anyhow::Result<String> 
     Ok(result)
 }
 
-/// Builds the runner in `dir` with the NDK; the library's path.
+/// Builds the runner in `dir` for `arch` with the NDK; the library's path.
 pub(crate) fn build(
     dir: &Path,
     ndk: &Ndk,
+    arch: Arch,
     release: bool,
     verbose: bool,
 ) -> anyhow::Result<PathBuf> {
+    let abi = arch.abi();
+    let triple = arch.triple();
     println!(
-        "• building {LIBRARY} for arm64-v8a (cargo build{})",
+        "• building {LIBRARY} for {abi} (cargo build{})",
         if release { " --release" } else { "" }
     );
-    let mut cmd = ndk.cargo();
+    let mut cmd = ndk.cargo(arch);
     cmd.args([
         "build",
         "--target",
-        TRIPLE,
+        triple,
         "--message-format=json-render-diagnostics",
     ])
     .current_dir(dir)
@@ -236,7 +239,7 @@ pub(crate) fn build(
     let output = child.wait_with_output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("the native library did not build (rustup target add {TRIPLE}?)\n{stderr}");
+        bail!("the native library did not build for {abi} (rustup target add {triple}?)\n{stderr}");
     }
     library.context("cargo built no .so")
 }
