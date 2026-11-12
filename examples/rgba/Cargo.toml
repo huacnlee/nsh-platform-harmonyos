@@ -10,5 +10,5 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-nsh-core = { path = "../../../nsh/crates/nsh-core" }
-nsh-base = { path = "../../../nsh/crates/nsh-base" }
+nsh-core = "0.5"
+nsh-base = "0.5"

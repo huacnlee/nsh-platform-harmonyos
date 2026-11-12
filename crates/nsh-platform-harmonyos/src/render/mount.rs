@@ -1382,7 +1382,6 @@ impl Mounter {
                         | Command::CancelEvaluate { .. }
                         | Command::MeasureScrollPosition { .. }
                         | Command::Reveal(_)
-                        | Command::Orientations(_)
                         | Command::HostPost { .. }
                         | Command::CancelPress => {}
                         Command::Haptic(haptic) => {

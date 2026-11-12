@@ -73,21 +73,3 @@ codegen-units = 1
 opt-level = 3
 [profile.dev.package.taffy]
 opt-level = 3
-
-# NSH's crates at the revision this platform is built against: the platform
-# extension points (longbridge/nsh#1393) are on `main` and not in a release yet.
-# To build against a local checkout, give each a `path = "<checkout>/crates/<name>"`.
-# Local checkout: pin c5214aaf + cherry-pick of upstream #1561 (ImageSrc::rgba),
-# branch `rgba-on-pin`.
-[patch.crates-io]
-nsh-testing = { path = "../nsh/crates/nsh-testing" }
-nsh-bundler = { path = "../nsh/crates/nsh-bundler" }
-nsh-core = { path = "../nsh/crates/nsh-core" }
-nsh-engine = { path = "../nsh/crates/nsh-engine" }
-nsh-base = { path = "../nsh/crates/nsh-base" }
-nsh-package = { path = "../nsh/crates/nsh-package" }
-nsh-dev = { path = "../nsh/crates/nsh-dev" }
-nsh-js = { path = "../nsh/crates/nsh-js" }
-nsh-macros = { path = "../nsh/crates/nsh-macros" }
-nsh-i18n = { path = "../nsh/crates/nsh-i18n" }
-nsh-updater = { path = "../nsh/crates/nsh-updater" }
