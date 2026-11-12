@@ -10,5 +10,5 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-nsh-core = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
-nsh-base = { git = "https://github.com/longbridge/nsh", rev = "826654b5cd10f02fec795f66fb53c4fe3dbb9981" }
+nsh-core = "0.5"
+nsh-base = "0.5"

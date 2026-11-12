@@ -1044,7 +1044,7 @@ impl Mounter {
                                 .0
                                 .downcast_ref::<NativeText>()
                                 .ok_or(Error::Unsupported("foreign text layout"))?;
-                            let shown: Arc<str> = Arc::from(raster.source.shown_text());
+                            let shown: Arc<str> = Arc::from(raster.source.visible_text());
                             node.accessibility_state.text(node, &shown);
                             let links_changed =
                                 node.text(raster, content.into(), layout.clone())?;
@@ -1377,6 +1377,8 @@ impl Mounter {
                         }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
+                        | Command::PushAppUrl(_)
+                        | Command::CancelEvaluate { .. }
                         | Command::CancelPress => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
@@ -1387,9 +1389,13 @@ impl Mounter {
                         }
                         Command::ScrollToIndex { .. }
                         | Command::ScrollToEnd { .. }
+                        | Command::Reveal(_)
+                        | Command::MeasureScrollPosition { .. }
+                        | Command::Evaluate { .. }
                         | Command::SetStatusBar(_)
                         | Command::Measure { .. }
-                        | Command::HostCall { .. } => {
+                        | Command::HostCall { .. }
+                        | Command::HostPost { .. } => {
                             return Err(Error::Unsupported("unresolved core command"));
                         }
                         Command::PickScreenColor { id } => self.control.dispatch_event(
