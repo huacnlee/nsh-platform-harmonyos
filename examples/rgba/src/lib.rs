@@ -3,6 +3,7 @@
 
 use std::{
     cell::Cell,
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -24,20 +25,13 @@ pub fn App() -> impl IntoElement {
     let frame = signal(0_u64);
     let fps = signal(0_u32);
     let source = signal(ImageSrc::rgba(WIDTH, HEIGHT, render(0)));
-    let ticks = Cell::new(0_u32);
-    let since = Cell::new(Instant::now());
-    set_interval(Duration::from_millis(16), move || {
-        let n = frame.get() + 1;
-        frame.set(n);
-        source.set(ImageSrc::rgba(WIDTH, HEIGHT, render(n)));
-        ticks.set(ticks.get() + 1);
-        let elapsed = since.get().elapsed();
-        if elapsed >= Duration::from_secs(1) {
-            fps.set((f64::from(ticks.get()) / elapsed.as_secs_f64()).round() as u32);
-            ticks.set(0);
-            since.set(Instant::now());
-        }
-    });
+    next_frame(
+        frame,
+        source,
+        fps,
+        Rc::new(Cell::new(Instant::now())),
+        Rc::new(Cell::new(0_u32)),
+    );
     view()
         .flex_1()
         .p_safe_area()
@@ -60,6 +54,30 @@ pub fn App() -> impl IntoElement {
                         .text_size(px(17.0)),
                 ),
         )
+}
+
+/// Redraws on every display frame (`requestAnimationFrame`): each frame is a
+/// new pixel buffer shown as it is, and the loop asks for the next frame.
+fn next_frame(
+    frame: Signal<u64>,
+    source: Signal<ImageSrc>,
+    fps: Signal<u32>,
+    since: Rc<Cell<Instant>>,
+    ticks: Rc<Cell<u32>>,
+) {
+    request_animation_frame(move |_| {
+        let n = frame.get() + 1;
+        frame.set(n);
+        source.set(ImageSrc::rgba(WIDTH, HEIGHT, render(n)));
+        ticks.set(ticks.get() + 1);
+        let elapsed = since.get().elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            fps.set((f64::from(ticks.get()) / elapsed.as_secs_f64()).round() as u32);
+            ticks.set(0);
+            since.set(Instant::now());
+        }
+        next_frame(frame, source, fps, since, ticks);
+    });
 }
 
 /// The test pattern: opaque color bars with a moving marker over a

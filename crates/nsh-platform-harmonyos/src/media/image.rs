@@ -705,9 +705,18 @@ impl ImageView {
         self.primary.set(false);
         self.loaded.set(false);
         self.data.borrow_mut().take();
-        self.native.borrow().reset_attribute(A::ImageSrc)?;
-        self.native.borrow().reset_attribute(A::ImageAlt)?;
-        *self.decoded.borrow_mut() = [None, None];
+        // A pixel buffer swaps in synchronously: keep the previous frame on
+        // screen until the new one is set, so a per-frame source does not
+        // flash blank between the reset and the set.
+        let seamless = source
+            .as_ref()
+            .and_then(|source| source.data.as_ref())
+            .is_some_and(|data| data.rgba().is_some());
+        if !seamless {
+            self.native.borrow().reset_attribute(A::ImageSrc)?;
+            self.native.borrow().reset_attribute(A::ImageAlt)?;
+            *self.decoded.borrow_mut() = [None, None];
+        }
         self.native.borrow().set_i32_attribute(
             A::ImageObjectFit,
             match mode {
