@@ -153,7 +153,73 @@ pub(crate) enum Message {
     Reclaim(u64),
     VideoRetired(u64),
     VideoUi(u64, crate::media::video::UiState),
+    UiTask(u64, Option<Box<dyn std::any::Any + Send>>),
 }
+
+type UiTaskFn = Box<dyn FnOnce(Box<dyn std::any::Any + Send>)>;
+type UiTaskEntry = (Weak<Dispatcher>, UiTaskFn);
+
+static NEXT_UI_TASK_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+thread_local! {
+    static UI_TASKS: RefCell<rustc_hash::FxHashMap<u64, UiTaskEntry>> = RefCell::default();
+}
+
+fn prune_dead_tasks() {
+    UI_TASKS.with(|tasks| {
+        tasks.borrow_mut().retain(|_, (dispatcher, _)| {
+            dispatcher
+                .upgrade()
+                .is_some_and(|d| d.live.load(std::sync::atomic::Ordering::Acquire))
+        });
+    });
+}
+
+struct UiReplyInner {
+    id: u64,
+    dispatcher: Weak<Dispatcher>,
+    sent: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for UiReplyInner {
+    fn drop(&mut self) {
+        if !self.sent.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(dispatcher) = self.dispatcher.upgrade()
+            && dispatcher.live.load(std::sync::atomic::Ordering::Acquire)
+        {
+            dispatcher.send(Message::UiTask(self.id, None));
+        }
+    }
+}
+
+pub(crate) struct UiReply<T> {
+    inner: Option<Arc<UiReplyInner>>,
+    _marker: std::marker::PhantomData<fn(T)>,
+}
+
+impl<T> Clone for UiReply<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _marker: std::marker::PhantomData,
+        }
+    }
+}
+
+impl<T: Send + 'static> UiReply<T> {
+    pub(crate) fn send(&self, value: T) {
+        let Some(inner) = &self.inner else {
+            return;
+        };
+        if !inner.sent.swap(true, std::sync::atomic::Ordering::AcqRel)
+            && let Some(dispatcher) = inner.dispatcher.upgrade()
+            && dispatcher.live.load(std::sync::atomic::Ordering::Acquire)
+        {
+            dispatcher.send(Message::UiTask(inner.id, Some(Box::new(value))));
+        }
+    }
+}
+
 pub(crate) struct Dispatcher {
     pub(crate) owner: std::sync::Weak<crate::app::surface::Queue>,
     queue: ThreadsafeFunction<Message, (), (), Status, false>,
@@ -184,6 +250,57 @@ impl Dispatcher {
         if status != Status::Ok {
             log::error!("OHOS UI dispatch failed: {status:?}");
         }
+    }
+    /// Registers a single-shot UI-thread continuation and returns a `Send` handle
+    /// that can complete it from any worker thread. Must be called on the UI thread.
+    pub(crate) fn reply<T: Send + 'static>(
+        this: &Weak<Self>,
+        done: impl FnOnce(T) + 'static,
+    ) -> UiReply<T> {
+        let Some(dispatcher) = this.upgrade() else {
+            return UiReply {
+                inner: None,
+                _marker: std::marker::PhantomData,
+            };
+        };
+        if !dispatcher.live.load(std::sync::atomic::Ordering::Acquire) {
+            return UiReply {
+                inner: None,
+                _marker: std::marker::PhantomData,
+            };
+        }
+        let id = NEXT_UI_TASK_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        UI_TASKS.with(|tasks| {
+            tasks.borrow_mut().insert(
+                id,
+                (
+                    this.clone(),
+                    Box::new(move |value| {
+                        if let Ok(typed) = value.downcast::<T>() {
+                            done(*typed);
+                        }
+                    }),
+                ),
+            );
+        });
+        UiReply {
+            inner: Some(Arc::new(UiReplyInner {
+                id,
+                dispatcher: this.clone(),
+                sent: std::sync::atomic::AtomicBool::new(false),
+            })),
+            _marker: std::marker::PhantomData,
+        }
+    }
+    pub(crate) fn after(this: &Weak<Self>, delay: std::time::Duration, work: Box<dyn FnOnce()>) {
+        let reply = Self::reply(this, move |()| work());
+        if reply.inner.is_none() {
+            return;
+        }
+        napi_ohos::bindgen_prelude::spawn(async move {
+            tokio::time::sleep(delay).await;
+            reply.send(());
+        });
     }
 }
 struct Sink(
@@ -306,6 +423,11 @@ impl State {
             return Ok(());
         }
         if self.engine.is_none() {
+            if let Message::UiTask(id, _) = message {
+                UI_TASKS.with(|tasks| {
+                    tasks.borrow_mut().remove(&id);
+                });
+            }
             if let Some(mounter) = &self.mounter {
                 mounter.shaders.collect()?;
                 if let Some(worker) = mounter.compositor.borrow().as_ref() {
@@ -423,6 +545,16 @@ impl State {
             Message::Image(ready) => self.mounter.as_ref().unwrap().image_ready(ready)?,
             Message::ImageProgress(progress) => {
                 self.mounter.as_ref().unwrap().image_progress(progress)
+            }
+            Message::UiTask(id, payload) => {
+                let entry = UI_TASKS.with(|tasks| tasks.borrow_mut().remove(&id));
+                if let (Some((dispatcher, work)), Some(value)) = (entry, payload)
+                    && dispatcher
+                        .upgrade()
+                        .is_some_and(|d| d.live.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    work(value);
+                }
             }
             Message::Batch(batch) => {
                 #[cfg(feature = "dev")]
@@ -693,6 +825,7 @@ impl State {
             dispatcher
                 .live
                 .store(false, std::sync::atomic::Ordering::Release);
+            prune_dead_tasks();
         }
         if let Some(engine) = self.engine.take() {
             #[cfg(feature = "dev")]
@@ -719,6 +852,7 @@ impl State {
 }
 impl Drop for State {
     fn drop(&mut self) {
+        prune_dead_tasks();
         if let Some(engine) = self.engine.take() {
             #[cfg(feature = "dev")]
             let testing = self.testing.take();
@@ -879,6 +1013,7 @@ impl Runtime {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
             web_input: true,
+            web_evaluate: true,
             notifications: true,
             speech: config.host.speech_available,
             file_requests: true,

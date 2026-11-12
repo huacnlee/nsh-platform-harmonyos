@@ -1370,15 +1370,19 @@ impl Mounter {
                         | Command::InjectJavaScript(_)
                         | Command::PostMessage(_)
                         | Command::Load(_)
-                        | Command::SendInput(_)) => {
-                            if let Some(web) = self.node(id)?.web.borrow().as_ref() {
+                        | Command::SendInput(_)
+                        | Command::Evaluate { .. }
+                        | Command::CancelEvaluate { .. }) => {
+                            let node = self.node(id)?;
+                            if let Some(web) = node.web.borrow().as_ref() {
                                 web.command(command)?;
+                            } else if let Command::Evaluate { request, .. } = command {
+                                crate::media::webview::abort_evaluation(&self.control, id, request);
                             }
                         }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
-                        | Command::CancelEvaluate { .. }
                         | Command::CancelPress => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
@@ -1391,7 +1395,6 @@ impl Mounter {
                         | Command::ScrollToEnd { .. }
                         | Command::Reveal(_)
                         | Command::MeasureScrollPosition { .. }
-                        | Command::Evaluate { .. }
                         | Command::SetStatusBar(_)
                         | Command::Measure { .. }
                         | Command::HostCall { .. }

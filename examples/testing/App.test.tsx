@@ -70,3 +70,8 @@ test("a manual clock controls application timers", async () => {
   await app.clock!.runFor(10000);
   await app.waitFor("Timer: done");
 });
+
+test("WebView.evaluate resolves JSON and promises and enforces error codes", async () => {
+  const app = await open("./WebEvaluate.tsx");
+  await app.waitFor("Eval: pass", { timeout: 15000 });
+});
