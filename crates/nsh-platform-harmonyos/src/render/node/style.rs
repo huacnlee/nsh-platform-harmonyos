@@ -126,10 +126,119 @@ impl Node {
             applied.visibility = 0;
             applied.transform = None;
             applied.transform_center = [f32::NAN; 3];
+            applied.blur = 0.0;
+            applied.blend = nsh_core::BlendMode::Normal;
+            applied.z_index = 0.0;
             self.applied.set(applied);
             self.interaction.invalidate_opacity();
-            self.decoration.invalidate_native();
         }
+    }
+    pub(crate) fn effects_plan_for(
+        &self,
+        style: &ViewStyle,
+    ) -> crate::render::effects::EffectsPlan {
+        let shaders = self.shader_layers.borrow();
+        let has_shaders = !shaders.is_empty();
+        let shader_samples_backdrop = self.id != nsh_core::ROOT_ID
+            && shaders.iter().any(|(_, layer)| {
+                layer
+                    .shader
+                    .inputs()
+                    .contains(nsh_core::shader::ShaderInput::Backdrop)
+            });
+        drop(shaders);
+        let composite_active = self
+            .wrapper
+            .borrow()
+            .as_ref()
+            .is_some_and(|wrapper| wrapper.composite.borrow().is_some());
+        crate::render::effects::EffectsPlan::compute(
+            style,
+            crate::render::effects::EffectsContext {
+                has_shaders,
+                shader_samples_backdrop,
+                navigation_capture: self.navigation_capture.get(),
+                scene_active: self.scene_active(),
+                composite_active,
+                has_native_paint: self.has_native_paint(style),
+            },
+        )
+    }
+    pub(crate) fn effects_plan(&self) -> crate::render::effects::EffectsPlan {
+        self.effects_plan_for(&self.style.borrow())
+    }
+    pub(crate) fn desired_z_index(&self) -> f32 {
+        if self.pinned.get() != (0.0, 0.0) {
+            1_000_000.0
+        } else if self.kind == ViewKind::HeaderItem {
+            2.0
+        } else {
+            0.0
+        }
+    }
+    pub(crate) fn apply_z_index(&self) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        let z_index = self.desired_z_index();
+        let mut applied = self.applied.get();
+        if applied.z_index != z_index {
+            visual
+                .borrow()
+                .set_f32_attribute(Attribute::ZIndex, z_index)?;
+            applied.z_index = z_index;
+            self.applied.set(applied);
+        }
+        Ok(())
+    }
+    pub(super) fn apply_effects(&self, style: &ViewStyle) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        let plan = self.effects_plan_for(style);
+        let mut applied = self.applied.get();
+        if applied.blur != plan.native_blur {
+            visual
+                .borrow()
+                .set_f32_attribute(Attribute::Blur, plan.native_blur.max(0.0))?;
+            applied.blur = plan.native_blur;
+        }
+        if applied.backdrop_blur != plan.native_backdrop_blur {
+            self.native
+                .borrow()
+                .set_f32_attribute(Attribute::BackdropBlur, plan.native_backdrop_blur.max(0.0))?;
+            applied.backdrop_blur = plan.native_backdrop_blur;
+        }
+        if applied.blend != plan.native_blend {
+            let mode = crate::render::decor::arkui_blend_mode(plan.native_blend);
+            visual
+                .borrow()
+                .set_attribute(Attribute::BlendMode, vec![i32::from(mode), 1].into())?;
+            applied.blend = plan.native_blend;
+        }
+        self.applied.set(applied);
+        Ok(())
+    }
+    pub(crate) fn reset_visual_baseline(&self, node: &NativeNode) -> Result<()> {
+        let native = node.borrow();
+        native.reset_attribute(Attribute::LayoutRect)?;
+        native.reset_attribute(Attribute::Position)?;
+        native.reset_attribute(Attribute::Transform)?;
+        native.reset_attribute(Attribute::TransformCenter)?;
+        native.reset_attribute(Attribute::Blur)?;
+        native.reset_attribute(Attribute::BlendMode)?;
+        native.reset_attribute(Attribute::ZIndex)?;
+        native.opacity(1.0)?;
+        native.set_i32_attribute(Attribute::Visibility, 0)?;
+        Ok(())
+    }
+    pub(crate) fn apply_visual_style(&self, style: &ViewStyle) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        self.apply_effects(style)?;
+        self.apply_z_index()?;
+        self.apply_opacity(style.opacity)?;
+        self.transform(style, |_| None)?;
+        self.animator.apply_node(self)?;
+        Ok(())
     }
     pub(super) fn apply_opacity(&self, style_opacity: f32) -> Result<()> {
         let visual = self.visual_node();
@@ -419,9 +528,8 @@ impl Node {
         }) {
             self.enable_drawing();
         }
+        crate::render::decor::warn_repeating_conic(self, style);
         self.ensure_shadow_layer(style)?;
-        let visual = self.visual_node();
-        self.sync_visual_node(&visual);
         if let Some(wrapper) = self.wrapper.borrow().as_ref()
             && let Some(composite) = wrapper.composite.borrow().as_ref()
         {
@@ -430,9 +538,6 @@ impl Node {
         if let Some(image) = self.image.borrow().as_ref() {
             image.style(style)?;
         }
-        self.decoration.native(self, style)?;
-        self.apply_opacity(style.opacity)?;
-        self.transform(style, |_| None)?;
         self.apply_background_color(style.background_color)?;
         self.apply_borders(style)?;
         self.apply_shadow(style)?;
@@ -441,8 +546,7 @@ impl Node {
         }
         self.apply_ink_outset(style)?;
         self.apply_clip()?;
-        self.animator.apply_node(self)?;
-        Ok(())
+        self.apply_visual_style(style)
     }
     pub(crate) fn reset_text_tint(&self) -> Result<()> {
         if self.tint.take().is_some() {

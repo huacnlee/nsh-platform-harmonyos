@@ -13,6 +13,9 @@ mod composite_blend;
 #[path = "../../src/render/composition/geometry.rs"]
 #[allow(dead_code)]
 mod composite_geometry;
+#[path = "../../src/render/effects.rs"]
+#[allow(dead_code)]
+mod effects;
 #[path = "../../src/app/features.rs"]
 #[allow(unreachable_pub)]
 mod features;

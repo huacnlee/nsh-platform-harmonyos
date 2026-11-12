@@ -26,6 +26,7 @@ pub(crate) struct Wrapper {
     closed: std::cell::Cell<bool>,
     pub(crate) outer: NativeNode,
     target: RefCell<Option<NativeAttachment>>,
+    replaces: Cell<Option<u32>>,
     route: RefCell<Option<ViewRoute>>,
     context_live: Cell<bool>,
     owner: std::rc::Weak<Node>,
@@ -126,6 +127,7 @@ impl Wrapper {
     }
     pub(crate) fn invalidate_context(&self) {
         self.settings.borrow_mut().take();
+        self.replaces.set(None);
         self.route.borrow_mut().take();
         self.context_live.set(false);
         // Keep the old target through SDK lifecycle cleanup; replacement queues its final owner.
@@ -133,8 +135,12 @@ impl Wrapper {
     fn replace_target(&self, owner: &Node) -> Result<u32> {
         let target = NativeAttachment::for_subtree(&self.outer, &owner.native)?;
         let id = target.id();
-        if let Some(old) = self.target.replace(Some(target)) {
-            owner.view_remove(old);
+        let old_attached = self
+            .target
+            .replace(Some(target))
+            .and_then(|old| owner.view_remove(old));
+        if old_attached.is_some() {
+            self.replaces.set(old_attached);
         }
         // The native target is the unique, nonreused callback generation.
         let weak = self.owner.clone();
@@ -194,16 +200,6 @@ impl Wrapper {
     fn new(owner: &Rc<Node>) -> Result<Self> {
         let outer = Custom::new()?.into_node();
         let setup = || -> Result<NativeAttachment> {
-            // Header slots are siblings of the native bar, whose z-index is 1.
-            // Preserve their chrome ordering (and any active pin z-index) when export adds an outer node.
-            if owner.is_pinned() {
-                outer.borrow().set_f32_attribute(
-                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::ZIndex,
-                    1_000_000.0,
-                )?;
-            } else if owner.kind == nsh_core::ViewKind::HeaderItem {
-                outer.borrow().z_index(2)?;
-            }
             outer
                 .borrow()
                 .set_length_metric_unit(LengthMetricUnit::Vp)?;
@@ -315,6 +311,7 @@ impl Wrapper {
             closed: std::cell::Cell::new(false),
             outer,
             target: RefCell::new(Some(target)),
+            replaces: Cell::new(None),
             route: RefCell::new(Some(route)),
             context_live: Cell::new(true),
             owner: Rc::downgrade(owner),
@@ -358,9 +355,10 @@ impl Wrapper {
         let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
             return Ok(false);
         };
+        let replaces = self.replaces.take();
         let spec = owner.accessibility_state.spec.borrow();
         let frame = owner.frame.get();
-        let settings = ViewOptions {
+        let mut settings = ViewOptions {
             texture_insets: self
                 .composite
                 .borrow()
@@ -373,6 +371,7 @@ impl Wrapper {
                 .as_ref()
                 .is_some_and(|composite| composite.is_ready(owner)),
             target_id,
+            replaces: None,
             test_id: owner.interaction.test_id(),
             width: frame.width as f64,
             height: frame.height as f64,
@@ -410,16 +409,18 @@ impl Wrapper {
             menu: owner.selection_menu(),
         };
         let mut previous = self.settings.borrow_mut();
-        if previous.as_ref() == Some(&settings) {
+        if replaces.is_none() && previous.as_ref() == Some(&settings) {
             return Ok(false);
         }
         *previous = Some(settings.clone());
+        settings.replaces = replaces;
         owner.view_update(settings);
         Ok(true)
     }
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
         self.closed.set(true);
         self.retiring.set(0);
+        self.replaces.set(None);
         self.route.borrow_mut().take();
         if let Some(old) = self.target.borrow_mut().take() {
             owner.view_remove(old);
@@ -431,16 +432,7 @@ impl Wrapper {
 }
 impl Node {
     pub(crate) fn needs_texture(&self) -> bool {
-        let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
-            effects.filters.iter().any(|filter| {
-                !crate::render::composition::geometry::is_noop_filter(filter)
-                    && !matches!(filter, nsh_core::Filter::Blur(_))
-            })
-        });
-        self.navigation_capture.get()
-            || self.scene_active() && self.has_native_paint()
-            || non_blur_filter
-            || !self.shader_layers.borrow().is_empty()
+        self.effects_plan().requires_texture
     }
     pub(crate) fn wrapper_owns_semantics(&self) -> bool {
         self.wrapper.borrow().is_some() && owns_semantics(&self.accessibility_state.spec.borrow())
@@ -481,40 +473,20 @@ impl Node {
         if cfg!(feature = "api-26") && spec.actions.len() > 16 {
             log::warn!("OHOS accessibility: showing the first 16 custom actions");
         }
-        let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
-            effects.filters.iter().any(|filter| {
-                !crate::render::composition::geometry::is_noop_filter(filter)
-                    && !matches!(filter, nsh_core::Filter::Blur(_))
-            })
-        });
+        let has_semantics = owns_semantics(&spec);
+        drop(spec);
+        let requires_texture = self.effects_plan().requires_texture;
         // Establish the root's layout host before it has scroll descendants.
         // Adding it around an already laid-out tree resets native scroll offsets.
         let needed = self.id == nsh_core::ROOT_ID
             || self.kind == nsh_core::ViewKind::Modal
-            || self.scene_active() && self.has_native_paint()
             || self.selectable()
-            || owns_semantics(&spec)
-            || non_blur_filter
-            || !self.shader_layers.borrow().is_empty();
-        drop(spec);
+            || has_semantics
+            || requires_texture;
         let mut created_wrapper = false;
         if needed && self.wrapper.borrow().is_none() {
-            use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
             self.enable_layout();
-            {
-                let native = self.native.borrow();
-                native.reset_attribute(A::LayoutRect)?;
-                native.reset_attribute(A::Position)?;
-                native.reset_attribute(A::Transform)?;
-                native.reset_attribute(A::TransformCenter)?;
-                native.reset_attribute(A::Blur)?;
-                native.reset_attribute(A::BlendMode)?;
-                if self.is_pinned() {
-                    native.reset_attribute(A::ZIndex)?;
-                }
-                native.opacity(1.0)?;
-                native.set_i32_attribute(A::Visibility, 0)?;
-            }
+            self.reset_visual_baseline(&self.native)?;
             let parent = self.mount_parent.borrow().upgrade();
             let index = parent
                 .as_ref()
@@ -551,8 +523,8 @@ impl Node {
             #[cfg(feature = "api-23")]
             self.accessibility_provider.clear();
         }
-        let needs_texture = self.needs_texture();
-        if !needs_texture {
+        let mut created_composite = false;
+        if !requires_texture {
             let start_retirement = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
                 if wrapper.composite.borrow().is_some() && wrapper.retiring.get() == 0 {
                     wrapper.retiring.set(1);
@@ -588,6 +560,7 @@ impl Node {
                         .id(),
                 )?;
                 *wrapper.composite.borrow_mut() = Some(composite);
+                created_composite = true;
             }
         }
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
@@ -620,8 +593,8 @@ impl Node {
                 native.set_bool_attribute(A::AccessibilityGroup, next.1)?;
             }
         }
-        if created_wrapper {
-            self.restore_style()?;
+        if created_wrapper || created_composite {
+            self.apply_visual_style(&self.style.borrow())?;
         }
         self.update_wrapper()
     }

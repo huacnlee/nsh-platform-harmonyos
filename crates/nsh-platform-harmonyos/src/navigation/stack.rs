@@ -287,7 +287,6 @@ impl Screen {
         drop(c);
         for child in owner.children.borrow().iter().filter_map(Weak::upgrade) {
             if child.kind == ViewKind::HeaderItem {
-                child.mounted().borrow().z_index(2)?;
                 child.restore_style()?;
             } else {
                 child.set_frame(child.raw_frame.get())?;

@@ -362,6 +362,7 @@ export interface TextureInsets {
 
 export interface ViewOptions {
   targetId: number
+  replaces?: number
   width: number
   height: number
   hue: number

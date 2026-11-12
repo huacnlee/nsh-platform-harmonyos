@@ -30,6 +30,7 @@ export interface Settings {
   textureInsets?: TextureInsets | null;
   textureReady?: boolean;
   targetId: number;
+  replaces?: number | null;
   testId?: string | null;
   width: number;
   height: number;
@@ -703,43 +704,37 @@ class ViewEntry {
 }
 export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
-  private snapshots: Map<string, image.PixelMap[]> = new Map();
+  private previews: Map<number, image.PixelMap> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
-  private snapshotKey(state: Settings): string {
-    return state.testId ?? `${state.width}x${state.height}`;
-  }
-  private clearSnapshots(): void {
-    this.snapshots.forEach((pixelMaps: image.PixelMap[]): void => {
-      for (const pixelMap of pixelMaps) {
-        try {
-          pixelMap.release();
-        } catch (_) {}
-      }
+  private clearPreviews(): void {
+    this.previews.forEach((pixelMap: image.PixelMap): void => {
+      try {
+        pixelMap.release();
+      } catch (_) {}
     });
-    this.snapshots.clear();
+    this.previews.clear();
   }
   remove(ids: number[], context: NshRuntimeContext, incoming: Settings[] = []): void {
-    this.clearSnapshots();
-    const neededSnapshots: Map<string, number> = new Map();
+    this.clearPreviews();
+    const replacements: Map<number, number> = new Map();
     for (const state of incoming) {
-      if (state.textureSurface != null && !this.entries.has(state.targetId)) {
-        const key = this.snapshotKey(state);
-        neededSnapshots.set(key, (neededSnapshots.get(key) ?? 0) + 1);
+      if (
+        state.replaces != null &&
+        state.textureSurface != null &&
+        !this.entries.has(state.targetId)
+      ) {
+        replacements.set(state.replaces, state.targetId);
       }
     }
     for (const id of ids) {
       const entry = this.entries.get(id);
       if (entry) {
-        const key = this.snapshotKey(entry.settings);
-        const remaining = neededSnapshots.get(key) ?? 0;
-        if (entry.settings.textureSurface == null && remaining > 0) {
+        const nextTargetId = replacements.get(id);
+        if (nextTargetId !== undefined && entry.settings.textureSurface == null) {
           const snapshot = entry.snapshot();
           if (snapshot) {
-            const list = this.snapshots.get(key) ?? [];
-            list.push(snapshot);
-            this.snapshots.set(key, list);
-            neededSnapshots.set(key, remaining - 1);
+            this.previews.set(nextTargetId, snapshot);
           }
         }
         entry.dispose(context);
@@ -766,11 +761,10 @@ export class NativeViews {
         if (entry) {
           entry.update(state);
         } else {
-          const key = this.snapshotKey(state);
-          const list = state.textureSurface != null ? this.snapshots.get(key) : undefined;
-          const backdrop = list && list.length > 0 ? list.shift() : undefined;
-          if (list && list.length === 0) {
-            this.snapshots.delete(key);
+          const backdrop =
+            state.textureSurface != null ? this.previews.get(state.targetId) : undefined;
+          if (backdrop) {
+            this.previews.delete(state.targetId);
           }
           entry = new ViewEntry(state, context, this.menus, this.pointerPosting, backdrop);
           this.entries.set(state.targetId, entry);
@@ -778,14 +772,14 @@ export class NativeViews {
         }
       }
     } finally {
-      this.clearSnapshots();
+      this.clearPreviews();
     }
   }
   async settled(): Promise<void> {
     await this.menus.settled();
   }
   dispose(context: NshRuntimeContext): void {
-    this.clearSnapshots();
+    this.clearPreviews();
     let failure: Error | undefined;
     for (const id of Array.from(this.entries.keys())) {
       const entry = this.entries.get(id)!;

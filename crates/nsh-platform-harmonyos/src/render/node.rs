@@ -66,9 +66,13 @@ struct AppliedStyle {
     ink_outset: f32,
     clip: bool,
     clip_shape: Option<(Size, [f32; 4])>,
+    backdrop_blur: f32,
     visibility: i32,
     transform: Option<[f32; 16]>,
     transform_center: [f32; 3],
+    blur: f32,
+    blend: nsh_core::BlendMode,
+    z_index: f32,
 }
 impl Default for AppliedStyle {
     fn default() -> Self {
@@ -83,9 +87,13 @@ impl Default for AppliedStyle {
             ink_outset: 0.0,
             clip: false,
             clip_shape: None,
+            backdrop_blur: 0.0,
             visibility: 0,
             transform: None,
             transform_center: [f32::NAN; 3],
+            blur: 0.0,
+            blend: nsh_core::BlendMode::Normal,
+            z_index: 0.0,
         }
     }
 }

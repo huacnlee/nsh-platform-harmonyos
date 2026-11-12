@@ -138,6 +138,7 @@ pub(crate) struct TextureInsets {
 #[napi(object)]
 pub(crate) struct ViewOptions {
     pub target_id: u32,
+    pub replaces: Option<u32>,
     pub width: f64,
     pub height: f64,
     pub hue: f64,

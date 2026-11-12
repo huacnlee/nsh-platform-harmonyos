@@ -80,24 +80,9 @@ impl Node {
             .map(|world| self.input_to_parent(&parent).map(|m| m.mul(&world)))
             .transpose()
     }
-    pub(crate) fn is_pinned(&self) -> bool {
-        self.pinned.get() != (0.0, 0.0)
-    }
     pub(crate) fn pin(&self, x: f32, y: f32) -> Result<()> {
         if self.pinned.replace((x, y)) != (x, y) {
-            let default_z = if self.kind == nsh_core::ViewKind::HeaderItem {
-                2.0
-            } else {
-                0.0
-            };
-            self.mounted().borrow().set_f32_attribute(
-                Attribute::ZIndex,
-                if x != 0.0 || y != 0.0 {
-                    1_000_000.0
-                } else {
-                    default_z
-                },
-            )?;
+            self.apply_z_index()?;
             self.transform(&self.style.borrow(), |_| None)?;
             self.animator.apply_node(self)?;
         }

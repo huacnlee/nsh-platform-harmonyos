@@ -114,8 +114,9 @@ impl Filters {
             scale,
         );
         // Reserve rounding room for the padding of each ordered pass.
+        let active_count = crate::render::effects::active_filter_count(filters);
         let ratio = if bounded_scale < scale {
-            bounded_scale / scale * (1.0 - (filters.len() as f32 * 4.0 + 2.0).min(1024.0) / 4096.0)
+            bounded_scale / scale * (1.0 - (active_count as f32 * 4.0 + 2.0).min(1024.0) / 4096.0)
         } else {
             1.0
         };
@@ -136,7 +137,7 @@ impl Filters {
         let (mut x, mut y) = (0.0, 0.0);
         for filter in filters
             .iter()
-            .filter(|filter| !super::super::geometry::is_noop_filter(filter))
+            .filter(|filter| !crate::render::effects::is_noop_filter(filter))
         {
             match *filter {
                 Filter::Blur(radius) => {

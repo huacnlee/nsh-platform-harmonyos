@@ -49,7 +49,7 @@ impl Image {
         for effect in effects
             .iter()
             .copied()
-            .filter(|effect| !super::geometry::is_noop_filter(effect))
+            .filter(|effect| !crate::render::effects::is_noop_filter(effect))
         {
             image = image.apply(effect, scale, tile)?;
         }

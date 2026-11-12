@@ -64,39 +64,6 @@ pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
     radius.max(0.0) * scale * 0.5
 }
 
-pub(crate) fn is_noop_filter(filter: &Filter) -> bool {
-    match *filter {
-        Filter::Blur(radius) => radius.0 <= 0.0,
-        Filter::Brightness(v) | Filter::Contrast(v) | Filter::Saturate(v) => {
-            (v - 1.0).abs() <= f32::EPSILON
-        }
-        Filter::Grayscale(v) | Filter::Sepia(v) | Filter::Invert(v) => v <= 0.0,
-        Filter::HueRotate(angle) => {
-            let rem = angle.0.rem_euclid(std::f32::consts::TAU);
-            rem <= f32::EPSILON || (std::f32::consts::TAU - rem) <= f32::EPSILON
-        }
-        Filter::Opacity(v) => v >= 1.0,
-        Filter::DropShadow { color, .. } => (color.0 & 0xff) == 0,
-    }
-}
-
-pub(crate) fn requires_scene(style: &ViewStyle) -> bool {
-    style.blend_mode == nsh_core::BlendMode::PlusDarker
-        || style.effects.as_ref().is_some_and(|effects| {
-            !effects.mask_images.is_empty()
-                || effects
-                    .backdrop_filters
-                    .iter()
-                    .filter(|filter| !is_noop_filter(filter))
-                    .count()
-                    > 1
-                || effects
-                    .backdrop_filters
-                    .iter()
-                    .any(|filter| !is_noop_filter(filter) && !matches!(filter, Filter::Blur(_)))
-        })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Bounds(pub(crate) [f32; 4]);
 impl Bounds {
@@ -163,7 +130,7 @@ impl Bounds {
     }
     pub(crate) fn filters(mut self, filters: &[Filter]) -> Self {
         for filter in filters {
-            if is_noop_filter(filter) {
+            if crate::render::effects::is_noop_filter(filter) {
                 continue;
             }
             match *filter {
@@ -311,25 +278,6 @@ mod tests {
         assert_eq!(f32::from_bits(second[1]), 50.0);
     }
     #[test]
-    fn scene_requirements_follow_the_current_style() {
-        let mut style = ViewStyle {
-            blend_mode: nsh_core::BlendMode::PlusDarker,
-            ..ViewStyle::default()
-        };
-        assert!(requires_scene(&style));
-        style.blend_mode = nsh_core::BlendMode::Normal;
-        assert!(!requires_scene(&style));
-        let mut effects = nsh_core::Effects {
-            backdrop_filters: vec![Filter::Blur(Points(4.0)), Filter::Blur(Points(8.0))],
-            ..Default::default()
-        };
-        style.effects = Some(std::sync::Arc::new(effects.clone()));
-        assert!(requires_scene(&style));
-        effects.backdrop_filters.pop();
-        style.effects = Some(std::sync::Arc::new(effects));
-        assert!(!requires_scene(&style));
-    }
-    #[test]
     fn css_blur_radius_becomes_half_a_physical_sigma() {
         assert_eq!(blur_sigma(8.0, 3.0), 12.0);
         assert_eq!(blur_sigma(-8.0, 3.0), 0.0);
@@ -362,35 +310,7 @@ mod tests {
         assert!(Bounds::new(20.0, 10.0).transformed(matrix).is_none());
     }
     #[test]
-    fn identity_filters_do_not_require_scene_or_extend_bounds() {
-        assert!(is_noop_filter(&Filter::Brightness(1.0)));
-        assert!(is_noop_filter(&Filter::Contrast(1.0)));
-        assert!(is_noop_filter(&Filter::Saturate(1.0)));
-        assert!(is_noop_filter(&Filter::Grayscale(0.0)));
-        assert!(is_noop_filter(&Filter::Sepia(0.0)));
-        assert!(is_noop_filter(&Filter::Invert(0.0)));
-        assert!(is_noop_filter(&Filter::Opacity(1.0)));
-        assert!(is_noop_filter(&Filter::Blur(Points(0.0))));
-        assert!(is_noop_filter(&Filter::HueRotate(
-            nsh_core::prelude::Radians(0.0)
-        )));
-        assert!(is_noop_filter(&Filter::DropShadow {
-            offset_x: Points(4.0),
-            offset_y: Points(4.0),
-            blur: Points(8.0),
-            color: Color::TRANSPARENT,
-        }));
-        assert!(!is_noop_filter(&Filter::Brightness(0.95)));
-        assert!(!is_noop_filter(&Filter::Blur(Points(2.0))));
-
-        let style = ViewStyle {
-            effects: Some(std::sync::Arc::new(nsh_core::Effects {
-                backdrop_filters: vec![Filter::Brightness(1.0), Filter::Blur(Points(4.0))],
-                ..Default::default()
-            })),
-            ..ViewStyle::default()
-        };
-        assert!(!requires_scene(&style));
+    fn identity_filters_do_not_extend_bounds() {
         assert_eq!(
             Bounds::new(20.0, 20.0)
                 .filters(&[

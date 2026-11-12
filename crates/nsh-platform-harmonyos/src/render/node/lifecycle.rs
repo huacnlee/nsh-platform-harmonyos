@@ -161,6 +161,9 @@ impl Node {
         if node.canvas.borrow().is_some() {
             node.enable_drawing();
         }
+        if kind == ViewKind::HeaderItem {
+            node.apply_z_index()?;
+        }
         if kind == ViewKind::Modal {
             node.ensure_wrapper()?;
         }

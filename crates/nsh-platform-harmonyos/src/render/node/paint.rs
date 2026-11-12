@@ -59,8 +59,7 @@ impl Node {
             * self.extra.get().0
             * self.navigation_presentation.get().0
     }
-    pub(crate) fn has_native_paint(&self) -> bool {
-        let style = self.style.borrow();
+    pub(crate) fn has_native_paint(&self, style: &nsh_core::ViewStyle) -> bool {
         self.id == nsh_core::ROOT_ID
             || self.scene_root.get()
             || self.kind != ViewKind::View

@@ -12,9 +12,10 @@ use ohos_drawing_binding::{Bitmap, BitmapFormat, Canvas};
 use crate::render::{
     composition::{
         draw::{PaintNode, Plan, Root},
-        geometry::{Bounds, requires_scene},
+        geometry::Bounds,
         raster::Shared as SceneShared,
     },
+    effects::has_active_filters,
     geometry::Size,
     node::{Error, Node, Result},
 };
@@ -46,14 +47,7 @@ impl Scene {
         self.bitmaps.borrow().iter().any(Option::is_some)
     }
     pub(crate) fn require(&self, node: &Rc<Node>) {
-        let required = requires_scene(&node.style.borrow())
-            || node.id != nsh_core::ROOT_ID
-                && node.shader_layers.borrow().iter().any(|(_, layer)| {
-                    layer
-                        .shader
-                        .inputs()
-                        .contains(nsh_core::shader::ShaderInput::Backdrop)
-                });
+        let required = node.effects_plan().requires_scene;
         let mut nodes = self.requirements.borrow_mut();
         nodes.retain(|weak| weak.upgrade().is_some_and(|owner| owner.id != node.id));
         if required {
@@ -307,11 +301,10 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
     let samples_backdrop = {
         let style = node.style.borrow();
         style.blend_mode != nsh_core::BlendMode::Normal
-            || style.effects.as_ref().is_some_and(|e| {
-                e.backdrop_filters
-                    .iter()
-                    .any(|f| !super::geometry::is_noop_filter(f))
-            })
+            || style
+                .effects
+                .as_ref()
+                .is_some_and(|e| has_active_filters(&e.backdrop_filters))
             || node.shader_layers.borrow().iter().any(|(_, layer)| {
                 layer
                     .shader
@@ -323,12 +316,10 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
         let overflows = {
             let style = node.style.borrow();
             style.outline.is_visible()
-                || style.effects.as_ref().is_some_and(|e| {
-                    !e.box_shadows.is_empty()
-                        || e.filters
-                            .iter()
-                            .any(|f| !super::geometry::is_noop_filter(f))
-                })
+                || style
+                    .effects
+                    .as_ref()
+                    .is_some_and(|e| !e.box_shadows.is_empty() || has_active_filters(&e.filters))
                 || !node.shader_layers.borrow().is_empty()
         };
         if !overflows {
@@ -348,12 +339,8 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
                 || style.blend_mode != nsh_core::BlendMode::Normal
                 || effects.is_some_and(|e| {
                     !e.mask_images.is_empty()
-                        || e.filters
-                            .iter()
-                            .any(|f| !super::geometry::is_noop_filter(f))
-                        || e.backdrop_filters
-                            .iter()
-                            .any(|f| !super::geometry::is_noop_filter(f))
+                        || has_active_filters(&e.filters)
+                        || has_active_filters(&e.backdrop_filters)
                 })
         };
         if Rc::ptr_eq(&ancestor, root)

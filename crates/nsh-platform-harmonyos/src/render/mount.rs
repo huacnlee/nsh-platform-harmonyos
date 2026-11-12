@@ -459,6 +459,9 @@ impl Mounter {
             };
             let capture = wanted.contains(&id);
             if root.navigation_capture.replace(capture) != capture {
+                if let Some(scene) = root.scene.borrow().as_ref() {
+                    scene.require(root);
+                }
                 root.invalidate_composites();
                 root.ensure_wrapper()?;
                 root.restore_style()?;

@@ -119,12 +119,8 @@ impl<S: Sources> Renderer<'_, S> {
         let masks = effects.map_or(&[][..], |effects| effects.mask_images.as_slice());
         let backdrop = effects.map_or(&[][..], |effects| effects.backdrop_filters.as_slice());
         // These are precisely the properties that establish a backdrop root.
-        let has_filters = filters
-            .iter()
-            .any(|filter| !super::geometry::is_noop_filter(filter));
-        let has_backdrop = backdrop
-            .iter()
-            .any(|filter| !super::geometry::is_noop_filter(filter));
+        let has_filters = crate::render::effects::has_active_filters(filters);
+        let has_backdrop = crate::render::effects::has_active_filters(backdrop);
         let grouped = node.shaders
             || node.capture
             || !masks.is_empty()
