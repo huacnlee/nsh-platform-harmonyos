@@ -41,6 +41,10 @@ pub(crate) fn root() -> Option<Root> {
 /// nsh_platform_harmonyos::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);
 /// // A TSX app, whose bundle the host loads: nsh/base's UI set.
 /// nsh_platform_harmonyos::app!();
+/// // A TSX app with Rust crates of its own (`nsh.json` `"rust"` without
+/// // `"root"`): nsh/base's UI set, then each crate's (`#[native_module]`'s
+/// // `registry()`), for the bundle the host loads to import.
+/// nsh_platform_harmonyos::app!(sets = [app_0::registry, app_1::registry]);
 /// ```
 #[macro_export]
 macro_rules! app {
@@ -58,6 +62,9 @@ macro_rules! app {
     };
     () => {
         $crate::app!(@define || ::std::vec![$crate::__private::nsh_base_registry()], None);
+    };
+    (sets = [$($registry:path),* $(,)?]) => {
+        $crate::app!(@define || ::std::vec![$crate::__private::nsh_base_registry(), $($registry()),*], None);
     };
     ($ui_sets:path, $root:path) => {
         $crate::app!(@define $ui_sets, Some($root));

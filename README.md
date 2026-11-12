@@ -133,8 +133,8 @@ The project the CLI writes is a standard stage-model app: `EntryAbility` loads `
 
 ## Status
 
-- Apps written in **Rust** (`nsh.json` `"rust"` and `"root"`) and in **TSX**. TSX apps whose own Rust crates export
-  components (`"rust"` without `"root"`) are not linked yet.
+- Apps written in **Rust** (`nsh.json` `"rust"` and `"root"`), in **TSX**, and in TSX with Rust crates of their own
+  (`"rust"` without `"root"`), whose components, modules and classes the runner links for the bundle to import.
 - The backend covers what NSH's mobile backends do: views and their decoration, text, images, canvases, shader views,
   scroll views and lists with pull to refresh, text inputs, gestures and the responder system, the native animation
   graph, navigation stacks with HarmonyOS's headers, modals and sheets, popups, video, web views, accessibility,

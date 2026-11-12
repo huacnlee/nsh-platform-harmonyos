@@ -1,7 +1,8 @@
 //! The runner: a `cdylib` crate the CLI writes in the app's
 //! `.nsh/harmonyos/runner`, linking this platform's backend with the app (an
-//! app written in Rust: NSH's generated `nsh_rust_app`), built for the target
-//! OHOS ABI (`arm64-v8a` by default, or `armeabi-v7a` / `x86_64`) into
+//! app written in Rust: NSH's generated `nsh_rust_app`; a TSX app with Rust
+//! crates of its own: those crates' UI sets), built for the target OHOS ABI
+//! (`arm64-v8a` by default, or `armeabi-v7a` / `x86_64`) into
 //! `libnsh_platform_harmonyos.so`, the native library the HAP loads.
 
 use std::{
@@ -56,6 +57,44 @@ fn value<'a>(manifest: &'a str, line_start: &str, key: &str) -> Option<&'a str> 
     Some(&rest[..rest.find('"')?])
 }
 
+/// The `[package] name` of a `Cargo.toml` manifest.
+fn package_name(manifest: &str) -> Option<&str> {
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+        } else if in_package
+            && let Some(rest) = line.strip_prefix("name")
+            && let Some(rest) = rest.trim_start().strip_prefix('=')
+        {
+            let rest = rest.trim_start();
+            let quote = rest.chars().next().filter(|c| *c == '"' || *c == '\'')?;
+            let rest = &rest[1..];
+            return Some(&rest[..rest.find(quote)?]);
+        }
+    }
+    None
+}
+
+/// What the runner links with the backend.
+pub(crate) enum App<'a> {
+    /// A TSX app: its bundle is a raw file of the HAP; `nsh/base`'s UI set.
+    Tsx,
+    /// An app written in Rust (`nsh.json` `"root"`): NSH's generated crate
+    /// `rust-app` (`nsh_rust_app`), with its UI sets and root.
+    Rust(&'a Path),
+    /// A TSX app with Rust crates of its own (`nsh.json` `"rust"` without
+    /// `"root"`): the bundle is a raw file of the HAP, and the crates'
+    /// UI sets (each crate's `#[native_module]` `registry()`) are served
+    /// after `nsh/base`'s for it to import. `workspace` is NSH's generated
+    /// workspace (`.nsh/rust`), whose `[patch]` sections the runner takes.
+    TsxWithCrates {
+        crates: &'a [PathBuf],
+        workspace: &'a Path,
+    },
+}
+
 /// The `[patch]` sections of NSH's generated workspace (`.nsh/rust`): the
 /// runner takes them as they are, so the app and the backend share one
 /// `nsh-core`.
@@ -74,24 +113,30 @@ fn workspace_patches(workspace_manifest: &str) -> String {
     out
 }
 
-/// Writes the runner crate in `dir`: for NSH's generated crate `rust_app`
-/// (an app written in Rust), or for a TSX app (`None`), whose bundle the
-/// HAP carries as a raw file.
-pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::Result<()> {
-    let (app_dependency, patch, lib) = match rust_app {
-        Some(rust_app) => {
+/// The `[patch]` sections of the generated workspace in `workspace`, or the
+/// backend's own revision of NSH when it has none.
+fn patches_of(workspace: &Path) -> String {
+    fs::read_to_string(workspace.join("Cargo.toml"))
+        .ok()
+        .map(|m| workspace_patches(&m))
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned())
+}
+
+/// Writes the runner crate in `dir` for `app`.
+pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
+    let (app_dependency, patch, lib) = match app {
+        App::Rust(rust_app) => {
             let manifest = fs::read_to_string(rust_app.join("Cargo.toml"))
                 .with_context(|| format!("reading {}", rust_app.display()))?;
-            let package = value(&manifest, "name = ", "name")
-                .context("NSH's rust-app crate has no package name")?;
+            let package =
+                package_name(&manifest).context("NSH's rust-app crate has no [package] name")?;
             let patches = rust_app
                 .parent()
-                .and_then(|ws| fs::read_to_string(ws.join("Cargo.toml")).ok())
-                .map(|m| workspace_patches(&m))
-                .filter(|p| !p.is_empty())
+                .map(patches_of)
                 .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned());
             let patches = if dev {
-                testing_patches(&patches, &manifest)?
+                testing_patches(&patches, Some(&manifest))?
             } else {
                 patches
             };
@@ -103,14 +148,51 @@ pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::R
                 patches,
                 "// An app written in Rust: its UI sets (`nsh/base`'s, then its crates')\n\
                  // and its root, which `NshSurface.runApp()` starts.\n\
-                 backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);\n",
+                 backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);\n"
+                    .to_owned(),
             )
         }
-        None => (
+        App::TsxWithCrates { crates, workspace } => {
+            let mut dependencies = String::new();
+            let mut sets = Vec::new();
+            for (i, krate) in crates.iter().enumerate() {
+                let manifest_path = krate.join("Cargo.toml");
+                let manifest = fs::read_to_string(&manifest_path)
+                    .with_context(|| format!("reading {}", manifest_path.display()))?;
+                let package = package_name(&manifest).with_context(|| {
+                    format!("{} has no [package] name", manifest_path.display())
+                })?;
+                // Renamed, so the runner names each crate without knowing its
+                // library's name.
+                dependencies.push_str(&format!(
+                    "app_{i} = {{ package = {package:?}, path = {:?} }}\n",
+                    krate.to_string_lossy()
+                ));
+                sets.push(format!("app_{i}::registry"));
+            }
+            let patches = patches_of(workspace);
+            let patches = if dev {
+                testing_patches(&patches, None)?
+            } else {
+                patches
+            };
+            (
+                dependencies,
+                patches,
+                format!(
+                    "// A TSX app with Rust crates of its own: its bundle is a raw file of the\n\
+                     // HAP (`loadResource`), and it imports the crates' UI sets.\n\
+                     backend::app!(sets = [{}]);\n",
+                    sets.join(", ")
+                ),
+            )
+        }
+        App::Tsx => (
             String::new(),
             crate::embedded::NSH_PATCH.to_owned(),
             "// A TSX app: its bundle is a raw file of the HAP (`loadResource`).\n\
-             backend::app!();\n",
+             backend::app!();\n"
+                .to_owned(),
         ),
     };
     fs::create_dir_all(dir)?;
@@ -146,7 +228,7 @@ pub(crate) fn write(dir: &Path, rust_app: Option<&Path>, dev: bool) -> anyhow::R
 
 /// The agent must use the same core/engine as the app, including when its
 /// generated workspace points to a local NSH checkout instead of crates.io.
-fn testing_patches(patches: &str, app_manifest: &str) -> anyhow::Result<String> {
+fn testing_patches(patches: &str, app_manifest: Option<&str>) -> anyhow::Result<String> {
     let mut in_crates_io = false;
     for line in patches.lines() {
         if line.starts_with('[') {
@@ -156,7 +238,9 @@ fn testing_patches(patches: &str, app_manifest: &str) -> anyhow::Result<String> 
             return Ok(patches.to_owned());
         }
     }
-    let patch = match value(app_manifest, "nsh-core", "path") {
+    let core = value(patches, "nsh-core", "path")
+        .or_else(|| app_manifest.and_then(|m| value(m, "nsh-core", "path")));
+    let patch = match core {
         Some(core) => format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new(core).with_file_name("nsh-testing")
@@ -271,7 +355,7 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        write(&dir.join("runner"), Some(&app), false).unwrap();
+        write(&dir.join("runner"), App::Rust(&app), false).unwrap();
         let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
         assert!(manifest.contains("nsh_rust_app = { package = \"counter-rust-app\", path = "));
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
@@ -281,7 +365,7 @@ mod tests {
         let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
 
-        write(&dir.join("runner-dev"), Some(&app), true).unwrap();
+        write(&dir.join("runner-dev"), App::Rust(&app), true).unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"dev\"]"));
         let expected_testing = format!(
@@ -290,11 +374,92 @@ mod tests {
         );
         assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
 
-        write(&dir.join("tsx"), None, true).unwrap();
+        write(&dir.join("tsx"), App::Tsx, true).unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
         assert!(tsx_manifest.contains("features = [\"dev\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_tsx_app_s_runner_links_its_crates_ui_sets() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-crates-{}", std::process::id()));
+        let (one, two, ws) = (
+            dir.join("native"),
+            dir.join("charts"),
+            join_all(&dir, [".nsh", "rust"]),
+        );
+        fs::create_dir_all(&one).unwrap();
+        fs::write(
+            one.join("Cargo.toml"),
+            "[package]\nname = \"app-native\"\nversion = \"0.1.0\"\n\n[lib]\nname = \"other\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&two).unwrap();
+        fs::write(
+            two.join("Cargo.toml"),
+            "[lib]\nname = \"other\"\n\n[package]\n  name = \"app-charts\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
+        )
+        .unwrap();
+        let crates = [one.clone(), two.clone()];
+        write(
+            &dir.join("runner"),
+            App::TsxWithCrates {
+                crates: &crates,
+                workspace: &ws,
+            },
+            false,
+        )
+        .unwrap();
+        let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
+        assert!(
+            manifest.contains(&format!(
+                "app_0 = {{ package = \"app-native\", path = {:?} }}",
+                one.to_string_lossy()
+            )),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains(&format!(
+                "app_1 = {{ package = \"app-charts\", path = {:?} }}",
+                two.to_string_lossy()
+            )),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"),
+            "{manifest}"
+        );
+        assert!(!manifest.contains("features = [\"dev\"]"));
+        let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
+        assert!(
+            lib.contains("backend::app!(sets = [app_0::registry, app_1::registry]);"),
+            "{lib}"
+        );
+
+        write(
+            &dir.join("runner-dev"),
+            App::TsxWithCrates {
+                crates: &crates,
+                workspace: &ws,
+            },
+            true,
+        )
+        .unwrap();
+        let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
+        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        let expected_testing = format!(
+            "nsh-testing = {{ path = {:?} }}",
+            Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
+        );
+        assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
         fs::remove_dir_all(&dir).unwrap();
     }
 }
