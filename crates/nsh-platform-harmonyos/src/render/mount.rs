@@ -1044,7 +1044,7 @@ impl Mounter {
                                 .0
                                 .downcast_ref::<NativeText>()
                                 .ok_or(Error::Unsupported("foreign text layout"))?;
-                            let shown: Arc<str> = Arc::from(raster.source.shown_text());
+                            let shown: Arc<str> = Arc::from(raster.source.visible_text().as_ref());
                             node.accessibility_state.text(node, &shown);
                             let links_changed =
                                 node.text(raster, content.into(), layout.clone())?;
@@ -1377,6 +1377,13 @@ impl Mounter {
                         }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
+                        | Command::PushAppUrl(_)
+                        | Command::Evaluate { .. }
+                        | Command::CancelEvaluate { .. }
+                        | Command::MeasureScrollPosition { .. }
+                        | Command::Reveal(_)
+                        | Command::Orientations(_)
+                        | Command::HostPost { .. }
                         | Command::CancelPress => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;

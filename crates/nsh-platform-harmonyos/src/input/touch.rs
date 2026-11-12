@@ -247,6 +247,7 @@ impl Touches {
                             ),
                             location: nsh_core::Point::default(),
                             changed: true,
+                            pointer_type: nsh_core::PointerType::Touch,
                         },
                         node: Rc::downgrade(&node),
                         start: page,

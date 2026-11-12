@@ -13,12 +13,12 @@ missing_docs = "warn"
 unreachable_pub = "deny"
 
 [workspace.dependencies]
-nsh-core = "0.4"
-nsh-engine = { version = "0.4", default-features = false }
-nsh-base = { version = "0.4", default-features = false }
-nsh-package = "0.4"
-nsh-dev = "0.4"
-nsh-testing = { version = "0.4", default-features = false }
+nsh-core = "0.5"
+nsh-engine = { version = "0.5", default-features = false }
+nsh-base = { version = "0.5", default-features = false }
+nsh-package = "0.5"
+nsh-dev = "0.5"
+nsh-testing = { version = "0.5", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
