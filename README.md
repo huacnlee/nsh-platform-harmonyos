@@ -129,7 +129,8 @@ The project the CLI writes is a standard stage-model app: `EntryAbility` loads `
 (`surface.runApp()`); a TSX app's bundle is a raw file of the HAP (`surface.loadResource("bundle.js")`). The same
 `@nsh/harmonyos` package embeds NSH apps in an existing HarmonyOS app: see [docs/embedding.md](docs/embedding.md).
 
-[docs/architecture.md](docs/architecture.md) describes the backend's parts.
+[docs/development.md](docs/development.md) walks through starting from an empty repository or integrating into an
+existing HarmonyOS project; [docs/architecture.md](docs/architecture.md) describes the backend's parts.
 
 ## Status
 
