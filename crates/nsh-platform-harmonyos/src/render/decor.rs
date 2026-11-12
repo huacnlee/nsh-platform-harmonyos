@@ -107,19 +107,23 @@ impl Decoration {
             .into_iter()
             .flat_map(|e| &e.backdrop_filters)
         {
-            if let F::Blur(radius) = filter {
+            if let F::Blur(radius) = filter
+                && radius.0 > 0.0
+            {
                 effect.backdrop_blur += radius.0;
             }
         }
         if !owner.scene_active()
             && let Some(effects) = style.effects.as_ref()
-            && effects
-                .filters
-                .iter()
-                .all(|filter| matches!(filter, F::Blur(_)))
+            && effects.filters.iter().all(|filter| {
+                crate::render::composition::geometry::is_noop_filter(filter)
+                    || matches!(filter, F::Blur(_))
+            })
         {
             for filter in &effects.filters {
-                if let F::Blur(radius) = filter {
+                if let F::Blur(radius) = filter
+                    && radius.0 > 0.0
+                {
                     effect.blur += radius.0;
                 }
             }

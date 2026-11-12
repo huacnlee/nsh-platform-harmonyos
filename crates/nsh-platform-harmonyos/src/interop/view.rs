@@ -93,14 +93,6 @@ impl Wrapper {
                 if let Some(wrapper) = node.wrapper.borrow().as_ref() {
                     wrapper.lingering.borrow_mut().push(old);
                     Self::retire_lingering(Rc::downgrade(&node), 6);
-                    wrapper.outer.borrow().reset_attribute(
-                        ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
-                    )?;
-                    wrapper.outer.borrow().opacity(1.0)?;
-                    wrapper.outer.borrow().set_i32_attribute(
-                        ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
-                        0,
-                    )?;
                     wrapper
                         .outer
                         .borrow()
@@ -203,8 +195,13 @@ impl Wrapper {
         let outer = Custom::new()?.into_node();
         let setup = || -> Result<NativeAttachment> {
             // Header slots are siblings of the native bar, whose z-index is 1.
-            // Preserve their chrome ordering when export adds an outer node.
-            if owner.kind == nsh_core::ViewKind::HeaderItem {
+            // Preserve their chrome ordering (and any active pin z-index) when export adds an outer node.
+            if owner.is_pinned() {
+                outer.borrow().set_f32_attribute(
+                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::ZIndex,
+                    1_000_000.0,
+                )?;
+            } else if owner.kind == nsh_core::ViewKind::HeaderItem {
                 outer.borrow().z_index(2)?;
             }
             outer
@@ -435,10 +432,10 @@ impl Wrapper {
 impl Node {
     pub(crate) fn needs_texture(&self) -> bool {
         let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
-            effects
-                .filters
-                .iter()
-                .any(|filter| !matches!(filter, nsh_core::Filter::Blur(_)))
+            effects.filters.iter().any(|filter| {
+                !crate::render::composition::geometry::is_noop_filter(filter)
+                    && !matches!(filter, nsh_core::Filter::Blur(_))
+            })
         });
         self.navigation_capture.get()
             || self.scene_active() && self.has_native_paint()
@@ -485,10 +482,10 @@ impl Node {
             log::warn!("OHOS accessibility: showing the first 16 custom actions");
         }
         let non_blur_filter = self.style.borrow().effects.as_ref().is_some_and(|effects| {
-            effects
-                .filters
-                .iter()
-                .any(|filter| !matches!(filter, nsh_core::Filter::Blur(_)))
+            effects.filters.iter().any(|filter| {
+                !crate::render::composition::geometry::is_noop_filter(filter)
+                    && !matches!(filter, nsh_core::Filter::Blur(_))
+            })
         });
         // Establish the root's layout host before it has scroll descendants.
         // Adding it around an already laid-out tree resets native scroll offsets.
@@ -500,14 +497,24 @@ impl Node {
             || non_blur_filter
             || !self.shader_layers.borrow().is_empty();
         drop(spec);
+        let mut created_wrapper = false;
         if needed && self.wrapper.borrow().is_none() {
+            use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
             self.enable_layout();
-            self.native.borrow().reset_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::LayoutRect,
-            )?;
-            self.native.borrow().reset_attribute(
-                ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Position,
-            )?;
+            {
+                let native = self.native.borrow();
+                native.reset_attribute(A::LayoutRect)?;
+                native.reset_attribute(A::Position)?;
+                native.reset_attribute(A::Transform)?;
+                native.reset_attribute(A::TransformCenter)?;
+                native.reset_attribute(A::Blur)?;
+                native.reset_attribute(A::BlendMode)?;
+                if self.is_pinned() {
+                    native.reset_attribute(A::ZIndex)?;
+                }
+                native.opacity(1.0)?;
+                native.set_i32_attribute(A::Visibility, 0)?;
+            }
             let parent = self.mount_parent.borrow().upgrade();
             let index = parent
                 .as_ref()
@@ -535,6 +542,7 @@ impl Node {
                 }
             }
             *self.wrapper.borrow_mut() = Some(wrapper);
+            created_wrapper = true;
             self.accessibility_wrappers
                 .set(self.accessibility_wrappers.get() + 1);
             self.invalidate_mounted_geometry();
@@ -579,14 +587,6 @@ impl Node {
                         ))?
                         .id(),
                 )?;
-                self.native.borrow().reset_attribute(
-                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Transform,
-                )?;
-                self.native.borrow().opacity(1.0)?;
-                self.native.borrow().set_i32_attribute(
-                    ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::Visibility,
-                    0,
-                )?;
                 *wrapper.composite.borrow_mut() = Some(composite);
             }
         }
@@ -619,6 +619,9 @@ impl Node {
                 native.set_i32_attribute(A::AccessibilityMode, next.0)?;
                 native.set_bool_attribute(A::AccessibilityGroup, next.1)?;
             }
+        }
+        if created_wrapper {
+            self.restore_style()?;
         }
         self.update_wrapper()
     }
@@ -666,18 +669,7 @@ impl Node {
         }
     }
     pub(crate) fn visual_node(&self) -> NativeNode {
-        self.wrapper
-            .borrow()
-            .as_ref()
-            .filter(|wrapper| {
-                wrapper.composite.borrow().is_some()
-                    && !wrapper
-                        .settings
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|s| s.texture_surface.is_none())
-            })
-            .map_or_else(|| self.native.clone(), |wrapper| wrapper.outer.clone())
+        self.mounted()
     }
     pub(crate) fn composite_ready(&self, generation: u32) -> Result<()> {
         let mut initialized = false;

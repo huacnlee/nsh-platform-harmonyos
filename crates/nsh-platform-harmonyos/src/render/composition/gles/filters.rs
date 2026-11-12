@@ -134,7 +134,10 @@ impl Filters {
             scale *= ratio;
         }
         let (mut x, mut y) = (0.0, 0.0);
-        for filter in filters {
+        for filter in filters
+            .iter()
+            .filter(|filter| !super::super::geometry::is_noop_filter(filter))
+        {
             match *filter {
                 Filter::Blur(radius) => {
                     let sigma = super::super::geometry::blur_sigma(radius.0, scale);

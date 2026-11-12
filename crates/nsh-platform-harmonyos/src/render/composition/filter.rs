@@ -46,8 +46,12 @@ impl Image {
         tile: TileMode,
     ) -> Result<Self, &'static str> {
         let mut image = Self::copy(&self.bitmap, self.x, self.y);
-        for effect in effects {
-            image = image.apply(*effect, scale, tile)?;
+        for effect in effects
+            .iter()
+            .copied()
+            .filter(|effect| !super::geometry::is_noop_filter(effect))
+        {
+            image = image.apply(effect, scale, tile)?;
         }
         Ok(image)
     }

@@ -119,12 +119,18 @@ impl<S: Sources> Renderer<'_, S> {
         let masks = effects.map_or(&[][..], |effects| effects.mask_images.as_slice());
         let backdrop = effects.map_or(&[][..], |effects| effects.backdrop_filters.as_slice());
         // These are precisely the properties that establish a backdrop root.
+        let has_filters = filters
+            .iter()
+            .any(|filter| !super::geometry::is_noop_filter(filter));
+        let has_backdrop = backdrop
+            .iter()
+            .any(|filter| !super::geometry::is_noop_filter(filter));
         let grouped = node.shaders
             || node.capture
             || !masks.is_empty()
             || node.opacity < 1.0
-            || !filters.is_empty()
-            || !backdrop.is_empty()
+            || has_filters
+            || has_backdrop
             || node.style.blend_mode != BlendMode::Normal;
         if grouped {
             let [left, top, right, bottom] = node.bounds.0.map(|v| v * self.scale);
@@ -140,7 +146,7 @@ impl<S: Sources> Renderer<'_, S> {
             layer.clear(0);
             layer.translate(-left, -top);
             let mut shader_backdrop = None;
-            if !backdrop.is_empty() || node.shader_backdrop {
+            if has_backdrop || node.shader_backdrop {
                 let matrix = destination.total_matrix();
                 if let Some(inverse) = matrix.inverted() {
                     let prefix =
@@ -154,7 +160,7 @@ impl<S: Sources> Renderer<'_, S> {
                     if node.shader_backdrop {
                         shader_backdrop = Some(Image::copy(&prefix.bitmap, prefix.x, prefix.y));
                     }
-                    if !backdrop.is_empty() {
+                    if has_backdrop {
                         let prefix = prefix
                             .backdrop(backdrop, self.scale)
                             .map_err(str::to_owned)?;

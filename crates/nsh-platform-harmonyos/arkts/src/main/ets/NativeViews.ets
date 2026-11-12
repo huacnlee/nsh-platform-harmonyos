@@ -703,36 +703,43 @@ class ViewEntry {
 }
 export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
-  private snapshots: Map<string, image.PixelMap> = new Map();
+  private snapshots: Map<string, image.PixelMap[]> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
+  private snapshotKey(state: Settings): string {
+    return state.testId ?? `${state.width}x${state.height}`;
+  }
   private clearSnapshots(): void {
-    this.snapshots.forEach((pixelMap: image.PixelMap): void => {
-      try {
-        pixelMap.release();
-      } catch (_) {}
+    this.snapshots.forEach((pixelMaps: image.PixelMap[]): void => {
+      for (const pixelMap of pixelMaps) {
+        try {
+          pixelMap.release();
+        } catch (_) {}
+      }
     });
     this.snapshots.clear();
   }
   remove(ids: number[], context: NshRuntimeContext, incoming: Settings[] = []): void {
     this.clearSnapshots();
-    const neededSnapshots: Set<string> = new Set();
+    const neededSnapshots: Map<string, number> = new Map();
     for (const state of incoming) {
       if (state.textureSurface != null && !this.entries.has(state.targetId)) {
-        neededSnapshots.add(`${state.width}x${state.height}`);
+        const key = this.snapshotKey(state);
+        neededSnapshots.set(key, (neededSnapshots.get(key) ?? 0) + 1);
       }
     }
     for (const id of ids) {
       const entry = this.entries.get(id);
       if (entry) {
-        const key = `${entry.settings.width}x${entry.settings.height}`;
-        if (entry.settings.textureSurface == null && neededSnapshots.has(key)) {
+        const key = this.snapshotKey(entry.settings);
+        const remaining = neededSnapshots.get(key) ?? 0;
+        if (entry.settings.textureSurface == null && remaining > 0) {
           const snapshot = entry.snapshot();
           if (snapshot) {
-            try {
-              this.snapshots.get(key)?.release();
-            } catch (_) {}
-            this.snapshots.set(key, snapshot);
+            const list = this.snapshots.get(key) ?? [];
+            list.push(snapshot);
+            this.snapshots.set(key, list);
+            neededSnapshots.set(key, remaining - 1);
           }
         }
         entry.dispose(context);
@@ -759,9 +766,10 @@ export class NativeViews {
         if (entry) {
           entry.update(state);
         } else {
-          const key = `${state.width}x${state.height}`;
-          const backdrop = state.textureSurface != null ? this.snapshots.get(key) : undefined;
-          if (backdrop) {
+          const key = this.snapshotKey(state);
+          const list = state.textureSurface != null ? this.snapshots.get(key) : undefined;
+          const backdrop = list && list.length > 0 ? list.shift() : undefined;
+          if (list && list.length === 0) {
             this.snapshots.delete(key);
           }
           entry = new ViewEntry(state, context, this.menus, this.pointerPosting, backdrop);

@@ -307,10 +307,11 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
     let samples_backdrop = {
         let style = node.style.borrow();
         style.blend_mode != nsh_core::BlendMode::Normal
-            || style
-                .effects
-                .as_ref()
-                .is_some_and(|e| !e.backdrop_filters.is_empty())
+            || style.effects.as_ref().is_some_and(|e| {
+                e.backdrop_filters
+                    .iter()
+                    .any(|f| !super::geometry::is_noop_filter(f))
+            })
             || node.shader_layers.borrow().iter().any(|(_, layer)| {
                 layer
                     .shader
@@ -322,10 +323,12 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
         let overflows = {
             let style = node.style.borrow();
             style.outline.is_visible()
-                || style
-                    .effects
-                    .as_ref()
-                    .is_some_and(|e| !e.box_shadows.is_empty() || !e.filters.is_empty())
+                || style.effects.as_ref().is_some_and(|e| {
+                    !e.box_shadows.is_empty()
+                        || e.filters
+                            .iter()
+                            .any(|f| !super::geometry::is_noop_filter(f))
+                })
                 || !node.shader_layers.borrow().is_empty()
         };
         if !overflows {
@@ -345,8 +348,12 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
                 || style.blend_mode != nsh_core::BlendMode::Normal
                 || effects.is_some_and(|e| {
                     !e.mask_images.is_empty()
-                        || !e.filters.is_empty()
-                        || !e.backdrop_filters.is_empty()
+                        || e.filters
+                            .iter()
+                            .any(|f| !super::geometry::is_noop_filter(f))
+                        || e.backdrop_filters
+                            .iter()
+                            .any(|f| !super::geometry::is_noop_filter(f))
                 })
         };
         if Rc::ptr_eq(&ancestor, root)
