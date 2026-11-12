@@ -136,7 +136,7 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
                 .map(patches_of)
                 .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned());
             let patches = if dev {
-                testing_patches(&patches, Some(&manifest))?
+                testing_patches(&patches, Some(&manifest))
             } else {
                 patches
             };
@@ -172,7 +172,7 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
             }
             let patches = patches_of(workspace);
             let patches = if dev {
-                testing_patches(&patches, None)?
+                testing_patches(&patches, None)
             } else {
                 patches
             };
@@ -228,28 +228,35 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
 
 /// The agent must use the same core/engine as the app, including when its
 /// generated workspace points to a local NSH checkout instead of crates.io.
-fn testing_patches(patches: &str, app_manifest: Option<&str>) -> anyhow::Result<String> {
+fn testing_patches(patches: &str, app_manifest: Option<&str>) -> String {
     let mut in_crates_io = false;
     for line in patches.lines() {
         if line.starts_with('[') {
             in_crates_io = line.trim() == "[patch.crates-io]";
         }
         if in_crates_io && line.trim_start().starts_with("nsh-testing =") {
-            return Ok(patches.to_owned());
+            return patches.to_owned();
         }
     }
     let core = value(patches, "nsh-core", "path")
         .or_else(|| app_manifest.and_then(|m| value(m, "nsh-core", "path")));
-    let patch = match core {
-        Some(core) => format!(
+    let patch = if let Some(core) = core {
+        format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new(core).with_file_name("nsh-testing")
-        ),
-        None => crate::embedded::NSH_PATCH
-            .lines()
-            .find(|line| line.starts_with("nsh-testing ="))
-            .context("the backend has no pinned nsh-testing dependency")?
-            .to_owned(),
+        )
+    } else if let Some(line) = patches
+        .lines()
+        .find(|line| line.trim_start().starts_with("nsh-core ="))
+    {
+        line.replacen("nsh-core", "nsh-testing", 1)
+    } else if let Some(line) = crate::embedded::NSH_PATCH
+        .lines()
+        .find(|line| line.starts_with("nsh-testing ="))
+    {
+        line.to_owned()
+    } else {
+        return patches.to_owned();
     };
     let mut result = String::new();
     let mut inserted = false;
@@ -265,7 +272,7 @@ fn testing_patches(patches: &str, app_manifest: Option<&str>) -> anyhow::Result<
     if !inserted {
         result.push_str(&format!("\n[patch.crates-io]\n{patch}\n"));
     }
-    Ok(result)
+    result
 }
 
 /// Builds the runner in `dir` for `arch` with the NDK; the library's path.
@@ -460,6 +467,32 @@ mod tests {
             Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
         );
         assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dev_runners_need_no_patch_against_released_crates() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-released-{}", std::process::id()));
+        let app = dir.join("rust-app");
+        fs::create_dir_all(&app).unwrap();
+        fs::write(
+            app.join("Cargo.toml"),
+            "[package]\nname = \"counter-rust-app\"\nversion = \"0.0.0\"\n\n\
+             [dependencies]\nnsh-core = \"0.5\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"rust-app\"]\n",
+        )
+        .unwrap();
+        write(&dir.join("runner-dev"), App::Rust(&app), true).unwrap();
+        let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
+        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        assert!(
+            !dev_manifest.contains("[patch.crates-io]"),
+            "{dev_manifest}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 }

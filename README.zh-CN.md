@@ -124,7 +124,7 @@ CLI 写出的是标准的 Stage 模型应用：`EntryAbility` 加载 `pages/Inde
 
 ## 跟进 NSH
 
-这个平台针对 NSH 的某个 revision 构建（`Cargo.toml` 里的 `[patch.crates-io]`，等 NSH 发布带平台扩展点的版本后再改）。mount item、文本引擎和事件都是
+这个平台针对 crates.io 上的 NSH `0.5` 构建（如需针对未发版的 revision 或本地仓库测试，可在 `Cargo.toml` 里加 `[patch.crates-io]`）。mount item、文本引擎和事件都是
 NSH 的协议，会随版本增长；新版 NSH 可能加入这个后端还没处理的 mount item，在处理之前会被跳过（`render/mount.rs`）。
 
 ## 开发
