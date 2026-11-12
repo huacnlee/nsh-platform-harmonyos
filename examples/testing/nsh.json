@@ -1,5 +1,8 @@
 {
   "name": "NSH device tests",
   "id": "com.example.nsh.testing",
-  "capabilities": { "network": { "hosts": ["api.test"] } }
+  "capabilities": {
+    "network": { "hosts": ["api.test"] },
+    "webview": { "hosts": ["example.test"] }
+  }
 }

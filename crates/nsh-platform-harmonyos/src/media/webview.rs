@@ -7,7 +7,7 @@ use std::{
 };
 
 use nsh_core::{Command, EventKind, EventPayload, PayloadValue, WebProps, WebSource};
-use nsh_engine::Access;
+use nsh_engine::{Access, EngineControl};
 use ohos_arkui_binding::{
     component::{attribute::ArkUICommonAttribute, built_in_component::Custom},
     types::advanced::{LengthMetricUnit, NodeDirtyFlag},
@@ -18,8 +18,9 @@ use ohos_web_binding::{
 };
 use rustc_hash::FxHashMap;
 
+use super::web_evaluation::{Evaluations, JsDone, ScriptHost, abort_payload};
 use crate::{
-    app::session::Services,
+    app::{runtime::Dispatcher, session::Services},
     interop::{
         attachment::NativeAttachment,
         sdk::{WebCommand, WebEvent, WebHeader, WebSettings},
@@ -81,17 +82,84 @@ fn send_response(handle: &ResourceHandle, status: u16, mime_type: &str, body: &[
     handle.finish();
 }
 
+type PendingJs = Box<dyn FnOnce(&Web)>;
+
 struct Route {
     node: Weak<Node>,
+    dispatcher: std::sync::Weak<Dispatcher>,
     access: Arc<Access>,
     assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
     url_schemes: Vec<nsh_core::web_resource::WebUrlScheme>,
     proxy: RefCell<Option<WebProxy>>,
+    web: RefCell<Option<Web>>,
+    controller_ready: Cell<bool>,
+    pending_js: RefCell<Vec<PendingJs>>,
+    evaluations: Rc<Evaluations>,
 }
 
 thread_local! {
     static ROUTES: RefCell<FxHashMap<u32, Rc<Route>>> = RefCell::default();
+}
+
+fn eval_on_web(dispatcher: &std::sync::Weak<Dispatcher>, web: &Web, script: &str, done: JsDone) {
+    let reply = Dispatcher::reply(dispatcher, move |raw: Option<Vec<u8>>| {
+        done(raw.as_deref());
+    });
+    let cb_reply = reply.clone();
+    if web
+        .run_javascript(script, move |bytes| {
+            cb_reply.send(bytes.map(<[u8]>::to_vec));
+        })
+        .is_err()
+    {
+        reply.send(None);
+    }
+}
+
+impl ScriptHost for Route {
+    fn evaluate(&self, script: &str, done: JsDone) {
+        if self.controller_ready.get()
+            && let Some(web) = self.web.borrow().as_ref()
+        {
+            eval_on_web(&self.dispatcher, web, script, done);
+        } else {
+            let script = script.to_owned();
+            let dispatcher = self.dispatcher.clone();
+            self.pending_js.borrow_mut().push(Box::new(move |web| {
+                eval_on_web(&dispatcher, web, &script, done)
+            }));
+        }
+    }
+
+    fn execute(&self, script: &str) {
+        if self.controller_ready.get()
+            && let Some(web) = self.web.borrow().as_ref()
+        {
+            let _ = web.run_javascript(script, |_| {});
+        } else {
+            let script = script.to_owned();
+            self.pending_js.borrow_mut().push(Box::new(move |web| {
+                let _ = web.run_javascript(&script, |_| {});
+            }));
+        }
+    }
+}
+
+impl Route {
+    fn run_detached(&self, script: &str) {
+        self.execute(script);
+    }
+
+    fn on_ready(&self) {
+        self.controller_ready.set(true);
+        let queued = std::mem::take(&mut *self.pending_js.borrow_mut());
+        if let Some(web) = self.web.borrow().as_ref() {
+            for job in queued {
+                job(web);
+            }
+        }
+    }
 }
 
 struct RouteRegistration(u32);
@@ -116,6 +184,8 @@ pub(crate) struct WebView {
     native: NativeNode,
     target: RefCell<Option<NativeAttachment>>,
     route: RefCell<Option<RouteRegistration>>,
+    route_ref: RefCell<Option<Rc<Route>>>,
+    evaluations: Rc<Evaluations>,
     frame: Cell<Size>,
     props: RefCell<Option<WebProps>>,
     applied_source: RefCell<Option<WebSource>>,
@@ -133,25 +203,39 @@ impl WebView {
             .borrow()
             .set_length_metric_unit(LengthMetricUnit::Vp)?;
         owner.native.borrow_mut().insert_child(native.clone(), 0)?;
+        let evaluations = {
+            let control = owner.control.clone();
+            let dispatcher = owner.dispatcher.clone();
+            Evaluations::new(
+                owner.id,
+                Box::new(move |id, kind, payload| control.dispatch_event(id, kind, payload)),
+                Box::new(move |delay, work| Dispatcher::after(&dispatcher, delay, work)),
+            )
+        };
         let mut target = None;
         let mut route = None;
+        let mut route_ref = None;
         if owner.host.check().is_ok() {
             let attachment = NativeAttachment::new(&native)?;
             let id = attachment.id();
+            let entry = Rc::new(Route {
+                node: node.clone(),
+                dispatcher: owner.dispatcher.clone(),
+                access: owner.access.clone(),
+                assets: owner.assets.clone(),
+                host: owner.host.clone(),
+                url_schemes: Vec::new(),
+                proxy: RefCell::new(None),
+                web: RefCell::new(None),
+                controller_ready: Cell::new(false),
+                pending_js: RefCell::default(),
+                evaluations: evaluations.clone(),
+            });
             ROUTES.with(|routes| {
-                routes.borrow_mut().insert(
-                    id,
-                    Rc::new(Route {
-                        node: node.clone(),
-                        access: owner.access.clone(),
-                        assets: owner.assets.clone(),
-                        host: owner.host.clone(),
-                        url_schemes: Vec::new(),
-                        proxy: RefCell::new(None),
-                    }),
-                );
+                routes.borrow_mut().insert(id, entry.clone());
             });
             route = Some(RouteRegistration(id));
+            route_ref = Some(entry);
             target = Some(attachment);
         }
         Ok(Self {
@@ -160,6 +244,8 @@ impl WebView {
             native,
             target: RefCell::new(target),
             route: RefCell::new(route),
+            route_ref: RefCell::new(route_ref),
+            evaluations,
             frame: Cell::new(Size::default()),
             props: RefCell::new(None),
             applied_source: RefCell::new(None),
@@ -190,6 +276,8 @@ impl WebView {
             return Ok(());
         };
         if !ready {
+            self.evaluations.dispose();
+            self.route_ref.borrow_mut().take();
             self.route.borrow_mut().take();
             *self.applied_source.borrow_mut() = None;
             *self.applied_document.borrow_mut() = None;
@@ -214,34 +302,63 @@ impl WebView {
     }
 
     pub(crate) fn command(&self, command: Command) -> Result<()> {
-        if self.closed.get() || !self.ready.get() {
-            return Ok(());
-        }
         let Some(node) = self.node.upgrade() else {
             return Ok(());
         };
-        let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
+        if let Command::Evaluate { request, script } = command {
+            if self.closed.get() || !self.ready.get() || self.applied_document.borrow().is_none() {
+                abort_evaluation(&node.control, node.id, request);
+                return Ok(());
+            }
+            let js_enabled = self
+                .props
+                .borrow()
+                .as_ref()
+                .is_none_or(|p| p.javascript_enabled);
+            self.evaluations.start(request, &script, js_enabled);
+            return Ok(());
+        }
+        if let Command::CancelEvaluate { request } = command {
+            self.evaluations.cancel(request);
+            return Ok(());
+        }
+        if self.closed.get() || !self.ready.get() {
+            return Ok(());
+        }
+        let (Some(target_id), Some(route)) = (
+            self.target.borrow().as_ref().map(NativeAttachment::id),
+            self.route_ref.borrow().clone(),
+        ) else {
             return Ok(());
         };
         let web_command = match command {
-            Command::Reload => WebCommand {
-                target_id,
-                kind: "reload".into(),
-                script: None,
-                ..Default::default()
-            },
-            Command::GoBack => WebCommand {
-                target_id,
-                kind: "go-back".into(),
-                script: None,
-                ..Default::default()
-            },
-            Command::GoForward => WebCommand {
-                target_id,
-                kind: "go-forward".into(),
-                script: None,
-                ..Default::default()
-            },
+            Command::Reload => {
+                self.evaluations.navigated();
+                WebCommand {
+                    target_id,
+                    kind: "reload".into(),
+                    script: None,
+                    ..Default::default()
+                }
+            }
+            Command::GoBack => {
+                self.evaluations.navigated();
+                WebCommand {
+                    target_id,
+                    kind: "go-back".into(),
+                    script: None,
+                    ..Default::default()
+                }
+            }
+            Command::GoForward => {
+                self.evaluations.navigated();
+                WebCommand {
+                    target_id,
+                    kind: "go-forward".into(),
+                    script: None,
+                    ..Default::default()
+                }
+            }
             Command::StopLoading => WebCommand {
                 target_id,
                 kind: "stop-loading".into(),
@@ -254,28 +371,20 @@ impl WebView {
                 script: None,
                 ..Default::default()
             },
-            Command::Blur => WebCommand {
-                target_id,
-                kind: "evaluate".into(),
-                script: Some("document.activeElement?.blur();".into()),
-                ..Default::default()
-            },
-            Command::InjectJavaScript(script) => WebCommand {
-                target_id,
-                kind: "evaluate".into(),
-                script: Some(script),
-                ..Default::default()
-            },
+            Command::Blur => {
+                route.run_detached("document.activeElement?.blur();");
+                return Ok(());
+            }
+            Command::InjectJavaScript(script) => {
+                route.run_detached(&script);
+                return Ok(());
+            }
             Command::PostMessage(data) => {
                 let literal = serde_json::to_string(&data).expect("string literal");
-                WebCommand {
-                    target_id,
-                    kind: "evaluate".into(),
-                    script: Some(format!(
-                        "window.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));document.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));"
-                    )),
-                    ..Default::default()
-                }
+                route.run_detached(&format!(
+                    "window.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));document.dispatchEvent(new MessageEvent('message',{{data:{literal}}}));"
+                ));
+                return Ok(());
             }
             Command::Load(load) => {
                 let schemes = self
@@ -305,6 +414,7 @@ impl WebView {
                     );
                     return Ok(());
                 }
+                self.evaluations.navigated();
                 WebCommand {
                     target_id,
                     kind: "load".into(),
@@ -364,6 +474,8 @@ impl WebView {
         if self.closed.replace(true) {
             return Ok(());
         }
+        self.evaluations.dispose();
+        self.route_ref.borrow_mut().take();
         self.route.borrow_mut().take();
         if let Some(node) = self.node.upgrade()
             && let Some(target) = self.target.borrow_mut().take()
@@ -376,6 +488,8 @@ impl WebView {
     }
 
     fn replace_target(&self, node: &Node) -> Result<u32> {
+        self.evaluations.set_web(None);
+        self.evaluations.navigated();
         let attachment = NativeAttachment::new(&self.native)?;
         let id = attachment.id();
         let url_schemes = self
@@ -384,20 +498,24 @@ impl WebView {
             .as_ref()
             .map(|p| p.url_schemes.clone())
             .unwrap_or_default();
+        let entry = Rc::new(Route {
+            node: self.node.clone(),
+            dispatcher: node.dispatcher.clone(),
+            access: node.access.clone(),
+            assets: node.assets.clone(),
+            host: node.host.clone(),
+            url_schemes,
+            proxy: RefCell::new(None),
+            web: RefCell::new(None),
+            controller_ready: Cell::new(false),
+            pending_js: RefCell::default(),
+            evaluations: self.evaluations.clone(),
+        });
         ROUTES.with(|routes| {
-            routes.borrow_mut().insert(
-                id,
-                Rc::new(Route {
-                    node: self.node.clone(),
-                    access: node.access.clone(),
-                    assets: node.assets.clone(),
-                    host: node.host.clone(),
-                    url_schemes,
-                    proxy: RefCell::new(None),
-                }),
-            );
+            routes.borrow_mut().insert(id, entry.clone());
         });
         *self.route.borrow_mut() = Some(RouteRegistration(id));
+        *self.route_ref.borrow_mut() = Some(entry);
         *self.applied_source.borrow_mut() = None;
         *self.applied_document.borrow_mut() = None;
         if let Some(old) = self.target.replace(Some(attachment)) {
@@ -438,6 +556,9 @@ impl WebView {
             );
             return Ok(());
         }
+        if !props.javascript_enabled {
+            self.evaluations.scripts_disabled();
+        }
         let shared_cookies = !props.incognito;
         let document = DocumentSettings {
             javascript: props.javascript_enabled,
@@ -461,10 +582,15 @@ impl WebView {
         } else {
             self.target.borrow().as_ref().unwrap().id()
         };
+        if let Some(route) = self.route_ref.borrow().as_ref() {
+            let host: Rc<dyn ScriptHost> = route.clone();
+            self.evaluations.set_web(Some(&host));
+        }
         *self.applied_document.borrow_mut() = Some(document);
 
         let source_changed = self.applied_source.borrow().as_ref() != Some(&props.source);
         if source_changed {
+            self.evaluations.navigated();
             *self.applied_source.borrow_mut() = Some(props.source.clone());
             self.load_generation
                 .set(self.load_generation.get().wrapping_add(1).max(1));
@@ -514,6 +640,9 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
         let Some(node) = route.node.upgrade() else {
             return Ok(false);
         };
+        if native_tag.contains('\0') {
+            return Err(napi_ohos::Error::from_reason("Invalid WebView tag"));
+        }
         install_asset_protocol(
             native_tag,
             route.assets.clone(),
@@ -536,6 +665,7 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
             .map_err(|error| {
                 napi_ohos::Error::from_reason(format!("Unable to build WebView JS proxy: {error}"))
             })?;
+        *route.web.borrow_mut() = Some(Web::new(native_tag.to_owned()));
         *route.proxy.borrow_mut() = Some(proxy);
         Ok(true)
     })?
@@ -694,6 +824,26 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
             ])
         };
         match event.phase.as_str() {
+            "ready" => {
+                route.on_ready();
+            }
+            "render-exited" => {
+                route.evaluations.process_terminated();
+                node.control.dispatch_event(
+                    node.id,
+                    EventKind::Error,
+                    EventPayload::Map(vec![
+                        (
+                            "message",
+                            PayloadValue::Str("The web content process terminated".into()),
+                        ),
+                        (
+                            "code",
+                            PayloadValue::Str("ERR_NSH_WEBVIEW_TERMINATED".into()),
+                        ),
+                    ]),
+                );
+            }
             "focus" | "blur" => {
                 let focus = event.phase == "focus";
                 let mut keyboard = dispatcher.keyboard.lock().unwrap();
@@ -756,6 +906,7 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                     .dispatch_event(node.id, EventKind::LoadEnd, state());
             }
             "start" => {
+                route.evaluations.navigated();
                 node.control
                     .dispatch_event(node.id, EventKind::LoadStart, state());
                 node.control
@@ -776,6 +927,10 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
         }
         true
     })
+}
+
+pub(crate) fn abort_evaluation(control: &EngineControl, node_id: nsh_core::NodeId, request: u32) {
+    control.dispatch_event(node_id, EventKind::WebEvaluation, abort_payload(request));
 }
 
 fn asset_url(uri: &str) -> String {

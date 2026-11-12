@@ -112,6 +112,9 @@ function webContent(entry: WebEntry) {
       if (event.request.isMainFrame()) {
         entry.emit("error", event.error.getErrorInfo(), event.error.getErrorCode());
       }
+    })
+    .onRenderExited(() => {
+      entry.emit("render-exited");
     });
 }
 
@@ -252,6 +255,7 @@ class WebEntry {
       for (const cmd of queued) {
         this.command(cmd);
       }
+      this.emit("ready");
     } catch (error) {
       this.emit("error", String(error));
     }
