@@ -245,11 +245,15 @@ fn testing_patches(patches: &str, app_manifest: Option<&str>) -> anyhow::Result<
             "nsh-testing = {{ path = {:?} }}",
             Path::new(core).with_file_name("nsh-testing")
         ),
-        None => crate::embedded::NSH_PATCH
+        None => match crate::embedded::NSH_PATCH
             .lines()
             .find(|line| line.starts_with("nsh-testing ="))
-            .context("the backend has no pinned nsh-testing dependency")?
-            .to_owned(),
+        {
+            Some(line) => line.to_owned(),
+            // A crates.io backend pins nothing: the runner's `dev` backend
+            // takes nsh-testing from crates.io at the app's own version.
+            None => return Ok(patches.to_owned()),
+        },
     };
     let mut result = String::new();
     let mut inserted = false;
