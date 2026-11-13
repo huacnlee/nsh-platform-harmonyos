@@ -75,11 +75,14 @@ impl Node {
             backface_away: Cell::new(false),
             interaction: Interaction::default(),
             style: RefCell::new(Box::default()),
+            animated_opacity: Cell::new(None),
             applied: Cell::new(AppliedStyle {
                 visual_ptr,
                 ..AppliedStyle::default()
             }),
             styled: Cell::new(false),
+            paint_frames: Cell::new(0),
+            paint_armed: Cell::new(false),
             live: RefCell::default(),
             leaving: Cell::new(false),
             extra: Cell::new((1.0, crate::render::transition::Extra::NONE)),
@@ -195,6 +198,8 @@ impl Node {
         if !self.active.replace(false) {
             return;
         }
+        self.paint_frames.set(0);
+        self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));
         callback(|| self.selection_clear());
         self.invalidate_scene();

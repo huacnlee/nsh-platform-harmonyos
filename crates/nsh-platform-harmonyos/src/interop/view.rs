@@ -22,6 +22,12 @@ use crate::{
     render::node::{NativeNode, Node, Result, callback},
 };
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetirePhase {
+    Exporting,
+    Settling,
+}
+
 pub(crate) struct Wrapper {
     closed: std::cell::Cell<bool>,
     pub(crate) outer: NativeNode,
@@ -32,7 +38,7 @@ pub(crate) struct Wrapper {
     owner: std::rc::Weak<Node>,
     settings: std::cell::RefCell<Option<ViewOptions>>,
     pub(crate) composite: std::cell::RefCell<Option<crate::render::composition::worker::Composite>>,
-    retiring: Cell<u8>,
+    retiring: Cell<Option<(u32, RetirePhase)>>,
     lingering: std::cell::RefCell<Vec<crate::render::composition::worker::Composite>>,
     /// The accessibility mode and grouping last given the wrapped node
     /// (`None`: to give again, after the node's own props reset them).
@@ -42,35 +48,51 @@ pub(crate) struct Wrapper {
 }
 impl Wrapper {
     pub(crate) fn retiring_export(&self) -> bool {
-        self.retiring.get() == 1
+        matches!(self.retiring.get(), Some((_, RetirePhase::Exporting)))
     }
-    fn retire_composite(owner: std::rc::Weak<Node>, remaining: u8) {
+    fn retire_composite(owner: std::rc::Weak<Node>, generation: u32, remaining: u8) {
         let Some(node) = owner.upgrade() else {
             return;
         };
-        let Some((outer, retiring, closed)) = node
-            .wrapper
-            .borrow()
-            .as_ref()
-            .map(|w| (w.outer.clone(), w.retiring.get(), w.closed.get()))
-        else {
+        let Some((outer, active, closed)) = node.wrapper.borrow().as_ref().map(|w| {
+            (
+                w.outer.clone(),
+                w.retiring.get().map(|(g, _)| g) == Some(generation)
+                    && w.composite
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|c| c.generation == generation),
+                w.closed.get(),
+            )
+        }) else {
             return;
         };
-        if closed || retiring == 0 {
+        if closed || !active {
             return;
         }
         if node.needs_texture() {
-            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
-                wrapper.retiring.set(0);
+            if let Some(wrapper) = node.wrapper.borrow().as_ref()
+                && wrapper.retiring.get().map(|(g, _)| g) == Some(generation)
+            {
+                wrapper.retiring.set(None);
             }
             return;
         }
         if remaining == 2 {
             callback(|| {
                 node.composite_dirty.set(true);
-                if let Some(wrapper) = node.wrapper.borrow().as_ref() {
-                    wrapper.retiring.set(2);
-                    if let Some(composite) = wrapper.composite.borrow().as_ref() {
+                if let Some(wrapper) = node.wrapper.borrow().as_ref()
+                    && wrapper.retiring.get().map(|(g, _)| g) == Some(generation)
+                {
+                    wrapper
+                        .retiring
+                        .set(Some((generation, RetirePhase::Settling)));
+                    if let Some(composite) = wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .filter(|c| c.generation == generation)
+                    {
                         let _ = composite.update(&node);
                     }
                 }
@@ -78,28 +100,47 @@ impl Wrapper {
             });
         }
         if remaining > 0 {
-            let _ = outer.borrow().post_frame_callback(move |_, _| {
-                Self::retire_composite(owner, remaining - 1);
-            });
-            return;
+            let next = owner.clone();
+            if outer
+                .borrow()
+                .post_frame_callback(move |_, _| {
+                    Self::retire_composite(next, generation, remaining - 1);
+                })
+                .is_ok()
+            {
+                return;
+            }
         }
         callback(|| {
             let retired = node.wrapper.borrow().as_ref().and_then(|wrapper| {
-                wrapper.retiring.set(0);
-                wrapper.composite.borrow_mut().take()
+                if wrapper.retiring.get().map(|(g, _)| g) != Some(generation) {
+                    return None;
+                }
+                wrapper.retiring.set(None);
+                if wrapper
+                    .composite
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|c| c.generation == generation)
+                {
+                    wrapper.composite.borrow_mut().take()
+                } else {
+                    None
+                }
             });
             if let Some(old) = retired {
+                let old_generation = old.generation;
                 node.composite_dirty.set(true);
                 let _ = old.update(&node);
                 if let Some(wrapper) = node.wrapper.borrow().as_ref() {
                     wrapper.lingering.borrow_mut().push(old);
-                    Self::retire_lingering(Rc::downgrade(&node), 6);
+                    Self::retire_lingering(Rc::downgrade(&node), old_generation, 12);
                     wrapper
                         .outer
                         .borrow()
                         .mark_dirty(NodeDirtyFlag::NeedRender)?;
                 }
-                node.schedule_subtree_paint(4)?;
+                node.schedule_subtree_paint(6)?;
                 node.update_wrapper()?;
                 node.restore_style()?;
                 node.flush_arkui()?;
@@ -107,23 +148,96 @@ impl Wrapper {
             Ok(())
         });
     }
-    fn retire_lingering(owner: std::rc::Weak<Node>, remaining: u8) {
+    fn commit_presentation(owner: std::rc::Weak<Node>, generation: u32, remaining: u8) {
         let Some(node) = owner.upgrade() else {
             return;
         };
-        let Some(outer) = node.wrapper.borrow().as_ref().map(|w| w.outer.clone()) else {
+        let Some((outer, active, closed)) = node.wrapper.borrow().as_ref().map(|w| {
+            (
+                w.outer.clone(),
+                w.composite
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|composite| composite.generation == generation),
+                w.closed.get(),
+            )
+        }) else {
             return;
         };
-        if remaining == 0 {
-            if let Some(wrapper) = node.wrapper.borrow().as_ref() {
-                wrapper.lingering.borrow_mut().clear();
-                let _ = wrapper.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender);
-            }
+        if closed || !active {
             return;
         }
-        let _ = outer.borrow().post_frame_callback(move |_, _| {
-            Self::retire_lingering(owner, remaining - 1);
+        if remaining > 0 {
+            let next = owner.clone();
+            if outer
+                .borrow()
+                .post_frame_callback(move |_, _| {
+                    Self::commit_presentation(next, generation, remaining - 1);
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        callback(|| {
+            let committed = node
+                .wrapper
+                .borrow()
+                .as_ref()
+                .filter(|w| !w.closed.get())
+                .and_then(|w| {
+                    w.composite
+                        .borrow()
+                        .as_ref()
+                        .filter(|composite| composite.generation == generation)
+                        .map(|composite| composite.commit_presentation())
+                })
+                .unwrap_or(false);
+            if committed {
+                node.update_wrapper()?;
+                node.flush_arkui()?;
+            }
+            Ok(())
         });
+    }
+    fn retire_lingering(owner: std::rc::Weak<Node>, generation: u32, remaining: u8) {
+        let Some(node) = owner.upgrade() else {
+            return;
+        };
+        let Some((outer, present)) = node.wrapper.borrow().as_ref().map(|w| {
+            (
+                w.outer.clone(),
+                !w.closed.get()
+                    && w.lingering
+                        .borrow()
+                        .iter()
+                        .any(|c| c.generation == generation),
+            )
+        }) else {
+            return;
+        };
+        if !present {
+            return;
+        }
+        if remaining > 0 {
+            let next = owner.clone();
+            if outer
+                .borrow()
+                .post_frame_callback(move |_, _| {
+                    Self::retire_lingering(next, generation, remaining - 1);
+                })
+                .is_ok()
+            {
+                return;
+            }
+        }
+        if let Some(wrapper) = node.wrapper.borrow().as_ref() {
+            wrapper
+                .lingering
+                .borrow_mut()
+                .retain(|c| c.generation != generation);
+            let _ = wrapper.outer.borrow().mark_dirty(NodeDirtyFlag::NeedRender);
+        }
     }
     pub(crate) fn invalidate_context(&self) {
         self.settings.borrow_mut().take();
@@ -148,15 +262,20 @@ impl Wrapper {
         Ok(id)
     }
     fn ensure_context(&self, owner: &Node) -> Result<()> {
-        if !self.context_live.get() {
-            let id = self.replace_target(owner)?;
-            if self.composite.borrow_mut().take().is_some() {
+        let target_retired = self
+            .target
+            .borrow()
+            .as_ref()
+            .is_none_or(NativeAttachment::is_retired);
+        if !self.context_live.get() || target_retired {
+            self.settings.borrow_mut().take();
+            self.replace_target(owner)?;
+            if !self.context_live.get() && self.composite.borrow_mut().take().is_some() {
                 let composite = crate::render::composition::worker::Composite::new(
                     &self
                         .owner
                         .upgrade()
                         .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
-                    id,
                 )?;
                 *self.composite.borrow_mut() = Some(composite);
             }
@@ -228,7 +347,7 @@ impl Wrapper {
                     // SAFETY: ArkUI owns this canvas until this draw callback returns.
                     let canvas = unsafe { ohos_drawing_binding::Canvas::from_raw_borrowed(raw) };
                     if let Some(scene) = owner.scene.borrow().as_ref() {
-                        scene.draw(owner.id, &canvas);
+                        scene.draw(owner.id, &canvas, owner.scale.get());
                     }
                 }
                 Ok(())
@@ -284,6 +403,7 @@ impl Wrapper {
                             .composite
                             .borrow()
                             .as_ref()
+                            .filter(|composite| composite.surface().is_some())
                             .map_or((0.0, 0.0), |composite| composite.origin());
                         event.layout_child(
                             node,
@@ -317,7 +437,7 @@ impl Wrapper {
             owner: Rc::downgrade(owner),
             settings: std::cell::RefCell::default(),
             composite: std::cell::RefCell::default(),
-            retiring: Cell::new(0),
+            retiring: Cell::new(None),
             lingering: std::cell::RefCell::default(),
             semantics: Cell::new(None),
             measured: Cell::new(None),
@@ -358,12 +478,29 @@ impl Wrapper {
         let replaces = self.replaces.take();
         let spec = owner.accessibility_state.spec.borrow();
         let frame = owner.frame.get();
+        let value = crate::accessibility::value::spoken_value(&spec).unwrap_or_default();
+        let actions: Vec<MenuItem> = if cfg!(feature = "api-26") {
+            spec.actions
+                .iter()
+                .take(16)
+                .map(|action| MenuItem {
+                    kind: "action".into(),
+                    name: action.name.to_string(),
+                    label: action.label.as_deref().unwrap_or(&action.name).to_owned(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let mut settings = ViewOptions {
-            texture_insets: self
-                .composite
-                .borrow()
-                .as_ref()
-                .map(|composite| composite.insets()),
+            texture_insets: if texture_surface.is_some() {
+                self.composite
+                    .borrow()
+                    .as_ref()
+                    .map(|composite| composite.insets())
+            } else {
+                None
+            },
             texture_surface,
             texture_ready: self
                 .composite
@@ -387,25 +524,13 @@ impl Wrapper {
             hidden: spec.hidden,
             label: owner.accessibility_state.label(owner),
             hint: spec.hint.as_deref().unwrap_or("").to_owned(),
-            value: crate::accessibility::value::spoken_value(&spec).unwrap_or_default(),
+            api23: cfg!(feature = "api-23") && !value.is_empty(),
+            api26: !actions.is_empty(),
+            value,
             role: role(spec.role).to_owned(),
             checked: spec.state.checked.map(|value| value == Checked::True),
             selected: spec.state.selected,
-            api23: cfg!(feature = "api-23"),
-            api26: cfg!(feature = "api-26"),
-            actions: if cfg!(feature = "api-26") {
-                spec.actions
-                    .iter()
-                    .take(16)
-                    .map(|action| MenuItem {
-                        kind: "action".into(),
-                        name: action.name.to_string(),
-                        label: action.label.as_deref().unwrap_or(&action.name).to_owned(),
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            },
+            actions,
             menu: owner.selection_menu(),
         };
         let mut previous = self.settings.borrow_mut();
@@ -419,7 +544,7 @@ impl Wrapper {
     }
     pub(crate) fn close(&self, owner: &Node) -> Result<()> {
         self.closed.set(true);
-        self.retiring.set(0);
+        self.retiring.set(None);
         self.replaces.set(None);
         self.route.borrow_mut().take();
         if let Some(old) = self.target.borrow_mut().take() {
@@ -525,15 +650,18 @@ impl Node {
         }
         let mut created_composite = false;
         if !requires_texture {
-            let start_retirement = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
-                if wrapper.composite.borrow().is_some() && wrapper.retiring.get() == 0 {
-                    wrapper.retiring.set(1);
-                    true
+            let start_generation = self.wrapper.borrow().as_ref().and_then(|wrapper| {
+                let generation = wrapper.composite.borrow().as_ref()?.generation;
+                if wrapper.retiring.get().is_none() {
+                    wrapper
+                        .retiring
+                        .set(Some((generation, RetirePhase::Exporting)));
+                    Some(generation)
                 } else {
-                    false
+                    None
                 }
             });
-            if start_retirement {
+            if let Some(generation) = start_generation {
                 self.composite_dirty.set(true);
                 self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
                 if let Some(wrapper) = self.wrapper.borrow().as_ref() {
@@ -542,23 +670,17 @@ impl Node {
                         .borrow()
                         .mark_dirty(NodeDirtyFlag::NeedRender)?;
                 }
-                Wrapper::retire_composite(Rc::downgrade(self), 3);
+                Wrapper::retire_composite(Rc::downgrade(self), generation, 3);
             }
         } else if let Some(wrapper) = self.wrapper.borrow().as_ref() {
-            wrapper.retiring.set(0);
+            wrapper.retiring.set(None);
             if wrapper.composite.borrow().is_none() {
-                wrapper.lingering.borrow_mut().clear();
-                let composite = crate::render::composition::worker::Composite::new(
-                    self,
-                    wrapper
-                        .target
-                        .borrow()
-                        .as_ref()
-                        .ok_or(crate::render::node::Error::Unsupported(
-                            "wrapper target retired",
-                        ))?
-                        .id(),
-                )?;
+                if wrapper.target.borrow().is_none() {
+                    return Err(crate::render::node::Error::Unsupported(
+                        "wrapper target retired",
+                    ));
+                }
+                let composite = crate::render::composition::worker::Composite::new(self)?;
                 *wrapper.composite.borrow_mut() = Some(composite);
                 created_composite = true;
             }
@@ -646,6 +768,9 @@ impl Node {
     }
     pub(crate) fn composite_ready(&self, generation: u32) -> Result<()> {
         let mut initialized = false;
+        let mut revealed = false;
+        let mut drop_failed = false;
+        let mut weak = None;
         if let Some(scroll) = self.scroll.borrow().as_ref()
             && let Some(plane) = scroll.overlay.borrow().as_ref()
         {
@@ -666,7 +791,9 @@ impl Node {
                 .as_ref()
                 .filter(|composite| composite.generation == generation)
             {
-                initialized = composite.ready();
+                (initialized, revealed) = composite.ready();
+                drop_failed = composite.is_failed();
+                weak = Some(wrapper.owner.clone());
                 if composite.needs_shader_frame() {
                     self.animator.request_frame();
                 }
@@ -675,12 +802,20 @@ impl Node {
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedRender)?;
             }
+            if drop_failed {
+                wrapper.composite.borrow_mut().take();
+            }
         }
-        if initialized {
+        if initialized || revealed || drop_failed {
             self.restore_style()?;
             self.update_wrapper()?;
             self.invalidate_scene();
-            self.schedule_subtree_paint(4)?;
+            if !drop_failed {
+                self.schedule_subtree_paint(4)?;
+            }
+        }
+        if revealed && let Some(weak) = weak {
+            Wrapper::commit_presentation(weak, generation, 6);
         }
         Ok(())
     }

@@ -40,7 +40,11 @@ impl crate::render::mount::UiContext {
         drop(pending);
         let target = self.retire_unattached(target);
         if let Some(target) = target {
-            self.arkui.borrow_mut().remove_editors.push(id);
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_editors.contains(&id) {
+                pending.remove_editors.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
         }
         self.editor_wake();
@@ -81,7 +85,11 @@ impl crate::render::mount::UiContext {
         drop(pending);
         let target = self.retire_unattached(target);
         if let Some(target) = target {
-            self.arkui.borrow_mut().remove_webs.push(id);
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_webs.contains(&id) {
+                pending.remove_webs.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
         }
         self.editor_wake();
@@ -109,8 +117,10 @@ impl crate::render::mount::UiContext {
         if self.host.check().is_err() {
             return Ok(());
         }
-        if let Some(scene) = self.scene.borrow().as_ref() {
-            scene.prepare()?;
+        if let Some(scene) = self.scene.borrow().as_ref()
+            && let Err(error) = scene.prepare()
+        {
+            log::warn!("OHOS scene prepare skipped: {error}");
         }
         let owners: Vec<_> = {
             let mut nodes = self.composite_nodes.borrow_mut();
@@ -174,9 +184,21 @@ impl crate::render::mount::UiContext {
                 let mut web_commands = batch.web_commands;
                 web_commands.append(&mut pending.web_commands);
                 pending.web_commands = web_commands;
-                pending.remove_editors.extend(batch.remove_editors);
-                pending.remove_views.extend(batch.remove_views);
-                pending.remove_webs.extend(batch.remove_webs);
+                for id in batch.remove_editors {
+                    if !pending.remove_editors.contains(&id) {
+                        pending.remove_editors.push(id);
+                    }
+                }
+                for id in batch.remove_views {
+                    if !pending.remove_views.contains(&id) {
+                        pending.remove_views.push(id);
+                    }
+                }
+                for id in batch.remove_webs {
+                    if !pending.remove_webs.contains(&id) {
+                        pending.remove_webs.push(id);
+                    }
+                }
                 self.arkui_views.borrow_mut().extend(retired);
                 return Err(error);
             }
@@ -227,7 +249,11 @@ impl crate::render::mount::UiContext {
         drop(pending);
         let target = self.retire_unattached(target);
         let replaced = if let Some(target) = target {
-            self.arkui.borrow_mut().remove_views.push(id);
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_views.contains(&id) {
+                pending.remove_views.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
             Some(id)
         } else {

@@ -9,10 +9,37 @@ import {
   RenderOptions,
   FrameNode,
 } from "@ohos.arkui.node";
-import { UIContext } from "@ohos.arkui.UIContext";
+import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import image from "@ohos.multimedia.image";
 import { NshRuntimeContext } from "./NativeEditors";
+
+class NextFrameTask extends FrameCallback {
+  private readonly callback: () => void;
+  constructor(callback: () => void) {
+    super();
+    this.callback = callback;
+  }
+  onFrame(_frameTimeInNano: number): void {
+    this.callback();
+  }
+}
+
+function runAfterFrames(ui: UIContext, frames: number, task: () => void): void {
+  if (frames <= 0) {
+    task();
+    return;
+  }
+  try {
+    ui.postFrameCallback(
+      new NextFrameTask((): void => {
+        runAfterFrames(ui, frames - 1, task);
+      }),
+    );
+  } catch (_) {
+    setTimeout(task, 32);
+  }
+}
 
 interface ViewAction {
   name: string;
@@ -132,6 +159,10 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
   }
   applyNormalAttribute(node: StackAttribute): void {
     const s = this.settings;
+    const useApi23 =
+      s.api23 &&
+      deviceInfo.sdkApiVersion >= 23 &&
+      typeof (node as StateAttribute).accessibilityStateDescription === "function";
     node
       .id(s.testId ?? `nsh-view-${s.targetId}`)
       .width(s.width)
@@ -142,7 +173,7 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       .hitTestBehavior(HitTestMode.Transparent)
       .accessibilityText(s.label)
       .accessibilityDescription(
-        s.api23 ? s.hint : [s.hint, s.value].filter((value) => value.length > 0).join(", "),
+        useApi23 ? s.hint : [s.hint, s.value].filter((value) => value.length > 0).join(", "),
       )
       .accessibilityLevel(
         s.hidden ? "no-hide-descendants" : !s.semantic || s.accessible === false ? "no" : "yes",
@@ -152,10 +183,10 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
     node.accessibilityRole(role(s.role));
     node.accessibilityChecked(s.checked === null ? undefined : s.checked);
     node.enabled(!s.disabled).onClick(s.clickable || s.menu != null ? (): void => {} : undefined);
-    if (s.api23 && typeof (node as StateAttribute).accessibilityStateDescription === "function") {
+    if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
     }
-    if (s.api26 && typeof (node as ActionsAttribute).accessibilityCustomActions === "function") {
+    if (deviceInfo.sdkApiVersion >= 26 && typeof (node as ActionsAttribute).accessibilityCustomActions === "function") {
       const actions: CustomAction[] = s.actions.map((action: ViewAction): CustomAction => {
         return {
           name: action.label,
@@ -166,7 +197,7 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       });
       (node as ActionsAttribute).accessibilityCustomActions(actions);
     } else if (s.api26 && s.actions.length > 0) {
-      throw new Error("The runtime has no ArkUI accessibilityCustomActions implementation");
+      console.warn("[NSH] runtime lacks ArkUI accessibilityCustomActions; degrading custom actions");
     }
   }
 }
@@ -330,11 +361,17 @@ class ViewEntry {
   private ui: UIContext;
   private menus: NativeMenuCleanup;
   private closed: boolean = false;
+  private attached: boolean = false;
+  private retiredNative: boolean = false;
+  private nodeDisposed: boolean = false;
+  private textureDisposed: boolean = false;
+  private sourceDisposed: boolean = false;
   private sdkBusy: boolean = false;
   private disposePending: boolean = false;
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
-  private backdropTimer?: number;
+  private backdropDiagTimer?: number;
+  private backdropReadyScheduled: boolean = false;
   private pointerPosting: PointerPosting;
   private retirement: NativeRetirement = new NativeRetirement();
   constructor(
@@ -368,44 +405,95 @@ class ViewEntry {
   get settings(): Settings {
     return this.state.settings;
   }
+  isClosed(): boolean {
+    return this.closed;
+  }
+  belongsTo(context: NshRuntimeContext): boolean {
+    return this.context === context;
+  }
+  private snapshotTargetNode(): FrameNode | null {
+    const root = this.node.getFrameNode();
+    let cursor: FrameNode | null = root;
+    let depth = 0;
+    while (cursor && cursor.getNodeType() !== "Stack" && depth < 8) {
+      cursor = cursor.getFirstChild();
+      depth += 1;
+    }
+    return cursor ?? root;
+  }
   snapshot(): image.PixelMap | undefined {
     if (this.closed || this.settings.textureSurface != null) {
       return undefined;
     }
     try {
-      const uniqueId = this.node.getFrameNode()?.getUniqueId();
-      if (uniqueId !== undefined && uniqueId >= 0) {
+      const uniqueId = this.snapshotTargetNode()?.getUniqueId();
+      if (uniqueId !== undefined && uniqueId > 0) {
         return this.ui.getComponentSnapshot().getSyncWithUniqueId(uniqueId);
       }
-    } catch (_) {}
+    } catch (error) {
+      console.warn(`[NSH] component snapshot failed: ${String(error)}`);
+    }
     return undefined;
   }
-  private clearBackdropTimer(): void {
-    if (this.backdropTimer !== undefined) {
-      clearTimeout(this.backdropTimer);
-      this.backdropTimer = undefined;
+  private clearBackdropDiagTimer(): void {
+    if (this.backdropDiagTimer !== undefined) {
+      clearTimeout(this.backdropDiagTimer);
+      this.backdropDiagTimer = undefined;
     }
   }
-  private scheduleBackdropRelease(delayMs: number): void {
-    if (!this.state.backdrop) {
+  private armBackdropDiagnostic(): void {
+    if (!this.state.backdrop || this.backdropDiagTimer !== undefined) {
       return;
     }
-    this.clearBackdropTimer();
-    this.backdropTimer = setTimeout((): void => {
-      this.backdropTimer = undefined;
+    this.backdropDiagTimer = setTimeout((): void => {
+      this.backdropDiagTimer = undefined;
+      if (!this.closed && this.state.backdrop && !this.backdropReadyScheduled) {
+        console.warn(
+          `[NSH] texture export backdrop still waiting for ready frame on target ${this.settings.targetId}`,
+        );
+      }
+    }, 5000);
+  }
+  private scheduleBackdropRelease(): void {
+    if (!this.state.backdrop || this.backdropReadyScheduled) {
+      return;
+    }
+    this.backdropReadyScheduled = true;
+    this.clearBackdropDiagTimer();
+    runAfterFrames(this.ui, 2, (): void => {
       this.releaseBackdrop();
-    }, delayMs);
+    });
+  }
+  private retirePixelMap(pixelMap: image.PixelMap): void {
+    runAfterFrames(this.ui, 2, (): void => {
+      try {
+        pixelMap.release();
+      } catch (_) {}
+    });
   }
   releaseBackdrop(): void {
-    this.clearBackdropTimer();
+    this.clearBackdropDiagTimer();
+    this.backdropReadyScheduled = false;
     const backdrop = this.state.backdrop;
     if (!backdrop) {
       return;
     }
     this.state.backdrop = undefined;
+    this.retirePixelMap(backdrop);
+  }
+  private abortCreate(): void {
+    this.closed = true;
     try {
-      backdrop.release();
+      if (this.menuLease) {
+        this.retireMenu(this.menuLease);
+        this.menuLease = undefined;
+      }
     } catch (_) {}
+    try {
+      this.disposeBuilders();
+    } catch (error) {
+      console.error(`[NSH] failed to clean up aborted wrapper ${this.settings.targetId}: ${String(error)}`);
+    }
   }
   create(): void {
     this.sdkBusy = true;
@@ -439,12 +527,23 @@ class ViewEntry {
       if (!accepted) {
         throw new Error("Native wrapper attachment was rejected");
       }
+      this.attached = true;
       if (this.state.backdrop) {
-        this.scheduleBackdropRelease(this.settings.textureReady === true ? 60 : 2000);
+        if (this.settings.textureReady === true) {
+          this.scheduleBackdropRelease();
+        } else {
+          this.armBackdropDiagnostic();
+        }
       }
       this.syncMenu();
     } catch (error) {
-      this.dispose();
+      if (this.attached) {
+        try {
+          this.dispose();
+        } catch (_) {}
+      } else {
+        this.abortCreate();
+      }
       throw new Error(`Native wrapper ${this.settings.targetId} ${stage} failed: ${String(error)}`);
     } finally {
       this.sdkBusy = false;
@@ -455,12 +554,15 @@ class ViewEntry {
     }
   }
   update(settings: Settings): void {
+    if (this.closed) {
+      throw new Error("Native wrapper is already closed");
+    }
     if (settings.targetId !== this.settings.targetId) {
       throw new Error("Native wrapper target cannot change");
     }
     this.state.settings = settings;
     if (this.state.backdrop && settings.textureReady === true) {
-      this.scheduleBackdropRelease(60);
+      this.scheduleBackdropRelease();
     }
     const params: ViewParameters = { entry: this, settings: settings };
     this.sdkBusy = true;
@@ -508,7 +610,7 @@ class ViewEntry {
       this.retireMenu(previous);
     }
     const ui = this.ui;
-    const frame = this.node.getFrameNode();
+    const frame = this.snapshotTargetNode() ?? this.node.getFrameNode();
     if (!frame) {
       return;
     }
@@ -654,13 +756,17 @@ class ViewEntry {
       }
       this.retirement.detachThenDispose(
         (): void => {
-          if (!cleanup.retireNativeNode(this.settings.targetId)) {
-            throw new Error("Native wrapper retirement was rejected");
+          if (this.attached && !this.retiredNative) {
+            if (!cleanup.retireNativeNode(this.settings.targetId)) {
+              throw new Error("Native wrapper retirement was rejected");
+            }
+            this.retiredNative = true;
           }
         },
         (): void => this.disposeBuilders(),
         this.pointerPosting,
       );
+      quarantinedViews.delete(this);
     } catch (error) {
       quarantinedViews.add(this);
       this.retirementFailure = new Error(`Native wrapper retirement failed: ${String(error)}`);
@@ -672,13 +778,21 @@ class ViewEntry {
       this.disposePending = true;
       return;
     }
-    try {
+    let failure: Error | undefined;
+    const step = (fn: () => void): void => {
+      try {
+        fn();
+      } catch (error) {
+        failure ??= error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    step((): void => {
       this.pointerPosting.owners.forEach((stream, pointer: number): void => {
         if (stream.owner !== String(this.settings.targetId)) {
           return;
         }
         this.pointerPosting.owners.delete(pointer);
-        if (this.sourceNode?.getFrameNode()) {
+        if (!this.sourceDisposed && this.sourceNode?.getFrameNode()) {
           this.pointerPosting.busy = true;
           try {
             this.sourceNode.postInputEvent(stream.snapshot as TouchEvent);
@@ -687,19 +801,37 @@ class ViewEntry {
           }
         }
       });
-      // NodeContainer retains the node returned by its controller. Detach
-      // those edges before disposing the builders, including texture exports.
-      this.releaseBackdrop();
-      this.textureController?.clear();
-      this.sourceController?.clear();
-      this.node.dispose();
-      this.textureNode?.dispose();
-      this.sourceNode?.dispose();
-      quarantinedViews.delete(this);
-    } catch (error) {
-      quarantinedViews.add(this);
-      console.error(`[NSH] wrapper disposal failed: ${String(error)}`);
+    });
+    // NodeContainer retains the node returned by its controller. Detach
+    // those edges before disposing the builders, including texture exports.
+    step((): void => this.releaseBackdrop());
+    step((): void => this.textureController?.clear());
+    step((): void => this.sourceController?.clear());
+    if (!this.nodeDisposed) {
+      step((): void => {
+        this.node.dispose();
+        this.nodeDisposed = true;
+      });
     }
+    if (this.textureNode && !this.textureDisposed) {
+      step((): void => {
+        this.textureNode!.dispose();
+        this.textureDisposed = true;
+      });
+    }
+    if (this.sourceNode && !this.sourceDisposed) {
+      step((): void => {
+        this.sourceNode!.dispose();
+        this.sourceDisposed = true;
+      });
+    }
+    if (failure) {
+      quarantinedViews.add(this);
+      this.retirementFailure = failure;
+      console.error(`[NSH] wrapper disposal failed: ${String(failure)}`);
+      throw failure;
+    }
+    quarantinedViews.delete(this);
   }
 }
 export class NativeViews {
@@ -715,64 +847,102 @@ export class NativeViews {
     });
     this.previews.clear();
   }
+  private retryQuarantined(context: NshRuntimeContext): void {
+    for (const view of Array.from(quarantinedViews)) {
+      if (!view.belongsTo(context)) {
+        continue;
+      }
+      try {
+        view.dispose(context);
+      } catch (_) {}
+    }
+  }
   remove(ids: number[], context: NshRuntimeContext, incoming: Settings[] = []): void {
-    this.clearPreviews();
+    this.retryQuarantined(context);
     const replacements: Map<number, number> = new Map();
     for (const state of incoming) {
+      const existing = this.entries.get(state.targetId);
       if (
         state.replaces != null &&
         state.textureSurface != null &&
-        !this.entries.has(state.targetId)
+        (!existing || existing.isClosed())
       ) {
         replacements.set(state.replaces, state.targetId);
       }
     }
+    let failure: Error | undefined;
     for (const id of ids) {
       const entry = this.entries.get(id);
-      if (entry) {
-        const nextTargetId = replacements.get(id);
-        if (nextTargetId !== undefined && entry.settings.textureSurface == null) {
-          const snapshot = entry.snapshot();
-          if (snapshot) {
-            this.previews.set(nextTargetId, snapshot);
-          }
-        }
-        entry.dispose(context);
+      if (!entry) {
+        continue;
       }
-      this.entries.delete(id);
+      const nextTargetId = replacements.get(id);
+      if (nextTargetId !== undefined && entry.settings.textureSurface == null) {
+        const snapshot = entry.snapshot();
+        if (snapshot) {
+          const prior = this.previews.get(nextTargetId);
+          if (prior) {
+            try {
+              prior.release();
+            } catch (_) {}
+          }
+          this.previews.set(nextTargetId, snapshot);
+        }
+      }
+      try {
+        entry.dispose(context);
+        this.entries.delete(id);
+      } catch (error) {
+        failure ??= error instanceof Error ? error : new Error(String(error));
+      }
+    }
+    if (failure) {
+      throw failure;
     }
   }
   update(states: Settings[], context: NshRuntimeContext): void {
+    let failure: Error | undefined;
     try {
       for (const state of states) {
-        if (!context.isActive()) {
-          throw new Error("NSH SDK session is inactive");
-        }
-        if (
-          (state.api26 && deviceInfo.sdkApiVersion < 26) ||
-          (state.api23 && deviceInfo.sdkApiVersion < 23)
-        ) {
-          throw new Error("NSH semantic feature requires a newer API level");
-        }
-        let entry = this.entries.get(state.targetId);
-        if (entry && entry.settings.textureSurface !== state.textureSurface) {
-          throw new Error("Texture replacement requires a fresh native target");
-        }
-        if (entry) {
-          entry.update(state);
-        } else {
-          const backdrop =
-            state.textureSurface != null ? this.previews.get(state.targetId) : undefined;
-          if (backdrop) {
-            this.previews.delete(state.targetId);
+        try {
+          if (!context.isActive()) {
+            throw new Error("NSH SDK session is inactive");
           }
-          entry = new ViewEntry(state, context, this.menus, this.pointerPosting, backdrop);
-          this.entries.set(state.targetId, entry);
-          entry.create();
+          let entry = this.entries.get(state.targetId);
+          if (entry && entry.isClosed()) {
+            this.entries.delete(state.targetId);
+            entry = undefined;
+          }
+          if (entry && entry.settings.textureSurface !== state.textureSurface) {
+            throw new Error("Texture replacement requires a fresh native target");
+          }
+          if (entry) {
+            entry.update(state);
+          } else {
+            const backdrop =
+              state.textureSurface != null ? this.previews.get(state.targetId) : undefined;
+            if (backdrop) {
+              this.previews.delete(state.targetId);
+            }
+            const created = new ViewEntry(
+              state,
+              context,
+              this.menus,
+              this.pointerPosting,
+              backdrop,
+            );
+            created.create();
+            this.entries.set(state.targetId, created);
+          }
+        } catch (error) {
+          failure ??= error instanceof Error ? error : new Error(String(error));
         }
       }
     } finally {
       this.clearPreviews();
+    }
+    if (failure) {
+      throw failure;
     }
   }
   async settled(): Promise<void> {
@@ -786,6 +956,16 @@ export class NativeViews {
       try {
         entry.dispose(context);
         this.entries.delete(id);
+      } catch (error) {
+        failure ??= new Error(String(error));
+      }
+    }
+    for (const view of Array.from(quarantinedViews)) {
+      if (!view.belongsTo(context)) {
+        continue;
+      }
+      try {
+        view.dispose(context);
       } catch (error) {
         failure ??= new Error(String(error));
       }

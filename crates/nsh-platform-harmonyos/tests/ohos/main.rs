@@ -66,3 +66,15 @@ mod system;
 
 #[path = "../../src/media/web_evaluation.rs"]
 mod web_evaluation;
+
+#[path = "../../src/app/frame_rate.rs"]
+#[allow(dead_code)]
+mod frame_rate;
+
+#[path = "../../src/render/composition/mailbox.rs"]
+#[allow(dead_code)]
+mod composition_mailbox;
+
+#[path = "../../src/media/video/mailbox.rs"]
+#[allow(dead_code)]
+mod video_mailbox;

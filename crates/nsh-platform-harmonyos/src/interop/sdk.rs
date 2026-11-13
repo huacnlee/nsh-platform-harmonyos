@@ -353,9 +353,6 @@ pub(crate) fn nsh_attach_native_subtree(
             })
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
-    ohos_arkui_binding::common::node_registry::register(&inner.borrow(), inner.clone())
-        .and_then(|()| inner.borrow().add_event_receiver())
-        .map_err(|error| Error::from_reason(error.to_string()))?;
     export
         .prepare(&owner, &inner)
         .map_err(|error| Error::from_reason(error.to_string()))?;
@@ -363,15 +360,16 @@ pub(crate) fn nsh_attach_native_subtree(
         export.restore();
         return Err(error);
     }
-    export
-        .after_attach(&inner)
-        .map_err(|error| Error::from_reason(error.to_string()))?;
+    if let Err(error) = export.after_attach(&inner) {
+        log::warn!("OHOS post-attach export repair failed for target {target_id}: {error}");
+    }
     // Reparenting into or out of a texture export changes the render target
     // across the attachment and surface-export frames. ArkUI's retained custom
     // draw recordings must be rebuilt once the destination pipeline is live.
-    owner
-        .schedule_subtree_paint(4)
-        .map_err(|error| Error::from_reason(error.to_string()))
+    if let Err(error) = owner.schedule_subtree_paint(4) {
+        log::warn!("OHOS post-attach subtree paint failed for target {target_id}: {error}");
+    }
+    Ok(())
 }
 
 #[napi]

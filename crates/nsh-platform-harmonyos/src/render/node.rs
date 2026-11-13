@@ -72,7 +72,7 @@ struct AppliedStyle {
     transform_center: [f32; 3],
     blur: f32,
     blend: nsh_core::BlendMode,
-    z_index: f32,
+    z_index: i32,
 }
 impl Default for AppliedStyle {
     fn default() -> Self {
@@ -93,7 +93,7 @@ impl Default for AppliedStyle {
             transform_center: [f32::NAN; 3],
             blur: 0.0,
             blend: nsh_core::BlendMode::Normal,
-            z_index: 0.0,
+            z_index: 0,
         }
     }
 }
@@ -134,7 +134,7 @@ pub(crate) struct Node {
     pub(crate) component_animated: RefCell<Vec<Option<nsh_core::animation::AnimatedPropValue>>>,
     pub(crate) video: RefCell<Option<crate::media::video::Video>>,
     pub(crate) web: RefCell<Option<crate::media::webview::WebView>>,
-    active: Cell<bool>,
+    pub(crate) active: Cell<bool>,
     pub(crate) export_repair: Cell<u32>,
     pub(crate) retained: Cell<bool>,
     pub(crate) retained_owner: RefCell<Weak<Node>>,
@@ -142,8 +142,11 @@ pub(crate) struct Node {
     backface_away: Cell<bool>,
     pub(crate) interaction: Interaction,
     pub(crate) style: RefCell<Box<ViewStyle>>,
+    pub(crate) animated_opacity: Cell<Option<f32>>,
     applied: Cell<AppliedStyle>,
     styled: Cell<bool>,
+    paint_frames: Cell<u8>,
+    paint_armed: Cell<bool>,
     pub(crate) live: RefCell<Option<Box<crate::render::transition::Live>>>,
     /// Leaving (an exit transition, a popped screen): changed only through
     /// [`Node::set_leaving`], which keeps the surface's count of them.

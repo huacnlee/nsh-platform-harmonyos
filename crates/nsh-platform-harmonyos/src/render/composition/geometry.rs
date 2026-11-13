@@ -60,7 +60,14 @@ impl Coverage {
     }
 }
 
+/// CSS `blur(<radius>)` standard deviation in physical pixels (`radius * scale`).
 pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
+    radius.max(0.0) * scale
+}
+
+/// CSS `drop-shadow` / `box-shadow` blur radius to Gaussian sigma (`radius * scale * 0.5`),
+/// matching W3C shadow blur and upstream Android/Apple/Windows implementations.
+pub(crate) fn shadow_blur_sigma(radius: f32, scale: f32) -> f32 {
     radius.max(0.0) * scale * 0.5
 }
 
@@ -140,7 +147,7 @@ impl Bounds {
                     offset_y,
                     blur,
                     ..
-                } => self.extend(offset_x.0, offset_y.0, blur_sigma(blur.0, 1.0) * 3.0),
+                } => self.extend(offset_x.0, offset_y.0, shadow_blur_sigma(blur.0, 1.0) * 3.0),
                 _ => {}
             }
         }
@@ -278,14 +285,16 @@ mod tests {
         assert_eq!(f32::from_bits(second[1]), 50.0);
     }
     #[test]
-    fn css_blur_radius_becomes_half_a_physical_sigma() {
-        assert_eq!(blur_sigma(8.0, 3.0), 12.0);
+    fn css_blur_radius_uses_full_sigma_while_drop_shadow_halves_radius() {
+        assert_eq!(blur_sigma(8.0, 3.0), 24.0);
         assert_eq!(blur_sigma(-8.0, 3.0), 0.0);
+        assert_eq!(shadow_blur_sigma(8.0, 3.0), 12.0);
+        assert_eq!(shadow_blur_sigma(-8.0, 3.0), 0.0);
         assert_eq!(
             Bounds::new(10.0, 10.0)
                 .filters(&[Filter::Blur(Points(8.0))])
                 .0,
-            [-12.0, -12.0, 22.0, 22.0]
+            [-24.0, -24.0, 34.0, 34.0]
         );
     }
     #[test]

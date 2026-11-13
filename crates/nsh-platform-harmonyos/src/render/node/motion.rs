@@ -271,8 +271,8 @@ impl Node {
                 _ => {}
             }
         }
-        if let Some(opacity) = opacity {
-            self.apply_opacity(opacity)?;
+        if self.animated_opacity.replace(opacity) != opacity {
+            self.apply_opacity(style.opacity)?;
         }
         if let Some(bg) = bg {
             self.apply_background_color(bg)?;

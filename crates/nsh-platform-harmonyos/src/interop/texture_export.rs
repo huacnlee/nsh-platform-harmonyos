@@ -29,6 +29,7 @@ use crate::render::node::{NativeNode, Node, Result, callback};
 #[derive(Default)]
 pub(crate) struct Export {
     pub(crate) enabled: Cell<bool>,
+    epoch: Cell<u64>,
     hidden: RefCell<Vec<Hidden>>,
 }
 
@@ -49,6 +50,7 @@ impl Export {
             return Ok(());
         }
         self.restore();
+        self.epoch.set(self.epoch.get().wrapping_add(1));
         let mut owners = FxHashMap::default();
         Self::owners(owner, &mut owners);
         let result = self.walk(inner, &owners, None);
@@ -142,7 +144,8 @@ impl Export {
         if self.hidden.borrow().is_empty() {
             return Ok(());
         }
-        let result = Self::defer_restore(Rc::downgrade(self), Rc::downgrade(inner), 3);
+        let epoch = self.epoch.get();
+        let result = Self::defer_restore(Rc::downgrade(self), Rc::downgrade(inner), epoch, 3);
         if result.is_err() {
             self.restore();
         }
@@ -152,10 +155,13 @@ impl Export {
     fn defer_restore(
         repair: Weak<Self>,
         native: Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
+        epoch: u64,
         remaining: u8,
     ) -> Result<()> {
         let Some(node) = native.upgrade() else {
-            if let Some(repair) = repair.upgrade() {
+            if let Some(repair) = repair.upgrade()
+                && repair.epoch.get() == epoch
+            {
                 repair.restore();
             }
             return Ok(());
@@ -165,6 +171,9 @@ impl Export {
                 let Some(current) = repair.upgrade() else {
                     return;
                 };
+                if current.epoch.get() != epoch {
+                    return;
+                }
                 if remaining == 0 {
                     current.restore();
                     return;
@@ -214,7 +223,7 @@ impl Export {
                         });
                     }
                 }
-                if Self::defer_restore(repair, native, remaining - 1).is_err() {
+                if Self::defer_restore(repair, native, epoch, remaining - 1).is_err() {
                     current.restore();
                 }
             })
@@ -222,6 +231,7 @@ impl Export {
     }
 
     pub(crate) fn restore(&self) {
+        self.epoch.set(self.epoch.get().wrapping_add(1));
         for hidden in self.hidden.take() {
             Self::restore_one(hidden);
         }
@@ -243,8 +253,13 @@ impl Export {
                 if !node.is_owned() {
                     return Ok(());
                 }
-                node.set_i32_attribute(A::Visibility, hidden.visibility)?;
-                node.opacity(hidden.opacity)?;
+                if owner
+                    .as_ref()
+                    .is_none_or(|owner| Rc::ptr_eq(&native, &owner.visual_node()))
+                {
+                    node.set_i32_attribute(A::Visibility, hidden.visibility)?;
+                    node.opacity(hidden.opacity)?;
+                }
                 node.set_i32_attribute(A::HitTestBehavior, hidden.hit_test)?;
                 node.set_i32_attribute(A::AccessibilityMode, hidden.accessibility)?;
                 node.set_i32_attribute(A::Focusable, hidden.focusable)?;

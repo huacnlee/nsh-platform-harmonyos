@@ -37,6 +37,19 @@ pub(crate) fn has_non_blur_filter(filters: &[Filter]) -> bool {
         .any(|filter| !is_noop_filter(filter) && !matches!(filter, Filter::Blur(_)))
 }
 
+/// Computes a node's combined visual opacity from its animation binding (if
+/// present) or static style opacity, multiplied by presentation transitions.
+/// Both the native visual layer and `Scene` composition consume this single source.
+pub(crate) fn resolve_visual_opacity(
+    style_opacity: f32,
+    animated_opacity: Option<f32>,
+    presentation: f32,
+    extra: f32,
+    navigation: f32,
+) -> f32 {
+    animated_opacity.unwrap_or(style_opacity) * presentation * extra * navigation
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
@@ -281,5 +294,14 @@ mod tests {
             )
             .requires_scene
         );
+    }
+
+    #[test]
+    fn visual_opacity_uses_animated_value_across_native_and_scene_paths() {
+        assert!((resolve_visual_opacity(0.8, None, 1.0, 1.0, 1.0) - 0.8).abs() < 1e-6);
+        assert!((resolve_visual_opacity(0.8, Some(0.25), 1.0, 1.0, 1.0) - 0.25).abs() < 1e-6);
+        assert!((resolve_visual_opacity(0.8, Some(0.5), 0.5, 0.8, 0.5) - 0.1).abs() < 1e-6);
+        // Unbinding restores the static style opacity without losing presentation factors.
+        assert!((resolve_visual_opacity(0.6, None, 0.5, 1.0, 1.0) - 0.3).abs() < 1e-6);
     }
 }

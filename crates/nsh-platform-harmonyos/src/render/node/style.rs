@@ -128,7 +128,7 @@ impl Node {
             applied.transform_center = [f32::NAN; 3];
             applied.blur = 0.0;
             applied.blend = nsh_core::BlendMode::Normal;
-            applied.z_index = 0.0;
+            applied.z_index = 0;
             self.applied.set(applied);
             self.interaction.invalidate_opacity();
         }
@@ -147,11 +147,13 @@ impl Node {
                     .contains(nsh_core::shader::ShaderInput::Backdrop)
             });
         drop(shaders);
-        let composite_active = self
-            .wrapper
-            .borrow()
-            .as_ref()
-            .is_some_and(|wrapper| wrapper.composite.borrow().is_some());
+        let composite_active = self.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+            wrapper
+                .composite
+                .borrow()
+                .as_ref()
+                .is_some_and(|composite| composite.surface().is_some())
+        });
         crate::render::effects::EffectsPlan::compute(
             style,
             crate::render::effects::EffectsContext {
@@ -167,13 +169,13 @@ impl Node {
     pub(crate) fn effects_plan(&self) -> crate::render::effects::EffectsPlan {
         self.effects_plan_for(&self.style.borrow())
     }
-    pub(crate) fn desired_z_index(&self) -> f32 {
+    pub(crate) fn desired_z_index(&self) -> i32 {
         if self.pinned.get() != (0.0, 0.0) {
-            1_000_000.0
+            1_000_000
         } else if self.kind == ViewKind::HeaderItem {
-            2.0
+            2
         } else {
-            0.0
+            0
         }
     }
     pub(crate) fn apply_z_index(&self) -> Result<()> {
@@ -184,7 +186,7 @@ impl Node {
         if applied.z_index != z_index {
             visual
                 .borrow()
-                .set_f32_attribute(Attribute::ZIndex, z_index)?;
+                .set_i32_attribute(Attribute::ZIndex, z_index)?;
             applied.z_index = z_index;
             self.applied.set(applied);
         }
@@ -240,20 +242,30 @@ impl Node {
         self.animator.apply_node(self)?;
         Ok(())
     }
+    pub(crate) fn visual_opacity_for(&self, style_opacity: f32) -> f32 {
+        crate::render::effects::resolve_visual_opacity(
+            style_opacity,
+            self.animated_opacity.get(),
+            self.presentation.get().0,
+            self.extra.get().0,
+            self.navigation_presentation.get().0,
+        )
+    }
     pub(super) fn apply_opacity(&self, style_opacity: f32) -> Result<()> {
         let visual = self.visual_node();
         self.sync_visual_node(&visual);
+        let scene_active = self.scene_active();
+        if scene_active {
+            self.invalidate_scene();
+        }
         self.interaction.opacity(
             self,
             if self.export_repair.get() != 0 {
                 0.0
-            } else if self.scene_active() {
+            } else if scene_active {
                 1.0
             } else {
-                style_opacity
-                    * self.presentation.get().0
-                    * self.extra.get().0
-                    * self.navigation_presentation.get().0
+                self.visual_opacity_for(style_opacity)
             },
         )
     }

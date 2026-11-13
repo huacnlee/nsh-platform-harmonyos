@@ -153,7 +153,7 @@ impl Filters {
                     blur,
                     color,
                 } => {
-                    let sigma = super::super::geometry::blur_sigma(blur.0, scale);
+                    let sigma = super::super::geometry::shadow_blur_sigma(blur.0, scale);
                     let blurred = self.blur(picture, sigma)?;
                     let pad = (sigma * 3.0).ceil();
                     let (dx, dy) = (offset_x.0 * scale, offset_y.0 * scale);

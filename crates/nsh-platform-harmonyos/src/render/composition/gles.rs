@@ -394,13 +394,15 @@ impl Program {
             })
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
         target: &Target,
         words: &[u32],
         builtins: &[u32; 8],
-        input: Picture,
+        content: Picture,
         from: Option<Picture>,
+        to: Option<Picture>,
         backdrop: Option<Picture>,
     ) -> Result<()> {
         let _current = self.gpu.context.enter()?;
@@ -428,12 +430,12 @@ impl Program {
                 );
             }
             for (index, (location, slot)) in self.compiled.pictures.iter().enumerate() {
-                let picture = if *slot == ShaderInput::Backdrop {
-                    backdrop.unwrap_or_else(|| self.empty.picture())
-                } else if *slot == ShaderInput::From {
-                    from.unwrap_or(input)
-                } else {
-                    input
+                let picture = match *slot {
+                    ShaderInput::Content => content,
+                    ShaderInput::Backdrop => backdrop.unwrap_or_else(|| self.empty.picture()),
+                    ShaderInput::From => from.unwrap_or_else(|| self.empty.picture()),
+                    ShaderInput::To => to.unwrap_or_else(|| self.empty.picture()),
+                    _ => self.empty.picture(),
                 };
                 gl.active_texture(glow::TEXTURE0 + index as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(picture.0));
@@ -782,6 +784,14 @@ impl Effects {
                         .unwrap()
                         .reframe(backdrop, coverage, layer_coverage)?;
                 }
+                let in_transition = transitioning || view.navigation;
+                let (from_pic, to_pic) = if !in_transition {
+                    (None, None)
+                } else if view.reverse_inputs {
+                    (Some(current), view.from.as_ref().map(Target::picture))
+                } else {
+                    (view.from.as_ref().map(Target::picture), Some(current))
+                };
                 view.program.draw(
                     scratch,
                     &view.words,
@@ -792,16 +802,9 @@ impl Effects {
                         nsh_core::geometry::Percentage(progress),
                         Points(view.layer.overflow.0.max(0.0)),
                     ),
-                    if view.reverse_inputs {
-                        view.from.as_ref().map_or(current, Target::picture)
-                    } else {
-                        current
-                    },
-                    if view.reverse_inputs {
-                        Some(current)
-                    } else {
-                        view.from.as_ref().map(Target::picture)
-                    },
+                    current,
+                    from_pic,
+                    to_pic,
                     backdrop.and_then(|_| view.backdrop.as_ref().map(Target::picture)),
                 )?;
                 view.output

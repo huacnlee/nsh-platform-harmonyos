@@ -15,7 +15,6 @@ use nsh_core::{NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_arkui_binding::{
     component::attribute::ArkUICommonAttribute, types::advanced::NodeDirtyFlag,
 };
-use ohos_vsync_binding::Vsync;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -96,10 +95,10 @@ impl Shaders {
         self.effects.animating()
     }
 
-    pub(crate) fn new(vsync: Arc<Vsync>) -> Shaders {
+    pub(crate) fn new(rate: Arc<FrameRate>) -> Shaders {
         Shaders {
             effects: effects::Effects::default(),
-            rate: FrameRate::new(vsync),
+            rate,
             worker: RefCell::default(),
             generation: Cell::new(0),
             visibility_generation: Cell::new(1),

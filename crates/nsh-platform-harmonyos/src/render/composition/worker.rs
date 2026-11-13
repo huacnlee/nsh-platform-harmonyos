@@ -1,11 +1,10 @@
 //! One compositor worker per surface; exports and replies are generation scoped.
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     rc::Rc,
     sync::{
         Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
+        atomic::{AtomicBool, AtomicU32, Ordering},
     },
 };
 
@@ -13,6 +12,7 @@ use nsh_core::{Filter, NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_native_window_binding::NativeWindow;
 
 use super::{
+    mailbox::{Coalesce, CommandSender, PlanOp, SceneMailbox, command_channel},
     raster::{Scene as ScenePlan, Shared as SceneShared},
     readback::{RgbaFrame, TextureContext, TextureReader},
 };
@@ -63,7 +63,6 @@ struct State {
 struct Shared {
     released: AtomicBool,
     active: AtomicBool,
-    surface_ready: std::sync::Condvar,
     state: Mutex<State>,
     queued: AtomicBool,
     posted: AtomicBool,
@@ -85,7 +84,7 @@ enum Task {
     Fill(super::fill::Command),
     Frame,
     Resume,
-    Wake(Key),
+    Wake(Key, Weak<Shared>),
     Slot(Key, NodeId, u16, AnimationValue),
     Transition(Key, NodeId, std::time::Duration),
     Capture(crate::render::shader::navigation::Key, Key),
@@ -97,11 +96,84 @@ enum Task {
     Drain,
     Close,
 }
+impl Coalesce for Task {
+    fn is_barrier(&self) -> bool {
+        use super::fill::Command as FillCmd;
+        match self {
+            Self::Frame | Self::Resume | Self::Plan | Self::Slot(..) => false,
+            Self::Fill(FillCmd::Slot(..) | FillCmd::Size(..) | FillCmd::Shown(..)) => false,
+            Self::Create { .. }
+            | Self::Fill(
+                FillCmd::Layer(..)
+                | FillCmd::Window(..)
+                | FillCmd::WindowGone(..)
+                | FillCmd::Remove(..),
+            )
+            | Self::Wake(..)
+            | Self::Transition(..)
+            | Self::Capture(..)
+            | Self::Navigation(..)
+            | Self::Window(..)
+            | Self::WindowGone(..)
+            | Self::RetireWindow(..)
+            | Self::Drain
+            | Self::Close => true,
+        }
+    }
+
+    fn try_merge(&mut self, incoming: &mut Option<Self>) -> bool {
+        use super::fill::Command as FillCmd;
+        match (self, incoming.as_ref()) {
+            (Self::Frame, Some(Self::Frame))
+            | (Self::Resume, Some(Self::Resume))
+            | (Self::Plan, Some(Self::Plan)) => {
+                incoming.take();
+                true
+            }
+            (Self::Slot(k1, id1, s1, v1), Some(Self::Slot(k2, id2, s2, _)))
+                if k1 == k2 && id1 == id2 && s1 == s2 =>
+            {
+                if let Some(Self::Slot(_, _, _, next)) = incoming.take() {
+                    *v1 = next;
+                }
+                true
+            }
+            (Self::Fill(FillCmd::Slot(k1, s1, v1)), Some(Self::Fill(FillCmd::Slot(k2, s2, _))))
+                if k1 == k2 && s1 == s2 =>
+            {
+                if let Some(Self::Fill(FillCmd::Slot(_, _, next))) = incoming.take() {
+                    *v1 = next;
+                }
+                true
+            }
+            (
+                Self::Fill(FillCmd::Size(k1, sz1, sc1)),
+                Some(Self::Fill(FillCmd::Size(k2, _, _))),
+            ) if k1 == k2 => {
+                if let Some(Self::Fill(FillCmd::Size(_, next_sz, next_sc))) = incoming.take() {
+                    *sz1 = next_sz;
+                    *sc1 = next_sc;
+                }
+                true
+            }
+            (Self::Fill(FillCmd::Shown(k1, sh1)), Some(Self::Fill(FillCmd::Shown(k2, _))))
+                if k1 == k2 =>
+            {
+                if let Some(Self::Fill(FillCmd::Shown(_, next_sh))) = incoming.take() {
+                    *sh1 = next_sh;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+}
 struct Navigation<S> {
     target: Key,
     key: crate::render::shader::navigation::Key,
     snapshot: S,
     duration: std::time::Duration,
+    queued_at: std::time::Instant,
     backwards: bool,
     reverse_inputs: bool,
     complete: bool,
@@ -112,8 +184,8 @@ struct Snapshot {
     origin: (f32, f32),
 }
 pub(crate) struct Worker {
-    send: mpsc::Sender<Task>,
-    plan: Arc<Mutex<Option<ScenePlan>>>,
+    send: CommandSender<Task>,
+    plan: Arc<SceneMailbox<ScenePlan>>,
     thread: Option<std::thread::JoinHandle<()>>,
     retired: RefCell<Vec<(Arc<Shared>, super::presentation::Presentation)>>,
     retired_windows: RefCell<Vec<(Arc<AtomicBool>, super::presentation::Presentation)>>,
@@ -128,7 +200,7 @@ enum WindowTarget {
 #[derive(Clone)]
 pub(crate) struct WindowEvents {
     target: WindowTarget,
-    send: mpsc::Sender<Task>,
+    send: CommandSender<Task>,
 }
 impl WindowEvents {
     pub(super) fn created(&self, window: NativeWindow) {
@@ -175,9 +247,9 @@ impl Worker {
         std::mem::take(&mut *self.retired_fills.lock().unwrap())
     }
     pub(crate) fn new(route: Weak<Dispatcher>, rate: Arc<FrameRate>) -> std::io::Result<Self> {
-        let (send, receive) = mpsc::channel();
+        let (send, receive) = command_channel();
         let callback = send.clone();
-        let plan = Arc::new(Mutex::new(None));
+        let plan = Arc::new(SceneMailbox::new());
         let pending_plan = plan.clone();
         let retired_fills = Arc::new(Mutex::new(Vec::new()));
         let completed_fills = retired_fills.clone();
@@ -204,11 +276,9 @@ impl Worker {
                         Task::Drain => {
                             scene = None;
                             captured = None;
-                            for entry in &mut entries {
-                                if let Some(entry) = entry.take() {
-                                    let shared = entry.shared.clone();
-                                    drop(entry);
-                                    shared.released.store(true, Ordering::Release);
+                            for slot in &mut entries {
+                                if let Some(entry) = slot.take() {
+                                    retire_entry(entry, &route);
                                 }
                             }
                             completed_fills.lock().unwrap().extend(fills.clear());
@@ -263,7 +333,11 @@ impl Worker {
                                 if route
                                     .upgrade()
                                     .is_some_and(|r| r.active.load(Ordering::Acquire))
-                                    && !entry.settings.scene
+                                    && (!entry.settings.scene
+                                        || entry
+                                            .navigation
+                                            .as_ref()
+                                            .is_some_and(|nav| !nav.complete))
                                     && entry.shared.active.load(Ordering::Acquire)
                                     && entry.shared.animating.load(Ordering::Acquire)
                                 {
@@ -271,16 +345,27 @@ impl Worker {
                                 }
                             }
                         }
-                        Task::Plan => {
-                            scene = pending_plan.lock().unwrap().take();
-                            repaint = scene.is_some();
-                        }
+                        Task::Plan => match pending_plan.take() {
+                            PlanOp::Set(next) => {
+                                scene = Some(next);
+                                repaint = true;
+                            }
+                            PlanOp::Clear => {
+                                scene = None;
+                            }
+                            PlanOp::None => {}
+                        },
                         Task::Create { key, shared } => {
                             let result = (|| {
                                 if shared.state.lock().unwrap().closed {
                                     return Err("composite retired".into());
                                 }
-                                if entries.iter().flatten().count() >= MAX_LAYERS {
+                                let occupied_others = entries
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(idx, slot)| *idx != key.slot() && slot.is_some())
+                                    .count();
+                                if occupied_others >= MAX_LAYERS {
                                     return Err("compositor layer budget exceeded".into());
                                 }
                                 let settings = shared.state.lock().unwrap().settings.clone();
@@ -304,6 +389,9 @@ impl Worker {
                                     .map_err(|error| error.to_string())?;
                                 let id = reader.id().map_err(|error| error.to_string())?;
                                 entries.resize_with(entries.len().max(key.slot() + 1), || None);
+                                if let Some(old) = entries[key.slot()].take() {
+                                    retire_entry(old, &route);
+                                }
                                 entries[key.slot()] = Some(Entry {
                                     key,
                                     shared: shared.clone(),
@@ -326,7 +414,6 @@ impl Worker {
                                 shared.released.store(true, Ordering::Release);
                             }
                             shared.state.lock().unwrap().surface = Some(result);
-                            shared.surface_ready.notify_all();
                             if let Some(route) = route.upgrade() {
                                 route.send(Message::Composite {
                                     id: key.id,
@@ -334,19 +421,22 @@ impl Worker {
                                 });
                             }
                         }
-                        Task::Wake(key) => {
+                        Task::Wake(key, weak_shared) => {
                             let Some(entry) = entries
                                 .get(key.slot())
                                 .and_then(Option::as_ref)
                                 .filter(|entry| entry.key == key)
                             else {
+                                if let Some(shared) = weak_shared.upgrade() {
+                                    shared.queued.store(false, Ordering::Release);
+                                }
                                 continue;
                             };
                             entry.shared.queued.store(false, Ordering::Release);
                             if entry.shared.state.lock().unwrap().closed {
-                                let shared = entry.shared.clone();
-                                entries[key.slot()].take();
-                                shared.released.store(true, Ordering::Release);
+                                if let Some(old) = entries[key.slot()].take() {
+                                    retire_entry(old, &route);
+                                }
                                 if let Some(route) = route.upgrade() {
                                     route.send(Message::Composite {
                                         id: key.id,
@@ -367,39 +457,44 @@ impl Worker {
                                 check_pixels(&entries, key, settings.pixels()).and_then(|()| {
                                     entries[key.slot()].as_mut().unwrap().render(settings)
                                 });
-                            let Some(route) = route.upgrade() else {
-                                break;
-                            };
+                            let upgraded = route.upgrade();
                             match result {
                                 Ok(changed) => repaint = changed,
                                 Err(error) => {
                                     let entry = entries[key.slot()].as_mut().unwrap();
                                     entry.shared.animating.store(false, Ordering::Release);
-                                    if let Some(navigation) = entry.navigation.take() {
+                                    if let Some(navigation) = entry.navigation.take()
+                                        && !navigation.complete
+                                        && let Some(route) = &upgraded
+                                    {
                                         route.send(Message::Navigation(navigation.key));
                                     }
-                                    route.send(Message::Error(format!(
-                                        "compositor node {} generation {}: {error}",
-                                        key.id, key.generation
-                                    )));
+                                    if let Some(route) = &upgraded {
+                                        route.send(Message::Error(format!(
+                                            "compositor node {} generation {}: {error}",
+                                            key.id, key.generation
+                                        )));
+                                    }
                                     continue;
                                 }
                             }
-                            let shared = &entries[key.slot()].as_ref().unwrap().shared;
-                            let publish = {
-                                let state = shared.state.lock().unwrap();
-                                !state.settings.scene && state.output.is_some()
-                            };
-                            if publish && !shared.posted.swap(true, Ordering::AcqRel) {
-                                route.send(Message::Composite {
-                                    id: key.id,
-                                    generation: key.generation,
-                                });
-                            }
-                            if let Some(key) =
-                                entries[key.slot()].as_mut().unwrap().completed.take()
-                            {
-                                route.send(Message::Navigation(key));
+                            let completed_nav =
+                                entries[key.slot()].as_mut().unwrap().completed.take();
+                            if let Some(route) = &upgraded {
+                                let shared = &entries[key.slot()].as_ref().unwrap().shared;
+                                let publish = {
+                                    let state = shared.state.lock().unwrap();
+                                    !state.settings.scene && state.output.is_some()
+                                };
+                                if publish && !shared.posted.swap(true, Ordering::AcqRel) {
+                                    route.send(Message::Composite {
+                                        id: key.id,
+                                        generation: key.generation,
+                                    });
+                                }
+                                if let Some(key) = completed_nav {
+                                    route.send(Message::Navigation(key));
+                                }
                             }
                         }
                         Task::Slot(key, id, slot, value) => {
@@ -459,6 +554,7 @@ impl Worker {
                                 target: request.target,
                                 key: request.key,
                                 duration: request.duration,
+                                queued_at: request.queued_at,
                                 backwards: request.backwards,
                                 reverse_inputs: request.reverse_inputs,
                                 complete: false,
@@ -473,9 +569,17 @@ impl Worker {
                                         route.send(Message::Navigation(request.key));
                                     }
                                 } else {
-                                    entry.navigation = Some(request);
+                                    if let Some(old) = entry.navigation.replace(request)
+                                        && !old.complete
+                                        && let Some(route) = route.upgrade()
+                                    {
+                                        route.send(Message::Navigation(old.key));
+                                    }
+                                    entry.shared.animating.store(true, Ordering::Release);
                                 }
                                 wake(&callback, entry.key, &entry.shared);
+                            } else if let Some(route) = route.upgrade() {
+                                route.send(Message::Navigation(request.key));
                             }
                         }
                         Task::Window(key, window) => {
@@ -537,19 +641,27 @@ impl Worker {
                         && std::mem::take(&mut scene_dirty)
                         && let Some(scene) = &scene
                     {
-                        let Some(route) = route.upgrade() else {
-                            break;
-                        };
+                        let upgraded = route.upgrade();
                         if let Some(gpu) = gpu.as_ref() {
-                            scene.render(
+                            let failed = scene.render(
                                 &mut SceneEntries {
                                     entries: &mut entries,
                                     gpu,
                                 },
-                                &route,
+                                upgraded.as_deref(),
                             );
                             for entry in entries.iter_mut().flatten() {
-                                if let Some(key) = entry.completed.take() {
+                                if failed
+                                    && entry.settings.scene
+                                    && let Some(nav) = entry.navigation.as_mut()
+                                    && !nav.complete
+                                {
+                                    nav.complete = true;
+                                    entry.completed = Some(nav.key);
+                                }
+                                if let Some(key) = entry.completed.take()
+                                    && let Some(route) = &upgraded
+                                {
                                     route.send(Message::Navigation(key));
                                 }
                             }
@@ -564,17 +676,74 @@ impl Worker {
                         && (scene_dirty
                             || fills.animating()
                             || entries.iter().flatten().any(|entry| {
-                                (entry.window.is_some() || entry.settings.scene)
+                                let pending_nav =
+                                    entry.navigation.as_ref().is_some_and(|n| !n.complete);
+                                (entry.window.is_some() || entry.settings.scene || pending_nav)
                                     && entry.shared.active.load(Ordering::Acquire)
-                                    && (entry.window_dirty || entry.shaders.wants_frame())
+                                    && (entry.window_dirty
+                                        || entry.shaders.wants_frame()
+                                        || pending_nav)
                             }));
                     vote.update(animating);
                     if !frame_pending && animating {
                         let send = callback.clone();
-                        frame_pending = vsync.request_frame_once(move |_| {
+                        let status = vsync.request_frame_once(move |_| {
                             let _ = send.send(Task::Frame);
-                        }) == 0;
+                        });
+                        if status == 0 {
+                            frame_pending = true;
+                        } else {
+                            log::warn!("OHOS compositor VSync request failed: {status}");
+                            if let Some(route) = route.upgrade() {
+                                route.request_frame();
+                            }
+                        }
                     }
+                }
+                // Deterministic exit handshake: release every remaining entry,
+                // retired window, and pending navigation even on early shutdown.
+                vote.update(false);
+                drop(scene);
+                drop(captured);
+                while let Some(task) = receive.try_recv() {
+                    match task {
+                        Task::Create { shared, .. } => {
+                            shared.released.store(true, Ordering::Release);
+                        }
+                        Task::RetireWindow(_, released) => {
+                            released.store(true, Ordering::Release);
+                        }
+                        Task::Navigation(request) => {
+                            if let Some(route) = route.upgrade() {
+                                route.send(Message::Navigation(request.key));
+                            }
+                        }
+                        Task::Wake(_, weak_shared) => {
+                            if let Some(shared) = weak_shared.upgrade() {
+                                shared.queued.store(false, Ordering::Release);
+                            }
+                        }
+                        Task::Fill(super::fill::Command::Remove(key)) => {
+                            fills.remove(key);
+                            completed_fills.lock().unwrap().push(key);
+                        }
+                        _ => {}
+                    }
+                }
+                for slot in &mut entries {
+                    if let Some(entry) = slot.take() {
+                        retire_entry(entry, &route);
+                    }
+                }
+                completed_fills.lock().unwrap().extend(fills.clear());
+                drop(gpu);
+                worker_drained.store(true, Ordering::Release);
+                if let Some(route) = route.upgrade() {
+                    route.send(Message::Composite {
+                        id: nsh_core::ROOT_ID,
+                        generation: 0,
+                    });
+                    route.send(Message::Shader);
                 }
             })?;
         Ok(Self {
@@ -605,18 +774,16 @@ impl Worker {
             .retain(|(shared, _)| !shared.released.load(Ordering::Acquire));
     }
     pub(crate) fn clear_plan(&self) {
-        self.plan.lock().unwrap().take();
-        let _ = self.send.send(Task::Plan);
+        if self.plan.clear() {
+            let _ = self.send.send(Task::Plan);
+        }
     }
     pub(crate) fn plan(
         &self,
         plan: Arc<crate::render::composition::draw::Plan>,
         shared: Arc<SceneShared>,
     ) {
-        let mut pending = self.plan.lock().unwrap();
-        let wake = pending.is_none();
-        *pending = Some(ScenePlan { plan, shared });
-        if wake {
+        if self.plan.set(ScenePlan { plan, shared }) {
             let _ = self.send.send(Task::Plan);
         }
     }
@@ -628,10 +795,23 @@ impl Drop for Worker {
         self.thread.take();
     }
 }
-fn wake(send: &mpsc::Sender<Task>, key: Key, shared: &Shared) {
-    if !shared.queued.swap(true, Ordering::AcqRel) {
-        let _ = send.send(Task::Wake(key));
+fn wake(send: &CommandSender<Task>, key: Key, shared: &Arc<Shared>) {
+    if !shared.queued.swap(true, Ordering::AcqRel)
+        && send.send(Task::Wake(key, Arc::downgrade(shared))).is_err()
+    {
+        shared.queued.store(false, Ordering::Release);
     }
+}
+fn retire_entry(mut entry: Entry, route: &Weak<Dispatcher>) {
+    if let Some(nav) = entry.navigation.take()
+        && !nav.complete
+        && let Some(route) = route.upgrade()
+    {
+        route.send(Message::Navigation(nav.key));
+    }
+    let shared = entry.shared.clone();
+    drop(entry);
+    shared.released.store(true, Ordering::Release);
 }
 fn check_pixels(
     entries: &[Option<Entry>],
@@ -677,11 +857,27 @@ impl Entry {
                 .iter()
                 .any(|(id, _)| *id == navigation.key.owner)
             {
-                self.navigation = None;
+                if let Some(navigation) = self.navigation.take()
+                    && !navigation.complete
+                {
+                    self.completed = Some(navigation.key);
+                }
             } else if navigation.complete {
                 // Keep the terminal picture until its generation is retired by the UI.
                 return Ok(false);
             }
+        }
+        if let Some(navigation) = &mut self.navigation
+            && !navigation.complete
+            && navigation.queued_at.elapsed()
+                > navigation.duration + std::time::Duration::from_secs(1)
+        {
+            navigation.complete = true;
+            self.completed = Some(navigation.key);
+            self.shared
+                .animating
+                .store(self.shaders.wants_frame(), Ordering::Release);
+            return Ok(false);
         }
         let mut changed = self.settings != settings || std::mem::take(&mut self.window_dirty);
         self.shaders.layers(&settings.shaders)?;
@@ -711,7 +907,8 @@ impl Entry {
             changed = true;
         }
         changed |= self.start_navigation()?;
-        if !changed && !self.shaders.wants_frame() {
+        let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
+        if !changed && !self.shaders.wants_frame() && !pending_nav {
             self.shared.animating.store(false, Ordering::Release);
             return Ok(false);
         }
@@ -719,6 +916,9 @@ impl Entry {
         let y = -(self.settings.insets[1] as f32);
         if direct {
             let Some(source) = self.reader.texture() else {
+                self.shared
+                    .animating
+                    .store(self.shaders.wants_frame() || pending_nav, Ordering::Release);
                 return Ok(false);
             };
             self.scene_source = None;
@@ -765,13 +965,15 @@ impl Entry {
             {
                 navigation.complete = true;
                 self.completed = Some(navigation.key);
-                self.shared.animating.store(false, Ordering::Release);
+                self.shared
+                    .animating
+                    .store(self.shaders.wants_frame(), Ordering::Release);
             }
             return Ok(repaint);
         }
         self.shared
             .animating
-            .store(self.shaders.wants_frame(), Ordering::Release);
+            .store(self.shaders.wants_frame() || pending_nav, Ordering::Release);
         Ok(changed || self.shaders.wants_frame())
     }
     fn coverage(&self) -> super::geometry::Coverage {
@@ -865,9 +1067,10 @@ impl Entry {
         Ok(true)
     }
     fn publish_gpu(&mut self, repaint: bool, x: f32, y: f32) -> std::result::Result<bool, String> {
+        let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
         self.shared
             .animating
-            .store(self.shaders.wants_frame(), Ordering::Release);
+            .store(self.shaders.wants_frame() || pending_nav, Ordering::Release);
         let Some(output) = self.shaders.output() else {
             return Ok(false);
         };
@@ -1001,11 +1204,22 @@ impl super::draw::Sources for SceneEntries<'_> {
             navigation.complete = true;
             entry.completed = Some(navigation.key);
         }
-        entry
-            .shared
-            .animating
-            .store(entry.shaders.wants_frame(), Ordering::Release);
+        let pending_nav = entry.navigation.as_ref().is_some_and(|nav| !nav.complete);
+        entry.shared.animating.store(
+            entry.shaders.wants_frame() || pending_nav,
+            Ordering::Release,
+        );
         Ok(result)
+    }
+}
+
+fn next_composite_generation() -> u32 {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    loop {
+        let generation = NEXT.fetch_add(1, Ordering::Relaxed);
+        if generation != 0 {
+            return generation;
+        }
     }
 }
 
@@ -1013,6 +1227,7 @@ pub(crate) struct Composite {
     owner: std::rc::Weak<Node>,
     presentation: RefCell<Option<super::presentation::Presentation>>,
     surface: RefCell<Option<String>>,
+    failed: Cell<bool>,
     pub(crate) generation: u32,
     key: Key,
     shared: Arc<Shared>,
@@ -1022,19 +1237,22 @@ impl Composite {
     pub(crate) fn key(&self) -> Key {
         self.key
     }
-    pub(crate) fn new(owner: &Rc<Node>, generation: u32) -> Result<Self> {
-        Self::create(owner, generation, false)
+    pub(crate) fn is_failed(&self) -> bool {
+        self.failed.get()
     }
-    pub(crate) fn overlay(owner: &Rc<Node>, generation: u32) -> Result<Self> {
-        Self::create(owner, generation, true)
+    pub(crate) fn new(owner: &Rc<Node>) -> Result<Self> {
+        Self::create(owner, false)
     }
-    fn create(owner: &Rc<Node>, generation: u32, overlay: bool) -> Result<Self> {
+    pub(crate) fn overlay(owner: &Rc<Node>) -> Result<Self> {
+        Self::create(owner, true)
+    }
+    fn create(owner: &Rc<Node>, overlay: bool) -> Result<Self> {
+        let generation = next_composite_generation();
         let worker = Worker::for_owner(owner)?;
         let initial_settings = settings(owner, overlay)?;
         let shared = Arc::new(Shared {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            surface_ready: std::sync::Condvar::new(),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
                 screen_origin: None,
@@ -1058,28 +1276,16 @@ impl Composite {
                 shared: shared.clone(),
             })
             .map_err(|_| napi_ohos::Error::from_reason("OHOS compositor stopped"))?;
-        let surface = {
-            let state = shared.state.lock().unwrap();
-            let (mut state, _) = shared
-                .surface_ready
-                .wait_timeout_while(state, std::time::Duration::from_millis(250), |state| {
-                    state.surface.is_none()
-                })
-                .unwrap();
-            match state.surface.take() {
-                Some(Ok(id)) => Some(id.to_string()),
-                Some(Err(error)) => {
-                    log::warn!("OHOS compositor initialization: {error}");
-                    None
-                }
-                None => None,
-            }
-        };
         if !overlay {
-            owner
-                .composite_nodes
-                .borrow_mut()
-                .push(Rc::downgrade(owner));
+            let mut nodes = owner.composite_nodes.borrow_mut();
+            nodes.retain(|node| node.strong_count() != 0);
+            let weak = Rc::downgrade(owner);
+            if !nodes
+                .iter()
+                .any(|existing| std::rc::Weak::ptr_eq(existing, &weak))
+            {
+                nodes.push(weak);
+            }
         }
         let presentation = if initial_settings.gpu {
             let mut layer = super::presentation::Presentation::new(
@@ -1096,6 +1302,7 @@ impl Composite {
                 (initial_settings.height as f32 * ratio).round().max(1.0) as u32,
                 -(initial_settings.insets[0] as f32 * ratio),
                 -(initial_settings.insets[1] as f32 * ratio),
+                initial_settings.density,
             )?;
             Some(layer)
         } else {
@@ -1104,7 +1311,8 @@ impl Composite {
         Ok(Self {
             owner: Rc::downgrade(owner),
             presentation: RefCell::new(presentation),
-            surface: RefCell::new(surface),
+            surface: RefCell::new(None),
+            failed: Cell::new(false),
             generation,
             key,
             shared,
@@ -1112,6 +1320,9 @@ impl Composite {
         })
     }
     pub(crate) fn update(&self, owner: &Node) -> Result<bool> {
+        if self.failed.get() {
+            return Ok(false);
+        }
         if !self.key.overlay
             && owner
                 .wrapper
@@ -1157,6 +1368,7 @@ impl Composite {
                 (settings.height as f32 * ratio).round().max(1.0) as u32,
                 -(settings.insets[0] as f32 * ratio),
                 -(settings.insets[1] as f32 * ratio),
+                settings.density,
             )?;
         }
         let mut state = self.shared.state.lock().unwrap();
@@ -1196,6 +1408,7 @@ impl Composite {
             key,
             snapshot: (),
             duration,
+            queued_at: std::time::Instant::now(),
             backwards,
             reverse_inputs,
             complete: false,
@@ -1243,16 +1456,31 @@ impl Composite {
             self.presentation
                 .borrow()
                 .as_ref()
-                .is_some_and(super::presentation::Presentation::is_revealed)
+                .is_some_and(super::presentation::Presentation::is_committed)
         }
     }
-    pub(crate) fn ready(&self) -> bool {
+    pub(crate) fn commit_presentation(&self) -> bool {
+        self.presentation
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(super::presentation::Presentation::commit)
+    }
+    pub(crate) fn ready(&self) -> (bool, bool) {
         let surface = self.shared.state.lock().unwrap().surface.take();
-        let initialized = surface.is_some();
+        let mut initialized = false;
         if let Some(result) = surface {
             match result {
-                Ok(id) => *self.surface.borrow_mut() = Some(id.to_string()),
-                Err(error) => log::warn!("OHOS compositor initialization: {error}"),
+                Ok(id) => {
+                    *self.surface.borrow_mut() = Some(id.to_string());
+                    initialized = true;
+                }
+                Err(error) => {
+                    log::warn!("OHOS compositor initialization: {error}");
+                    self.failed.set(true);
+                    if let Some(layer) = self.presentation.borrow_mut().take() {
+                        layer.hide();
+                    }
+                }
             }
         }
         self.shared.posted.store(false, Ordering::Release);
@@ -1269,20 +1497,21 @@ impl Composite {
                             (output.frame.height as f32 * ratio).round() as u32,
                             output.x * ratio,
                             output.y * ratio,
+                            state.settings.density,
                         )
                         .and_then(|()| layer.reveal())
                 };
                 match result {
                     Ok(revealed) => {
                         drop(presentation);
-                        return initialized || revealed;
+                        return (initialized, revealed);
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
                 }
-                return initialized;
+                return (initialized, false);
             }
         }
-        initialized
+        (initialized, false)
     }
     pub(crate) fn measure(
         &self,

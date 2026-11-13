@@ -5,6 +5,7 @@ pub(crate) mod filter;
 mod frame_wake;
 pub(crate) mod geometry;
 mod gles;
+pub(crate) mod mailbox;
 mod presentation;
 pub(crate) mod raster;
 pub(crate) mod readback;

@@ -2,6 +2,7 @@
 
 use ohos_arkui_binding::{
     api::node_custom_event::NodeCustomEvent, component::attribute::ArkUICommonAttribute,
+    types::advanced::NodeDirtyFlag,
 };
 
 use crate::render::node::{NativeNode, Node, Result, callback};
@@ -13,6 +14,7 @@ pub(super) struct Presentation {
     origin: (i32, i32),
     size: (u32, u32),
     revealed: bool,
+    committed: bool,
 }
 
 impl Presentation {
@@ -38,44 +40,69 @@ impl Presentation {
             origin: (0, 0),
             size: (0, 0),
             revealed: false,
+            committed: false,
         };
         let frame = owner.frame.get();
+        let scale = owner.scale.get();
         layer.update(
-            (frame.width * owner.scale.get()).ceil().max(1.0) as u32,
-            (frame.height * owner.scale.get()).ceil().max(1.0) as u32,
+            (frame.width * scale).ceil().max(1.0) as u32,
+            (frame.height * scale).ceil().max(1.0) as u32,
             0.0,
             0.0,
+            scale,
         )?;
         Ok(layer)
     }
 
-    pub(super) fn is_revealed(&self) -> bool {
-        self.revealed
+    pub(super) fn is_committed(&self) -> bool {
+        self.committed
     }
 
     pub(super) fn reveal(&mut self) -> Result<bool> {
         if !self.revealed {
-            self.surface.native.borrow().opacity(1.0)?;
+            let node = self.surface.native.borrow();
+            node.opacity(1.0)?;
+            node.mark_dirty(NodeDirtyFlag::NeedRender)?;
             self.revealed = true;
             return Ok(true);
         }
         Ok(false)
     }
 
+    pub(super) fn commit(&mut self) -> bool {
+        if self.revealed && !self.committed {
+            self.committed = true;
+            return true;
+        }
+        false
+    }
+
     pub(super) fn hide(&self) {
         let _ = self.surface.native.borrow().opacity(0.0);
     }
 
-    pub(super) fn update(&mut self, width: u32, height: u32, x: f32, y: f32) -> Result<()> {
+    pub(super) fn update(
+        &mut self,
+        width: u32,
+        height: u32,
+        x: f32,
+        y: f32,
+        scale: f32,
+    ) -> Result<()> {
+        let scale = scale.max(0.01);
+        let scale_changed = (self.scale - scale).abs() > f32::EPSILON;
+        if scale_changed {
+            self.scale = scale;
+        }
         let node = self.surface.native.borrow();
         let origin = (x.round() as i32, y.round() as i32);
         let origin_changed = self.origin != origin;
-        if origin_changed {
+        if origin_changed || scale_changed {
             node.set_position([x / self.scale, y / self.scale])?;
             self.origin = origin;
         }
-        if self.size != (width, height) || origin_changed {
-            if self.size != (width, height) {
+        if self.size != (width, height) || origin_changed || scale_changed {
+            if self.size != (width, height) || scale_changed {
                 node.width(width as f32 / self.scale)?;
                 node.height(height as f32 / self.scale)?;
                 self.size = (width, height);

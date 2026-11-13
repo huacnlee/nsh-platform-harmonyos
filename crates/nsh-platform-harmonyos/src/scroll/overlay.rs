@@ -53,7 +53,7 @@ impl Plane {
             .borrow()
             .set_length_metric_unit(LengthMetricUnit::Vp)?;
         let target = NativeAttachment::for_subtree(&outer, widget)?;
-        let composite = Composite::overlay(owner, target.id())?;
+        let composite = Composite::overlay(owner)?;
         let plane = Rc::new(Self {
             outer,
             route: RefCell::new(Some(crate::interop::sdk::ViewRoute::new(
@@ -125,22 +125,23 @@ impl Plane {
             return Ok(());
         }
         if !self.context_live.get() {
-            let id = self.replace_target(owner)?;
+            let _id = self.replace_target(owner)?;
             *self.composite.borrow_mut() = Some(Composite::overlay(
                 &self
                     .owner
                     .upgrade()
                     .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
-                id,
             )?);
             self.context_live.set(true);
         }
         let composite = self.composite.borrow();
-        let Some(composite) = composite.as_ref() else {
-            return Ok(());
+        let texture_surface = if let Some(composite) = composite.as_ref() {
+            composite.update(owner)?;
+            composite.surface()
+        } else {
+            None
         };
-        composite.update(owner)?;
-        let texture_surface = composite.surface();
+        drop(composite);
         if self
             .settings
             .borrow()
@@ -179,10 +180,15 @@ impl Plane {
         Ok(())
     }
     pub(crate) fn ready(&self, owner: &Node, generation: u32) -> Result<()> {
+        let mut drop_failed = false;
         if let Some(composite) = self.composite.borrow().as_ref()
             && composite.generation == generation
         {
             composite.ready();
+            drop_failed = composite.is_failed();
+        }
+        if drop_failed {
+            self.composite.borrow_mut().take();
         }
         self.update(owner)
     }
