@@ -15,7 +15,7 @@ use std::{
 use napi_derive_ohos::napi;
 use napi_ohos::{
     Env, Error, Result, Status,
-    bindgen_prelude::FunctionRef,
+    bindgen_prelude::{FunctionRef, Object, ObjectRef},
     threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
 use nsh_core::{EventKind, EventPayload, PayloadValue};
@@ -42,6 +42,17 @@ struct UiSession {
     tab_bar: std::rc::Rc<crate::interop::component::TabFactory>,
     apply_batch: std::rc::Rc<FunctionRef<crate::interop::sdk::Batch, ()>>,
     surfaces: Vec<crate::app::surface::LifecycleRoute>,
+    ui_context: Option<(Env, ObjectRef)>,
+}
+
+impl Drop for UiSession {
+    fn drop(&mut self) {
+        if let Some((env, context)) = self.ui_context.take()
+            && let Err(error) = context.unref(&env)
+        {
+            log::error!("OHOS UIContext release: {error}");
+        }
+    }
 }
 
 thread_local! {
@@ -153,11 +164,11 @@ pub(crate) fn resolve_context(
 pub(crate) fn close_ui_session(session_id: u32) {
     let ui_session = UI_SESSIONS.with(|sessions| sessions.borrow_mut().remove(&session_id));
     SESSIONS.lock().unwrap().remove(&session_id);
-    if let Some(ui_session) = ui_session {
+    if let Some(mut ui_session) = ui_session {
         // All UI retirement runs here, on the ArkTS callback thread, even when
         // chunks, trust verification or image IO still own Services references.
         ui_session.services.close();
-        for surface in ui_session.surfaces {
+        for surface in ui_session.surfaces.drain(..) {
             if let Err(error) = surface.dispose() {
                 log::error!("OHOS session surface teardown: {error}");
             }
@@ -232,6 +243,31 @@ impl Drop for LoadPermit {
 }
 
 impl Services {
+    pub(crate) fn bind_ui_context(&self, env: &Env, context: &Object<'_>) -> Result<()> {
+        UI_SESSIONS.with(|sessions| {
+            let mut sessions = sessions.borrow_mut();
+            let session = sessions
+                .get_mut(&self.id)
+                .ok_or_else(|| Error::from_reason("OHOS UI session closed"))?;
+            if session.ui_context.is_none() {
+                session.ui_context = Some((*env, context.create_ref()?));
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn ui_context<'env>(&self, env: &'env Env) -> Result<Object<'env>> {
+        self.check()?;
+        UI_SESSIONS.with(|sessions| {
+            let sessions = sessions.borrow();
+            let (_, context) = sessions
+                .get(&self.id)
+                .and_then(|session| session.ui_context.as_ref())
+                .ok_or_else(|| Error::from_reason("OHOS UIContext is not bound"))?;
+            context.get_value(env)
+        })
+    }
+
     pub(crate) fn window_id(&self) -> Option<u64> {
         let id = self.window_id.load(Ordering::Acquire);
         (id != 0).then_some(u64::from(id))
@@ -741,6 +777,7 @@ impl Services {
                     services: services.clone(),
                     apply_batch: std::rc::Rc::new(apply_batch),
                     surfaces: Vec::new(),
+                    ui_context: None,
                 },
             );
         });

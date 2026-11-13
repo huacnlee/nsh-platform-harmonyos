@@ -318,7 +318,9 @@ impl Mounter {
             return video.set_fullscreen(false);
         }
         if self.dialogs.visible() {
-            return self.dialogs.request_close();
+            // ArkUI handles back and cancelability for its system dialogs.
+            // Do not reply early while the window still displays the dialog.
+            return Ok(());
         }
         self.route_back(true)
     }
