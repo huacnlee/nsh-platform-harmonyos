@@ -33,8 +33,10 @@ Features:
   its own (`nsh.json` `"rust"` without `"root"`) has no `nsh_rust_app`: the runner depends on each crate by path and
   serves `nsh/base`'s UI set, then each crate's `#[native_module]` `registry()` (`app!(sets = [..])`), while the
   bundle is a raw file of the HAP as for any TSX app.
-- **Mount items** this backend does not apply yet (shader transitions, `NavShader`, `ShaderInput`) and the opt-in ones
-  it does not ask for (`TreeOrder`, `ProjectStates`) are skipped (`render/mount.rs`).
+- **Mount items** (`src/render/mount.rs`): `Shader`, `ShaderTransition` and `NavShader` are implemented; `ShaderInput`
+  is a no-op because ArkUI's `RenderNode` texture producer reports native content updates directly (including native
+  input and scroll changes between engine batches); and the terminal-only projections (`TreeOrder`, `ProjectStates`)
+  are ignored.
 - **Streaming assets**: the video player and web views read large files through `services::assets::StreamAssets`,
   this backend's trait over `nsh_engine::Assets`.
 
@@ -44,8 +46,10 @@ Features:
   `surface.content` (`NodeContent`) inside a standard ArkUI `ContentSlot`. `@nsh/harmonyos` binds each window session
   explicitly from the provided `UIContext` (`UIAbilityContext` and `Window`) in a standard `UIAbility` without a custom
   base class or process-global context guessing.
-- **Commits and frames** (`src/render/`): the engine submits each `MountBatch` through a N-API threadsafe function to
-  the ArkUI UI thread. Per-surface `NativeVSync` callbacks drive animations on the UI thread; idle surfaces request no
+- **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`): the engine submits each
+  `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. Per-surface `NativeVSync` callbacks drive UI
+  animations on the UI thread while `FrameRate` arbitrates UI animation demand (`120` Hz or reduced-rate `30` Hz) and
+  shader compositor demand as the single owner of `OH_NativeVSync_SetExpectedFrameRateRange`; idle surfaces request no
   frames.
 - **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
   CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
@@ -53,12 +57,26 @@ Features:
   geometry queries on its UI thread; the CLI injects system input through hdc (`uitest` / `uinput`) and captures the
   marked surface. A separate `.nshtest` bundle and per-open data directories isolate tests from the normal app.
   Quit retires the engine before removing its files; the CLI stops the host and removes its reverse forward.
-- **Shaders** (`src/render/shader/`): wgpu runs on GLES only, which waits for the GPU on the calling thread, so each
-  shader view renders into a native surface of its own (an XComponent first among its children) from a thread of the
-  surface's (`nsh-shader`), paced by the surface's `NativeVSync`, skipping views out of sight; nothing is read back
-  (`docs/dev/shaders.md`).
+- **Shaders and composition** (`src/render/shader/`, `src/render/composition/`, `src/interop/`): a per-surface
+  `nsh-compositor` worker thread owns an EGL / GLES 3 (`glow`) context and renders outside the ArkUI UI thread across
+  three lanes:
+  1. **Native ArkUI path**: standard views, transforms, opacity, single blur / backdrop-blur and native blend modes stay
+     entirely on ArkUI `C-API` nodes without texture export or GPU worker involvement.
+  2. **Direct GPU path** (`fill.rs`, `worker.rs` `Composite`): standalone fill shaders render directly into a child C
+     `XComponent` surface, while content shaders, non-blur filter chains, `ShaderTransition` and `NavShader` export the
+     wrapped subtree via ArkTS `RenderNode` texture export (`OH_NativeImage` OES external texture) into a presentation
+     `XComponent` without CPU readback. Generation-scoped handoff and `UIContext` frame callbacks coordinate retirement
+     and fallback to native rendering if surface creation or GL compilation fails.
+  3. **Surface `Scene` path** (`scene.rs`, `draw.rs`): subtrees requiring CSS `mask-image` (`masks[0]`, matching
+     upstream mobile backends), multi-filter / overflow backdrop sampling, or blend modes unsupported natively are
+     promoted into a minimal `Scene` root. For those roots, `nsh-compositor` reads exported `OES` planes into bounded
+     RGBA bitmaps, composites CPU masks / backdrop filters (`TileMode::Clamp`) and blends, runs any attached GLES
+     passes, and presents onto the root overlay `XComponent` (rolling back cleanly to native attributes on error).
+     Platform limitation: embedded separate hardware surfaces (`Video` / `ArkWeb` `XComponent`s) inside a `RenderNode`
+     texture export depend on system surface composition and are not guaranteed to appear in `RenderNode` pixel exports.
 - **Typography** (`src/text/`): the engine thread shapes and measures paragraphs with `ohos-drawing-binding`
-  (`FontCollection::shared()`, `Typography`) and hands owned RGBA bitmaps and selection geometry to the UI thread.
+  (`FontCollection::shared()`, `Typography`) and hands recorded native drawing commands and selection geometry to the UI
+  thread.
 - **Controls and media** (`src/input/`, `src/scroll/`, `src/media/`, `src/interop/`): `Input` uses the system
   `TextInput` / `TextArea` BuilderNode; `Scroll` and `List` use native ArkUI `Scroll` (with on-demand `Refresh`);
   `WebView` uses `ArkWeb`; `Video` uses a C `XComponent` surface and an `AVPlayer` worker.

@@ -54,13 +54,9 @@ impl Node {
         }
     }
     pub(crate) fn scene_opacity(&self) -> f32 {
-        self.style.borrow().opacity
-            * self.presentation.get().0
-            * self.extra.get().0
-            * self.navigation_presentation.get().0
+        self.visual_opacity_for(self.style.borrow().opacity)
     }
-    pub(crate) fn has_native_paint(&self) -> bool {
-        let style = self.style.borrow();
+    pub(crate) fn has_native_paint(&self, style: &nsh_core::ViewStyle) -> bool {
         self.id == nsh_core::ROOT_ID
             || self.scene_root.get()
             || self.kind != ViewKind::View
@@ -199,8 +195,36 @@ impl Node {
         self.set_events(self.interaction.mask())?;
         Ok(links_changed)
     }
+    fn has_ancestor_repaint(&self, min_frames: u8) -> bool {
+        let mut cur = self.parent_node.borrow().upgrade().or_else(|| {
+            self.retained
+                .get()
+                .then(|| self.retained_owner.borrow().upgrade())
+                .flatten()
+        });
+        while let Some(ancestor) = cur {
+            if ancestor.active.get()
+                && !ancestor.pending_delete.get()
+                && ancestor.paint_frames.get() >= min_frames
+            {
+                return true;
+            }
+            cur = ancestor.parent_node.borrow().upgrade().or_else(|| {
+                ancestor
+                    .retained
+                    .get()
+                    .then(|| ancestor.retained_owner.borrow().upgrade())
+                    .flatten()
+            });
+        }
+        false
+    }
+
     /// Re-record custom paint after a native visibility or render-target change.
     pub(crate) fn invalidate_subtree_paint(&self) -> Result<()> {
+        if !self.active.get() || self.pending_delete.get() {
+            return Ok(());
+        }
         self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
         if let Some(wrapper) = self.wrapper.borrow().as_ref() {
             wrapper
@@ -230,23 +254,59 @@ impl Node {
         Ok(())
     }
     pub(crate) fn schedule_subtree_paint(&self, frames: u8) -> Result<()> {
-        self.invalidate_subtree_paint()?;
-        Self::defer_subtree_paint(self.weak.clone(), frames);
+        if !self.active.get() || self.pending_delete.get() {
+            return Ok(());
+        }
+        if self.has_ancestor_repaint(frames.max(1)) {
+            return Ok(());
+        }
+        if !self.paint_armed.get() {
+            self.invalidate_subtree_paint()?;
+        }
+        let target = self.paint_frames.get().max(frames);
+        self.paint_frames.set(target);
+        if target > 0 && !self.paint_armed.replace(true) {
+            Self::arm_subtree_paint(self.weak.clone());
+        }
         Ok(())
     }
-    fn defer_subtree_paint(weak: Weak<Self>, remaining: u8) {
-        if remaining == 0 {
-            return;
-        }
+    fn arm_subtree_paint(weak: Weak<Self>) {
         let Some(owner) = weak.upgrade() else {
             return;
         };
-        let _ = owner.native.borrow().post_frame_callback(move |_, _| {
-            if let Some(owner) = weak.upgrade() {
+        if !owner.active.get() || owner.pending_delete.get() || owner.paint_frames.get() == 0 {
+            owner.paint_frames.set(0);
+            owner.paint_armed.set(false);
+            return;
+        }
+        let status = owner.native.borrow().post_frame_callback(move |_, _| {
+            let Some(owner) = weak.upgrade() else {
+                return;
+            };
+            if !owner.active.get() || owner.pending_delete.get() {
+                owner.paint_frames.set(0);
+                owner.paint_armed.set(false);
+                return;
+            }
+            let remaining = owner.paint_frames.get();
+            if remaining == 0 {
+                owner.paint_armed.set(false);
+                return;
+            }
+            owner.paint_frames.set(remaining - 1);
+            if !owner.has_ancestor_repaint(1) {
                 callback(|| owner.invalidate_subtree_paint());
-                Self::defer_subtree_paint(weak, remaining - 1);
+            }
+            if owner.paint_frames.get() > 0 {
+                Self::arm_subtree_paint(weak);
+            } else {
+                owner.paint_armed.set(false);
             }
         });
+        if status.is_err() {
+            owner.paint_frames.set(0);
+            owner.paint_armed.set(false);
+        }
     }
 
     pub(crate) fn draw_outer_shadows(&self, canvas: &Canvas) {

@@ -60,20 +60,15 @@ impl Coverage {
     }
 }
 
+/// CSS `blur(<radius>)` standard deviation in physical pixels (`radius * scale`).
 pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
-    radius.max(0.0) * scale * 0.5
+    radius.max(0.0) * scale
 }
 
-pub(crate) fn requires_scene(style: &ViewStyle) -> bool {
-    style.blend_mode == nsh_core::BlendMode::PlusDarker
-        || style.effects.as_ref().is_some_and(|effects| {
-            !effects.mask_images.is_empty()
-                || effects.backdrop_filters.len() > 1
-                || effects
-                    .backdrop_filters
-                    .iter()
-                    .any(|filter| !matches!(filter, Filter::Blur(_)))
-        })
+/// CSS `drop-shadow` / `box-shadow` blur radius to Gaussian sigma (`radius * scale * 0.5`),
+/// matching W3C shadow blur and upstream Android/Apple/Windows implementations.
+pub(crate) fn shadow_blur_sigma(radius: f32, scale: f32) -> f32 {
+    radius.max(0.0) * scale * 0.5
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -142,6 +137,9 @@ impl Bounds {
     }
     pub(crate) fn filters(mut self, filters: &[Filter]) -> Self {
         for filter in filters {
+            if crate::render::effects::is_noop_filter(filter) {
+                continue;
+            }
             match *filter {
                 Filter::Blur(radius) => self.extend(0.0, 0.0, blur_sigma(radius.0, 1.0) * 3.0),
                 Filter::DropShadow {
@@ -149,7 +147,7 @@ impl Bounds {
                     offset_y,
                     blur,
                     ..
-                } => self.extend(offset_x.0, offset_y.0, blur_sigma(blur.0, 1.0) * 3.0),
+                } => self.extend(offset_x.0, offset_y.0, shadow_blur_sigma(blur.0, 1.0) * 3.0),
                 _ => {}
             }
         }
@@ -287,33 +285,16 @@ mod tests {
         assert_eq!(f32::from_bits(second[1]), 50.0);
     }
     #[test]
-    fn scene_requirements_follow_the_current_style() {
-        let mut style = ViewStyle {
-            blend_mode: nsh_core::BlendMode::PlusDarker,
-            ..ViewStyle::default()
-        };
-        assert!(requires_scene(&style));
-        style.blend_mode = nsh_core::BlendMode::Normal;
-        assert!(!requires_scene(&style));
-        let mut effects = nsh_core::Effects {
-            backdrop_filters: vec![Filter::Blur(Points(4.0)), Filter::Blur(Points(8.0))],
-            ..Default::default()
-        };
-        style.effects = Some(std::sync::Arc::new(effects.clone()));
-        assert!(requires_scene(&style));
-        effects.backdrop_filters.pop();
-        style.effects = Some(std::sync::Arc::new(effects));
-        assert!(!requires_scene(&style));
-    }
-    #[test]
-    fn css_blur_radius_becomes_half_a_physical_sigma() {
-        assert_eq!(blur_sigma(8.0, 3.0), 12.0);
+    fn css_blur_radius_uses_full_sigma_while_drop_shadow_halves_radius() {
+        assert_eq!(blur_sigma(8.0, 3.0), 24.0);
         assert_eq!(blur_sigma(-8.0, 3.0), 0.0);
+        assert_eq!(shadow_blur_sigma(8.0, 3.0), 12.0);
+        assert_eq!(shadow_blur_sigma(-8.0, 3.0), 0.0);
         assert_eq!(
             Bounds::new(10.0, 10.0)
                 .filters(&[Filter::Blur(Points(8.0))])
                 .0,
-            [-12.0, -12.0, 22.0, 22.0]
+            [-24.0, -24.0, 34.0, 34.0]
         );
     }
     #[test]
@@ -336,5 +317,23 @@ mod tests {
         let mut matrix = Matrix::IDENTITY;
         matrix.0[3] = -0.1;
         assert!(Bounds::new(20.0, 10.0).transformed(matrix).is_none());
+    }
+    #[test]
+    fn identity_filters_do_not_extend_bounds() {
+        assert_eq!(
+            Bounds::new(20.0, 20.0)
+                .filters(&[
+                    Filter::Brightness(1.0),
+                    Filter::Blur(Points(0.0)),
+                    Filter::DropShadow {
+                        offset_x: Points(10.0),
+                        offset_y: Points(10.0),
+                        blur: Points(8.0),
+                        color: Color::TRANSPARENT,
+                    },
+                ])
+                .0,
+            [0.0, 0.0, 20.0, 20.0]
+        );
     }
 }

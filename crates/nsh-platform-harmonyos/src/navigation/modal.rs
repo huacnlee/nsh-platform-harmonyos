@@ -29,6 +29,7 @@ pub(crate) struct Modal {
     config: Cell<ModalConfig>,
     pending_present: Cell<bool>,
     shown: Cell<bool>,
+    show_emitted: Cell<bool>,
     progress: Cell<f32>,
     transition: RefCell<Option<Transition>>,
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
@@ -55,6 +56,7 @@ impl Modal {
             config: Cell::new(ModalConfig::default()),
             pending_present: Cell::new(false),
             shown: Cell::new(false),
+            show_emitted: Cell::new(false),
             progress: Cell::new(0.0),
             transition: RefCell::default(),
             shader: RefCell::default(),
@@ -153,6 +155,9 @@ impl Modal {
     pub(crate) fn schedule_present(&self) {
         self.pending_present.set(true);
     }
+    pub(crate) fn is_pending_present(&self) -> bool {
+        self.pending_present.get()
+    }
     pub(crate) fn present_if_pending(&self) -> Result<()> {
         if self.pending_present.replace(false) {
             self.present()?;
@@ -166,7 +171,10 @@ impl Modal {
         };
         self.sync_metrics();
         owner.set_frame(owner.raw_frame.get())?;
-        if !self.shown.replace(true) {
+        let was_shown = self.shown.replace(true);
+        let was_closing = self.closing.replace(false);
+        if !was_shown {
+            self.show_emitted.set(false);
             self.theme()?;
             self.dialog.borrow().content_node(&owner.mounted())?;
             self.dialog.borrow().show()?;
@@ -188,8 +196,9 @@ impl Modal {
             .native
             .borrow()
             .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
-        self.closing.set(false);
-        self.begin(1.0)?;
+        if !was_shown || was_closing {
+            self.begin(1.0)?;
+        }
         Ok(())
     }
     pub(crate) fn request_close(&self) -> Result<()> {
@@ -335,6 +344,7 @@ impl Modal {
         self.transition.borrow_mut().take();
         self.progress.set(to);
         if to == 0.0 {
+            self.show_emitted.set(false);
             if self.shown.replace(false) {
                 self.dialog.borrow().close()?;
                 self.overlay.borrow_mut().take();
@@ -348,7 +358,9 @@ impl Modal {
             }
         } else {
             self.paint()?;
-            if let Some(owner) = self.owner.upgrade() {
+            if !self.show_emitted.replace(true)
+                && let Some(owner) = self.owner.upgrade()
+            {
                 owner.emit(EventKind::Show, EventPayload::None);
             }
         }

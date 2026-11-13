@@ -190,6 +190,7 @@ impl Mounter {
     pub(crate) fn environment(&self, environment: nsh_engine::Environment) -> Result<()> {
         let density_changed =
             self.scale.replace(environment.pixel_ratio) != environment.pixel_ratio;
+        let reduce_motion_changed = self.platform.get().reduce_motion != environment.reduce_motion;
         self.platform.set(environment);
         for node in self.slots.iter().flatten() {
             if density_changed {
@@ -204,10 +205,15 @@ impl Mounter {
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }
         }
+        if reduce_motion_changed {
+            self.reconcile_navigation_capture()?;
+            self.flush_arkui()?;
+        }
         if density_changed {
             if let Some(scene) = self.scene.borrow().as_ref() {
                 scene.invalidate();
             }
+            self.flush_arkui()?;
             self.animator.request_frame();
         }
         self.system_appearance()
@@ -423,18 +429,26 @@ impl Mounter {
     }
     fn reconcile_navigation_capture(&self) -> Result<()> {
         let mut wanted = rustc_hash::FxHashSet::default();
-        for node in self.slots.iter().flatten() {
-            if node.navigation_shader.borrow().is_none() {
-                continue;
-            }
-            if node.kind == ViewKind::Modal {
-                wanted.insert(nsh_core::ROOT_ID);
-                for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
-                    if let Some(id) = modal.node_id() {
-                        wanted.insert(id);
-                    }
+        if !self.platform.get().reduce_motion {
+            for node in self.slots.iter().flatten() {
+                if !node.active.get()
+                    || node.pending_delete.get()
+                    || node.navigation_shader.borrow().is_none()
+                {
+                    continue;
                 }
-            } else {
+                if node.kind == ViewKind::Modal {
+                    let modal_active = node.modal.borrow().as_ref().is_some_and(|modal| {
+                        !modal.closing() && (modal.is_visible() || modal.is_pending_present())
+                    });
+                    if !modal_active {
+                        continue;
+                    }
+                } else if (node.id != nsh_core::ROOT_ID && node.parent.get().is_none())
+                    || node.retained.get()
+                {
+                    continue;
+                }
                 let mut root = nsh_core::ROOT_ID;
                 let mut ancestor = node.parent_node.borrow().upgrade();
                 while let Some(current) = ancestor {
@@ -459,6 +473,9 @@ impl Mounter {
             };
             let capture = wanted.contains(&id);
             if root.navigation_capture.replace(capture) != capture {
+                if let Some(scene) = root.scene.borrow().as_ref() {
+                    scene.require(root);
+                }
                 root.invalidate_composites();
                 root.ensure_wrapper()?;
                 root.restore_style()?;

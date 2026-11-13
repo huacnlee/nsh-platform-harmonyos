@@ -413,6 +413,10 @@ impl NativeAttachment {
         self.0.id
     }
 
+    pub(crate) fn is_retired(&self) -> bool {
+        self.0.state.retired.get()
+    }
+
     /// Runs a platform callback under the same guard as attachment and retirement.
     pub(crate) fn dispatch<R>(id: u32, callback: impl FnOnce() -> R) -> Result<R> {
         let target = target(id)?;
@@ -486,12 +490,15 @@ impl NativeAttachment {
             })
             .transpose()?;
         if let Some(inner) = inner.as_ref() {
-            inner
-                .borrow()
-                .remove_event_receiver()
-                .map_err(|error| Error::from_reason(error.to_string()))?;
+            // Nodes that have not yet been mounted through `add_child` (such as
+            // `ROOT_ID` or nodes transitioning directly from a retired wrapper)
+            // have no active `node_event_receiver`, for which ArkUI returns
+            // `ARKUI_ERROR_CODE_PARAM_INVALID`. Only restore on failure if one
+            // was actually removed here.
+            let removed_receiver = inner.borrow().remove_event_receiver().is_ok();
             if let Err(error) = inner.borrow().remove_from_parent() {
-                if let Err(restore_error) = inner.borrow().add_event_receiver() {
+                if removed_receiver && let Err(restore_error) = inner.borrow().add_event_receiver()
+                {
                     log::error!("Failed to restore native subtree event receiver: {restore_error}");
                 }
                 return Err(Error::from_reason(error.to_string()));

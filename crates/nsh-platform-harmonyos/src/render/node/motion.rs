@@ -176,31 +176,27 @@ impl Node {
             self.set_frame(frame)?;
         }
         let previous = self.extra.replace((step.opacity, step.extra));
-        let style = self.style.borrow();
         if step.restyled {
             self.invalidate_composites();
-            self.ensure_shadow_layer(&style)?;
-            self.apply_background_color(style.background_color)?;
-            self.apply_borders(&style)?;
-            self.apply_shadow(&style)?;
-            self.decoration.native(self, &style)?;
-            if let Some(image) = self.image.borrow().as_ref() {
-                image.style(&style)?;
+            if let Some(owner) = self.weak.upgrade() {
+                if let Some(scene) = self.scene.borrow().as_ref() {
+                    scene.require(&owner);
+                }
+                owner.ensure_wrapper()?;
             }
-            if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-                layer.update(self, &style)?;
-            }
-            self.apply_ink_outset(&style)?;
-            self.apply_clip()?;
+            self.restore_style()?;
             self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        } else {
+            let style = self.style.borrow();
+            if previous.0 != step.opacity {
+                self.apply_opacity(style.opacity)?;
+            }
+            if previous.1 != step.extra {
+                self.transform(&style, |_| None)?;
+            }
+            drop(style);
+            self.animator.apply_node(self)?;
         }
-        if step.restyled || previous.0 != step.opacity {
-            self.apply_opacity(style.opacity)?;
-        }
-        if step.restyled || previous.1 != step.extra {
-            self.transform(&style, |_| None)?;
-        }
-        self.animator.apply_node(self)?;
         Ok((
             step.active || image_active || navigation_active || video_active,
             step.removed || navigation_removed,
@@ -275,8 +271,8 @@ impl Node {
                 _ => {}
             }
         }
-        if let Some(opacity) = opacity {
-            self.apply_opacity(opacity)?;
+        if self.animated_opacity.replace(opacity) != opacity {
+            self.apply_opacity(style.opacity)?;
         }
         if let Some(bg) = bg {
             self.apply_background_color(bg)?;

@@ -1,20 +1,18 @@
 //! C XComponent playback; a media worker owns decoding, bounded input and release.
 mod controls;
 mod icon;
+mod mailbox;
 mod player;
 mod source;
 mod ui;
 
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     rc::{Rc, Weak},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc,
-    },
+    sync::Arc,
 };
 
+use mailbox::{RawWindow, VideoMailbox};
 use nsh_core::{Command, VideoProps};
 use ohos_arkui_binding::component::attribute::ArkUICommonAttribute;
 use ohos_native_window_binding::NativeWindow;
@@ -25,22 +23,17 @@ use crate::render::{
     node::{NativeNode, Node, Result},
 };
 
-enum Operation {
-    Configure(Box<VideoProps>, u64),
-    Context(bool),
-    Seek(f64),
-    Toggle,
-    Window(Option<NativeWindow>),
-    WindowGone(usize),
-    Wake,
-    Close,
+impl RawWindow for NativeWindow {
+    fn raw_addr(&self) -> usize {
+        self.raw() as usize
+    }
 }
+
+pub(super) type SharedMailbox = Arc<VideoMailbox<NativeWindow>>;
+
 pub(crate) struct Video {
     ui: Rc<ui::Ui>,
-    queue: mpsc::SyncSender<Operation>,
-    active: Arc<AtomicBool>,
-    source: RefCell<Option<Arc<str>>>,
-    source_epoch: Arc<AtomicU64>,
+    mailbox: SharedMailbox,
     closed: Cell<bool>,
 }
 impl Video {
@@ -64,17 +57,9 @@ impl Video {
     }
     pub(crate) fn new(owner: Weak<Node>) -> Result<Self> {
         let owner = owner.upgrade().expect("live Video owner");
-        let (queue, receiver) = mpsc::sync_channel(128);
-        let active = Arc::new(AtomicBool::new(true));
-        let source_epoch = Arc::new(AtomicU64::new(0));
-        let ui = ui::Ui::new(&owner, queue.clone())?;
-        let worker = match player::Worker::new(
-            &owner,
-            ui.token,
-            active.clone(),
-            source_epoch.clone(),
-            queue.clone(),
-        ) {
+        let mailbox = Arc::new(VideoMailbox::new());
+        let ui = ui::Ui::new(&owner, mailbox.clone())?;
+        let worker = match player::Worker::new(&owner, ui.token, mailbox.clone()) {
             Ok(worker) => worker,
             Err(error) => {
                 ui.abort();
@@ -88,18 +73,15 @@ impl Video {
         }
         if let Err(error) = std::thread::Builder::new()
             .name("nsh-video".into())
-            .spawn(move || worker.run(receiver))
+            .spawn(move || worker.run())
         {
-            active.store(false, Ordering::Release);
+            mailbox.close();
             ui.abort();
             return Err(napi_ohos::Error::from_reason(error.to_string()).into());
         }
         Ok(Self {
             ui,
-            queue,
-            active,
-            source: RefCell::default(),
-            source_epoch,
+            mailbox,
             closed: Cell::new(false),
         })
     }
@@ -107,44 +89,29 @@ impl Video {
         if self.closed.get() {
             return Ok(());
         }
-        if *self.source.borrow() != props.source {
-            let epoch = self
-                .source_epoch
-                .load(Ordering::Acquire)
-                .checked_add(1)
-                .ok_or_else(|| {
-                    napi_ohos::Error::from_reason("Video source generation exhausted")
-                })?;
-            *self.source.borrow_mut() = props.source.clone();
-            self.source_epoch.store(epoch, Ordering::Release);
-        }
         self.ui.configure(&props)?;
-        self.send(Operation::Configure(
-            props,
-            self.source_epoch.load(Ordering::Acquire),
-        ))
+        self.mailbox
+            .configure(props)
+            .map(|_| ())
+            .map_err(|reason| napi_ohos::Error::from_reason(reason).into())
     }
     pub(crate) fn context(&self, ready: bool) -> Result<()> {
         if self.closed.get() {
             return Ok(());
         }
-        if ready {
-            self.send(Operation::Window(self.ui.current_window()?))?;
-        }
-        self.send(Operation::Context(ready))
+        let window = if ready {
+            self.ui.current_window()?
+        } else {
+            None
+        };
+        self.mailbox.set_context(ready, window);
+        Ok(())
     }
     pub(crate) fn command(&self, command: Command) -> Result<()> {
-        if let Command::Seek(seconds) = command {
-            self.send(Operation::Seek(seconds))
-        } else {
-            Ok(())
-        }
-    }
-    fn send(&self, operation: Operation) -> Result<()> {
-        if !self.closed.get() {
-            self.queue.try_send(operation).map_err(|_| {
-                napi_ohos::Error::from_reason("Video operation queue is full or closed")
-            })?;
+        if !self.closed.get()
+            && let Command::Seek(seconds) = command
+        {
+            self.mailbox.seek(seconds);
         }
         Ok(())
     }
@@ -164,8 +131,7 @@ impl Video {
         if !self.closed.replace(true) {
             // Retain the complete UI owner before the worker may enqueue its final ack.
             self.ui.begin_retirement();
-            self.active.store(false, Ordering::Release);
-            let _ = self.queue.try_send(Operation::Close);
+            self.mailbox.close();
         }
         Ok(())
     }

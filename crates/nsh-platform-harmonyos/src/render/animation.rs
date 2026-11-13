@@ -95,6 +95,7 @@ impl Animator {
         }
         drop(bindings);
         owner.component_animated.borrow_mut().clear();
+        owner.animated_opacity.set(None);
         owner.reset_text_tint()?;
         owner.restore_style()
     }

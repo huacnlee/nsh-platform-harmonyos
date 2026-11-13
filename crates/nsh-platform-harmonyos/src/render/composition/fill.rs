@@ -177,7 +177,7 @@ impl Fills {
         for view in self.views.values_mut().filter(|view| view.due()) {
             if let Err(error) = view.render() {
                 log::warn!("shader fill: {error}");
-                view.shown = false;
+                view.dirty = false;
             }
         }
     }

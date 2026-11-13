@@ -8,24 +8,34 @@ use std::{
 use nsh_core::{Matrix, ViewKind};
 use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{Bitmap, BitmapFormat, Canvas};
+use rustc_hash::FxHashMap;
 
 use crate::render::{
     composition::{
         draw::{PaintNode, Plan, Root},
-        geometry::{Bounds, requires_scene},
+        geometry::{Bounds, target_size},
         raster::Shared as SceneShared,
     },
+    effects::has_active_filters,
     geometry::Size,
     node::{Error, Node, Result},
 };
+
+struct RootBitmap {
+    bitmap: Bitmap,
+    x: f32,
+    y: f32,
+    scale: f32,
+}
 
 pub(crate) struct Scene {
     root: Weak<Node>,
     active: Cell<bool>,
     dirty: Cell<bool>,
     preparing: Cell<bool>,
+    requeued: Cell<bool>,
     shared: Arc<SceneShared>,
-    bitmaps: RefCell<Vec<Option<Bitmap>>>,
+    bitmaps: RefCell<FxHashMap<u32, RootBitmap>>,
     roots: RefCell<Vec<Weak<Node>>>,
     requirements: RefCell<Vec<Weak<Node>>>,
 }
@@ -36,6 +46,7 @@ impl Scene {
             active: Cell::new(false),
             dirty: Cell::new(false),
             preparing: Cell::new(false),
+            requeued: Cell::new(false),
             shared: Arc::default(),
             bitmaps: RefCell::default(),
             roots: RefCell::default(),
@@ -43,24 +54,21 @@ impl Scene {
         }
     }
     pub(crate) fn has_output(&self) -> bool {
-        self.bitmaps.borrow().iter().any(Option::is_some)
+        !self.bitmaps.borrow().is_empty()
     }
     pub(crate) fn require(&self, node: &Rc<Node>) {
-        let required = requires_scene(&node.style.borrow())
-            || node.id != nsh_core::ROOT_ID
-                && node.shader_layers.borrow().iter().any(|(_, layer)| {
-                    layer
-                        .shader
-                        .inputs()
-                        .contains(nsh_core::shader::ShaderInput::Backdrop)
-                });
+        let required = node.effects_plan().requires_scene;
         let mut nodes = self.requirements.borrow_mut();
         nodes.retain(|weak| weak.upgrade().is_some_and(|owner| owner.id != node.id));
         if required {
             nodes.push(Rc::downgrade(node));
         }
         drop(nodes);
-        self.invalidate();
+        if self.preparing.get() {
+            self.requeued.set(true);
+        } else {
+            self.invalidate();
+        }
     }
     pub(crate) fn invalidate(&self) {
         if (self.active.get() || !self.requirements.borrow().is_empty())
@@ -79,6 +87,9 @@ impl Scene {
         self.preparing.set(true);
         let result = self.reconcile();
         self.preparing.set(false);
+        if self.requeued.replace(false) {
+            self.invalidate();
+        }
         result
     }
     fn reconcile(&self) -> Result<()> {
@@ -178,27 +189,68 @@ impl Scene {
             Ok(())
         }
         let mut roots = initial_roots.clone();
-        for scene_root in &initial_roots {
-            scene_root.scene_root.set(true);
-            prepare(scene_root, &mut roots, 0)?;
-        }
-        let mut plan = Plan {
-            scale: root.scale.get(),
-            roots: Vec::new(),
-        };
-        for root in &roots {
-            if !root.paint_visible() {
-                continue;
+        let build_result = (|| -> Result<Plan> {
+            for scene_root in &initial_roots {
+                scene_root.scene_root.set(true);
+                prepare(scene_root, &mut roots, 0)?;
             }
-            let frame = root.frame.get();
-            let node = snapshot(root, None, 0)?;
-            plan.roots.push(Root {
-                id: root.id,
-                width: (frame.width * root.scale.get()).ceil().max(1.0) as u32,
-                height: (frame.height * root.scale.get()).ceil().max(1.0) as u32,
-                node,
-            });
-        }
+            let mut plan = Plan { roots: Vec::new() };
+            for scene_root in &roots {
+                if !scene_root.paint_visible() {
+                    continue;
+                }
+                let node = snapshot(scene_root, None, 0)?;
+                let own_filters = node
+                    .style
+                    .effects
+                    .as_ref()
+                    .map_or(&[][..], |effects| effects.filters.as_slice());
+                let root_bounds = node.bounds.filters(own_filters);
+                let logical_w = (root_bounds.0[2] - root_bounds.0[0]).max(1.0);
+                let logical_h = (root_bounds.0[3] - root_bounds.0[1]).max(1.0);
+                let (_, _, root_scale) = target_size(logical_w, logical_h, scene_root.scale.get());
+                if root_scale <= 0.0 {
+                    return Err(Error::Unsupported("invalid scene root dimensions"));
+                }
+                let origin_x = (root_bounds.0[0] * root_scale).floor();
+                let origin_y = (root_bounds.0[1] * root_scale).floor();
+                let width =
+                    ((root_bounds.0[2] * root_scale).ceil() - origin_x).clamp(1.0, 4096.0) as u32;
+                let height =
+                    ((root_bounds.0[3] * root_scale).ceil() - origin_y).clamp(1.0, 4096.0) as u32;
+                plan.roots.push(Root {
+                    id: scene_root.id,
+                    width,
+                    height,
+                    origin: (origin_x, origin_y),
+                    scale: root_scale,
+                    node,
+                });
+            }
+            Ok(plan)
+        })();
+        let plan = match build_result {
+            Ok(plan) => plan,
+            Err(error) => {
+                // Roll back any nodes touched during the failed build so no node
+                // remains stranded with `scene_prepared = true` outside `self.roots`.
+                self.active.set(false);
+                if let Some(worker) = root.compositor.borrow().as_ref() {
+                    worker.clear_plan();
+                }
+                self.bitmaps.borrow_mut().clear();
+                self.shared.output.lock().unwrap().take();
+                let old_roots = std::mem::take(&mut *self.roots.borrow_mut());
+                for old in old_roots.into_iter().filter_map(|w| w.upgrade()) {
+                    let _ = restore(&old);
+                }
+                for touched in &roots {
+                    let _ = restore(touched);
+                }
+                let _ = restore(root);
+                return Err(error);
+            }
+        };
         *self.roots.borrow_mut() = roots.iter().map(Rc::downgrade).collect();
         if let Some(worker) = root.compositor.borrow().as_ref() {
             worker.plan(Arc::new(plan), self.shared.clone());
@@ -214,36 +266,34 @@ impl Scene {
         if let Some(frames) = frames {
             let was_empty = !self.has_output();
             let mut bitmaps = self.bitmaps.borrow_mut();
-            let max_id = frames
-                .iter()
-                .map(|frame| frame.id as usize + 1)
-                .max()
-                .unwrap_or(0);
-            if bitmaps.len() < max_id {
-                bitmaps.resize_with(max_id, || None);
-            }
-            let mut active_ids = vec![false; bitmaps.len()];
+            let mut next_ids = rustc_hash::FxHashSet::default();
             for frame in frames {
-                let idx = frame.id as usize;
-                active_ids[idx] = true;
-                if let Some(existing) = bitmaps[idx].as_mut()
-                    && existing.width() == frame.width
-                    && existing.height() == frame.height
+                next_ids.insert(frame.id);
+                if let Some(existing) = bitmaps.get_mut(&frame.id)
+                    && existing.bitmap.width() == frame.width
+                    && existing.bitmap.height() == frame.height
                 {
-                    existing.pixels_mut().copy_from_slice(&frame.pixels);
+                    existing.bitmap.pixels_mut().copy_from_slice(&frame.pixels);
+                    existing.x = frame.x;
+                    existing.y = frame.y;
+                    existing.scale = frame.scale;
                 } else {
                     let mut bitmap =
                         Bitmap::new(frame.width, frame.height, BitmapFormat::default());
                     bitmap.pixels_mut().copy_from_slice(&frame.pixels);
-                    bitmaps[idx] = Some(bitmap);
+                    bitmaps.insert(
+                        frame.id,
+                        RootBitmap {
+                            bitmap,
+                            x: frame.x,
+                            y: frame.y,
+                            scale: frame.scale,
+                        },
+                    );
                 }
             }
-            for (idx, active) in active_ids.into_iter().enumerate() {
-                if !active {
-                    bitmaps[idx] = None;
-                }
-            }
-            let has_output = bitmaps.iter().any(Option::is_some);
+            bitmaps.retain(|id, _| next_ids.contains(id));
+            let has_output = !bitmaps.is_empty();
             drop(bitmaps);
             for root in self.roots.borrow().iter().filter_map(Weak::upgrade) {
                 root.mounted()
@@ -262,9 +312,18 @@ impl Scene {
         }
         Ok(())
     }
-    pub(crate) fn draw(&self, id: u32, canvas: &Canvas) {
-        if let Some(Some(bitmap)) = self.bitmaps.borrow().get(id as usize) {
-            canvas.draw_bitmap(bitmap, 0.0, 0.0);
+    pub(crate) fn draw(&self, id: u32, canvas: &Canvas, display_scale: f32) {
+        if let Some(entry) = self.bitmaps.borrow().get(&id) {
+            let scale = entry.scale.max(0.01);
+            if (display_scale - scale).abs() <= 1e-4 {
+                canvas.draw_bitmap(&entry.bitmap, entry.x, entry.y);
+            } else {
+                let ratio = display_scale / scale;
+                canvas.save();
+                canvas.scale(ratio, ratio);
+                canvas.draw_bitmap(&entry.bitmap, entry.x, entry.y);
+                canvas.restore();
+            }
         }
     }
 }
@@ -310,7 +369,7 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
             || style
                 .effects
                 .as_ref()
-                .is_some_and(|e| !e.backdrop_filters.is_empty())
+                .is_some_and(|e| has_active_filters(&e.backdrop_filters))
             || node.shader_layers.borrow().iter().any(|(_, layer)| {
                 layer
                     .shader
@@ -325,7 +384,7 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
                 || style
                     .effects
                     .as_ref()
-                    .is_some_and(|e| !e.box_shadows.is_empty() || !e.filters.is_empty())
+                    .is_some_and(|e| !e.box_shadows.is_empty() || has_active_filters(&e.filters))
                 || !node.shader_layers.borrow().is_empty()
         };
         if !overflows {
@@ -345,8 +404,8 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
                 || style.blend_mode != nsh_core::BlendMode::Normal
                 || effects.is_some_and(|e| {
                     !e.mask_images.is_empty()
-                        || !e.filters.is_empty()
-                        || !e.backdrop_filters.is_empty()
+                        || has_active_filters(&e.filters)
+                        || has_active_filters(&e.backdrop_filters)
                 })
         };
         if Rc::ptr_eq(&ancestor, root)

@@ -53,7 +53,7 @@ impl ShadowLayer {
             native.set_length_metric_unit(LengthMetricUnit::Px)?;
             native.set_attribute(A::HitTestBehavior, i32::from(HitTestMode::None).into())?;
             native.set_bool_attribute(A::Clip, true)?;
-            native.set_f32_attribute(A::ZIndex, -1_000_000.0)?;
+            native.set_i32_attribute(A::ZIndex, -1_000_000)?;
             Ok(())
         };
         if let Err(error) = setup() {

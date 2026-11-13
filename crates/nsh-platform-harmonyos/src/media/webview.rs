@@ -18,7 +18,7 @@ use ohos_web_binding::{
 };
 use rustc_hash::FxHashMap;
 
-use super::web_evaluation::{Evaluations, JsDone, ScriptHost, abort_payload};
+use super::web_evaluation::{EvalGuard, Evaluations, JsDone, ScriptHost, abort_payload};
 use crate::{
     app::{runtime::Dispatcher, session::Services},
     interop::{
@@ -84,6 +84,13 @@ fn send_response(handle: &ResourceHandle, status: u16, mime_type: &str, body: &[
 
 type PendingJs = Box<dyn FnOnce(&Web)>;
 
+const MAX_PENDING_JS: usize = 256;
+
+struct PendingJob {
+    guard: Option<EvalGuard>,
+    run: PendingJs,
+}
+
 struct Route {
     node: Weak<Node>,
     dispatcher: std::sync::Weak<Dispatcher>,
@@ -94,7 +101,7 @@ struct Route {
     proxy: RefCell<Option<WebProxy>>,
     web: RefCell<Option<Web>>,
     controller_ready: Cell<bool>,
-    pending_js: RefCell<Vec<PendingJs>>,
+    pending_js: RefCell<std::collections::VecDeque<PendingJob>>,
     evaluations: Rc<Evaluations>,
 }
 
@@ -118,17 +125,28 @@ fn eval_on_web(dispatcher: &std::sync::Weak<Dispatcher>, web: &Web, script: &str
 }
 
 impl ScriptHost for Route {
-    fn evaluate(&self, script: &str, done: JsDone) {
+    fn evaluate(&self, script: &str, guard: EvalGuard, done: JsDone) {
+        if !guard.is_alive() {
+            return;
+        }
         if self.controller_ready.get()
             && let Some(web) = self.web.borrow().as_ref()
         {
+            guard.mark_dispatched();
             eval_on_web(&self.dispatcher, web, script, done);
         } else {
             let script = script.to_owned();
             let dispatcher = self.dispatcher.clone();
-            self.pending_js.borrow_mut().push(Box::new(move |web| {
-                eval_on_web(&dispatcher, web, &script, done)
-            }));
+            let cb_guard = guard.clone();
+            self.enqueue_job(
+                Some(guard),
+                Box::new(move |web| {
+                    if cb_guard.is_alive() {
+                        cb_guard.mark_dispatched();
+                        eval_on_web(&dispatcher, web, &script, done);
+                    }
+                }),
+            );
         }
     }
 
@@ -139,14 +157,30 @@ impl ScriptHost for Route {
             let _ = web.run_javascript(script, |_| {});
         } else {
             let script = script.to_owned();
-            self.pending_js.borrow_mut().push(Box::new(move |web| {
-                let _ = web.run_javascript(&script, |_| {});
-            }));
+            self.enqueue_job(
+                None,
+                Box::new(move |web| {
+                    let _ = web.run_javascript(&script, |_| {});
+                }),
+            );
         }
     }
 }
 
 impl Route {
+    fn enqueue_job(&self, guard: Option<EvalGuard>, run: PendingJs) {
+        let mut queue = self.pending_js.borrow_mut();
+        queue.retain(|job| job.guard.as_ref().is_none_or(EvalGuard::is_alive));
+        if queue.len() >= MAX_PENDING_JS {
+            if let Some(idx) = queue.iter().position(|job| job.guard.is_none()) {
+                queue.remove(idx);
+            } else {
+                queue.pop_front();
+            }
+        }
+        queue.push_back(PendingJob { guard, run });
+    }
+
     fn run_detached(&self, script: &str) {
         self.execute(script);
     }
@@ -156,7 +190,9 @@ impl Route {
         let queued = std::mem::take(&mut *self.pending_js.borrow_mut());
         if let Some(web) = self.web.borrow().as_ref() {
             for job in queued {
-                job(web);
+                if job.guard.as_ref().is_none_or(EvalGuard::is_alive) {
+                    (job.run)(web);
+                }
             }
         }
     }

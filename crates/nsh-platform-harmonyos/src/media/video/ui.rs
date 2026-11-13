@@ -7,7 +7,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-        mpsc,
     },
 };
 
@@ -29,7 +28,7 @@ use ohos_arkui_binding::{
 use ohos_native_window_binding::NativeWindow;
 use ohos_xcomponent_binding::NativeXComponent;
 
-use super::Operation;
+use super::SharedMailbox;
 use crate::{
     app::{
         runtime::{Dispatcher, Message},
@@ -137,7 +136,7 @@ impl Drop for Construction {
     }
 }
 impl Ui {
-    pub(super) fn new(owner: &Rc<Node>, queue: mpsc::SyncSender<Operation>) -> Result<Rc<Self>> {
+    pub(super) fn new(owner: &Rc<Node>, queue: SharedMailbox) -> Result<Rc<Self>> {
         let token = NEXT
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
             .map_err(|_| napi_ohos::Error::from_reason("Video UI identity exhausted"))?;
@@ -268,20 +267,18 @@ impl Ui {
             // retained until the worker releases its player and acknowledges.
             let window = unsafe { NativeWindow::retain_from_ptr(raw) }
                 .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
-            send.try_send(Operation::Window(Some(window)))
-                .map_err(|_| napi_ohos::Error::from_reason("Video window queue is full or closed"))
+            send.set_window(Some(window));
+            Ok(())
         });
         let send = queue.clone();
         xcomponent.on_surface_destroyed(move |_, window| {
-            send.try_send(Operation::WindowGone(window.0 as usize))
-                .map_err(|_| napi_ohos::Error::from_reason("Video window queue is full or closed"))
+            send.window_gone(window.0 as usize);
+            Ok(())
         });
         xcomponent.register_callback()?;
         let send = queue.clone();
         toggle.borrow_mut().on_event_no_param(E::OnClick, move || {
-            if let Err(error) = send.try_send(Operation::Toggle) {
-                log::error!("Video control queue: {error}");
-            }
+            send.toggle();
         });
         let updating_slider = Rc::new(Cell::new(false));
         let setting = updating_slider.clone();
@@ -299,10 +296,8 @@ impl Ui {
                 if !setting.get() {
                     scrub.set(matches!(mode, Some(0 | 1)));
                 }
-                if let Some(seconds) = slider_seek(event.component_f32(0), mode, setting.get())
-                    && let Err(error) = queue.try_send(Operation::Seek(seconds))
-                {
-                    log::error!("Video seek queue: {error}");
+                if let Some(seconds) = slider_seek(event.component_f32(0), mode, setting.get()) {
+                    queue.seek(seconds);
                 }
             });
         let ui = Rc::new(Self {

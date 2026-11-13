@@ -342,13 +342,24 @@ impl MountSink for Sink {
 struct VsyncVote {
     remaining: std::sync::atomic::AtomicU8,
     armed: std::sync::atomic::AtomicBool,
+    active: std::sync::atomic::AtomicBool,
 }
 
 fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
     use std::sync::atomic::Ordering;
+    if !vote.active.load(Ordering::Acquire) {
+        vote.remaining.store(0, Ordering::Release);
+        vote.armed.store(false, Ordering::Release);
+        return;
+    }
     let weak = Arc::downgrade(vsync);
     let vote_cb = vote.clone();
     if vsync.request_frame_once(move |_| {
+        if !vote_cb.active.load(Ordering::Acquire) {
+            vote_cb.remaining.store(0, Ordering::Release);
+            vote_cb.armed.store(false, Ordering::Release);
+            return;
+        }
         let prev = vote_cb
             .remaining
             .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
@@ -356,12 +367,14 @@ fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
             })
             .unwrap_or(0);
         if prev > 1
+            && vote_cb.active.load(Ordering::Acquire)
             && let Some(vsync) = weak.upgrade()
         {
             arm_vsync_vote(&vsync, &vote_cb);
         } else {
             vote_cb.armed.store(false, Ordering::Release);
-            if vote_cb.remaining.load(Ordering::Acquire) > 0
+            if vote_cb.active.load(Ordering::Acquire)
+                && vote_cb.remaining.load(Ordering::Acquire) > 0
                 && let Some(vsync) = weak.upgrade()
                 && vote_cb
                     .armed
@@ -388,6 +401,7 @@ struct State {
     mounter: Option<Mounter>,
     dispatcher: Weak<Dispatcher>,
     vsync: Arc<Vsync>,
+    frame_rate: Arc<crate::app::frame_rate::FrameRate>,
     vsync_vote: Arc<VsyncVote>,
     environment: Environment,
     errors: Errors,
@@ -396,7 +410,6 @@ struct State {
     attached: bool,
     visible: bool,
     frame_wanted: bool,
-    vsync_hz: i32,
     retiring_dispatcher: Option<Arc<Dispatcher>>,
     #[cfg(feature = "dev")]
     reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
@@ -616,6 +629,16 @@ impl State {
     }
     fn update_back(&self) {
         let active = self.is_active();
+        self.vsync_vote
+            .active
+            .store(active, std::sync::atomic::Ordering::Release);
+        if !active {
+            self.vsync_vote
+                .remaining
+                .store(0, std::sync::atomic::Ordering::Release);
+            self.frame_rate
+                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
+        }
         if let Some(dispatcher) = self.dispatcher.upgrade() {
             if dispatcher
                 .active
@@ -670,10 +693,15 @@ impl State {
         if !self.is_active() {
             return;
         }
-        // Keep the window-associated VSync active for ~33 ms (4 frames at 120 Hz)
-        // across scroll batches and live ticks so LTPO stays at the preferred
-        // refresh rate without waking the UI thread when idle.
-        self.vsync_vote.remaining.store(4, Ordering::Release);
+        // Keep the window-associated VSync active across ~33 ms of scroll batches
+        // and live ticks (scaled to the current panel rate: 2 frames at 60 Hz,
+        // 3 at 90 Hz, 4 at 120 Hz) so LTPO maintains its negotiated rate without
+        // waking the UI thread when idle. Disarmed immediately on background/hide.
+        let keepalive_frames = (self.frame_rate.hz() / 30).clamp(1, 4) as u8;
+        self.vsync_vote.active.store(true, Ordering::Release);
+        self.vsync_vote
+            .remaining
+            .store(keepalive_frames, Ordering::Release);
         if self
             .vsync_vote
             .armed
@@ -699,27 +727,20 @@ impl State {
         }
         let mounter_wants = self.mounter.as_mut().unwrap().frame(timestamp)?;
         if mounter_wants || self.frame_wanted {
-            let max = crate::app::frame_rate::display_hz() as i32;
-            let capped = if !self.frame_wanted {
+            let demand = if !self.frame_wanted {
                 self.mounter
                     .as_ref()
                     .and_then(|m| m.animator.frame_rate())
-                    .map(|hz| (hz.round() as i32).clamp(1, max))
+                    .map(|hz| crate::app::frame_rate::UiDemand::Capped((hz.round() as i32).max(1)))
+                    .unwrap_or(crate::app::frame_rate::UiDemand::Uncapped)
             } else {
-                None
+                crate::app::frame_rate::UiDemand::Uncapped
             };
-            let expected = capped.unwrap_or_else(|| max.min(60));
-            if expected != self.vsync_hz {
-                self.vsync_hz = expected;
-                let _ = self.vsync.set_expected_frame_rate_range(
-                    ohos_vsync_binding::OH_NativeVSync_ExpectedRateRange {
-                        min: 0,
-                        max: capped.unwrap_or(max),
-                        expected,
-                    },
-                );
-            }
+            self.frame_rate.set_ui_demand(demand);
             self.request_frame()?;
+        } else {
+            self.frame_rate
+                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         }
         self.retire()?;
         self.update_back();
@@ -808,6 +829,14 @@ impl State {
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        self.vsync_vote
+            .active
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.vsync_vote
+            .remaining
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.frame_rate
+            .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         if let Some(dispatcher) = self.dispatcher.upgrade() {
             if self
                 .mounter
@@ -932,13 +961,8 @@ impl Runtime {
                     napi_ohos::Error::from_reason("failed to create OHOS native VSync")
                 })?,
         );
-        let status = vsync.set_expected_frame_rate_range(
-            ohos_vsync_binding::OH_NativeVSync_ExpectedRateRange {
-                min: 0,
-                max: crate::app::frame_rate::display_hz() as i32,
-                expected: crate::app::frame_rate::display_hz().min(60) as i32,
-            },
-        );
+        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone());
+        let status = frame_rate.apply_initial();
         if status != 0 {
             return Err(napi_ohos::Error::from_reason(format!(
                 "failed to configure OHOS native VSync rate: {status}"
@@ -947,9 +971,10 @@ impl Runtime {
         let vsync_vote = Arc::new(VsyncVote {
             remaining: std::sync::atomic::AtomicU8::new(0),
             armed: std::sync::atomic::AtomicBool::new(false),
+            active: std::sync::atomic::AtomicBool::new(true),
         });
-        // The shader thread paces itself on the surface's VSync too.
-        let shader_vsync = vsync.clone();
+        // The shader thread paces itself on the surface's shared FrameRate too.
+        let shader_rate = frame_rate.clone();
         let state = Rc::new_cyclic(|weak| {
             RefCell::new(State {
                 #[cfg(feature = "dev")]
@@ -962,6 +987,7 @@ impl Runtime {
                 mounter: None,
                 dispatcher: Weak::new(),
                 vsync,
+                frame_rate,
                 vsync_vote,
                 errors,
                 frame_pending: false,
@@ -969,7 +995,6 @@ impl Runtime {
                 attached: true,
                 visible: true,
                 frame_wanted: false,
-                vsync_hz: crate::app::frame_rate::display_hz().min(60) as i32,
                 retiring_dispatcher: None,
                 environment: Environment::default(),
                 #[cfg(feature = "dev")]
@@ -1109,7 +1134,7 @@ impl Runtime {
         let context = Rc::new(crate::render::mount::UiContext {
             theme: RefCell::default(),
             cursor: Default::default(),
-            shaders: crate::render::shader::Shaders::new(shader_vsync),
+            shaders: crate::render::shader::Shaders::new(shader_rate),
             fullscreen_video: RefCell::default(),
             scroll_reports: RefCell::default(),
             scroll_watchers,

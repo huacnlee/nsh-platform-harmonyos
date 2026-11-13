@@ -82,14 +82,7 @@ impl Node {
     }
     pub(crate) fn pin(&self, x: f32, y: f32) -> Result<()> {
         if self.pinned.replace((x, y)) != (x, y) {
-            self.native.borrow().set_f32_attribute(
-                Attribute::ZIndex,
-                if x != 0.0 || y != 0.0 {
-                    1_000_000.0
-                } else {
-                    0.0
-                },
-            )?;
+            self.apply_z_index()?;
             self.transform(&self.style.borrow(), |_| None)?;
             self.animator.apply_node(self)?;
         }
