@@ -1044,7 +1044,7 @@ impl Mounter {
                                 .0
                                 .downcast_ref::<NativeText>()
                                 .ok_or(Error::Unsupported("foreign text layout"))?;
-                            let shown: Arc<str> = Arc::from(raster.source.visible_text().as_ref());
+                            let shown: Arc<str> = Arc::from(raster.source.visible_text());
                             node.accessibility_state.text(node, &shown);
                             let links_changed =
                                 node.text(raster, content.into(), layout.clone())?;
@@ -1370,19 +1370,19 @@ impl Mounter {
                         | Command::InjectJavaScript(_)
                         | Command::PostMessage(_)
                         | Command::Load(_)
-                        | Command::SendInput(_)) => {
-                            if let Some(web) = self.node(id)?.web.borrow().as_ref() {
+                        | Command::SendInput(_)
+                        | Command::Evaluate { .. }
+                        | Command::CancelEvaluate { .. }) => {
+                            let node = self.node(id)?;
+                            if let Some(web) = node.web.borrow().as_ref() {
                                 web.command(command)?;
+                            } else if let Command::Evaluate { request, .. } = command {
+                                crate::media::webview::abort_evaluation(&self.control, id, request);
                             }
                         }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
-                        | Command::Evaluate { .. }
-                        | Command::CancelEvaluate { .. }
-                        | Command::MeasureScrollPosition { .. }
-                        | Command::Reveal(_)
-                        | Command::HostPost { .. }
                         | Command::CancelPress => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
@@ -1393,9 +1393,12 @@ impl Mounter {
                         }
                         Command::ScrollToIndex { .. }
                         | Command::ScrollToEnd { .. }
+                        | Command::Reveal(_)
+                        | Command::MeasureScrollPosition { .. }
                         | Command::SetStatusBar(_)
                         | Command::Measure { .. }
-                        | Command::HostCall { .. } => {
+                        | Command::HostCall { .. }
+                        | Command::HostPost { .. } => {
                             return Err(Error::Unsupported("unresolved core command"));
                         }
                         Command::PickScreenColor { id } => self.control.dispatch_event(

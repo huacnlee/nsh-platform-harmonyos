@@ -52,7 +52,7 @@ ohos-drawing-binding = { version = "0.2.8", default-features = false, features =
 ohos-native-image-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
 ohos-resource-manager-binding = { version = "0.3.6", default-features = false, features = ["napi", "api-20"] }
 ohos-vsync-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
-ohos-web-binding = { version = "0.3.1", default-features = false, features = ["api-20"] }
+ohos-web-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
 ohos-window-manager-binding = { version = "0.1.2", default-features = false, features = ["input", "api-20"] }
 ohos-image-native-binding = { version = "0.0.8", default-features = false }
 ohos-pasteboard-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }

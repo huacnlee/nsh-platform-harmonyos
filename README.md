@@ -146,9 +146,9 @@ The project the CLI writes is a standard stage-model app: `EntryAbility` loads `
 
 ## Following NSH
 
-The platform is built against a revision of NSH (`[patch.crates-io]` in `Cargo.toml`, until a release of NSH has the
-platform extension points). Mount items, the text engine and events are NSH's protocol and grow with each release; a
-new NSH may add mount items this backend skips until it handles them (`render/mount.rs`).
+The platform is built against NSH `0.5` on crates.io (to test against an unreleased revision or a local checkout of
+NSH, add `[patch.crates-io]` in `Cargo.toml`). Mount items, the text engine and events are NSH's protocol and grow with
+each release; a new NSH may add mount items this backend skips until it handles them (`render/mount.rs`).
 
 ## Development
 

@@ -4,8 +4,10 @@ use std::{
     rc::{Rc, Weak},
 };
 
-use nsh_core::{EventKind, EventPayload, PointerEvents, TouchEvent, TouchPhase, TouchPoint};
-use ohos_arkui_binding::arkui_input_binding::{ArkUIInputEvent, UIInputAction};
+use nsh_core::{
+    EventKind, EventPayload, PointerEvents, PointerType, TouchEvent, TouchPhase, TouchPoint,
+};
+use ohos_arkui_binding::arkui_input_binding::{ArkUIInputEvent, UIInputAction, UIInputToolType};
 
 use crate::render::node::{Node, Result};
 
@@ -247,7 +249,13 @@ impl Touches {
                             ),
                             location: nsh_core::Point::default(),
                             changed: true,
-                            pointer_type: nsh_core::PointerType::Touch,
+                            pointer_type: match input.tool_type {
+                                UIInputToolType::Mouse | UIInputToolType::Touchpad => {
+                                    PointerType::Mouse
+                                }
+                                UIInputToolType::Pen => PointerType::Pen,
+                                _ => PointerType::Touch,
+                            },
                         },
                         node: Rc::downgrade(&node),
                         start: page,
