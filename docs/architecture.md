@@ -62,6 +62,15 @@ Features:
 - **Controls and media** (`src/input/`, `src/scroll/`, `src/media/`, `src/interop/`): `Input` uses the system
   `TextInput` / `TextArea` BuilderNode; `Scroll` and `List` use native ArkUI `Scroll` (with on-demand `Refresh`);
   `WebView` uses `ArkWeb`; `Video` uses a C `XComponent` surface and an `AVPlayer` worker.
+- **Alerts and action sheets** (`src/services/dialogs.rs`): Rust calls the bound window's
+  `UIContext.showAlertDialog` / `showActionSheet` through N-API. ArkUI owns the entire layout, typography, colors,
+  accessibility and animations; NSH does not build nodes or apply theme overrides. Actions keep their original
+  indices; the first cancel action of a sheet becomes its system footer. ArkUI has no destructive button role,
+  so destructive actions use the standard system appearance too. The queue advances after `onDidDisappear`.
+  These system APIs expose no programmatic close operation: a displayed dialog belongs to its window and can
+  outlive a surface reload/disposal until the user dismisses it or the window closes. Surface retirement
+  invalidates its callbacks and queued requests; an orphaned dialog always permits system-back dismissal.
+  Device tests resolve system buttons from `uitest dumpLayout`, then inject real input in screen pixels.
 - **Navigation** (`src/navigation/`): HarmonyOS is a native-header platform, as iOS and Android: each `Screen` draws its own
   bar (back button, title) and places only the `headerLeft` / `headerTitle` / `headerRight` items in it; a screen's
   `header` slot (the bar on platforms without a native header) is never shown, as UIKit's and the Android toolbar's
