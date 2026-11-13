@@ -100,6 +100,7 @@ impl Mounter {
             }
             SceneQuery::Animating => Ok(json!(
                 self.animator.test_animating()
+                    || self.dialogs.animating()
                     || self.shaders.animating()
                     || self.leaving_nodes.get() > 0
                     || self.slots.iter().flatten().any(|node| node
@@ -119,19 +120,7 @@ impl Mounter {
                             .is_some_and(|modal| modal.test_animating()))
             )),
             SceneQuery::DialogPoint { button } => {
-                let root = self.node(nsh_core::ROOT_ID).map_err(|e| e.to_string())?;
-                let origin = self
-                    .mount
-                    .parent
-                    .upgrade()
-                    .and_then(|parent| parent.borrow().layout_position_in_screen().ok())
-                    .or_else(|| root.mounted().borrow().layout_position_in_screen().ok())
-                    .ok_or("root node is not laid out on screen")?;
-                Ok(json!(self.dialogs.test_point(
-                    button.as_deref(),
-                    (origin.x, origin.y),
-                    self.scale.get()
-                )?))
+                Ok(json!(self.dialogs.test_point(button.as_deref())?))
             }
             _ => Err("this query belongs to the test model".into()),
         }

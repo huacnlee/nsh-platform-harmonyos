@@ -118,7 +118,9 @@ pub(crate) fn bind_session(env: &Env, ui_context: &Object<'_>) -> Result<Arc<Ser
     // SAFETY: a successful call initialized raw_result in this environment;
     // FromNapiValue checks the binder's session ID before converting it.
     let session_id = unsafe { u32::from_napi_value(env.raw(), raw_result) }?;
-    crate::app::session::get(session_id)
+    let host = crate::app::session::get(session_id)?;
+    host.bind_ui_context(env, ui_context)?;
+    Ok(host)
 }
 
 #[napi]
