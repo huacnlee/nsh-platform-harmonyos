@@ -34,8 +34,8 @@ Features:
   serves `nsh/base`'s UI set, then each crate's `#[native_module]` `registry()` (`app!(sets = [..])`), while the
   bundle is a raw file of the HAP as for any TSX app.
 - **Mount items** (`src/render/mount.rs`): `Shader`, `ShaderTransition` and `NavShader` are implemented; `ShaderInput`
-  is a no-op because ArkUI's `RenderNode` texture producer reports native content updates directly (including native
-  input and scroll changes between engine batches); and the terminal-only projections (`TreeOrder`, `ProjectStates`)
+  invalidates enclosing effects. NativeImage frame-available events deliver changed native content, including
+  scrolling and nested shader fills. Only the initial fullscreen input uses an asynchronous content capture. The terminal-only projections (`TreeOrder`, `ProjectStates`)
   are ignored.
 - **Streaming assets**: the video player and web views read large files through `services::assets::StreamAssets`,
   this backend's trait over `nsh_engine::Assets`.
@@ -46,11 +46,16 @@ Features:
   `surface.content` (`NodeContent`) inside a standard ArkUI `ContentSlot`. `@nsh/harmonyos` binds each window session
   explicitly from the provided `UIContext` (`UIAbilityContext` and `Window`) in a standard `UIAbility` without a custom
   base class or process-global context guessing.
-- **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`): the engine submits each
-  `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. Per-surface `NativeVSync` callbacks drive UI
-  animations on the UI thread while `FrameRate` arbitrates UI animation demand (`120` Hz or reduced-rate `30` Hz) and
-  shader compositor demand as the single owner of `OH_NativeVSync_SetExpectedFrameRateRange`; idle surfaces request no
-  frames.
+- **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`, `src/app/runtime.rs`): the
+  engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. The surface's
+  window-associated `NativeVSync` drives demanded NSH animation frames; its callback posts UI work through
+  that same dispatcher and never accesses ArkUI off the UI thread. `FrameRate` owns the rate request on
+  this actual frame source, combining explicit UI caps with the compositor's animation demand. Uncapped
+  animations request the display's maximum supported rate supplied by the window host. Idle surfaces
+  request no synthetic keepalive frames. GPU animations keep the shared clock at the panel rate;
+  explicit UI caps resume when the last GPU vote ends. The native range setter performs synchronous RS IPC;
+  a dedicated worker applies the latest demand without holding the arbitration lock. UI/GPU callbacks only
+  enqueue a bounded wake. Successful IPC completion updates the applied range, then rechecks current demand.
 - **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
   CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
   observes mount batches and provides selectors, storage, network mocks and the manual clock. ArkUI answers native
@@ -60,20 +65,47 @@ Features:
 - **Shaders and composition** (`src/render/shader/`, `src/render/composition/`, `src/interop/`): a per-surface
   `nsh-compositor` worker thread owns an EGL / GLES 3 (`glow`) context and renders outside the ArkUI UI thread across
   three lanes:
-  1. **Native ArkUI path**: standard views, transforms, opacity, single blur / backdrop-blur and native blend modes stay
-     entirely on ArkUI `C-API` nodes without texture export or GPU worker involvement.
-  2. **Direct GPU path** (`fill.rs`, `worker.rs` `Composite`): standalone fill shaders render directly into a child C
-     `XComponent` surface, while content shaders, non-blur filter chains, `ShaderTransition` and `NavShader` export the
-     wrapped subtree via ArkTS `RenderNode` texture export (`OH_NativeImage` OES external texture) into a presentation
-     `XComponent` without CPU readback. Generation-scoped handoff and `UIContext` frame callbacks coordinate retirement
-     and fallback to native rendering if surface creation or GL compilation fails.
+  1. **Native ArkUI content**: standard views, transforms, opacity, single blur / backdrop-blur and native blend modes
+     are drawn by ArkUI `C-API` nodes into the surface's native texture producer. `Attribute::Blur` and
+     `Attribute::BackdropBlur` pass through `native_blur_value(css_radius, scale)`, inverting ArkUI/Rosen's
+     physical-pixel `ConvertRadiusToSigma(r) = 0.57735 * r + 0.5` mapping so native blur matches CSS `sigma = radius * scale`.
+  2. **GPU effects** (`fill.rs`, `worker.rs` `Composite`): standalone fill shaders render directly into a child C
+     `XComponent` surface. Content shaders, filter chains and transitions use a `BuilderNode` texture export
+     into a `NativeImage`, then sample its external OES texture on the compositor worker. This follows the upstream
+     split between native content recording and GPU effect presentation. On first enabling a fullscreen effect,
+     public ArkUI asynchronous component capture supplies one actual shader input, matching upstream
+     `Pictures` / `children_picture`. Pixel reading is asynchronous; the compositor normalizes and uploads
+     owned RGBA bytes. The existing presentation-ready signal reveals this shader output before switching
+     the native source to texture export. The initial input is released when NativeImage supplies its first
+     texture; continuous GPU inputs require no CPU readback. Roots and dialogs keep their native display path until
+     `EffectsPlan` requires an image input; configuring a navigation shader alone does not require export.
+     Root pictures are bounded by the window viewport so an exiting toast or Sheet does not resize the
+     whole-window buffer or change its capture padding; subtree pictures still include their painted overflow.
+     A stable layout wrapper owns the content parent and sibling presentation surface. Attachment generations and
+     worker release acknowledgement bound their lifetimes. The layout host remains mounted when capture starts
+     or ends. It does not provide a preview image across native/texture producer changes. Shader
+     programs adapt their vertex clip space to the top-left texture convention, avoiding a separate output-flip
+     copy. Navigation retains a GPU texture of the old picture
+     for the transition, just as upstream transitions retain their before image.
+     Custom text, canvas ink, outlines, shadows and header glyphs use native `RenderNode` content modifiers
+     (`paint_node.rs`). C custom-node draw events record one-shot commands via `DrawOnNode`; those recordings are not
+     replayed by Rosen’s `DoFlushModifier` when a subtree changes renderer. A content modifier retains its draw
+     callback, so renderer migration records the current ink without scroll tracking, subtree repaint loops or
+     frame-count delays. Its property is invalidated only by actual content changes. The modifier is attached to its node
+     before the property is attached, so Rosen assigns that property a live invalidation target.
   3. **Surface `Scene` path** (`scene.rs`, `draw.rs`): subtrees requiring CSS `mask-image` (`masks[0]`, matching
-     upstream mobile backends), multi-filter / overflow backdrop sampling, or blend modes unsupported natively are
-     promoted into a minimal `Scene` root. For those roots, `nsh-compositor` reads exported `OES` planes into bounded
-     RGBA bitmaps, composites CPU masks / backdrop filters (`TileMode::Clamp`) and blends, runs any attached GLES
-     passes, and presents onto the root overlay `XComponent` (rolling back cleanly to native attributes on error).
-     Platform limitation: embedded separate hardware surfaces (`Video` / `ArkWeb` `XComponent`s) inside a `RenderNode`
-     texture export depend on system surface composition and are not guaranteed to appear in `RenderNode` pixel exports.
+     upstream mobile backends), multi-filter / backdrop-filter combinations, shader backdrop sampling, or blend modes
+     unsupported natively are promoted into a minimal stable `Scene` root (`scene_root_for` keeps non-overflowing
+     `mask-image` nodes on their own subtree and stops backdrop walks at the nearest ancestor whose opaque rounded-rect
+     background covers the projected sample bounds). `Scene::prepare` builds the composition plan via `paint_plan()` /
+     `build_paint_tree()`, commits processed state only on success under an RAII `preparing` guard, marks `Unsupported`
+     requirements ineligible with one diagnostic, retries transient errors with bounded backoff (`0` / `100` / `500` ms),
+     and unconditionally clears `scene_prepared` / `scene_root` on rollback. `nsh-compositor` reads exported NativeImage textures
+     as bounded RGBA bitmaps, composites CPU masks / backdrop filters (`TileMode::Clamp`) and blends, runs any
+     attached GLES passes, presents onto the `Scene` root wrapper's custom draw canvas, and logs throttled
+     `[NSH] scene-stats` counters (active planes, readback bytes, upload bytes).
+     Platform limitation: embedded separate hardware surfaces (`Video` / `ArkWeb` `XComponent`s) inside texture exports depend on
+     system surface composition support; their inclusion must be checked on the target OS.
 - **Typography** (`src/text/`): the engine thread shapes and measures paragraphs with `ohos-drawing-binding`
   (`FontCollection::shared()`, `Typography`) and hands recorded native drawing commands and selection geometry to the UI
   thread.
@@ -85,5 +117,11 @@ Features:
   `header` slot (the bar on platforms without a native header) is never shown, as UIKit's and the Android toolbar's
   bars never place it. Screens and modals report `onInsets` as the other backends do: a screen's top inset is 0 below
   a visible, opaque header, else the safe area's top.
+  Retained screens have a stable native wrapper before their content is mounted. ArkUI visibility applies to the
+  screen content, while its wrapper carries presentation opacity and transforms. This keeps the hidden screen's
+  host in the RS child list, so changing between ordinary display and texture export also synchronizes its zero
+  opacity. Applying visibility to the host would remove it from that list: Rosen can then retain the previously
+  visible page in the other renderer. Native content visibility still excludes hidden pages from hit testing and
+  accessibility; no additional navigation state or retained page picture is needed.
 - **Hit areas**: `hitSlop` and overflowing children widen `NODE_RESPONSE_REGION`, whose width and height are
   percentages of the node's size (`100` is the node itself), not ratios.

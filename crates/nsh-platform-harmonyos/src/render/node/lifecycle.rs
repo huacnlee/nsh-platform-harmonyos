@@ -164,7 +164,7 @@ impl Node {
         if kind == ViewKind::HeaderItem {
             node.apply_z_index()?;
         }
-        if kind == ViewKind::Modal {
+        if matches!(kind, ViewKind::Modal | ViewKind::Screen) {
             node.ensure_wrapper()?;
         }
         Ok(node)

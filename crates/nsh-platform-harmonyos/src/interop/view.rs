@@ -443,6 +443,10 @@ impl Node {
         // Establish the root's layout host before it has scroll descendants.
         // Adding it around an already laid-out tree resets native scroll offsets.
         let needed = self.id == nsh_core::ROOT_ID
+            // A retained screen keeps its presentation host in the RS tree.
+            // Visibility belongs to its content; the host's opacity also hides
+            // any old children retained by the texture-export renderer.
+            || self.kind == nsh_core::ViewKind::Screen
             || self.kind == nsh_core::ViewKind::Modal
             || self.selectable()
             || has_semantics

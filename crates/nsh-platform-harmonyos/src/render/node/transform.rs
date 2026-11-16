@@ -150,12 +150,25 @@ impl Node {
             && pres_y == 0.0;
         let mut applied = self.applied.get();
         let native = visual.borrow();
+        // ArkUI removes invisible FrameNodes from its RS child list. Rosen's
+        // texture-export switch replays that list into the other renderer but
+        // does not clear children left there by an earlier export. Retained
+        // navigation screens therefore hide their content, while their stable
+        // presentation host stays in both trees and receives opacity = 0.
+        // Native visibility still excludes the content from input/accessibility.
+        let visibility_node = if self.kind == nsh_core::ViewKind::Screen {
+            &self.native
+        } else {
+            &visual
+        };
         if is_identity {
             self.backface_away.set(false);
             let visibility = self.desired_visibility();
             let visibility_changed = applied.visibility != visibility;
             if visibility_changed {
-                native.set_i32_attribute(Attribute::Visibility, visibility)?;
+                visibility_node
+                    .borrow()
+                    .set_i32_attribute(Attribute::Visibility, visibility)?;
                 applied.visibility = visibility;
             }
             if applied.transform.is_some() {
@@ -228,7 +241,9 @@ impl Node {
         };
         let visibility_changed = applied.visibility != visibility;
         if visibility_changed {
-            native.set_i32_attribute(Attribute::Visibility, visibility)?;
+            visibility_node
+                .borrow()
+                .set_i32_attribute(Attribute::Visibility, visibility)?;
             applied.visibility = visibility;
         }
         let frame = self.frame.get();
