@@ -98,6 +98,8 @@ pub(crate) struct UiContext {
     /// none is, no mount item needs the walk up its ancestors that looks
     /// for one ([`Node::set_leaving`]).
     pub(crate) leaving_nodes: std::cell::Cell<usize>,
+    pub(crate) pending_delete_count: std::cell::Cell<usize>,
+    pub(crate) unreclaimed_delete_count: std::cell::Cell<usize>,
     pub(crate) arkui: std::cell::RefCell<crate::interop::sdk::Batch>,
     pub(crate) arkui_views: std::cell::RefCell<Vec<crate::interop::attachment::NativeAttachment>>,
     pub(crate) host: Arc<crate::app::session::Services>,
@@ -156,8 +158,28 @@ impl Mounter {
         }
         if let Some(Some(node)) = self.slots.get(id as usize) {
             node.composite_ready(generation)?;
+            if id == nsh_core::ROOT_ID {
+                self.shaders.reveal()?;
+            } else if let Some(Some(root)) = self.slots.get(nsh_core::ROOT_ID as usize)
+                && root.composite_dirty.get()
+            {
+                Self::attribute(root.update_wrapper());
+            }
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                modal.refresh_presentation()?;
+            }
         }
         self.flush_arkui()
+    }
+    pub(crate) fn navigation_event(
+        &self,
+        event: crate::render::shader::navigation::Event,
+    ) -> Result<()> {
+        self.shaders.navigation_event(event)?;
+        self.reconcile_navigation_capture()?;
+        self.flush_arkui()?;
+        self.animator.request_frame();
+        Ok(())
     }
     pub(crate) fn text_selection(
         &self,
@@ -191,6 +213,7 @@ impl Mounter {
         let density_changed =
             self.scale.replace(environment.pixel_ratio) != environment.pixel_ratio;
         let reduce_motion_changed = self.platform.get().reduce_motion != environment.reduce_motion;
+        let was_background = self.platform.get().lifecycle == nsh_engine::Lifecycle::Background;
         self.platform.set(environment);
         for node in self.slots.iter().flatten() {
             if density_changed {
@@ -205,7 +228,11 @@ impl Mounter {
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }
         }
-        if reduce_motion_changed {
+        let background = environment.lifecycle == nsh_engine::Lifecycle::Background;
+        if background {
+            self.shaders.cancel_navigation("background")?;
+        }
+        if reduce_motion_changed || background || was_background {
             self.reconcile_navigation_capture()?;
             self.flush_arkui()?;
         }
@@ -238,6 +265,7 @@ impl Mounter {
     }
     pub(crate) fn native_context(&self, ready: bool) -> Result<()> {
         if !ready {
+            self.shaders.cancel_navigation("context-lost")?;
             let mut pending = self.arkui.borrow_mut();
             pending.editors.clear();
             pending.commands.clear();
@@ -270,6 +298,7 @@ impl Mounter {
                 video.context(ready)?;
             }
         }
+        self.shaders.reconcile_hosts_now()?;
         if ready {
             self.flush_arkui()?;
         }
@@ -417,6 +446,7 @@ impl Mounter {
         .cloned()
     }
     pub(crate) fn reconcile_navigation(&mut self) -> Result<()> {
+        self.shaders.reconcile_hosts_now()?;
         crate::navigation::stack::reconcile(
             self.stacks
                 .iter()
@@ -428,60 +458,8 @@ impl Mounter {
         self.reconcile_navigation_capture()
     }
     fn reconcile_navigation_capture(&self) -> Result<()> {
-        let mut wanted = rustc_hash::FxHashSet::default();
-        if !self.platform.get().reduce_motion {
-            for node in self.slots.iter().flatten() {
-                if !node.active.get()
-                    || node.pending_delete.get()
-                    || node.navigation_shader.borrow().is_none()
-                {
-                    continue;
-                }
-                if node.kind == ViewKind::Modal {
-                    let modal_active = node.modal.borrow().as_ref().is_some_and(|modal| {
-                        !modal.closing() && (modal.is_visible() || modal.is_pending_present())
-                    });
-                    if !modal_active {
-                        continue;
-                    }
-                } else if (node.id != nsh_core::ROOT_ID && node.parent.get().is_none())
-                    || node.retained.get()
-                {
-                    continue;
-                }
-                let mut root = nsh_core::ROOT_ID;
-                let mut ancestor = node.parent_node.borrow().upgrade();
-                while let Some(current) = ancestor {
-                    if current.kind == ViewKind::Modal {
-                        root = current.id;
-                        break;
-                    }
-                    ancestor = current.parent_node.borrow().upgrade();
-                }
-                wanted.insert(root);
-            }
-        }
-        let mut candidates = vec![nsh_core::ROOT_ID];
-        for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
-            if let Some(id) = modal.node_id() {
-                candidates.push(id);
-            }
-        }
-        for id in candidates {
-            let Some(Some(root)) = self.slots.get(id as usize) else {
-                continue;
-            };
-            let capture = wanted.contains(&id);
-            if root.navigation_capture.replace(capture) != capture {
-                if let Some(scene) = root.scene.borrow().as_ref() {
-                    scene.require(root);
-                }
-                root.invalidate_composites();
-                root.ensure_wrapper()?;
-                root.restore_style()?;
-            }
-        }
-        Ok(())
+        self.shaders
+            .reconcile_navigation_capture(self.platform.get().reduce_motion)
     }
     pub(crate) fn dialog_result(&mut self, id: u32, index: i32) -> Result<()> {
         self.dialogs.finish(id, index)
@@ -600,12 +578,13 @@ impl Mounter {
                 .borrow()
                 .children()
                 .iter()
-                .position(|entry| Rc::ptr_eq(entry, &mounted))
-                .ok_or(Error::InvalidNode(id))?;
-            container
-                .borrow_mut()
-                .remove_child(index)
-                .map_err(|error| Error::Tree(Box::new(error.into())))?;
+                .position(|entry| Rc::ptr_eq(entry, &mounted));
+            if let Some(index) = index {
+                container
+                    .borrow_mut()
+                    .remove_child(index)
+                    .map_err(|error| Error::Tree(Box::new(error.into())))?;
+            }
         }
         if let Some(parent) = parent {
             let index = parent
@@ -644,6 +623,7 @@ impl Mounter {
         }
         node.parent.set(None);
         *node.parent_node.borrow_mut() = std::rc::Weak::new();
+        self.shaders.invalidate_visibility();
         node.invalidate_scene();
         Ok(())
     }
@@ -677,16 +657,24 @@ impl Mounter {
             id = parent;
         }
     }
+    fn sync_pending_deletions(&self) {
+        self.pending_delete_count.set(self.pending_delete.len());
+        self.unreclaimed_delete_count
+            .set(self.removed.len() + self.retired.len());
+    }
     fn delete(&mut self, id: NodeId) -> Result<()> {
         if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
             Self::attribute(modal.close(true));
         }
-        if self.frozen(id) {
-            if !self.node(id)?.pending_delete.replace(true) {
+        let frozen = self.frozen(id);
+        if frozen {
+            let node = self.node(id)?.clone();
+            if !node.pending_delete.replace(true) {
                 // Both exits still render their retained subtree. Deactivation
                 // closes texture wrappers, so it belongs to delete_now after
                 // the page/dialog transition has finished.
                 self.pending_delete.push(id);
+                self.sync_pending_deletions();
             }
             return Ok(());
         }
@@ -731,6 +719,7 @@ impl Mounter {
         while self.slots.last().is_some_and(Option::is_none) {
             self.slots.pop();
         }
+        self.sync_pending_deletions();
         Ok(())
     }
 
@@ -741,6 +730,8 @@ impl Mounter {
             | MountItem::Text { id, .. }
             | MountItem::ScreenConfig { id, .. }
             | MountItem::ModalConfig { id, .. }
+            | MountItem::Shader { id, .. }
+            | MountItem::ShaderTransition { id, .. }
             | MountItem::NavShader { id, .. }
             | MountItem::Remove { id } => Some(*id),
             _ => None,
@@ -785,28 +776,13 @@ impl Mounter {
         if let Some(scene) = self.scene.borrow().as_ref() {
             scene.invalidate();
         }
-        let mut layout = None;
-        let mut deletions = Vec::new();
-        let mut deleted = rustc_hash::FxHashSet::default();
-        let mut removals = Vec::new();
-        let mut removed = rustc_hash::FxHashSet::default();
-        for item in &batch.items {
-            match item {
-                MountItem::LayoutAnimation(animation) => layout = Some(*animation),
-                MountItem::Delete { id } => {
-                    if deleted.insert(*id) {
-                        deletions.push(*id);
-                    }
-                    if removed.insert(*id) {
-                        removals.push((*id, layout));
-                    }
-                }
-                MountItem::Remove { id } if removed.insert(*id) => {
-                    removals.push((*id, layout));
-                }
-                _ => {}
-            }
-        }
+        let crate::render::transition::BatchPrepass {
+            deletions,
+            deleted,
+            removals,
+            removed,
+            mut motion,
+        } = crate::render::transition::BatchMotion::scan(&batch.items);
         // Start a screen's exit before its descendants' delete operations. An
         // enclosing tree deletion retires immediately instead of animating orphans.
         for id in &deletions {
@@ -861,11 +837,13 @@ impl Mounter {
         }
         // Each frame uses the most recent marker. Batch-local state also keeps
         // an unclosed scope from leaking into a later commit or deferred replay.
-        let mut layout = None;
+        let mut nav_shader_configured = false;
         self.batches += 1;
         let items = batch.items.len();
         for (at, item) in batch.items.into_iter().enumerate() {
-            if Self::deferred_node(&item).is_some_and(|id| self.frozen(id)) {
+            if Self::deferred_node(&item)
+                .is_some_and(|id| motion.allows_defer(id) && self.frozen(id))
+            {
                 self.deferred.push(item);
                 continue;
             }
@@ -938,6 +916,7 @@ impl Mounter {
                             Node::new(id, kind, self.context.clone())
                                 .map_err(|error| Error::Tree(Box::new(error)))?,
                         );
+                        motion.note_created(id);
                         if kind == ViewKind::Stack {
                             let index = self.stacks.partition_point(|stack| *stack < id);
                             self.stacks.insert(index, id);
@@ -1010,7 +989,7 @@ impl Mounter {
                         {
                             Self::attribute(screen.update(screen.has_back()));
                         }
-                        Self::attribute(node.inserted(layout.as_ref()));
+                        Self::attribute(node.inserted(motion.insert_animation()));
                         // This Insert supersedes a removal deferred while the node
                         // was leaving. Replay its other updates before newer ones.
                         self.deferred.retain(
@@ -1019,10 +998,17 @@ impl Mounter {
                         self.finish_deferred()?;
                     }
                     MountItem::Remove { id } => {
-                        if !self.frozen(id)
+                        if motion.is_created_in_batch(id) {
+                            let node = self.node(id)?;
+                            if node.live.borrow_mut().take().is_some() {
+                                self.animator.remove(id);
+                                Self::attribute(node.finish_removal());
+                            }
+                            self.unlink(id, true)?;
+                        } else if !self.frozen(id)
                             && !self
                                 .node(id)?
-                                .removing(layout.as_ref())
+                                .removing(motion.remove_animation(id))
                                 .unwrap_or_else(|error| {
                                     Self::attribute(Err(error));
                                     false
@@ -1032,20 +1018,31 @@ impl Mounter {
                         }
                     }
                     MountItem::Delete { id } => {
-                        if !self.frozen(id) {
-                            Self::attribute(self.node(id)?.removing(layout.as_ref()).map(|_| ()));
+                        if motion.note_deleted(id) {
+                            if let Some(modal) = self.node(id)?.modal.borrow().as_ref() {
+                                Self::attribute(modal.close(true));
+                            }
+                            self.delete_now(id)?;
+                        } else {
+                            if !self.frozen(id) {
+                                Self::attribute(
+                                    self.node(id)?
+                                        .removing(motion.remove_animation(id))
+                                        .map(|_| ()),
+                                );
+                            }
+                            self.delete(id)?;
                         }
-                        self.delete(id)?;
                     }
                     MountItem::Frame { id, frame } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             self.node(id)?
-                                .animated_frame(frame.into(), layout.as_ref())?;
+                                .animated_frame(frame.into(), motion.frame_animation(id))?;
                         }
                     }
-                    MountItem::LayoutAnimation(animation) => layout = Some(animation),
+                    MountItem::LayoutAnimation(animation) => motion.set_layout(animation),
                     MountItem::ViewStyle { id, style } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             self.node(id)?.style(&style)?;
                         }
                     }
@@ -1055,7 +1052,7 @@ impl Mounter {
                         content,
                         ..
                     } => {
-                        if !self.frozen(id) {
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
                             let node = self.node(id)?;
                             let raster = layout
                                 .0
@@ -1133,18 +1130,33 @@ impl Mounter {
                         }
                     }
                     MountItem::Shader { id, layer } => {
-                        self.shaders.set(self.node(id)?, layer)?;
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
+                            self.shaders.set(self.node(id)?, layer)?;
+                        }
                     }
                     MountItem::ShaderTransition { id, duration } => {
-                        self.shaders.transition(id, duration)
+                        if motion.is_created_in_batch(id) || !self.frozen(id) {
+                            self.shaders.transition(id, duration);
+                        }
                     }
-                    // ArkUI's texture producer reports native content changes,
-                    // including native input/scroll updates between core batches.
-                    MountItem::ShaderInput { .. } => {}
+                    // Core content changes invalidate enclosing shader pictures.
+                    MountItem::ShaderInput { id } => self.node(id)?.invalidate_composites(),
                     MountItem::NavShader { id, shader } => {
                         if !self.frozen(id) {
+                            let configured = shader.is_some();
                             let node = self.node(id)?;
+                            if let Some(spec) = &shader
+                                && let Ok(worker) =
+                                    crate::render::composition::worker::Worker::for_owner(node)
+                            {
+                                worker.precompile(spec.layer.clone());
+                            }
                             *node.navigation_shader.borrow_mut() = shader;
+                            if !configured {
+                                self.shaders.end_navigation(id)?;
+                            } else {
+                                nav_shader_configured = true;
+                            }
                             node.ensure_wrapper()?;
                             node.restore_style()?;
                         }
@@ -1513,6 +1525,9 @@ impl Mounter {
             }
         }
         Self::attribute(self.reconcile_navigation());
+        if nav_shader_configured {
+            self.shaders.log_idle_configured();
+        }
         Self::attribute(self.animator.flush());
         Self::attribute(self.shaders.frame().map(|_| ()));
         let selected = self
@@ -1523,6 +1538,7 @@ impl Mounter {
         if let Some(owner) = selected {
             Self::attribute(owner.selection_refresh());
         }
+        self.sync_pending_deletions();
         self.flush_arkui()
     }
 
@@ -1580,7 +1596,6 @@ impl Mounter {
     }
     pub(crate) fn frame(&mut self, timestamp: Option<u64>) -> Result<bool> {
         let mut animating = self.animator.tick(timestamp)?;
-        animating |= self.shaders.frame()?;
         let mut settled_leaving = false;
         for id in self.animator.take_removals() {
             if let Ok(node) = self.node(id) {
@@ -1593,6 +1608,7 @@ impl Mounter {
                 }
             }
         }
+        animating |= self.shaders.frame()?;
         self.modals.retain(|modal| modal.strong_count() > 0);
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
             animating |= modal.frame(self.animator.frame_time())?;
@@ -1610,10 +1626,11 @@ impl Mounter {
                     deleted_any = true;
                 }
             }
-            if deleted_any {
+            if settled_leaving || deleted_any {
                 self.reconcile_navigation_capture()?;
             }
         }
+        self.sync_pending_deletions();
         self.finish_deferred()?;
         self.flush_arkui()?;
         Ok(animating)
@@ -1688,16 +1705,19 @@ impl Mounter {
             worker.collect();
             worker.drain();
         }
+        self.sync_pending_deletions();
         self.flush_arkui()
     }
 
     pub(crate) fn freeze_retired(&mut self) -> Option<u64> {
         if self.removed.is_empty() {
+            self.sync_pending_deletions();
             return None;
         }
         self.epoch += 1;
         self.retired
             .push_back((self.epoch, std::mem::take(&mut self.removed)));
+        self.sync_pending_deletions();
         Some(self.epoch)
     }
 
@@ -1705,6 +1725,7 @@ impl Mounter {
         while self.retired.front().is_some_and(|(id, _)| *id <= epoch) {
             self.retired.pop_front();
         }
+        self.sync_pending_deletions();
     }
 }
 

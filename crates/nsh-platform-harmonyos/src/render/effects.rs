@@ -1,5 +1,5 @@
 //! Unified CSS filter and effect routing across native ArkUI attributes,
-//! direct GLES texture export (`Composite`), and surface-level `Scene` drawing.
+//! GLES composition of native snapshots (`Composite`), and surface-level `Scene` drawing.
 
 use nsh_core::{BlendMode, Filter, ViewStyle};
 
@@ -50,6 +50,28 @@ pub(crate) fn resolve_visual_opacity(
     animated_opacity.unwrap_or(style_opacity) * presentation * extra * navigation
 }
 
+/// Resolves the `ArkUINode` `Opacity` (`RSNode::SetAlpha`) written to `visual_node()`.
+///
+/// In ArkUI/Rosen, `Attribute::Opacity` flushes immediately on the child's own
+/// `FlushModifyTask`, whereas `Attribute::Visibility` (`Hidden`/`None`) only
+/// detaches the child's `RSNode` when its parent `FrameNode` runs
+/// `RebuildRenderContextTree()`. Keeping `Opacity == 0.0` whenever a node is
+/// hidden (`native_visibility_hidden`) prevents any
+/// 1-frame `Alpha = 1.0` flash before parent render-tree rebuilds.
+pub(crate) fn resolve_native_node_opacity(
+    native_visibility_hidden: bool,
+    scene_active: bool,
+    combined_opacity: f32,
+) -> f32 {
+    if native_visibility_hidden {
+        0.0
+    } else if scene_active {
+        1.0
+    } else {
+        combined_opacity
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
@@ -76,7 +98,7 @@ pub(crate) struct EffectsPlan {
     pub(crate) native_blend: BlendMode,
     /// Whether this node's own style/shaders require surface `Scene` composition.
     pub(crate) requires_scene: bool,
-    /// Whether this node requires offscreen texture export (`Composite`).
+    /// Whether this node requires a native snapshot for `Composite`.
     pub(crate) requires_texture: bool,
 }
 
@@ -91,10 +113,8 @@ impl EffectsPlan {
         let active_backdrops = active_filter_count(backdrop_filters);
         let non_blur_backdrop = has_non_blur_filter(backdrop_filters);
 
-        // When a node exports its own subtree to `RENDER_TYPE_TEXTURE` (for
-        // non-blur CSS filters or shader layers), `self.native` renders into an
-        // isolated transparent buffer and cannot sample the window backdrop via
-        // `Attribute::BackdropBlur`; `Scene` must composite the backdrop instead.
+        // A sampled subtree is rendered in isolation. Compose its backdrop in
+        // Scene so the picture does not depend on the live window behind it.
         let own_texture = non_blur_filter || ctx.has_shaders || ctx.navigation_capture;
         let requires_scene = style.blend_mode == BlendMode::PlusDarker
             || ctx.shader_samples_backdrop
@@ -297,11 +317,57 @@ mod tests {
     }
 
     #[test]
+    fn idle_navigation_shader_keeps_root_and_backdrop_blur_native_until_capture_demanded() {
+        let backdrop_style = ViewStyle {
+            effects: Some(Arc::new(Effects {
+                backdrop_filters: vec![Filter::Blur(Points(12.0))],
+                ..Default::default()
+            })),
+            ..ViewStyle::default()
+        };
+
+        // Idle NavShader configuration sets `navigation_capture: false`: zero
+        // persistent content snapshots and single backdrop-blur stays native.
+        let idle_root = EffectsPlan::compute(&ViewStyle::default(), EffectsContext::default());
+        assert!(!idle_root.requires_texture);
+        assert!(!idle_root.requires_scene);
+
+        let idle_backdrop = EffectsPlan::compute(&backdrop_style, EffectsContext::default());
+        assert!(!idle_backdrop.requires_texture);
+        assert!(!idle_backdrop.requires_scene);
+        assert_eq!(idle_backdrop.native_backdrop_blur, 12.0);
+
+        // Active transition capture demand enables export only for the capture window.
+        let demanded = EffectsPlan::compute(
+            &backdrop_style,
+            EffectsContext {
+                navigation_capture: true,
+                ..EffectsContext::default()
+            },
+        );
+        assert!(demanded.requires_texture);
+        assert!(demanded.requires_scene);
+        assert_eq!(demanded.native_backdrop_blur, 0.0);
+
+        // Releasing the last demand restores the native path.
+        let restored = EffectsPlan::compute(&backdrop_style, EffectsContext::default());
+        assert_eq!(restored, idle_backdrop);
+    }
+
+    #[test]
     fn visual_opacity_uses_animated_value_across_native_and_scene_paths() {
         assert!((resolve_visual_opacity(0.8, None, 1.0, 1.0, 1.0) - 0.8).abs() < 1e-6);
         assert!((resolve_visual_opacity(0.8, Some(0.25), 1.0, 1.0, 1.0) - 0.25).abs() < 1e-6);
         assert!((resolve_visual_opacity(0.8, Some(0.5), 0.5, 0.8, 0.5) - 0.1).abs() < 1e-6);
         // Unbinding restores the static style opacity without losing presentation factors.
         assert!((resolve_visual_opacity(0.6, None, 0.5, 1.0, 1.0) - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn native_node_opacity_stays_zero_while_visibility_hidden() {
+        assert_eq!(resolve_native_node_opacity(true, false, 1.0), 0.0);
+        assert_eq!(resolve_native_node_opacity(true, true, 0.8), 0.0);
+        assert!((resolve_native_node_opacity(false, false, 0.75) - 0.75).abs() < 1e-6);
+        assert!((resolve_native_node_opacity(false, true, 0.25) - 1.0).abs() < 1e-6);
     }
 }

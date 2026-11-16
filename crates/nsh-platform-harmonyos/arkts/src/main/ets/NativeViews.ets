@@ -1,45 +1,17 @@
 import { NativeMenuItem, NativeMenuCleanup } from "./NativeMenus";
-import { TouchCoordinates, PointerPosting, TouchCancel, NativeRetirement } from "./NativePointer";
+import { PointerPosting, NativeRetirement } from "./NativePointer";
 import {
   BuilderNode,
+  NodeRenderType,
+  NodeController,
   ComponentContent,
   NodeContent,
-  NodeController,
-  NodeRenderType,
-  RenderOptions,
-  FrameNode,
 } from "@ohos.arkui.node";
-import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
+import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
-import image from "@ohos.multimedia.image";
 import { NshRuntimeContext } from "./NativeEditors";
 
-class NextFrameTask extends FrameCallback {
-  private readonly callback: () => void;
-  constructor(callback: () => void) {
-    super();
-    this.callback = callback;
-  }
-  onFrame(_frameTimeInNano: number): void {
-    this.callback();
-  }
-}
 
-function runAfterFrames(ui: UIContext, frames: number, task: () => void): void {
-  if (frames <= 0) {
-    task();
-    return;
-  }
-  try {
-    ui.postFrameCallback(
-      new NextFrameTask((): void => {
-        runAfterFrames(ui, frames - 1, task);
-      }),
-    );
-  } catch (_) {
-    setTimeout(task, 32);
-  }
-}
 
 interface ViewAction {
   name: string;
@@ -53,11 +25,9 @@ interface ViewMenu {
   items: NativeMenuItem[];
 }
 export interface Settings {
-  textureSurface?: string | null;
+  textureSurface?: string;
   textureInsets?: TextureInsets | null;
-  textureReady?: boolean;
   targetId: number;
-  replaces?: number | null;
   testId?: string | null;
   width: number;
   height: number;
@@ -258,14 +228,11 @@ class ViewController extends NodeController {
 @Observed
 class ViewState {
   settings: Settings;
-  backdrop?: image.PixelMap;
-  constructor(settings: Settings, backdrop?: image.PixelMap) {
+  constructor(settings: Settings) {
     this.settings = settings;
-    this.backdrop = backdrop;
   }
 }
-// Custom roots preserve ArkUI's native export boundary. Observed settings refresh
-// their attributes without rebuilding the slot or changing its native ownership.
+// The source owns one native hierarchy and one texture destination for its lifetime.
 @Component
 struct SourceRoot {
   entry!: ViewEntry;
@@ -286,11 +253,11 @@ function sourceContent(params: ViewParameters) {
   SourceRoot({ entry: params.entry, state: params.entry.state });
 }
 @Component
-struct TextureRoot {
+struct TextureContainer {
   entry!: ViewEntry;
   @ObjectLink state!: ViewState;
   build() {
-    NodeContainer(this.entry.sourceController!)
+    NodeContainer(this.entry.textureController!)
       .width(captureWidth(this.state.settings))
       .height(captureHeight(this.state.settings))
       .clip(false)
@@ -298,64 +265,19 @@ struct TextureRoot {
   }
 }
 @Builder
-function textureContent(params: ViewParameters) {
-  TextureRoot({ entry: params.entry, state: params.entry.state });
-}
-@Component
-struct TextureContainer {
-  entry!: ViewEntry;
-  @ObjectLink state!: ViewState;
-  build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      if (this.state.backdrop) {
-        Image(this.state.backdrop)
-          .width(this.state.settings.width)
-          .height(this.state.settings.height)
-          .position({
-            x: this.state.settings.textureInsets?.left ?? 0,
-            y: this.state.settings.textureInsets?.top ?? 0,
-          })
-          .syncLoad(true)
-          .hitTestBehavior(HitTestMode.None)
-      }
-      NodeContainer(this.entry.textureController!)
-        .width(captureWidth(this.state.settings))
-        .height(captureHeight(this.state.settings))
-        .clip(false)
-        .hitTestBehavior(HitTestMode.Transparent)
-        .onTouch((event: TouchEvent): void => {
-          this.entry.postMouseTouch(event);
-        })
-    }
-    .width(captureWidth(this.state.settings))
-    .height(captureHeight(this.state.settings))
-    .clip(false)
-    .hitTestBehavior(HitTestMode.Transparent);
-  }
-}
-@Component
-struct DirectRoot {
-  entry!: ViewEntry;
-  @ObjectLink state!: ViewState;
-  build() {
-    nativeView({ entry: this.entry, settings: this.state.settings });
-  }
-}
-@Builder
 function viewContent(params: ViewParameters) {
-  if (params.entry.textureNode) {
+  if (params.entry.textureController) {
     TextureContainer({ entry: params.entry, state: params.entry.state });
   } else {
-    DirectRoot({ entry: params.entry, state: params.entry.state });
+    SourceRoot({ entry: params.entry, state: params.entry.state });
   }
 }
 class ViewEntry {
+  readonly textureNode?: BuilderNode<[ViewParameters]>;
+  readonly textureController?: ViewController;
+  private textureDisposed: boolean = false;
   readonly state: ViewState;
   readonly slot: NodeContent = new NodeContent();
-  readonly textureNode?: BuilderNode<[ViewParameters]>;
-  readonly sourceNode?: BuilderNode<[ViewParameters]>;
-  readonly sourceController?: ViewController;
-  readonly textureController?: ViewController;
   private node: BuilderNode<[ViewParameters]>;
   private context: NshRuntimeContext;
   private ui: UIContext;
@@ -364,14 +286,10 @@ class ViewEntry {
   private attached: boolean = false;
   private retiredNative: boolean = false;
   private nodeDisposed: boolean = false;
-  private textureDisposed: boolean = false;
-  private sourceDisposed: boolean = false;
   private sdkBusy: boolean = false;
   private disposePending: boolean = false;
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
-  private backdropDiagTimer?: number;
-  private backdropReadyScheduled: boolean = false;
   private pointerPosting: PointerPosting;
   private retirement: NativeRetirement = new NativeRetirement();
   constructor(
@@ -379,25 +297,18 @@ class ViewEntry {
     context: NshRuntimeContext,
     menus: NativeMenuCleanup,
     posting: PointerPosting,
-    backdrop?: image.PixelMap,
   ) {
-    this.state = new ViewState(settings, backdrop);
+    this.state = new ViewState(settings);
     this.menus = menus;
     this.context = context;
     this.ui = context.getUIContext();
     this.pointerPosting = posting;
-    const options: RenderOptions | undefined =
-      settings.textureSurface == null
-        ? undefined
-        : {
-            type: NodeRenderType.RENDER_TYPE_TEXTURE,
-            surfaceId: settings.textureSurface,
-            selfIdealSize: { width: captureWidth(settings), height: captureHeight(settings) },
-          };
-    if (options !== undefined) {
-      this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, options);
-      this.sourceNode = new BuilderNode<[ViewParameters]>(this.ui);
-      this.sourceController = new ViewController(this.sourceNode);
+    if (settings.textureSurface !== undefined) {
+      this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, {
+        type: NodeRenderType.RENDER_TYPE_TEXTURE,
+        surfaceId: settings.textureSurface,
+        selfIdealSize: { width: captureWidth(settings), height: captureHeight(settings) },
+      });
       this.textureController = new ViewController(this.textureNode);
     }
     this.node = new BuilderNode<[ViewParameters]>(this.ui);
@@ -411,7 +322,7 @@ class ViewEntry {
   belongsTo(context: NshRuntimeContext): boolean {
     return this.context === context;
   }
-  private snapshotTargetNode(): FrameNode | null {
+  private focusTargetNode(): FrameNode | null {
     const root = this.node.getFrameNode();
     let cursor: FrameNode | null = root;
     let depth = 0;
@@ -420,66 +331,6 @@ class ViewEntry {
       depth += 1;
     }
     return cursor ?? root;
-  }
-  snapshot(): image.PixelMap | undefined {
-    if (this.closed || this.settings.textureSurface != null) {
-      return undefined;
-    }
-    try {
-      const uniqueId = this.snapshotTargetNode()?.getUniqueId();
-      if (uniqueId !== undefined && uniqueId > 0) {
-        return this.ui.getComponentSnapshot().getSyncWithUniqueId(uniqueId);
-      }
-    } catch (error) {
-      console.warn(`[NSH] component snapshot failed: ${String(error)}`);
-    }
-    return undefined;
-  }
-  private clearBackdropDiagTimer(): void {
-    if (this.backdropDiagTimer !== undefined) {
-      clearTimeout(this.backdropDiagTimer);
-      this.backdropDiagTimer = undefined;
-    }
-  }
-  private armBackdropDiagnostic(): void {
-    if (!this.state.backdrop || this.backdropDiagTimer !== undefined) {
-      return;
-    }
-    this.backdropDiagTimer = setTimeout((): void => {
-      this.backdropDiagTimer = undefined;
-      if (!this.closed && this.state.backdrop && !this.backdropReadyScheduled) {
-        console.warn(
-          `[NSH] texture export backdrop still waiting for ready frame on target ${this.settings.targetId}`,
-        );
-      }
-    }, 5000);
-  }
-  private scheduleBackdropRelease(): void {
-    if (!this.state.backdrop || this.backdropReadyScheduled) {
-      return;
-    }
-    this.backdropReadyScheduled = true;
-    this.clearBackdropDiagTimer();
-    runAfterFrames(this.ui, 2, (): void => {
-      this.releaseBackdrop();
-    });
-  }
-  private retirePixelMap(pixelMap: image.PixelMap): void {
-    runAfterFrames(this.ui, 2, (): void => {
-      try {
-        pixelMap.release();
-      } catch (_) {}
-    });
-  }
-  releaseBackdrop(): void {
-    this.clearBackdropDiagTimer();
-    this.backdropReadyScheduled = false;
-    const backdrop = this.state.backdrop;
-    if (!backdrop) {
-      return;
-    }
-    this.state.backdrop = undefined;
-    this.retirePixelMap(backdrop);
   }
   private abortCreate(): void {
     this.closed = true;
@@ -500,20 +351,7 @@ class ViewEntry {
     let stage: string = "build";
     try {
       const params: ViewParameters = { entry: this, settings: this.settings };
-      if (this.textureNode) {
-        this.sourceNode?.build(wrapBuilder(sourceContent), params, {
-          nestingBuilderSupported: true,
-        });
-        if (this.closed) {
-          throw new Error("Native wrapper creation was cancelled");
-        }
-        this.textureNode.build(wrapBuilder(textureContent), params, {
-          nestingBuilderSupported: true,
-        });
-      }
-      if (this.closed) {
-        throw new Error("Native wrapper creation was cancelled");
-      }
+      this.textureNode?.build(wrapBuilder(sourceContent), params, { nestingBuilderSupported: true });
       this.node.build(wrapBuilder(viewContent), params, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("Native wrapper creation was cancelled");
@@ -528,13 +366,6 @@ class ViewEntry {
         throw new Error("Native wrapper attachment was rejected");
       }
       this.attached = true;
-      if (this.state.backdrop) {
-        if (this.settings.textureReady === true) {
-          this.scheduleBackdropRelease();
-        } else {
-          this.armBackdropDiagnostic();
-        }
-      }
       this.syncMenu();
     } catch (error) {
       if (this.attached) {
@@ -561,9 +392,6 @@ class ViewEntry {
       throw new Error("Native wrapper target cannot change");
     }
     this.state.settings = settings;
-    if (this.state.backdrop && settings.textureReady === true) {
-      this.scheduleBackdropRelease();
-    }
     const params: ViewParameters = { entry: this, settings: settings };
     this.sdkBusy = true;
     try {
@@ -610,7 +438,7 @@ class ViewEntry {
       this.retireMenu(previous);
     }
     const ui = this.ui;
-    const frame = this.snapshotTargetNode() ?? this.node.getFrameNode();
+    const frame = this.focusTargetNode() ?? this.node.getFrameNode();
     if (!frame) {
       return;
     }
@@ -661,57 +489,6 @@ class ViewEntry {
     );
   }
 
-  postMouseTouch(event: TouchEvent): void {
-    const pointer = event.changedTouches[0]?.id;
-    const down = event.type === TouchType.Down;
-    const terminal = event.type === TouchType.Up || event.type === TouchType.Cancel;
-    const owner = pointer === undefined ? undefined : this.pointerPosting.owners.get(pointer);
-    const target = this.sourceNode;
-    if (
-      this.closed ||
-      this.pointerPosting.busy ||
-      !target ||
-      !this.context.isActive() ||
-      event.source !== SourceType.Mouse ||
-      pointer === undefined ||
-      (down ? owner !== undefined : owner?.owner !== String(this.settings.targetId))
-    ) {
-      return;
-    }
-    const offset = target.getFrameNode()?.getPositionToWindow();
-    if (!offset) {
-      return;
-    }
-    const coordinates = new TouchCoordinates(event);
-    this.pointerPosting.busy = true;
-    try {
-      coordinates.apply(this.ui, offset.x, offset.y);
-      const accepted = target.postInputEvent(event);
-      if (accepted) {
-        if (!terminal) {
-          const snapshot = new TouchCancel(event);
-          if (owner) {
-            owner.snapshot = snapshot;
-          } else {
-            this.pointerPosting.owners.set(pointer, {
-              owner: String(this.settings.targetId),
-              snapshot: snapshot,
-            });
-          }
-        }
-        event.stopPropagation();
-      } else if (down && !this.closed && this.context.isActive()) {
-        // Even a miss records DOWN in ArkUI. Close that attempt before another export tries.
-        coordinates.cancel();
-        target.postInputEvent(event);
-      }
-    } finally {
-      if (terminal) {
-        this.pointerPosting.owners.delete(pointer);
-      }
-      this.pointerPosting.finish(coordinates);
-    }
-  }
   menuOptions(lease: MenuLease): MenuOptions {
     const menu = this.settings.menu;
     return {
@@ -786,27 +563,7 @@ class ViewEntry {
         failure ??= error instanceof Error ? error : new Error(String(error));
       }
     };
-    step((): void => {
-      this.pointerPosting.owners.forEach((stream, pointer: number): void => {
-        if (stream.owner !== String(this.settings.targetId)) {
-          return;
-        }
-        this.pointerPosting.owners.delete(pointer);
-        if (!this.sourceDisposed && this.sourceNode?.getFrameNode()) {
-          this.pointerPosting.busy = true;
-          try {
-            this.sourceNode.postInputEvent(stream.snapshot as TouchEvent);
-          } finally {
-            this.pointerPosting.finish();
-          }
-        }
-      });
-    });
-    // NodeContainer retains the node returned by its controller. Detach
-    // those edges before disposing the builders, including texture exports.
-    step((): void => this.releaseBackdrop());
-    step((): void => this.textureController?.clear());
-    step((): void => this.sourceController?.clear());
+    this.textureController?.clear();
     if (!this.nodeDisposed) {
       step((): void => {
         this.node.dispose();
@@ -817,12 +574,6 @@ class ViewEntry {
       step((): void => {
         this.textureNode!.dispose();
         this.textureDisposed = true;
-      });
-    }
-    if (this.sourceNode && !this.sourceDisposed) {
-      step((): void => {
-        this.sourceNode!.dispose();
-        this.sourceDisposed = true;
       });
     }
     if (failure) {
@@ -836,17 +587,8 @@ class ViewEntry {
 }
 export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
-  private previews: Map<number, image.PixelMap> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
-  private clearPreviews(): void {
-    this.previews.forEach((pixelMap: image.PixelMap): void => {
-      try {
-        pixelMap.release();
-      } catch (_) {}
-    });
-    this.previews.clear();
-  }
   private retryQuarantined(context: NshRuntimeContext): void {
     for (const view of Array.from(quarantinedViews)) {
       if (!view.belongsTo(context)) {
@@ -857,37 +599,13 @@ export class NativeViews {
       } catch (_) {}
     }
   }
-  remove(ids: number[], context: NshRuntimeContext, incoming: Settings[] = []): void {
+  remove(ids: number[], context: NshRuntimeContext): void {
     this.retryQuarantined(context);
-    const replacements: Map<number, number> = new Map();
-    for (const state of incoming) {
-      const existing = this.entries.get(state.targetId);
-      if (
-        state.replaces != null &&
-        state.textureSurface != null &&
-        (!existing || existing.isClosed())
-      ) {
-        replacements.set(state.replaces, state.targetId);
-      }
-    }
     let failure: Error | undefined;
     for (const id of ids) {
       const entry = this.entries.get(id);
       if (!entry) {
         continue;
-      }
-      const nextTargetId = replacements.get(id);
-      if (nextTargetId !== undefined && entry.settings.textureSurface == null) {
-        const snapshot = entry.snapshot();
-        if (snapshot) {
-          const prior = this.previews.get(nextTargetId);
-          if (prior) {
-            try {
-              prior.release();
-            } catch (_) {}
-          }
-          this.previews.set(nextTargetId, snapshot);
-        }
       }
       try {
         entry.dispose(context);
@@ -901,45 +619,33 @@ export class NativeViews {
     }
   }
   update(states: Settings[], context: NshRuntimeContext): void {
+    this.retryQuarantined(context);
     let failure: Error | undefined;
-    try {
-      for (const state of states) {
-        try {
-          if (!context.isActive()) {
-            throw new Error("NSH SDK session is inactive");
-          }
-          let entry = this.entries.get(state.targetId);
-          if (entry && entry.isClosed()) {
-            this.entries.delete(state.targetId);
-            entry = undefined;
-          }
-          if (entry && entry.settings.textureSurface !== state.textureSurface) {
-            throw new Error("Texture replacement requires a fresh native target");
-          }
-          if (entry) {
-            entry.update(state);
-          } else {
-            const backdrop =
-              state.textureSurface != null ? this.previews.get(state.targetId) : undefined;
-            if (backdrop) {
-              this.previews.delete(state.targetId);
-            }
-            const created = new ViewEntry(
-              state,
-              context,
-              this.menus,
-              this.pointerPosting,
-              backdrop,
-            );
-            created.create();
-            this.entries.set(state.targetId, created);
-          }
-        } catch (error) {
-          failure ??= error instanceof Error ? error : new Error(String(error));
+    for (const state of states) {
+      try {
+        if (!context.isActive()) {
+          throw new Error("NSH SDK session is inactive");
         }
+        let entry = this.entries.get(state.targetId);
+        if (entry && entry.isClosed()) {
+          this.entries.delete(state.targetId);
+          entry = undefined;
+        }
+        if (entry) {
+          entry.update(state);
+        } else {
+          const created = new ViewEntry(
+            state,
+            context,
+            this.menus,
+            this.pointerPosting,
+          );
+          created.create();
+          this.entries.set(state.targetId, created);
+        }
+      } catch (error) {
+        failure ??= error instanceof Error ? error : new Error(String(error));
       }
-    } finally {
-      this.clearPreviews();
     }
     if (failure) {
       throw failure;
@@ -949,7 +655,6 @@ export class NativeViews {
     await this.menus.settled();
   }
   dispose(context: NshRuntimeContext): void {
-    this.clearPreviews();
     let failure: Error | undefined;
     for (const id of Array.from(this.entries.keys())) {
       const entry = this.entries.get(id)!;

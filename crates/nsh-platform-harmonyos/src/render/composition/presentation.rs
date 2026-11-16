@@ -1,8 +1,9 @@
-//! Shader frames presented by an XComponent Surface, outside the exported subtree.
+//! Shader frames presented by an XComponent Surface, beside the sampled subtree.
 
 use ohos_arkui_binding::{
-    api::node_custom_event::NodeCustomEvent, component::attribute::ArkUICommonAttribute,
-    types::advanced::NodeDirtyFlag,
+    api::node_custom_event::NodeCustomEvent,
+    component::attribute::ArkUICommonAttribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
 
 use crate::render::node::{NativeNode, Node, Result, callback};
@@ -14,7 +15,6 @@ pub(super) struct Presentation {
     origin: (i32, i32),
     size: (u32, u32),
     revealed: bool,
-    committed: bool,
 }
 
 impl Presentation {
@@ -40,7 +40,6 @@ impl Presentation {
             origin: (0, 0),
             size: (0, 0),
             revealed: false,
-            committed: false,
         };
         let frame = owner.frame.get();
         let scale = owner.scale.get();
@@ -54,8 +53,8 @@ impl Presentation {
         Ok(layer)
     }
 
-    pub(super) fn is_committed(&self) -> bool {
-        self.committed
+    pub(super) fn is_revealed(&self) -> bool {
+        self.revealed
     }
 
     pub(super) fn reveal(&mut self) -> Result<bool> {
@@ -69,16 +68,19 @@ impl Presentation {
         Ok(false)
     }
 
-    pub(super) fn commit(&mut self) -> bool {
-        if self.revealed && !self.committed {
-            self.committed = true;
-            return true;
-        }
-        false
+    pub(super) fn hide(&mut self) {
+        let node = self.surface.native.borrow();
+        let _ = node.opacity(0.0);
+        let _ = node.mark_dirty(NodeDirtyFlag::NeedRender);
+        self.revealed = false;
     }
 
-    pub(super) fn hide(&self) {
-        let _ = self.surface.native.borrow().opacity(0.0);
+    pub(super) fn retire_gone(&mut self) {
+        self.hide();
+        let node = self.surface.native.borrow();
+        if node.is_owned() {
+            let _ = node.set_i32_attribute(Attribute::Visibility, 2);
+        }
     }
 
     pub(super) fn update(

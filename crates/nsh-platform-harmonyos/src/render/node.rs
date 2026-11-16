@@ -135,7 +135,6 @@ pub(crate) struct Node {
     pub(crate) video: RefCell<Option<crate::media::video::Video>>,
     pub(crate) web: RefCell<Option<crate::media::webview::WebView>>,
     pub(crate) active: Cell<bool>,
-    pub(crate) export_repair: Cell<u32>,
     pub(crate) retained: Cell<bool>,
     pub(crate) retained_owner: RefCell<Weak<Node>>,
     pub(crate) retained_children: RefCell<Vec<Weak<Node>>>,
@@ -145,8 +144,6 @@ pub(crate) struct Node {
     pub(crate) animated_opacity: Cell<Option<f32>>,
     applied: Cell<AppliedStyle>,
     styled: Cell<bool>,
-    paint_frames: Cell<u8>,
-    paint_armed: Cell<bool>,
     pub(crate) live: RefCell<Option<Box<crate::render::transition::Live>>>,
     /// Leaving (an exit transition, a popped screen): changed only through
     /// [`Node::set_leaving`], which keeps the surface's count of them.
@@ -155,8 +152,8 @@ pub(crate) struct Node {
     navigation_presentation: Cell<(f32, f32)>,
     decoration: crate::render::decor::Decoration,
     layout_callbacks: Cell<bool>,
-    drawing: Cell<bool>,
-    outlined: Cell<bool>,
+    drawing: RefCell<Option<super::paint_node::PaintNode>>,
+    outlined: RefCell<Option<super::paint_node::PaintNode>>,
     shadow_layer: RefCell<Option<Rc<super::shadow::ShadowLayer>>>,
     pub(crate) text_drawing: RefCell<Option<crate::text::typography::TextDrawing>>,
     pub(crate) selection_area: RefCell<Option<crate::text::selection::area::Area>>,

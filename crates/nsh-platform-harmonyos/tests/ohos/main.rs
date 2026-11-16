@@ -78,3 +78,7 @@ mod composition_mailbox;
 #[path = "../../src/media/video/mailbox.rs"]
 #[allow(dead_code)]
 mod video_mailbox;
+
+#[path = "../../src/render/composition/scene_policy.rs"]
+#[allow(dead_code)]
+mod scene_policy;
