@@ -143,6 +143,10 @@ pub(crate) fn nsh_create_session(
         crate::interop::component::TabBarContext,
         napi_ohos::bindgen_prelude::ObjectRef,
     >,
+    #[napi(
+        ts_arg_type = "(callbacks: { frame(timestamp: number): boolean }) => (request: object) => void"
+    )]
+    frame_factory: crate::app::frame_source::Factory,
 ) -> Result<u32> {
     if init.sdk_api_version < crate::app::features::MIN_API as i32 {
         return Err(Error::from_reason(format!(
@@ -165,6 +169,7 @@ pub(crate) fn nsh_create_session(
         applier,
         command_tsfn,
         tab_bar.create_ref()?,
+        frame_factory,
     )
 }
 

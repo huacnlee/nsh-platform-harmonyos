@@ -3,7 +3,6 @@ use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
     sync::{Arc, atomic::Ordering},
-    time::Instant,
 };
 
 use nsh_core::{Matrix, NodeId, ViewKind};
@@ -12,15 +11,15 @@ use ohos_drawing_binding::{Bitmap, BitmapFormat, Canvas};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    app::runtime::{Dispatcher, Message},
+    app::runtime::Message,
     render::{
         composition::{
             draw::{PaintNode, Plan, Root},
             geometry::{Bounds, target_size},
             raster::Shared as SceneShared,
             scene_policy::{
-                MAX_PREPARE_RETRIES, SceneRetry, TransientOutcome, bounds_overflow_box,
-                is_opaque_color, opaque_background_covers_bounds,
+                SceneRequirements, bounds_overflow_box, is_opaque_color,
+                opaque_background_covers_bounds,
             },
         },
         effects::has_active_filters,
@@ -83,7 +82,7 @@ pub(crate) struct Scene {
     roots: RefCell<Vec<Weak<Node>>>,
     pending_restore: RefCell<Vec<Weak<Node>>>,
     requirements: RefCell<Vec<Weak<Node>>>,
-    retry: RefCell<SceneRetry>,
+    eligibility: RefCell<SceneRequirements>,
 }
 impl Scene {
     pub(crate) fn new(root: &Rc<Node>) -> Self {
@@ -98,7 +97,7 @@ impl Scene {
             roots: RefCell::default(),
             pending_restore: RefCell::default(),
             requirements: RefCell::default(),
-            retry: RefCell::default(),
+            eligibility: RefCell::default(),
         }
     }
     pub(crate) fn has_output(&self) -> bool {
@@ -115,7 +114,7 @@ impl Scene {
             nodes.push(Rc::downgrade(node));
         }
         drop(nodes);
-        self.retry
+        self.eligibility
             .borrow_mut()
             .on_requirement_updated(node.id, required);
         if self.preparing.get() {
@@ -125,12 +124,6 @@ impl Scene {
         }
     }
     pub(crate) fn invalidate(&self) {
-        if !self.active.get()
-            && self.pending_restore.borrow().is_empty()
-            && self.retry.borrow().is_exhausted()
-        {
-            return;
-        }
         if (self.active.get()
             || !self.pending_restore.borrow().is_empty()
             || !self.requirements.borrow().is_empty())
@@ -143,11 +136,7 @@ impl Scene {
         }
     }
     pub(crate) fn prepare(&self) {
-        if !self.dirty.get() {
-            return;
-        }
-        let now = Instant::now();
-        if !self.retry.borrow().due(now) {
+        if !self.dirty.replace(false) {
             return;
         }
         let _guard = PreparingGuard::enter(self);
@@ -156,12 +145,12 @@ impl Scene {
             match self.reconcile() {
                 Ok(()) => {
                     self.dirty.set(false);
-                    self.retry.borrow_mut().on_success();
+                    self.eligibility.borrow_mut().on_success();
                     return;
                 }
                 Err(failure) if is_unsupported_error(&failure.error) => {
                     let emit = self
-                        .retry
+                        .eligibility
                         .borrow_mut()
                         .mark_unsupported(&failure.culprit_ids);
                     if emit {
@@ -177,45 +166,18 @@ impl Scene {
                     }
                 }
                 Err(failure) => {
-                    match self.retry.borrow_mut().on_transient_failure(Instant::now()) {
-                        TransientOutcome::Retry { delay, .. } => {
-                            self.dirty.set(true);
-                            self.schedule_retry(delay);
-                        }
-                        TransientOutcome::Exhausted { emit_diagnostic } => {
-                            self.dirty.set(false);
-                            if emit_diagnostic {
-                                log::warn!(
-                                    "OHOS scene prepare failed after {MAX_PREPARE_RETRIES} retries; falling back to native: {}",
-                                    failure.error
-                                );
-                            }
-                        }
+                    // Rollback has restored native display. Retry only when a
+                    // mount, layout, paint or resource update invalidates input;
+                    // this failure itself must not schedule another UI turn.
+                    if self.eligibility.borrow_mut().on_failure() {
+                        log::warn!(
+                            "OHOS scene prepare failed; retaining native display until input changes: {}",
+                            failure.error
+                        );
                     }
                     return;
                 }
             }
-        }
-    }
-    fn schedule_retry(&self, delay: std::time::Duration) {
-        let Some(root) = self.root.upgrade() else {
-            return;
-        };
-        if delay.is_zero() {
-            if let Some(route) = root.dispatcher.upgrade() {
-                route.send(Message::Arkui);
-            }
-        } else {
-            let dispatcher = root.dispatcher.clone();
-            Dispatcher::after(
-                &root.dispatcher,
-                delay,
-                Box::new(move || {
-                    if let Some(route) = dispatcher.upgrade() {
-                        route.send(Message::Arkui);
-                    }
-                }),
-            );
         }
     }
     fn reconcile(&self) -> std::result::Result<(), ReconcileFailure> {
@@ -227,12 +189,12 @@ impl Scene {
         {
             let mut requirements = self.requirements.borrow_mut();
             requirements.retain(|node| node.strong_count() > 0);
-            let retry = self.retry.borrow();
+            let eligibility = self.eligibility.borrow();
             // Most surfaces have no scene effects. Check only current trigger nodes;
             // ordinary mount/animation turns do not scan the whole native tree.
             for node in requirements.iter().filter_map(Weak::upgrade) {
                 live_ids.insert(node.id);
-                if !retry.is_eligible(node.id) || !node.paint_visible() {
+                if !eligibility.is_eligible(node.id) || !node.paint_visible() {
                     continue;
                 }
                 let mut connected = false;
@@ -262,7 +224,7 @@ impl Scene {
                 }
             }
         }
-        self.retry
+        self.eligibility
             .borrow_mut()
             .retain_live(|id| live_ids.contains(&id));
 

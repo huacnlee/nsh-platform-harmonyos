@@ -809,7 +809,10 @@ impl Scroller {
         // UIKit/Android report a position change once. ArkUI also reports
         // programmatic moves later in OnDidScroll and again in OnScrollStop;
         // replaying those offsets makes synchronized scroll views feed back.
-        if !self.reported.update(reported, self.corrections.get()) {
+        if !self
+            .reported
+            .update(reported, self.zoom.get(), self.corrections.get())
+        {
             return Ok(());
         }
 
@@ -1151,7 +1154,7 @@ impl Scroller {
                     offset: self.offset.get(),
                 },
                 to,
-                start: owner.animator.now(),
+                start: None,
             }));
             owner.animator.track_scroll(&owner);
             Ok(())
@@ -1160,7 +1163,7 @@ impl Scroller {
         }
     }
     pub(crate) fn tick(&self, now: f64) -> Result<bool> {
-        let Some(motion) = self.zoom_motion.get() else {
+        let Some(mut motion) = self.zoom_motion.get() else {
             return Ok(false);
         };
         let (frame, running) = if self
@@ -1172,10 +1175,10 @@ impl Scroller {
         } else {
             motion.sample(now)
         };
+        // Anchor and advance in the native frame clock's domain. Input can
+        // arrive between VSync callbacks, whose timestamps include delivery lag.
+        self.zoom_motion.set(running.then_some(motion));
         self.apply_zoom(frame)?;
-        if !running {
-            self.zoom_motion.set(None);
-        }
         Ok(running)
     }
     fn apply_zoom(&self, frame: ZoomFrame) -> Result<()> {
@@ -1200,16 +1203,20 @@ impl Scroller {
             self.report()?;
             return Ok(());
         }
+        self.zoom_offset
+            .set(Some((frame.offset.0, frame.offset.1, false)));
+        // Native writes may report scrolling synchronously. Publish the scale
+        // first, as didZoom does upstream, so every offset carries this scale.
+        owner.control.zoom(owner.id, frame.scale);
         let content = self.content.borrow();
         content.set_attribute(A::Scale, vec![frame.scale, frame.scale].into())?;
         content.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
         drop(content);
         let viewport = owner.frame.get();
         self.viewport(Size::new(viewport.width, viewport.height))?;
-        self.zoom_offset
-            .set(Some((frame.offset.0, frame.offset.1, false)));
-        owner.control.zoom(owner.id, frame.scale);
-        Ok(())
+        // A scale-only final sample need not cause another native offset or
+        // layout callback. Pair it with a report before the animation stops.
+        self.report()
     }
     fn configure_axes(self: &Rc<Self>) -> Result<()> {
         use ohos_arkui_binding::component::attribute::ArkUIEvent;

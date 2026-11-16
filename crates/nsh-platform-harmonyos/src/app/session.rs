@@ -41,6 +41,7 @@ struct UiSession {
     services: Arc<Services>,
     tab_bar: std::rc::Rc<crate::interop::component::TabFactory>,
     apply_batch: std::rc::Rc<FunctionRef<crate::interop::sdk::Batch, ()>>,
+    frame_factory: std::rc::Rc<super::frame_source::Factory>,
     surfaces: Vec<crate::app::surface::LifecycleRoute>,
     ui_context: Option<(Env, ObjectRef)>,
 }
@@ -689,6 +690,17 @@ impl Services {
             .ok_or_else(|| Error::from_reason("OHOS UI session closed"))
     }
 
+    pub(crate) fn frame_factory(&self) -> Result<std::rc::Rc<super::frame_source::Factory>> {
+        UI_SESSIONS
+            .with(|sessions| {
+                sessions
+                    .borrow()
+                    .get(&self.id)
+                    .map(|session| session.frame_factory.clone())
+            })
+            .ok_or_else(|| Error::from_reason("OHOS UI session closed"))
+    }
+
     pub(crate) fn create(
         init: HostInit,
         platform_window_id: i32,
@@ -696,6 +708,7 @@ impl Services {
         apply_batch: FunctionRef<crate::interop::sdk::Batch, ()>,
         command_tsfn: HostCommandCallback,
         tab_bar: crate::interop::component::TabFactory,
+        frame_factory: super::frame_source::Factory,
     ) -> Result<u32> {
         if platform_window_id < 0 {
             return Err(Error::from_reason("platformWindowId must be nonnegative"));
@@ -790,6 +803,7 @@ impl Services {
                     tab_bar: std::rc::Rc::new(tab_bar),
                     services: services.clone(),
                     apply_batch: std::rc::Rc::new(apply_batch),
+                    frame_factory: std::rc::Rc::new(frame_factory),
                     surfaces: Vec::new(),
                     ui_context: None,
                 },

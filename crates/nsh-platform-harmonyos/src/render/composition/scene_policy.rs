@@ -1,68 +1,31 @@
-//! Pure retry, eligibility, root-narrowing, and telemetry helpers for [`super::scene::Scene`].
+//! Requirement eligibility, root-narrowing, and telemetry for [`super::scene::Scene`].
 //!
-//! Kept free of ArkUI handle dependencies so host tests exercise the exact B04/A14
-//! state transitions and geometry rules.
+//! Native preparation runs only when inputs invalidate the scene, never on a timer.
 
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use nsh_core::{Color, NodeId, ViewStyle};
+use rustc_hash::FxHashSet;
 
-pub(crate) const MAX_PREPARE_RETRIES: u8 = 3;
-
-/// Retry delays after consecutive transient `Scene::prepare` failures:
-/// 1st failure -> next ArkUI turn immediately (`0 ms`),
-/// 2nd failure -> `100 ms`,
-/// 3rd failure -> `500 ms`,
-/// 4th failure -> stop retrying and emit one diagnostic.
-const PREPARE_BACKOFFS: [Duration; MAX_PREPARE_RETRIES as usize] = [
-    Duration::ZERO,
-    Duration::from_millis(100),
-    Duration::from_millis(500),
-];
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TransientOutcome {
-    /// Keep `dirty = true` and retry after `delay` (`Duration::ZERO` = next ArkUI turn).
-    Retry { delay: Duration, attempt: u8 },
-    /// Retries exhausted: clear `dirty`, stay on native fallback, emit one diagnostic.
-    Exhausted { emit_diagnostic: bool },
-}
-
-/// Bounded retry and unsupported-requirement tracking for `Scene::prepare` (B04).
+/// Unsupported inputs are reconsidered when their requirement changes. Transient
+/// errors only suppress duplicate diagnostics; they never block a new invalidation.
 #[derive(Default, Debug)]
-pub(crate) struct SceneRetry {
-    attempts: u8,
-    retry_at: Option<Instant>,
-    exhausted: bool,
-    exhausted_reported: bool,
-    ineligible: HashSet<NodeId>,
-    unsupported_reported: HashSet<NodeId>,
+pub(crate) struct SceneRequirements {
+    ineligible: FxHashSet<NodeId>,
+    unsupported_reported: FxHashSet<NodeId>,
+    failure_reported: bool,
 }
 
-impl SceneRetry {
+impl SceneRequirements {
     pub(crate) fn is_eligible(&self, id: NodeId) -> bool {
         !self.ineligible.contains(&id)
     }
 
-    pub(crate) fn is_exhausted(&self) -> bool {
-        self.exhausted
-    }
-
-    /// Called when `Scene::require(node)` updates a requirement node.
-    /// Clears any stale unsupported/exhausted latch so style/effect edits can
-    /// re-enter `Scene` cleanly.
     pub(crate) fn on_requirement_updated(&mut self, id: NodeId, required: bool) {
         self.ineligible.remove(&id);
         if !required {
             self.unsupported_reported.remove(&id);
         }
-        self.attempts = 0;
-        self.retry_at = None;
-        self.exhausted = false;
-        self.exhausted_reported = false;
     }
 
     pub(crate) fn retain_live(&mut self, mut is_live: impl FnMut(NodeId) -> bool) {
@@ -70,49 +33,21 @@ impl SceneRetry {
         self.unsupported_reported.retain(|&id| is_live(id));
     }
 
-    /// Returns `true` when `prepare()` may run at `now`. During a non-zero backoff
-    /// window, `prepare()` yields immediately without clearing `dirty` so other
-    /// `flush_arkui()` updates proceed unimpeded.
-    pub(crate) fn due(&self, now: Instant) -> bool {
-        !self.exhausted && self.retry_at.is_none_or(|at| now >= at)
-    }
-
     pub(crate) fn on_success(&mut self) {
-        self.attempts = 0;
-        self.retry_at = None;
-        self.exhausted = false;
-        self.exhausted_reported = false;
+        self.failure_reported = false;
     }
 
-    /// Marks `ids` ineligible for `Scene` due to `Error::Unsupported`.
-    /// Returns `true` if at least one node has not been reported yet (emit one diagnostic).
     pub(crate) fn mark_unsupported(&mut self, ids: &[NodeId]) -> bool {
         let mut should_report = false;
         for &id in ids {
             self.ineligible.insert(id);
-            if self.unsupported_reported.insert(id) {
-                should_report = true;
-            }
+            should_report |= self.unsupported_reported.insert(id);
         }
         should_report
     }
 
-    pub(crate) fn on_transient_failure(&mut self, now: Instant) -> TransientOutcome {
-        if (self.attempts as usize) < PREPARE_BACKOFFS.len() {
-            let delay = PREPARE_BACKOFFS[self.attempts as usize];
-            self.attempts += 1;
-            self.retry_at = (!delay.is_zero()).then(|| now + delay);
-            TransientOutcome::Retry {
-                delay,
-                attempt: self.attempts,
-            }
-        } else {
-            self.retry_at = None;
-            self.exhausted = true;
-            let emit_diagnostic = !self.exhausted_reported;
-            self.exhausted_reported = true;
-            TransientOutcome::Exhausted { emit_diagnostic }
-        }
+    pub(crate) fn on_failure(&mut self) -> bool {
+        !std::mem::replace(&mut self.failure_reported, true)
     }
 }
 
@@ -282,79 +217,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transient_prepare_failures_retry_with_backoff_and_exhaust_cleanly() {
-        let t0 = Instant::now();
-        let mut retry = SceneRetry::default();
-        assert!(retry.due(t0));
-
-        // 1st failure: immediate next ArkUI turn (0ms).
-        assert_eq!(
-            retry.on_transient_failure(t0),
-            TransientOutcome::Retry {
-                delay: Duration::ZERO,
-                attempt: 1,
-            }
-        );
-        assert!(retry.due(t0));
-
-        // 2nd failure: 100ms backoff; intermediate flush_arkui turns do not burn attempts.
-        assert_eq!(
-            retry.on_transient_failure(t0),
-            TransientOutcome::Retry {
-                delay: Duration::from_millis(100),
-                attempt: 2,
-            }
-        );
-        assert!(!retry.due(t0 + Duration::from_millis(50)));
-        assert!(retry.due(t0 + Duration::from_millis(100)));
-
-        // 3rd failure: 500ms backoff.
-        let t1 = t0 + Duration::from_millis(100);
-        assert_eq!(
-            retry.on_transient_failure(t1),
-            TransientOutcome::Retry {
-                delay: Duration::from_millis(500),
-                attempt: 3,
-            }
-        );
-        assert!(!retry.due(t1 + Duration::from_millis(499)));
-        assert!(retry.due(t1 + Duration::from_millis(500)));
-
-        // 4th failure: exhausted, emits exactly one diagnostic.
-        let t2 = t1 + Duration::from_millis(500);
-        assert_eq!(
-            retry.on_transient_failure(t2),
-            TransientOutcome::Exhausted {
-                emit_diagnostic: true,
-            }
-        );
-        assert!(!retry.due(t2 + Duration::from_secs(10)));
-        assert!(retry.is_exhausted());
-
-        // Requirement update clears exhausted latch so subsequent valid changes recover.
-        retry.on_requirement_updated(42, true);
-        assert!(!retry.is_exhausted());
-        assert!(retry.due(t2 + Duration::from_secs(10)));
-    }
-
-    #[test]
-    fn transient_failure_then_success_resets_attempt_counter() {
-        let t0 = Instant::now();
-        let mut retry = SceneRetry::default();
-        assert!(matches!(
-            retry.on_transient_failure(t0),
-            TransientOutcome::Retry { attempt: 1, .. }
-        ));
-        retry.on_success();
-        assert!(matches!(
-            retry.on_transient_failure(t0),
-            TransientOutcome::Retry { attempt: 1, .. }
-        ));
+    fn transient_errors_do_not_disable_inputs_or_reset_on_unrelated_updates() {
+        let mut requirements = SceneRequirements::default();
+        assert!(requirements.on_failure());
+        for _ in 0..8 {
+            assert!(requirements.is_eligible(7));
+            assert!(!requirements.on_failure());
+        }
+        requirements.on_requirement_updated(99, false);
+        assert!(!requirements.on_failure());
+        assert!(requirements.is_eligible(7));
+        requirements.on_success();
+        assert!(requirements.on_failure());
     }
 
     #[test]
     fn unsupported_marks_requirement_ineligible_and_reports_once_until_updated() {
-        let mut retry = SceneRetry::default();
+        let mut retry = SceneRequirements::default();
         assert!(retry.is_eligible(7));
         assert!(retry.mark_unsupported(&[7]));
         assert!(!retry.is_eligible(7));

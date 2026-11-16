@@ -223,6 +223,11 @@ impl FrameRate {
         let _ = self.sync_locked(&mut state, true);
     }
 
+    #[cfg(target_env = "ohos")]
+    pub(crate) fn desired_range(&self) -> RateRange {
+        self.state.lock().unwrap().desired()
+    }
+
     pub(crate) fn vote(self: &Arc<Self>) -> Vote {
         Vote {
             rate: self.clone(),

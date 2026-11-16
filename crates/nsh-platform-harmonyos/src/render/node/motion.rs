@@ -146,24 +146,20 @@ impl Node {
             .map(|image| image.tick(now))
             .transpose()?
             .unwrap_or(false);
-        let video_active = self
-            .video
-            .borrow()
-            .as_ref()
-            .map(|video| video.tick(now))
-            .transpose()?
-            .unwrap_or(false);
         let Some(mut live) = self.live.borrow_mut().take() else {
-            return Ok((
-                image_active || navigation_active || video_active,
-                navigation_removed,
-            ));
+            return Ok((image_active || navigation_active, navigation_removed));
         };
         let step = if self.platform.get().reduce_motion {
             live.finish(&mut self.style.borrow_mut())
         } else {
             live.step(now, self.frame.get(), &mut self.style.borrow_mut())
         };
+        // A completed exit returns the upstream default style together with
+        // `removed`. Keep the last exit sample until the mounter detaches it;
+        // applying that default would flash the disappearing subtree back on.
+        if step.removed {
+            return Ok((false, true));
+        }
         if live.recolor {
             self.invalidate_paint()?;
             self.invalidate_scene();
@@ -197,7 +193,7 @@ impl Node {
             self.animator.apply_node(self)?;
         }
         Ok((
-            step.active || image_active || navigation_active || video_active,
+            step.active || image_active || navigation_active,
             step.removed || navigation_removed,
         ))
     }

@@ -128,6 +128,7 @@ export interface HostInit {
   cacheDir: string
   filesDir: string
   pixelRatio: number
+  maxRefreshRate?: number
   rtl: boolean
   lifecycle: string
   colorMode: number
@@ -307,6 +308,14 @@ export interface PickedDescriptor {
   name: string
 }
 
+export interface Request {
+  enabled: boolean
+  close: boolean
+  min: number
+  max: number
+  expected: number
+}
+
 /** Typed SDK request; fields cross N-API directly without a JSON envelope. */
 export interface SystemCommand {
   op: string
@@ -365,8 +374,8 @@ export interface ViewOptions {
   width: number
   height: number
   hue: number
-  textureSurface?: string
   textureInsets?: TextureInsets
+  textureSurface?: string
   testId?: string
   semantic: boolean
   clickable: boolean
@@ -449,7 +458,7 @@ export declare function nshAttachNativeSubtree(targetId: number, content: FrameN
 
 export declare function nshCloseSession(sessionId: number): void
 
-export declare function nshCreateSession(init: HostInit, platformWindowId: number, resourceManager: object, applyBatch: (batch: Batch) => void, onCommand: (command: HostCommand) => void, tabBar: (context: TabBarContext) => object): number
+export declare function nshCreateSession(init: HostInit, platformWindowId: number, resourceManager: object, applyBatch: (batch: Batch) => void, onCommand: (command: HostCommand) => void, tabBar: (context: TabBarContext) => object, frameFactory: (callbacks: { frame(timestamp: number): boolean }) => (request: object) => void): number
 
 export declare function nshEditorEvent(targetId: number, event: EditorEvent): EditorReceipt
 
@@ -473,7 +482,7 @@ export declare function nshUpdateConfig(sessionId: number, colorMode: number, fo
 
 export declare function nshUpdateKeyboard(sessionId: number, duration: number): void
 
-export declare function nshUpdateWindow(sessionId: number, platformWindowId: number, visual: Array<AvoidArea>, keyboard: AvoidArea): void
+export declare function nshUpdateWindow(sessionId: number, platformWindowId: number, visual: Array<AvoidArea>, keyboard: AvoidArea, maxRefreshRate?: number | undefined | null): void
 
 export declare function nshViewAction(action: MenuAction): boolean
 

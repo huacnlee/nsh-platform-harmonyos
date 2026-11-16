@@ -14,7 +14,7 @@ use ohos_arkui_binding::{
 };
 
 use crate::render::{
-    geometry::Size,
+    geometry::{Size, WindowRect, visual_insets},
     node::{Node, Result},
 };
 struct Transition {
@@ -35,6 +35,8 @@ pub(crate) struct Modal {
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     closing: Cell<bool>,
     insets: Cell<EdgeInsets>,
+    /// Native window geometry, refreshed by presentation, measure and window events.
+    available: Cell<Option<Size>>,
     reported: Cell<nsh_core::navigation::Reported>,
     overlay: RefCell<Option<crate::app::session::Overlay>>,
 }
@@ -62,6 +64,7 @@ impl Modal {
             shader: RefCell::default(),
             closing: Cell::new(false),
             insets: Cell::new(EdgeInsets::default()),
+            available: Cell::new(None),
             reported: Cell::new(nsh_core::navigation::Reported::default()),
             overlay: RefCell::default(),
         });
@@ -115,7 +118,7 @@ impl Modal {
             }
         }
         self.theme()?;
-        self.sync_metrics();
+        self.refresh_metrics();
         if let Some(owner) = self.owner.upgrade() {
             owner.set_frame(owner.raw_frame.get())?;
             owner.restore_style()?;
@@ -166,7 +169,7 @@ impl Modal {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
-        self.sync_metrics();
+        self.refresh_metrics();
         owner.set_frame(owner.raw_frame.get())?;
         let was_shown = self.shown.replace(true);
         let was_closing = self.closing.replace(false);
@@ -400,6 +403,7 @@ impl Modal {
                 self.dialog.borrow().close()?;
                 self.overlay.borrow_mut().take();
                 self.dialog.borrow().remove_content()?;
+                self.available.set(None);
             }
             if let Some(owner) = self.owner.upgrade() {
                 owner.shaders.finish_modal_close(&owner, had_shader)?;
@@ -430,17 +434,82 @@ impl Modal {
     fn size_for_bounds(&self, owner: &Node, width: f32, height: f32) -> Size {
         match self.config.get().presentation {
             ModalPresentation::FullScreen => Size::new(width, height),
-            ModalPresentation::PageSheet => Size::new(
-                width.min(720.0),
-                (height - owner.platform.get().safe_area.top.0 - 24.0).max(0.0),
-            ),
+            ModalPresentation::PageSheet => {
+                let scale = owner.scale.get() as f64;
+                let safe_top = Self::insets_for_rect(
+                    owner,
+                    WindowRect {
+                        width: width as f64 * scale,
+                        height: height as f64 * scale,
+                        ..WindowRect::default()
+                    },
+                )
+                .map_or(owner.platform.get().safe_area.top.0, |insets| insets.top.0);
+                Size::new(width.min(720.0), (height - safe_top - 24.0).max(0.0))
+            }
             ModalPresentation::FormSheet => {
                 Size::new(width.min(540.0), (height - 32.0).clamp(0.0, 620.0))
             }
         }
     }
+    fn window_size(owner: &Node) -> Option<Size> {
+        let window = ohos_window_manager_binding::Window::from_id(owner.host.window_id()? as i32);
+        let bounds = window.properties().ok()?.drawable_rect;
+        (bounds.width > 0 && bounds.height > 0).then(|| {
+            Size::new(
+                bounds.width as f32 / owner.scale.get(),
+                bounds.height as f32 / owner.scale.get(),
+            )
+        })
+    }
+    fn insets_for_rect(owner: &Node, viewport: WindowRect) -> Option<EdgeInsets> {
+        let (visual, _) = owner.host.window_areas()?;
+        let rect = |rect: crate::app::session::AvoidRect| WindowRect {
+            x: rect.left as f64,
+            y: rect.top as f64,
+            width: rect.width as f64,
+            height: rect.height as f64,
+        };
+        let [top, right, bottom, left] = visual_insets(
+            viewport,
+            visual.into_iter().filter(|area| area.visible).map(|area| {
+                [
+                    rect(area.top_rect),
+                    rect(area.right_rect),
+                    rect(area.bottom_rect),
+                    rect(area.left_rect),
+                ]
+            }),
+        );
+        let scale = owner.scale.get() as f64;
+        Some(EdgeInsets {
+            top: Points((top / scale) as f32),
+            right: Points((right / scale) as f32),
+            bottom: Points((bottom / scale) as f32),
+            left: Points((left / scale) as f32),
+        })
+    }
     fn report_metrics(&self, owner: &Node, size: Size) {
-        let safe = owner.platform.get().safe_area;
+        // The dialog is rooted in the window, independently of the embedding
+        // surface. Only the avoid areas intersecting its own bounds are insets.
+        let safe = owner
+            .mounted()
+            .borrow()
+            .layout_position_in_window()
+            .ok()
+            .and_then(|origin| {
+                let scale = owner.scale.get() as f64;
+                Self::insets_for_rect(
+                    owner,
+                    WindowRect {
+                        x: origin.x as f64,
+                        y: origin.y as f64,
+                        width: size.width as f64 * scale,
+                        height: size.height as f64 * scale,
+                    },
+                )
+            })
+            .unwrap_or(owner.platform.get().safe_area);
         let presentation = self.config.get().presentation;
         let full = presentation == ModalPresentation::FullScreen;
         let insets = EdgeInsets {
@@ -479,13 +548,23 @@ impl Modal {
             }
         }
     }
+    pub(crate) fn refresh_metrics(&self) -> Option<Size> {
+        let owner = self.owner.upgrade()?;
+        self.available.set(Self::window_size(&owner));
+        self.sync_metrics()
+    }
     pub(crate) fn sync_metrics(&self) -> Option<Size> {
         let owner = self.owner.upgrade()?;
-        let window = owner.platform.get().window;
-        if window.width.0 <= 0.0 || window.height.0 <= 0.0 {
+        // A native Dialog fills its window, which may be larger than the NSH
+        // surface after the host has already avoided system bars.
+        let available = self
+            .available
+            .get()
+            .unwrap_or_else(|| owner.platform.get().window.into());
+        if available.width <= 0.0 || available.height <= 0.0 {
             return None;
         }
-        let size = self.size_for_bounds(&owner, window.width.0, window.height.0);
+        let size = self.size_for_bounds(&owner, available.width, available.height);
         self.report_metrics(&owner, size);
         Some(size)
     }
@@ -493,7 +572,9 @@ impl Modal {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(Size::default());
         };
-        let size = if let Some(constraint) = event.layout_constraint_in_measure() {
+        let available = if let Some(size) = Self::window_size(&owner) {
+            size
+        } else if let Some(constraint) = event.layout_constraint_in_measure() {
             let bound = |value: i32, fallback: f32| {
                 let value = value as f32 / owner.scale.get();
                 if value > 0.0 && value <= 16384.0 {
@@ -507,13 +588,20 @@ impl Modal {
                 constraint.max_height(),
                 owner.platform.get().window.height.0,
             );
-            self.size_for_bounds(&owner, width, height)
+            Size::new(width, height)
         } else {
-            self.sync_metrics()
-                .unwrap_or_else(|| Size::new(owner.frame.get().width, owner.frame.get().height))
+            owner.platform.get().window.into()
         };
+        self.available.set(Some(available));
+        let size = self.size_for_bounds(&owner, available.width, available.height);
         self.report_metrics(&owner, size);
         Ok(size)
+    }
+    pub(crate) fn laid_out(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            let frame = owner.frame.get();
+            self.report_metrics(&owner, Size::new(frame.width, frame.height));
+        }
     }
 }
 impl Drop for Modal {

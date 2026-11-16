@@ -25,12 +25,16 @@ impl Controls {
             self.show(playing, now);
         }
     }
-    pub(super) fn tick(&mut self, now: f64) -> bool {
-        if self.hide_at.is_some_and(|deadline| now >= deadline) {
+    pub(super) fn deadline(&self) -> Option<f64> {
+        self.hide_at
+    }
+    pub(super) fn expire(&mut self, deadline: f64, now: f64) -> bool {
+        if self.hide_at == Some(deadline) && now >= deadline {
             self.hide_at = None;
             self.visible = false;
+            return true;
         }
-        self.hide_at.is_some()
+        false
     }
 }
 #[cfg(test)]
@@ -40,11 +44,11 @@ mod tests {
     fn paused_controls_stay_visible_and_playing_controls_expire() {
         let mut controls = Controls::default();
         controls.show(false, 0.0);
-        assert!(!controls.tick(60_000.0));
+        assert_eq!(controls.deadline(), None);
         assert!(controls.visible);
         controls.show(true, 60_000.0);
-        assert!(controls.tick(62_999.0));
-        assert!(!controls.tick(63_000.0));
+        assert!(!controls.expire(63_000.0, 62_999.0));
+        assert!(controls.expire(63_000.0, 63_000.0));
         assert!(!controls.visible);
     }
     #[test]
@@ -54,10 +58,22 @@ mod tests {
         assert!(!controls.visible);
         controls.toggle(true, 1000.0);
         assert!(controls.visible);
-        assert!(controls.tick(3999.0));
-        assert!(!controls.tick(4000.0));
+        assert!(!controls.expire(4000.0, 3999.0));
+        assert!(controls.expire(4000.0, 4000.0));
         controls.toggle(false, 5000.0);
         assert!(controls.visible);
-        assert!(!controls.tick(10000.0));
+        assert!(!controls.expire(4000.0, 10000.0));
+    }
+    #[test]
+    fn posted_expiration_cannot_hide_refreshed_or_paused_controls() {
+        let mut controls = Controls::default();
+        controls.show(true, 0.0);
+        controls.show(true, 2000.0);
+        assert!(!controls.expire(3000.0, 4000.0));
+        assert!(controls.visible);
+        assert_eq!(controls.deadline(), Some(5000.0));
+        controls.show(false, 4500.0);
+        assert!(!controls.expire(5000.0, 6000.0));
+        assert!(controls.visible);
     }
 }

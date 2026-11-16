@@ -1,4 +1,3 @@
-import { PicturePixels } from "./NativeViews";
 import {
   AbilityConstant,
   AbilityLifecycleCallback,
@@ -26,6 +25,7 @@ import {
 } from "./NativeEditors";
 import { Batch, NshPlugin } from "./NshPlugin";
 import { NativeTabBar, TabBarContext } from "./NativeTabBar";
+import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames";
 
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
@@ -95,6 +95,7 @@ interface NshNativeModule {
     applyBatch: (batch: Batch) => void,
     onCommand: (command: HostCommandPayload) => void,
     tabBar: (context: TabBarContext) => object,
+    frames: (callbacks: FrameCallbacks) => (request: FrameRequest) => void,
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
@@ -126,7 +127,6 @@ interface NshNativeModule {
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
-  nshNativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshViewAction(action: MenuActionPayload): boolean;
@@ -283,12 +283,6 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     } catch (error) {
       console.error(`[NSH] retireNativeNode(${targetId}) failed: ${String(error)}`);
       return false;
-    }
-  }
-
-  nativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void {
-    if (this.active) {
-      this.mod.nshNativePicture(targetId, generation, picture, error);
     }
   }
 
@@ -534,6 +528,8 @@ class HostSession {
         this.handleHostCommand(command);
       },
       (context: TabBarContext): object => new NativeTabBar(uiContext, context),
+      (callbacks: FrameCallbacks): ((request: FrameRequest) => void) =>
+        createFrameSource(uiContext, callbacks),
     );
 
     this.system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
@@ -913,6 +909,12 @@ class HostSession {
       return;
     }
 
+    if (command.kind === "back") {
+      // Programmatic router back resumes the host's default return without
+      // re-entering the page's onBackPress and its NSH BackHandler listeners.
+      this.runtimeContext.getUIContext().getRouter().back();
+      return;
+    }
     if (command.kind === "system") {
       this.system
         .execute(command.openId ?? 0, command.system ?? { op: "" })

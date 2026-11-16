@@ -59,13 +59,14 @@ struct Output {
 }
 struct State {
     settings: Settings,
-    initial_picture: Option<super::picture::Picture>,
     screen_origin: Option<(i32, i32)>,
     output: Option<Output>,
     presented: bool,
     published_geom: Option<(u32, u32, u32, u32)>,
     initialized: Option<std::result::Result<Option<u64>, String>>,
     output_surface: Option<u64>,
+    /// Producer destination acknowledged by the UI attachment.
+    surface: Option<u64>,
     closed: bool,
 }
 struct Shared {
@@ -492,7 +493,6 @@ impl Worker {
                                     key,
                                     shared: shared.clone(),
                                     reader,
-                                    initial_picture: None,
                                     gpu: gpu.as_ref().unwrap().clone(),
                                     settings,
                                     scene_source: None,
@@ -510,8 +510,10 @@ impl Worker {
                             })();
                             if result.is_err() {
                                 shared.released.store(true, Ordering::Release);
+                                shared.state.lock().unwrap().initialized = Some(result);
+                            } else if let Some(entry) = entries[key.slot()].as_ref() {
+                                entry.publish_input(entry.settings.native_output(), result);
                             }
-                            shared.state.lock().unwrap().initialized = Some(result);
                             if let Some(route) = route.upgrade() {
                                 route.send(Message::Composite {
                                     id: key.id,
@@ -604,8 +606,9 @@ impl Worker {
                                     !was_animating && shared.animating.load(Ordering::Acquire);
                                 let publish = {
                                     let state = shared.state.lock().unwrap();
-                                    !state.settings.scene
-                                        && (state.output.is_some() || state.initialized.is_some() || started_animating)
+                                    state.initialized.is_some()
+                                        || (!state.settings.scene
+                                            && (state.output.is_some() || started_animating))
                                 };
                                 if publish && !shared.posted.swap(true, Ordering::AcqRel) {
                                     route.send(Message::Composite {
@@ -784,8 +787,6 @@ impl Worker {
                                 {
                                     let mut state = entry.shared.state.lock().unwrap();
                                     state.output_surface = output_surface.as_ref().ok().copied();
-                                    // Notify the UI that its native export target is available.
-                                    state.initialized = Some(output_surface.and(input_surface));
                                 }
                                 let raw = window.raw() as usize;
                                 if let Some(existing) = entry.window.as_ref()
@@ -798,6 +799,16 @@ impl Worker {
                                     entry.shared.state.lock().unwrap().published_geom = None;
                                     entry.window_dirty = true;
                                 }
+                                let native_output = entry.settings.native_output();
+                                let destination = if native_output {
+                                    if let Some(window) = &entry.window {
+                                        window.release_egl();
+                                    }
+                                    output_surface.map(Some)
+                                } else {
+                                    output_surface.and(input_surface)
+                                };
+                                entry.publish_input(native_output, destination);
                                 wake(&callback, key, &entry.shared);
                             }
                         }
@@ -1206,7 +1217,6 @@ struct Entry {
     key: Key,
     shared: Arc<Shared>,
     reader: Option<TextureReader>,
-    initial_picture: Option<super::gles::Target>,
     gpu: TextureContext,
     settings: Settings,
     scene_source: Option<Image>,
@@ -1244,6 +1254,22 @@ fn create_input(
     Ok(Some(reader))
 }
 impl Entry {
+    fn publish_input(
+        &self,
+        native_output: bool,
+        destination: std::result::Result<Option<u64>, String>,
+    ) {
+        let mut state = self.shared.state.lock().unwrap();
+        // An engine commit may have changed producers while this worker was
+        // creating its input. Such a reply must not migrate the native tree.
+        if state.settings.native_output() != native_output {
+            return;
+        }
+        if destination.as_ref().is_ok_and(|id| *id == state.surface) {
+            return;
+        }
+        state.initialized = Some(destination);
+    }
     fn update_input(
         &mut self,
         settings: &Settings,
@@ -1251,14 +1277,22 @@ impl Entry {
     ) -> std::result::Result<(), String> {
         if self.reader.is_some() == settings.native_output() {
             self.reader = create_input(&self.gpu, settings, self.key, &self.shared, callback)?;
-            let id = self
-                .reader
+        }
+        let id = if settings.native_output() {
+            if let Some(window) = &self.window {
+                window.release_egl();
+            }
+            self.shared.state.lock().unwrap().output_surface
+        } else {
+            self.reader
                 .as_mut()
                 .map(TextureReader::id)
                 .transpose()
-                .map_err(|e| e.to_string())?;
-            self.shared.state.lock().unwrap().initialized = Some(Ok(id));
-        }
+                .map_err(|e| e.to_string())?
+        };
+        // Comparing with the UI's acknowledged destination also covers a fast
+        // native -> GPU -> native reversal coalesced into one worker wake.
+        self.publish_input(settings.native_output(), Ok(id));
         Ok(())
     }
     fn render(&mut self, settings: Settings) -> std::result::Result<bool, String> {
@@ -1282,22 +1316,6 @@ impl Entry {
         let mut changed = self.settings != settings || std::mem::take(&mut self.window_dirty);
         self.shaders.layers(&settings.shaders)?;
         self.settings = settings;
-        let initial = self.shared.state.lock().unwrap().initial_picture.take();
-        if self.settings.scene || self.settings.native_output() {
-            self.initial_picture = None;
-        } else if let Some(picture) = initial {
-            let _trace = super::trace::Scope::new(c"NSH initial picture upload");
-            let (width, height) = (picture.width, picture.height);
-            self.initial_picture = Some(super::gles::Target::upload(
-                &self.gpu,
-                &RgbaFrame {
-                    width,
-                    height,
-                    pixels: picture.into_rgba()?,
-                },
-            )?);
-            changed = true;
-        }
         let direct = !self.settings.scene;
         let x = -(self.settings.insets[0] as f32);
         let y = -(self.settings.insets[1] as f32);
@@ -1322,9 +1340,6 @@ impl Entry {
             .map_err(|e| e.to_string())?;
         if direct {
             changed |= reader.update_texture().map_err(|e| e.to_string())?;
-            if reader.texture().is_some() {
-                self.initial_picture = None;
-            }
         } else if let Some(frame) = reader.read().map_err(|e| e.to_string())? {
             self.pending_readback_bytes += frame.pixels.len() as u64;
             let mut image = Image::new(frame);
@@ -1340,16 +1355,7 @@ impl Entry {
             return Ok(false);
         }
         if direct {
-            let Some(source) = self
-                .reader
-                .as_ref()
-                .and_then(TextureReader::texture)
-                .or_else(|| {
-                    self.initial_picture
-                        .as_ref()
-                        .map(super::gles::Target::picture)
-                })
-            else {
+            let Some(source) = self.reader.as_ref().and_then(TextureReader::texture) else {
                 // Only the producer can supply the first input. In particular,
                 // offscreen native subtrees need not export a frame at all.
                 // Their frame-available callback resumes this entry when ready.
@@ -1689,9 +1695,7 @@ fn next_composite_generation() -> u32 {
 pub(crate) struct Composite {
     owner: std::rc::Weak<Node>,
     presentation: RefCell<Option<super::presentation::Presentation>>,
-    surface: Cell<Option<u64>>,
     failed: Cell<bool>,
-    initial_picture: Cell<bool>,
     pub(crate) generation: u32,
     key: Key,
     shared: Arc<Shared>,
@@ -1738,13 +1742,13 @@ impl Composite {
             awaiting_origin: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
-                initial_picture: None,
                 screen_origin: initial_origin,
                 output: None,
                 presented: false,
                 published_geom: None,
                 initialized: None,
                 output_surface: None,
+                surface: None,
                 closed: false,
             }),
             queued: AtomicBool::new(false),
@@ -1798,17 +1802,7 @@ impl Composite {
         Ok(Self {
             owner: Rc::downgrade(owner),
             presentation: RefCell::new(presentation),
-            surface: Cell::new(None),
             failed: Cell::new(false),
-            // An already displayed root cannot export before there is an output:
-            // ArkUI removes its source RS node from the display tree first.
-            initial_picture: Cell::new(
-                owner.id == nsh_core::ROOT_ID
-                    && !overlay
-                    && initial_settings.gpu
-                    && !initial_settings.scene
-                    && !initial_settings.native_output(),
-            ),
             generation,
             key,
             shared,
@@ -1825,11 +1819,6 @@ impl Composite {
             return Ok(false);
         }
         let settings = settings(owner, self.key.overlay)?;
-        if !settings.gpu || settings.scene || settings.native_output() {
-            // This sample belongs to the direct GPU input. A scene/native
-            // producer change cancels it, including an asynchronous reply.
-            self.initial_picture.set(false);
-        }
         if settings.gpu && self.presentation.borrow().is_none() {
             let layer = super::presentation::Presentation::new(
                 owner,
@@ -1876,6 +1865,11 @@ impl Composite {
         }
         let changed = state.settings != settings;
         if changed {
+            if state.settings.native_output() != settings.native_output() {
+                // Invalidate an unconsumed worker reply from the previous mode.
+                // The current UI destination stays live until the new reply.
+                state.initialized = None;
+            }
             state.settings = settings;
             drop(state);
             wake(&self.worker.send, self.key, &self.shared);
@@ -1886,37 +1880,18 @@ impl Composite {
         }
         Ok(changed)
     }
-    pub(crate) fn needs_initial_picture(&self) -> bool {
-        self.initial_picture.get() && !self.is_revealed() && !self.failed.get()
-    }
-    pub(crate) fn initial_picture_scale(&self) -> f64 {
-        let state = self.shared.state.lock().unwrap();
-        f64::from(state.settings.scale / state.settings.density)
-    }
-    pub(crate) fn initial_picture(
-        &self,
-        picture: std::result::Result<super::picture::Picture, String>,
-    ) {
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            match picture {
-                Ok(picture) => state.initial_picture = Some(picture),
-                Err(error) => state.initialized = Some(Err(error)),
-            }
-        }
-        wake(&self.worker.send, self.key, &self.shared);
-    }
     pub(crate) fn surface_id(&self) -> Option<String> {
-        if self.failed.get() || self.needs_initial_picture() {
+        if self.failed.get() {
             return None;
         }
-        let state = self.shared.state.lock().unwrap();
-        let id = if state.settings.native_output() {
-            state.output_surface
-        } else {
-            self.surface.get()
-        };
-        id.map(|id| id.to_string())
+        // Only the worker can publish a new producer destination: switching to
+        // native output must first relinquish EGL ownership of that queue.
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .surface
+            .map(|id| id.to_string())
     }
     pub(crate) fn shader_slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
         let _ = self.worker.send.send(Task::Slot(self.key, id, slot, value));
@@ -1981,11 +1956,15 @@ impl Composite {
             .is_some_and(super::presentation::Presentation::is_revealed)
     }
     pub(crate) fn ready(&self) -> (bool, bool) {
-        let initialized = self.shared.state.lock().unwrap().initialized.take();
-        let first_input = self.surface.get().is_none();
-        if let Some(Ok(id)) = initialized.as_ref() {
-            self.surface.set(*id);
-        }
+        let initialized = {
+            let mut state = self.shared.state.lock().unwrap();
+            let initialized = state.initialized.take();
+            if let Some(Ok(id)) = initialized.as_ref() {
+                state.surface = *id;
+            }
+            initialized
+        };
+        let input_changed = initialized.is_some();
         if let Some(Err(error)) = initialized {
             log::warn!("OHOS compositor initialization: {error}");
             self.failed.set(true);
@@ -1993,8 +1972,6 @@ impl Composite {
                 layer.hide();
             }
         }
-        // A window-created notification can repeat the same input surface.
-        let initialized = first_input && self.surface.get().is_some();
         self.shared.posted.store(false, Ordering::Release);
         let output = self.shared.state.lock().unwrap().output.take();
         if let Some(output) = output {
@@ -2016,14 +1993,14 @@ impl Composite {
                 match result {
                     Ok(revealed) => {
                         drop(presentation);
-                        return (initialized, revealed);
+                        return (input_changed, revealed);
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
                 }
-                return (initialized, false);
+                return (input_changed, false);
             }
         }
-        (initialized, false)
+        (input_changed, false)
     }
     pub(crate) fn measure(
         &self,

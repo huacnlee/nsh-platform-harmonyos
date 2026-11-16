@@ -4,16 +4,16 @@
 /// be acknowledged even when their final position is unchanged.
 #[derive(Default)]
 pub(crate) struct OffsetReport {
-    last: std::cell::Cell<Option<((f32, f32), u32)>>,
+    last: std::cell::Cell<Option<(ZoomFrame, u32)>>,
 }
 impl OffsetReport {
-    pub(crate) fn update(&self, offset: (f32, f32), applied: u32) -> bool {
-        let next = Some((offset, applied));
+    pub(crate) fn update(&self, offset: (f32, f32), scale: f32, applied: u32) -> bool {
+        let next = Some((ZoomFrame { offset, scale }, applied));
         self.last.replace(next) != next
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub(crate) struct ZoomFrame {
     pub(crate) scale: f32,
     pub(crate) offset: (f32, f32),
@@ -23,12 +23,13 @@ pub(crate) struct ZoomFrame {
 pub(crate) struct ZoomMotion {
     pub(crate) from: ZoomFrame,
     pub(crate) to: ZoomFrame,
-    pub(crate) start: f64,
+    pub(crate) start: Option<f64>,
 }
 
 impl ZoomMotion {
-    pub(crate) fn sample(self, now: f64) -> (ZoomFrame, bool) {
-        let t = ((now - self.start) / 250.0).clamp(0.0, 1.0) as f32;
+    pub(crate) fn sample(&mut self, now: f64) -> (ZoomFrame, bool) {
+        let start = *self.start.get_or_insert(now);
+        let t = ((now - start) / 250.0).clamp(0.0, 1.0) as f32;
         let eased = 1.0 - (1.0 - t).powi(3);
         let lerp = |a, b| a + (b - a) * eased;
         (
@@ -72,18 +73,21 @@ mod tests {
     #[test]
     fn native_duplicates_are_suppressed_without_losing_command_acknowledgements() {
         let report = OffsetReport::default();
-        assert!(report.update((0.0, 0.0), 0));
-        assert!(report.update((40.0, 0.0), 1)); // immediate programmatic result
-        assert!(!report.update((40.0, 0.0), 1)); // delayed OnDidScroll
-        assert!(!report.update((40.0, 0.0), 1)); // OnScrollStop
-        assert!(report.update((40.0, 0.0), 2)); // clamped command still acknowledged
-        assert!(!report.update((40.0, 0.0), 2));
-        assert!(report.update((39.0, 0.0), 2)); // finger movement still delivered
+        assert!(report.update((0.0, 0.0), 1.0, 0));
+        assert!(report.update((40.0, 0.0), 1.0, 1)); // immediate programmatic result
+        assert!(!report.update((40.0, 0.0), 1.0, 1)); // delayed OnDidScroll
+        assert!(!report.update((40.0, 0.0), 1.0, 1)); // OnScrollStop
+        assert!(report.update((40.0, 0.0), 1.0, 2)); // clamped command still acknowledged
+        assert!(!report.update((40.0, 0.0), 1.0, 2));
+        assert!(report.update((39.0, 0.0), 1.0, 2)); // finger movement still delivered
+        assert!(report.update((0.0, 0.0), 0.5, 2));
+        assert!(report.update((0.0, 0.0), 0.75, 2)); // zoom below fit need not move
+        assert!(!report.update((0.0, 0.0), 0.75, 2));
     }
 
     #[test]
     fn zoom_interpolates_scale_and_offsets_and_finishes_exactly() {
-        let motion = ZoomMotion {
+        let mut motion = ZoomMotion {
             from: ZoomFrame {
                 scale: 1.0,
                 offset: (0.0, 10.0),
@@ -92,8 +96,12 @@ mod tests {
                 scale: 3.0,
                 offset: (200.0, 250.0),
             },
-            start: 20.0,
+            start: None,
         };
+        let (frame, running) = motion.sample(20.0);
+        assert!(running);
+        assert_eq!(frame.scale, 1.0);
+        assert_eq!(frame.offset, (0.0, 10.0));
         let (frame, running) = motion.sample(145.0);
         assert!(running);
         assert_eq!(frame.scale, 2.75);

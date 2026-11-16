@@ -222,8 +222,9 @@ impl Mounter {
             if let Some(screen) = node.screen.borrow().as_ref() {
                 screen.update_environment()?;
             }
-            if node.modal.borrow().is_some() {
-                node.native
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                modal.refresh_metrics();
+                node.mounted()
                     .borrow()
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }
@@ -399,7 +400,16 @@ impl Mounter {
                 nsh_core::EventKind::BackPress,
                 nsh_core::EventPayload::None,
             ),
-            None => {}
+            None => {
+                // BackHandler runs in the engine after the native callback has
+                // returned. If it declines and no NSH root can go back, resume
+                // the host router's default action instead of swallowing it.
+                self.host
+                    .send_host_command(crate::app::session::HostCommand {
+                        kind: "back".into(),
+                        ..Default::default()
+                    })?;
+            }
         }
         Ok(())
     }
@@ -1616,23 +1626,19 @@ impl Mounter {
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
             animating |= modal.frame(self.animator.frame_time())?;
         }
-        if settled_leaving && !self.pending_delete.is_empty() {
-            animating = true;
-        } else {
-            let pending = std::mem::take(&mut self.pending_delete);
-            let mut deleted_any = false;
-            for id in pending {
-                let _trace = super::composition::trace::Scope::new(c"NSH pending deletion");
-                if self.frozen(id) {
-                    self.pending_delete.push(id);
-                } else {
-                    self.delete_now(id)?;
-                    deleted_any = true;
-                }
+        let pending = std::mem::take(&mut self.pending_delete);
+        let mut deleted_any = false;
+        for id in pending {
+            let _trace = super::composition::trace::Scope::new(c"NSH pending deletion");
+            if self.frozen(id) {
+                self.pending_delete.push(id);
+            } else {
+                self.delete_now(id)?;
+                deleted_any = true;
             }
-            if settled_leaving || deleted_any {
-                self.reconcile_navigation_capture()?;
-            }
+        }
+        if settled_leaving || deleted_any {
+            self.reconcile_navigation_capture()?;
         }
         self.sync_pending_deletions();
         self.finish_deferred()?;
@@ -1645,10 +1651,10 @@ impl Mounter {
         platform.window = size.into();
         self.platform.set(platform);
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
-            modal.sync_metrics();
+            modal.refresh_metrics();
             if let Some(id) = modal.node_id() {
                 self.node(id)?
-                    .native
+                    .mounted()
                     .borrow()
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }

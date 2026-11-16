@@ -245,7 +245,9 @@ impl WebView {
             Evaluations::new(
                 owner.id,
                 Box::new(move |id, kind, payload| control.dispatch_event(id, kind, payload)),
-                Box::new(move |delay, work| Dispatcher::after(&dispatcher, delay, work)),
+                Box::new(move |delay, work| {
+                    let _ = Dispatcher::after(&dispatcher, delay, work);
+                }),
             )
         };
         let mut target = None;

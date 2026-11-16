@@ -126,41 +126,25 @@ export class PointerPosting {
   owners: Map<number, TouchStream> = new Map();
   retirements: (() => void)[] = [];
   finish(coordinates?: TouchCoordinates): void {
+    let failure: Error | undefined;
     try {
       coordinates?.restore();
+    } catch (error) {
+      failure = error instanceof Error ? error : new Error(String(error));
     } finally {
       this.busy = false;
       while (this.retirements.length > 0) {
         for (const retire of this.retirements.splice(0)) {
-          retire();
+          try {
+            retire();
+          } catch (error) {
+            failure ??= error instanceof Error ? error : new Error(String(error));
+          }
         }
       }
     }
-  }
-}
-
-/** Detach within the live cleanup scope; only builder disposal may outlive posting. */
-export class NativeRetirement {
-  private state: "live" | "retiring" | "retired" = "live";
-  detachThenDispose(detach: () => void, dispose: () => void, posting: PointerPosting): void {
-    if (this.state === "retired") {
-      return;
-    }
-    if (this.state === "retiring") {
-      throw new Error("Native retirement is already in progress");
-    }
-    this.state = "retiring";
-    try {
-      detach();
-    } catch (error) {
-      this.state = "live";
-      throw error as Error;
-    }
-    this.state = "retired";
-    if (posting.busy) {
-      posting.retirements.push(dispose);
-    } else {
-      dispose();
+    if (failure) {
+      throw failure;
     }
   }
 }

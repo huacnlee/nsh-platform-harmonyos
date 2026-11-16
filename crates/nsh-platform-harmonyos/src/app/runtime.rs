@@ -148,8 +148,6 @@ pub(crate) enum Message {
     Batch(MountBatch),
     Error(String),
     RequestFrame,
-    Frame(Option<u64>),
-    FrameSynced(u64),
     Reclaim(u64),
     VideoRetired(u64),
     VideoUi(u64, crate::media::video::UiState),
@@ -292,15 +290,17 @@ impl Dispatcher {
             _marker: std::marker::PhantomData,
         }
     }
-    pub(crate) fn after(this: &Weak<Self>, delay: std::time::Duration, work: Box<dyn FnOnce()>) {
+    pub(crate) fn after(
+        this: &Weak<Self>,
+        delay: std::time::Duration,
+        work: Box<dyn FnOnce()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let reply = Self::reply(this, move |()| work());
-        if reply.inner.is_none() {
-            return;
-        }
-        napi_ohos::bindgen_prelude::spawn(async move {
+        reply.inner.as_ref()?;
+        Some(napi_ohos::bindgen_prelude::spawn(async move {
             tokio::time::sleep(delay).await;
             reply.send(());
-        });
+        }))
     }
 }
 struct Sink(
@@ -340,6 +340,7 @@ impl MountSink for Sink {
 }
 
 struct State {
+    frame_source: Option<super::frame_source::FrameSource>,
     #[cfg(feature = "dev")]
     testing: Option<Arc<crate::app::testing::Session>>,
     #[cfg(feature = "dev")]
@@ -353,6 +354,8 @@ struct State {
     environment: Environment,
     errors: Errors,
     frame_pending: bool,
+    /// NativeVSync delivery is independent of the pending ArkUI sample.
+    engine_frame_pending: Arc<std::sync::atomic::AtomicBool>,
     laid_out: bool,
     attached: bool,
     visible: bool,
@@ -555,14 +558,6 @@ impl State {
                 self.report(error);
             }
             Message::RequestFrame => self.request_frame()?,
-            Message::Frame(timestamp) => {
-                self.step_frame(true, timestamp)?;
-                return Ok(());
-            }
-            Message::FrameSynced(timestamp) => {
-                self.step_frame(false, Some(timestamp))?;
-                return Ok(());
-            }
             Message::Reclaim(_)
             | Message::VideoRetired(_)
             | Message::VideoUi(..)
@@ -578,20 +573,34 @@ impl State {
             && self.visible
             && self.environment.lifecycle != nsh_engine::Lifecycle::Background
     }
-    fn update_back(&self) {
+    fn update_back(&mut self) {
         let active = self.is_active();
         if !active {
+            // DisplaySync is stopped below, so no UI callback remains pending.
+            // Preserve its work for a fresh display pump when this view resumes.
+            self.frame_wanted |= self.frame_pending;
+            self.frame_pending = false;
             self.frame_rate
                 .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
+            if let Some(source) = &self.frame_source
+                && let Err(error) = source.stop()
+            {
+                self.report(error.to_string());
+            }
         }
         if let Some(dispatcher) = self.dispatcher.upgrade() {
-            if dispatcher
+            let was_active = dispatcher
                 .active
-                .swap(active, std::sync::atomic::Ordering::AcqRel)
-                != active
-                && let Some(mounter) = &self.mounter
-            {
-                mounter.shaders.wake();
+                .swap(active, std::sync::atomic::Ordering::AcqRel);
+            if was_active != active {
+                if let Some(mounter) = &self.mounter {
+                    mounter.shaders.wake();
+                }
+                // Resume one combined engine/native display frame. Subsequent
+                // visible/attached/lifecycle notifications share frame_pending.
+                if active && let Err(error) = self.request_frame() {
+                    self.report(error.to_string());
+                }
             }
             dispatcher.wants_back.store(
                 active && self.mounter.as_ref().is_some_and(Mounter::wants_back),
@@ -623,6 +632,7 @@ impl State {
             mounter.cancel_input()?;
         }
         if lifecycle_changed && environment.lifecycle != nsh_engine::Lifecycle::Background {
+            self.update_back();
             self.request_frame()?;
         }
         if let Some(mounter) = &self.mounter {
@@ -633,7 +643,7 @@ impl State {
     fn report(&self, error: String) {
         self.errors.report(error);
     }
-    fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
+    fn step_frame(&mut self, timestamp: u64) -> Result<()> {
         let _trace = crate::render::composition::trace::Scope::new(c"NSH UI frame");
         self.frame_pending = false;
         if !self.is_active() {
@@ -645,10 +655,7 @@ impl State {
             self.update_back();
             return Ok(());
         }
-        if wake_engine {
-            self.engine.as_ref().unwrap().control().frame();
-        }
-        let mounter_wants = self.mounter.as_mut().unwrap().frame(timestamp)?;
+        let mounter_wants = self.mounter.as_mut().unwrap().frame(Some(timestamp))?;
         if mounter_wants || self.frame_wanted {
             let demand = if !self.frame_wanted {
                 self.mounter
@@ -660,7 +667,7 @@ impl State {
                 crate::app::frame_rate::UiDemand::Uncapped
             };
             self.frame_rate.set_ui_demand(demand);
-            self.request_frame()?;
+            self.schedule_frame()?;
         } else {
             self.frame_rate
                 .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
@@ -674,39 +681,72 @@ impl State {
         if !self.is_active() {
             return Ok(());
         }
+        // Input, mount batches and engine RAF requests are new motion. They
+        // must not wait behind an otherwise isolated capped native animation.
+        self.frame_rate
+            .set_ui_demand(crate::app::frame_rate::UiDemand::Uncapped);
+        self.schedule_frame()
+    }
+    fn schedule_frame(&mut self) -> Result<()> {
+        self.frame_source
+            .as_ref()
+            .ok_or_else(|| napi_ohos::Error::from_reason("OHOS frame source is unavailable"))?
+            .request(self.frame_rate.desired_range())?;
         if !self.frame_pending {
+            // Preserve the OHOS backend's combined display pump: one requested
+            // frame advances the engine off-thread and native animations in
+            // ArkUI's DisplaySync phase. Sink and animator demand coalesce here.
+            self.request_engine_frame()?;
             self.frame_wanted = false;
-            // The rate request and the frame source must use the same VSync
-            // connection. Its callback posts UI mutations through the existing
-            // dispatcher; it never accesses ArkUI from the VSync thread.
-            self.schedule(Message::Frame(None))?;
             self.frame_pending = true;
         }
         Ok(())
     }
-    fn schedule(&self, message: Message) -> Result<()> {
+    fn request_engine_frame(&self) -> Result<()> {
+        if !self.is_active() {
+            return Ok(());
+        }
+        if self
+            .engine_frame_pending
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return Ok(());
+        }
+        // The UI frame and engine pulse are scheduled together by schedule_frame.
+        // DisplaySync can arrive before this separate NativeVSync connection.
+        // Keep its request in flight until native delivery, so another UI sample
+        // cannot enqueue a second engine pulse for the same native VSync.
+        let pending = self.engine_frame_pending.clone();
+        let dispatcher = self.dispatcher.clone();
+        let control = self.engine.as_ref().unwrap().control();
+        let status = self.vsync.request_frame_once(move |_| {
+            // Release before publishing frame(): an engine RAF callback may
+            // immediately request the next frame. Inactive delivery also releases
+            // the request so resume can schedule it again.
+            pending.store(false, std::sync::atomic::Ordering::Release);
+            if let Some(dispatcher) = dispatcher.upgrade()
+                && dispatcher.live.load(std::sync::atomic::Ordering::Acquire)
+                && dispatcher.active.load(std::sync::atomic::Ordering::Acquire)
+            {
+                let _trace = crate::render::composition::trace::Scope::new(c"NSH engine frame");
+                control.frame();
+            }
+        });
+        if status != 0 {
+            self.engine_frame_pending
+                .store(false, std::sync::atomic::Ordering::Release);
+            return Err(Error::Vsync(status));
+        }
+        Ok(())
+    }
+    fn schedule_reclaim(&self, epoch: u64) -> Result<()> {
         let dispatcher = self.dispatcher.upgrade();
-        let control = matches!(message, Message::Frame(_))
-            .then(|| self.engine.as_ref().map(|e| e.control()))
-            .flatten();
-        let mut message = Some(message);
-        // NativeVSync is available on API 12. Its callback may run off the UI
-        // thread, so it only posts a message and never accesses ArkUI state.
-        let status = self.vsync.request_frame_once(move |timestamp| {
+        let mut message = Some(Message::Reclaim(epoch));
+        // Reclamation must run outside ArkUI's frame/layout/draw callbacks,
+        // including after this engine generation has closed.
+        let status = self.vsync.request_frame_once(move |_| {
             if let (Some(dispatcher), Some(message)) = (&dispatcher, message.take()) {
-                let wake_engine = matches!(message, Message::Frame(_))
-                    && dispatcher.active.load(std::sync::atomic::Ordering::Acquire);
-                let message = if wake_engine {
-                    Message::FrameSynced(timestamp.max(0) as u64)
-                } else if matches!(message, Message::Frame(_)) {
-                    Message::Frame(Some(timestamp.max(0) as u64))
-                } else {
-                    message
-                };
                 dispatcher.send(message);
-                if wake_engine && let Some(control) = &control {
-                    control.frame();
-                }
             }
         });
         if status != 0 {
@@ -718,11 +758,12 @@ impl State {
         if let Some(epoch) = self.mounter.as_mut().and_then(Mounter::freeze_retired) {
             // Disposing within a layout/draw callback is unsafe. The frame
             // callback posts a new UI turn, and only that turn releases nodes.
-            self.schedule(Message::Reclaim(epoch))?;
+            self.schedule_reclaim(epoch)?;
         }
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        self.frame_source.take();
         self.frame_rate
             .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         if let Some(dispatcher) = self.dispatcher.upgrade() {
@@ -769,6 +810,7 @@ impl State {
 }
 impl Drop for State {
     fn drop(&mut self) {
+        self.frame_source.take();
         prune_dead_tasks();
         if let Some(engine) = self.engine.take() {
             #[cfg(feature = "dev")]
@@ -862,6 +904,7 @@ impl Runtime {
         // The shader thread paces itself on the surface's shared FrameRate too.
         let shader_rate = frame_rate.clone();
         let state = Rc::new(RefCell::new(State {
+            frame_source: None,
             #[cfg(feature = "dev")]
             testing: app.testing.clone(),
             #[cfg(feature = "dev")]
@@ -874,6 +917,7 @@ impl Runtime {
             frame_rate,
             errors,
             frame_pending: false,
+            engine_frame_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             laid_out: false,
             attached: true,
             visible: true,
@@ -916,6 +960,40 @@ impl Runtime {
             live: std::sync::atomic::AtomicBool::new(true),
         });
         state.borrow_mut().dispatcher = Arc::downgrade(&dispatcher);
+        let weak = Rc::downgrade(&state);
+        let on_frame =
+            env.create_function_from_closure::<f64, bool, _>("nshFrame", move |ctx| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let timestamp: f64 = ctx.get(0)?;
+                    if !timestamp.is_finite() || timestamp < 0.0 {
+                        return Err(napi_ohos::Error::from_reason(
+                            "invalid display frame timestamp",
+                        ));
+                    }
+                    let Some(state) = weak.upgrade() else {
+                        return Ok(false);
+                    };
+                    let mut state = state.try_borrow_mut().map_err(reentry)?;
+                    if state.engine.is_none() {
+                        return Ok(false);
+                    }
+                    if let Err(error) = state.step_frame(timestamp as u64) {
+                        state.report(error.to_string());
+                        return Ok(false);
+                    }
+                    Ok(state.frame_pending && state.is_active())
+                }))
+                .unwrap_or_else(|_| {
+                    Err(napi_ohos::Error::from_reason(
+                        "panic in OHOS display frame callback",
+                    ))
+                })
+            })?;
+        state.borrow_mut().frame_source = Some(super::frame_source::FrameSource::new(
+            env,
+            &config.host,
+            on_frame,
+        )?);
         let environment = Environment {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
@@ -1145,7 +1223,7 @@ impl Runtime {
             }
         }
         state.update_back();
-        if state.is_active() && state.frame_wanted {
+        if state.is_active() && (state.frame_wanted || state.frame_pending) {
             state.request_frame().map_err(napi_error)?;
         }
         Ok(())
@@ -1160,7 +1238,7 @@ impl Runtime {
             mounter.cancel_input().map_err(napi_error)?;
         }
         state.update_back();
-        if state.is_active() && state.frame_wanted {
+        if state.is_active() && (state.frame_wanted || state.frame_pending) {
             state.request_frame().map_err(napi_error)?;
         }
         Ok(())

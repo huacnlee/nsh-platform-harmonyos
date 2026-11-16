@@ -167,16 +167,6 @@ impl crate::render::mount::UiContext {
                         pending.views.push(update);
                     }
                 }
-                for picture in batch.pictures {
-                    if !pending
-                        .pictures
-                        .iter()
-                        .any(|next| next.target_id == picture.target_id)
-                        && !pending.remove_views.contains(&picture.target_id)
-                    {
-                        pending.pictures.push(picture);
-                    }
-                }
                 for update in batch.webs {
                     if !pending
                         .webs
@@ -242,13 +232,6 @@ impl crate::render::mount::UiContext {
         if wake {
             self.editor_wake();
         }
-    }
-    pub(crate) fn picture_request(&self, request: crate::interop::sdk::PictureRequest) {
-        let mut pending = self.arkui.borrow_mut();
-        pending
-            .pictures
-            .retain(|old| old.target_id != request.target_id);
-        pending.pictures.push(request);
     }
     pub(crate) fn view_remove(&self, target: NativeAttachment) {
         let id = target.id();

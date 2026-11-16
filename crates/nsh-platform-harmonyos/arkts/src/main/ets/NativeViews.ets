@@ -1,5 +1,5 @@
 import { NativeMenuItem, NativeMenuCleanup } from "./NativeMenus";
-import { PointerPosting, NativeRetirement } from "./NativePointer";
+import { PointerPosting } from "./NativePointer";
 import {
   BuilderNode,
   NodeRenderType,
@@ -57,19 +57,6 @@ interface TextureInsets {
 interface ViewParameters {
   entry: ViewEntry;
   settings: Settings;
-}
-export interface PictureRequest {
-  targetId: number;
-  generation: number;
-  scale: number;
-}
-export interface PicturePixels {
-  width: number;
-  height: number;
-  stride: number;
-  format: number;
-  alpha: number;
-  pixels: Uint8Array;
 }
 interface MenuParameters {
   entry: ViewEntry;
@@ -256,7 +243,6 @@ struct SourceRoot {
     }
     .width(captureWidth(this.state.settings))
     .height(captureHeight(this.state.settings))
-    .id(`nsh-picture-${this.state.settings.targetId}`)
     .padding(this.state.settings.textureInsets ?? { left: 0, top: 0, right: 0, bottom: 0 })
     .clip(false)
     .hitTestBehavior(HitTestMode.Transparent);
@@ -305,7 +291,6 @@ class ViewEntry {
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
   private pointerPosting: PointerPosting;
-  private retirement: NativeRetirement = new NativeRetirement();
   constructor(
     settings: Settings,
     context: NshRuntimeContext,
@@ -329,43 +314,6 @@ class ViewEntry {
   }
   get settings(): Settings {
     return this.state.settings;
-  }
-  async picture(request: PictureRequest): Promise<void> {
-    if (this.closed) {
-      return;
-    }
-    try {
-      const picture = await this.ui.getComponentSnapshot().get(`nsh-picture-${request.targetId}`, {
-        scale: request.scale,
-        waitUntilRenderFinished: true,
-      });
-      try {
-        const info = await picture.getImageInfo();
-        const byteLength = picture.getPixelBytesNumber();
-        if (this.closed) {
-          return;
-        }
-        if (info.size.width > 4096 || info.size.height > 4096 || byteLength > 67108864) {
-          throw new Error("Shader content picture exceeds the pixel budget");
-        }
-        const pixels = new ArrayBuffer(byteLength);
-        await picture.readPixelsToBuffer(pixels);
-        if (!this.closed) {
-          this.context.nativePicture(request.targetId, request.generation, {
-            width: info.size.width, height: info.size.height,
-            stride: byteLength / info.size.height,
-            format: info.pixelFormat, alpha: info.alphaType,
-            pixels: new Uint8Array(pixels),
-          });
-        }
-      } finally {
-        await picture.release();
-      }
-    } catch (error) {
-      if (!this.closed) {
-        this.context.nativePicture(request.targetId, request.generation, undefined, String(error));
-      }
-    }
   }
   isClosed(): boolean {
     return this.closed;
@@ -577,24 +525,25 @@ class ViewEntry {
     }
     this.closed = true;
     this.retirementFailure = undefined;
+    quarantinedViews.add(this);
     try {
       if (this.menuLease) {
         this.retireMenu(this.menuLease);
         this.menuLease = undefined;
       }
-      this.retirement.detachThenDispose(
-        (): void => {
-          if (this.attached && !this.retiredNative) {
-            if (!cleanup.retireNativeNode(this.settings.targetId)) {
-              throw new Error("Native wrapper retirement was rejected");
-            }
-            this.retiredNative = true;
-          }
-        },
-        (): void => this.disposeBuilders(),
-        this.pointerPosting,
-      );
-      quarantinedViews.delete(this);
+      if (this.attached && !this.retiredNative) {
+        if (!cleanup.retireNativeNode(this.settings.targetId)) {
+          throw new Error("Native wrapper retirement was rejected");
+        }
+        this.retiredNative = true;
+      }
+      // Detachment and builder disposal have separate ownership. A failed
+      // builder remains retryable even after its native target is retired.
+      if (this.pointerPosting.busy) {
+        this.pointerPosting.retirements.push((): void => this.disposeBuilders());
+      } else {
+        this.disposeBuilders();
+      }
     } catch (error) {
       quarantinedViews.add(this);
       this.retirementFailure = new Error(`Native wrapper retirement failed: ${String(error)}`);
@@ -602,6 +551,7 @@ class ViewEntry {
     }
   }
   private disposeBuilders(): void {
+    quarantinedViews.add(this);
     if (this.sdkBusy) {
       this.disposePending = true;
       return;
@@ -614,7 +564,7 @@ class ViewEntry {
         failure ??= error instanceof Error ? error : new Error(String(error));
       }
     };
-    this.textureController?.clear();
+    step((): void => this.textureController?.clear());
     if (!this.nodeDisposed) {
       step((): void => {
         this.node.dispose();
@@ -633,6 +583,7 @@ class ViewEntry {
       console.error(`[NSH] wrapper disposal failed: ${String(failure)}`);
       throw failure;
     }
+    this.retirementFailure = undefined;
     quarantinedViews.delete(this);
   }
 }
@@ -640,11 +591,6 @@ export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
-  pictures(requests: PictureRequest[]): void {
-    for (const request of requests) {
-      this.entries.get(request.targetId)?.picture(request);
-    }
-  }
   private retryQuarantined(context: NshRuntimeContext): void {
     for (const view of Array.from(quarantinedViews)) {
       if (!view.belongsTo(context)) {

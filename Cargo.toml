@@ -73,3 +73,17 @@ codegen-units = 1
 opt-level = 3
 [profile.dev.package.taffy]
 opt-level = 3
+
+# NSH 0.5 scroll configuration must also reach views first mounted after culling.
+[patch.crates-io]
+nsh-base = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-bundler = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-core = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-dev = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-engine = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-i18n = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-js = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-macros = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-package = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-testing = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-updater = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }

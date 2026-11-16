@@ -304,6 +304,11 @@ impl Node {
         }
         let position = event.position_in_layout();
         event.set_layout_position(position.x, position.y)?;
+        if self.wrapper.borrow().is_none()
+            && let Some(modal) = self.modal.borrow().as_ref()
+        {
+            modal.laid_out();
+        }
         #[cfg(feature = "api-23")]
         self.accessibility_provider.bounds(self)?;
         if let Some(input) = self.input.borrow().as_ref() {
