@@ -849,7 +849,10 @@ impl Runtime {
                     napi_ohos::Error::from_reason("failed to create OHOS native VSync")
                 })?,
         );
-        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone());
+        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone())
+            .map_err(|error| {
+                napi_ohos::Error::from_reason(format!("failed to start VSync rate worker: {error}"))
+            })?;
         let status = frame_rate.apply_initial();
         if status != 0 {
             return Err(napi_ohos::Error::from_reason(format!(

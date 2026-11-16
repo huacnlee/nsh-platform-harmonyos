@@ -3,7 +3,7 @@
 //! `FrameRate` arbitrates the combined `(min, max, expected)` range and updates
 //! its applied cache only when the underlying setter succeeds.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
 #[cfg(target_env = "ohos")]
 use ohos_vsync_binding::{OH_NativeVSync_ExpectedRateRange, Vsync};
@@ -104,28 +104,81 @@ impl State {
 pub(crate) struct FrameRate {
     #[cfg(target_env = "ohos")]
     vsync: Arc<Vsync>,
-    sink: Box<dyn RateSink>,
-    state: Mutex<State>,
+    sink: Arc<dyn RateSink>,
+    state: Arc<Mutex<State>>,
+    updates: Option<RateUpdates>,
+}
+
+/// NativeVSync's range setter calls RS SyncFrameRateRange with TF_SYNC. Keep
+/// that IPC off both the UI and compositor threads. The mailbox carries only
+/// a wake; the worker reads the latest arbitration result when it can apply it.
+struct RateUpdates(mpsc::SyncSender<()>);
+
+impl RateUpdates {
+    fn new(sink: Arc<dyn RateSink>, state: Arc<Mutex<State>>) -> std::io::Result<Self> {
+        let (send, receive) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("nsh-frame-rate".into())
+            .spawn(move || {
+                while receive.recv().is_ok() {
+                    loop {
+                        let desired = {
+                            let state = state.lock().unwrap();
+                            let desired = state.desired();
+                            if state.applied == Some(desired) {
+                                break;
+                            }
+                            desired
+                        };
+                        // No arbitration lock is held while RS processes its IPC.
+                        #[cfg(target_env = "ohos")]
+                        let _trace =
+                            crate::render::composition::trace::Scope::new(c"NSH frame rate IPC");
+                        let status = sink.set_range(desired);
+                        if status == 0 {
+                            state.lock().unwrap().applied = Some(desired);
+                        } else {
+                            log::warn!("OHOS VSync rate vote failed: {status}");
+                            break;
+                        }
+                    }
+                }
+            })?;
+        Ok(Self(send))
+    }
+
+    fn wake(&self) -> i32 {
+        match self.0.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => 0,
+            Err(mpsc::TrySendError::Disconnected(())) => -1,
+        }
+    }
 }
 
 impl FrameRate {
     #[cfg(target_env = "ohos")]
-    pub(crate) fn new(vsync: Arc<Vsync>, host: Arc<crate::app::session::Services>) -> Arc<Self> {
-        let sink = Box::new(OhosSink {
+    pub(crate) fn new(
+        vsync: Arc<Vsync>,
+        host: Arc<crate::app::session::Services>,
+    ) -> std::io::Result<Arc<Self>> {
+        let sink: Arc<dyn RateSink> = Arc::new(OhosSink {
             vsync: vsync.clone(),
             host,
         });
         let hz = sink.read_display_hz();
-        Arc::new(Self {
+        let state = Arc::new(Mutex::new(State {
+            shader_votes: 0,
+            ui_demand: UiDemand::Idle,
+            hz,
+            applied: None,
+        }));
+        let updates = RateUpdates::new(sink.clone(), state.clone())?;
+        Ok(Arc::new(Self {
             vsync,
             sink,
-            state: Mutex::new(State {
-                shader_votes: 0,
-                ui_demand: UiDemand::Idle,
-                hz,
-                applied: None,
-            }),
-        })
+            state,
+            updates: Some(updates),
+        }))
     }
 
     #[cfg(test)]
@@ -134,13 +187,14 @@ impl FrameRate {
         Arc::new(Self {
             #[cfg(target_env = "ohos")]
             vsync: unreachable!(),
-            sink,
-            state: Mutex::new(State {
+            sink: sink.into(),
+            state: Arc::new(Mutex::new(State {
                 shader_votes: 0,
                 ui_demand: UiDemand::Idle,
                 hz,
                 applied: None,
-            }),
+            })),
+            updates: None,
         })
     }
 
@@ -153,7 +207,13 @@ impl FrameRate {
     /// surface startup can fail fast if the native VSync handle rejects it.
     pub(crate) fn apply_initial(&self) -> i32 {
         let mut state = self.state.lock().unwrap();
-        self.sync_locked(&mut state, false)
+        // Called once before either UI or shader frame demand can be published.
+        let desired = state.desired();
+        let status = self.sink.set_range(desired);
+        if status == 0 {
+            state.applied = Some(desired);
+        }
+        status
     }
 
     pub(crate) fn set_ui_demand(&self, demand: UiDemand) {
@@ -189,6 +249,9 @@ impl FrameRate {
         let desired = state.desired();
         if state.applied == Some(desired) {
             return 0;
+        }
+        if let Some(updates) = &self.updates {
+            return updates.wake();
         }
         let status = self.sink.set_range(desired);
         if status == 0 {
@@ -275,6 +338,57 @@ mod tests {
         fn read_display_hz(&self) -> u32 {
             self.0.hz.load(Ordering::SeqCst)
         }
+    }
+
+    struct BlockingSink {
+        entered: mpsc::Sender<RateRange>,
+        release: Mutex<mpsc::Receiver<i32>>,
+    }
+    impl RateSink for BlockingSink {
+        fn set_range(&self, range: RateRange) -> i32 {
+            self.entered.send(range).unwrap();
+            self.release.lock().unwrap().recv().unwrap()
+        }
+        fn read_display_hz(&self) -> u32 {
+            120
+        }
+    }
+
+    #[test]
+    fn slow_rs_ipc_does_not_block_demands_or_apply_an_obsolete_range_last() {
+        let (entered, calls) = mpsc::channel();
+        let (release, responses) = mpsc::channel();
+        let mut rate = FrameRate::with_sink(Box::new(BlockingSink {
+            entered,
+            release: Mutex::new(responses),
+        }));
+        let rate_mut = Arc::get_mut(&mut rate).unwrap();
+        let baseline = rate_mut.state.lock().unwrap().desired();
+        rate_mut.state.lock().unwrap().applied = Some(baseline);
+        rate_mut.updates =
+            Some(RateUpdates::new(rate_mut.sink.clone(), rate_mut.state.clone()).unwrap());
+        let next = || {
+            calls
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap()
+        };
+
+        rate.set_ui_demand(UiDemand::Uncapped);
+        assert_eq!(next().expected, 120);
+        // RS is still blocked. Arbitration remains usable and intermediate
+        // demands coalesce, including a return to the previously applied value.
+        assert!(rate.state.try_lock().is_ok());
+        rate.set_ui_demand(UiDemand::Capped(30));
+        rate.set_ui_demand(UiDemand::Idle);
+        release.send(0).unwrap();
+        assert_eq!(next(), baseline);
+
+        // A failed setter cannot poison the success cache. A new wake retries
+        // the latest demand even when its value is unchanged.
+        rate.set_ui_demand(UiDemand::Capped(30));
+        release.send(-1).unwrap();
+        assert_eq!(next().expected, 30);
+        release.send(0).unwrap();
     }
 
     #[test]
