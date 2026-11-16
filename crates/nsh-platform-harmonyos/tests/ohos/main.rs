@@ -21,6 +21,8 @@ mod effects;
 mod features;
 #[path = "../../src/render/geometry.rs"]
 mod geometry;
+#[path = "../../src/render/gradient.rs"]
+mod gradient;
 #[path = "../../src/media/request.rs"]
 mod image_request;
 #[path = "../../src/navigation/motion.rs"]

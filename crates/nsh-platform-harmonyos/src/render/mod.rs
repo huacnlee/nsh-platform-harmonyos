@@ -6,6 +6,7 @@ pub(crate) mod decor;
 pub(crate) mod effects;
 pub(crate) mod frame_clock;
 pub(crate) mod geometry;
+pub(crate) mod gradient;
 pub(crate) mod layout;
 pub(crate) mod mount;
 pub(crate) mod node;

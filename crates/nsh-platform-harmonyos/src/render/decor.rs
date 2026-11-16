@@ -10,7 +10,7 @@ use ohos_drawing_binding::{
     PathEffect, PathFillType, Pen, Rect, RoundRect, ShaderEffect, TileMode,
 };
 
-use super::shadow_geometry::visible_shadow;
+use super::{gradient::NativeStops, shadow_geometry::visible_shadow};
 use crate::{
     render::{geometry::Size, node::Node},
     text::typography::argb,
@@ -446,8 +446,30 @@ pub(crate) fn gradient(g: &Gradient, size: Size) -> Brush {
     let last = stops.last().unwrap().1.0;
     let span = (last - first).max(1e-6);
     brush.set_color(argb(stops.last().unwrap().0));
-    let colors: Vec<_> = stops.iter().map(|(c, _)| argb(*c)).collect();
-    let positions: Vec<_> = stops.iter().map(|(_, p)| (p.0 - first) / span).collect();
+    let stops = if let GradientKind::Conic { from, .. } = g.kind {
+        let mut stops: Vec<_> = stops.into_iter().map(|(c, p)| (p.0, c)).collect();
+        if g.repeating && span > 1e-5 {
+            let original = stops.clone();
+            stops.clear();
+            let start = (-last / span).floor() as i32;
+            let end = ((1.0 - first) / span).ceil() as i32;
+            // A maliciously tiny period must not allocate unbounded stops.
+            if (end - start) as usize * original.len() <= 4096 {
+                for k in start..=end {
+                    stops.extend(original.iter().map(|(p, c)| (*p + k as f32 * span, *c)));
+                }
+            } else {
+                stops = vec![(0.0, original[0].1), (1.0, original.last().unwrap().1)];
+            }
+        }
+        super::gradient::sweep_stops(&stops, from.0 - std::f32::consts::FRAC_PI_2)
+    } else {
+        stops
+            .into_iter()
+            .map(|(c, p)| ((p.0 - first) / span, c))
+            .collect()
+    };
+    let NativeStops { colors, positions } = NativeStops::new(&stops);
     let tile = if g.repeating {
         TileMode::Repeat
     } else {
@@ -470,29 +492,7 @@ pub(crate) fn gradient(g: &Gradient, size: Size) -> Brush {
                 Some(&matrix),
             )
         }
-        GradientKind::Conic { from, x, y } => {
-            let mut stops: Vec<_> = stops.into_iter().map(|(c, p)| (p.0, c)).collect();
-            if g.repeating && span > 1e-5 {
-                let original = stops.clone();
-                stops.clear();
-                let start = (-last / span).floor() as i32;
-                let end = ((1.0 - first) / span).ceil() as i32;
-                // A maliciously tiny period must not allocate unbounded stops.
-                if (end - start) as usize * original.len() <= 4096 {
-                    for k in start..=end {
-                        stops.extend(original.iter().map(|(p, c)| (*p + k as f32 * span, *c)));
-                    }
-                } else {
-                    stops = vec![(0.0, original[0].1), (1.0, original.last().unwrap().1)];
-                }
-            }
-            let begin = crate::render::canvas::sample(&stops, 0.0);
-            let end = crate::render::canvas::sample(&stops, 1.0);
-            stops.retain(|(p, _)| *p > 0.0 && *p < 1.0);
-            stops.insert(0, (0.0, begin));
-            stops.push((1.0, end));
-            let (colors, positions) =
-                crate::render::canvas::sweep_stops(&stops, from.0 - std::f32::consts::FRAC_PI_2);
+        GradientKind::Conic { x, y, .. } => {
             ShaderEffect::conic_gradient((x.0 * w, y.0 * h), &colors, &positions, TileMode::Clamp)
         }
         kind => {

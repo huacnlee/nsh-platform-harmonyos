@@ -93,6 +93,10 @@ Features:
      callback, so renderer migration records the current ink without scroll tracking, subtree repaint loops or
      frame-count delays. Its property is invalidated only by actual content changes. The modifier is attached to its node
      before the property is attached, so Rosen assigns that property a live invalidation target.
+     CSS background/mask gradients convert premultiplied stops into Drawing's straight-alpha shaders through
+     `gradient.rs`; transparent limits and bounded alpha subdivision avoid dark fringes. Conic clipping preserves
+     hard edges at the sweep seam. Canvas retains its separate interpolation semantics. Converted background
+     shaders use the existing brush cache.
   3. **Surface `Scene` path** (`scene.rs`, `draw.rs`): subtrees requiring CSS `mask-image` (`masks[0]`, matching
      upstream mobile backends), multi-filter / backdrop-filter combinations, shader backdrop sampling, or blend modes
      unsupported natively are promoted into a minimal stable `Scene` root (`scene_root_for` keeps non-overflowing
