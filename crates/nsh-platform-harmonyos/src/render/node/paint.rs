@@ -258,16 +258,16 @@ impl Node {
         {
             if has_effects {
                 self.decoration.background(
-                    &canvas,
+                    canvas,
                     &self.style.borrow(),
                     Size::new(frame.width, frame.height),
                     self.scale.get(),
                 );
             }
             if let Some(drawing) = self.canvas.borrow().as_ref() {
-                callback(|| drawing.draw(&canvas));
+                callback(|| drawing.draw(canvas));
             }
-            self.draw_selection(&canvas, false);
+            self.draw_selection(canvas, false);
             if let Some(drawing) = self.text_drawing.borrow_mut().as_mut() {
                 let content = self.content.get();
                 let brush = self
@@ -317,7 +317,7 @@ impl Node {
                 if let Some(brush) = &brush {
                     canvas.save_layer(None, Some(brush));
                 }
-                if let Err(error) = drawing.draw(&canvas) {
+                if let Err(error) = drawing.draw(canvas) {
                     log::warn!("OHOS text draw: {error}");
                 }
                 if brush.is_some() {
@@ -327,7 +327,7 @@ impl Node {
                     canvas.restore();
                 }
             }
-            self.draw_selection(&canvas, true);
+            self.draw_selection(canvas, true);
         }
     }
 }

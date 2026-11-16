@@ -58,6 +58,19 @@ interface ViewParameters {
   entry: ViewEntry;
   settings: Settings;
 }
+export interface PictureRequest {
+  targetId: number;
+  generation: number;
+  scale: number;
+}
+export interface PicturePixels {
+  width: number;
+  height: number;
+  stride: number;
+  format: number;
+  alpha: number;
+  pixels: Uint8Array;
+}
 interface MenuParameters {
   entry: ViewEntry;
   menu: ViewMenu;
@@ -243,6 +256,7 @@ struct SourceRoot {
     }
     .width(captureWidth(this.state.settings))
     .height(captureHeight(this.state.settings))
+    .id(`nsh-picture-${this.state.settings.targetId}`)
     .padding(this.state.settings.textureInsets ?? { left: 0, top: 0, right: 0, bottom: 0 })
     .clip(false)
     .hitTestBehavior(HitTestMode.Transparent);
@@ -315,6 +329,43 @@ class ViewEntry {
   }
   get settings(): Settings {
     return this.state.settings;
+  }
+  async picture(request: PictureRequest): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    try {
+      const picture = await this.ui.getComponentSnapshot().get(`nsh-picture-${request.targetId}`, {
+        scale: request.scale,
+        waitUntilRenderFinished: true,
+      });
+      try {
+        const info = await picture.getImageInfo();
+        const byteLength = picture.getPixelBytesNumber();
+        if (this.closed) {
+          return;
+        }
+        if (info.size.width > 4096 || info.size.height > 4096 || byteLength > 67108864) {
+          throw new Error("Shader content picture exceeds the pixel budget");
+        }
+        const pixels = new ArrayBuffer(byteLength);
+        await picture.readPixelsToBuffer(pixels);
+        if (!this.closed) {
+          this.context.nativePicture(request.targetId, request.generation, {
+            width: info.size.width, height: info.size.height,
+            stride: byteLength / info.size.height,
+            format: info.pixelFormat, alpha: info.alphaType,
+            pixels: new Uint8Array(pixels),
+          });
+        }
+      } finally {
+        await picture.release();
+      }
+    } catch (error) {
+      if (!this.closed) {
+        this.context.nativePicture(request.targetId, request.generation, undefined, String(error));
+      }
+    }
   }
   isClosed(): boolean {
     return this.closed;
@@ -589,6 +640,11 @@ export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
+  pictures(requests: PictureRequest[]): void {
+    for (const request of requests) {
+      this.entries.get(request.targetId)?.picture(request);
+    }
+  }
   private retryQuarantined(context: NshRuntimeContext): void {
     for (const view of Array.from(quarantinedViews)) {
       if (!view.belongsTo(context)) {

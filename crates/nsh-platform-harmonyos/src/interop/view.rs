@@ -269,7 +269,13 @@ impl Wrapper {
             .borrow()
             .as_ref()
             .and_then(Composite::surface_id);
-        if self.composite.borrow().is_some() && texture_surface.is_none() {
+        if self
+            .composite
+            .borrow()
+            .as_ref()
+            .is_some_and(|c| !c.needs_initial_picture())
+            && texture_surface.is_none()
+        {
             return Ok(false);
         }
         if self
@@ -431,15 +437,9 @@ impl Node {
         }
         let has_semantics = owns_semantics(&spec);
         drop(spec);
-        // Surface-wide effects and navigation shaders can start while their
-        // native content is already visible. ArkUI texture export removes its
-        // source from the display tree before producing the first buffer, so
-        // changing a live surface between display and texture targets loses a
-        // frame. Keep the surface's producer and presentation for its lifetime;
-        // without effects ArkUI exports directly into the output queue.
-        let requires_texture = self.id == nsh_core::ROOT_ID
-            || self.kind == nsh_core::ViewKind::Modal
-            || self.effects_plan().requires_texture;
+        // Native display remains the default. Only actual effect inputs export
+        // their content; idle navigation configuration does not demand a texture.
+        let requires_texture = self.effects_plan().requires_texture;
         // Establish the root's layout host before it has scroll descendants.
         // Adding it around an already laid-out tree resets native scroll offsets.
         let needed = self.id == nsh_core::ROOT_ID
@@ -588,7 +588,17 @@ impl Node {
                 .as_ref()
                 .filter(|c| c.generation == generation)
         {
-            composite.ready();
+            let (initialized, _) = composite.ready();
+            if initialized
+                && composite.needs_initial_picture()
+                && let Some(target) = wrapper.target.borrow().as_ref()
+            {
+                self.picture_request(crate::interop::sdk::PictureRequest {
+                    target_id: target.id(),
+                    generation,
+                    scale: composite.initial_picture_scale(),
+                });
+            }
             wrapper
                 .outer
                 .borrow()

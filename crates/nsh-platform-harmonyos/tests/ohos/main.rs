@@ -70,6 +70,8 @@ mod web_evaluation;
 #[path = "../../src/app/frame_rate.rs"]
 #[allow(dead_code)]
 mod frame_rate;
+#[path = "../../src/render/composition/picture.rs"]
+mod picture;
 
 #[path = "../../src/render/composition/mailbox.rs"]
 #[allow(dead_code)]

@@ -1,3 +1,4 @@
+import { PicturePixels } from "./NativeViews";
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import { uiAppearance } from "@kit.ArkUI";
@@ -107,6 +108,7 @@ export interface NshRuntimeContext {
   getUIContext(): UIContext;
   attachNativeNode(targetId: number, content: FrameNode | null): boolean;
   attachNativeSubtree(targetId: number, content: FrameNode | null, slot: NodeContent): boolean;
+  nativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void;
   retireNativeNode(targetId: number): boolean;
   editorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   viewAction(action: MenuActionPayload): boolean;

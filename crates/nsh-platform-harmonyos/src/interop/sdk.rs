@@ -158,6 +158,24 @@ pub(crate) struct ViewOptions {
     pub menu: Option<Menu>,
 }
 
+#[derive(Clone)]
+#[napi(object)]
+pub(crate) struct PictureRequest {
+    pub target_id: u32,
+    pub generation: u32,
+    pub scale: f64,
+}
+
+#[napi(object)]
+pub(crate) struct PicturePixels {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub alpha: u32,
+    pub pixels: napi_ohos::bindgen_prelude::Uint8Array,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[napi(object)]
 pub(crate) struct WebSettings {
@@ -280,6 +298,7 @@ pub(crate) struct Batch {
     pub commands: Vec<EditorCommand>,
     pub remove_editors: Vec<u32>,
     pub views: Vec<ViewOptions>,
+    pub pictures: Vec<PictureRequest>,
     pub remove_views: Vec<u32>,
     pub webs: Vec<WebSettings>,
     pub web_commands: Vec<WebCommand>,
@@ -292,6 +311,7 @@ impl Batch {
             && self.commands.is_empty()
             && self.remove_editors.is_empty()
             && self.views.is_empty()
+            && self.pictures.is_empty()
             && self.remove_views.is_empty()
             && self.webs.is_empty()
             && self.web_commands.is_empty()
@@ -343,6 +363,57 @@ pub(crate) fn nsh_attach_native_subtree(
 #[napi]
 pub(crate) fn nsh_retire_native_node(target_id: u32) -> Result<()> {
     NativeAttachment::retire(target_id)
+}
+
+#[napi]
+pub(crate) fn nsh_native_picture(
+    target_id: u32,
+    generation: u32,
+    picture: Option<PicturePixels>,
+    error: Option<String>,
+) -> Result<()> {
+    let _trace = crate::render::composition::trace::Scope::new(c"NSH initial picture reply");
+    let owner = VIEWS.with(|views| {
+        views
+            .borrow()
+            .get(&target_id)
+            .and_then(|route| route.owner.upgrade())
+    });
+    let Some(owner) = owner else { return Ok(()) };
+    let wrapper = owner.wrapper.borrow();
+    let Some(wrapper) = wrapper.as_ref() else {
+        return Ok(());
+    };
+    let composite = wrapper.composite.borrow();
+    let Some(composite) = composite
+        .as_ref()
+        .filter(|c| c.generation == generation && c.needs_initial_picture())
+    else {
+        return Ok(());
+    };
+    let Some(picture) = picture else {
+        composite.initial_picture(Err(
+            error.unwrap_or_else(|| "ArkUI content capture failed".into())
+        ));
+        return Ok(());
+    };
+    if picture.pixels.len() > 67_108_864 {
+        return Err(Error::from_reason(
+            "Shader content picture exceeds the pixel budget",
+        ));
+    }
+    // JS owns its buffer; only the copied bytes cross to the compositor worker.
+    let picture = crate::render::composition::picture::Picture {
+        width: picture.width,
+        height: picture.height,
+        stride: picture.stride,
+        format: picture.format,
+        alpha: picture.alpha,
+        pixels: picture.pixels.to_vec(),
+    };
+    picture.validate().map_err(Error::from_reason)?;
+    composite.initial_picture(Ok(picture));
+    Ok(())
 }
 
 #[napi]

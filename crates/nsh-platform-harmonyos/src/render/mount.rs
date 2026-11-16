@@ -1598,6 +1598,7 @@ impl Mounter {
         let mut animating = self.animator.tick(timestamp)?;
         let mut settled_leaving = false;
         for id in self.animator.take_removals() {
+            let _trace = super::composition::trace::Scope::new(c"NSH animation removal");
             if let Ok(node) = self.node(id) {
                 settled_leaving = true;
                 if node.pending_delete.get() {
@@ -1619,6 +1620,7 @@ impl Mounter {
             let pending = std::mem::take(&mut self.pending_delete);
             let mut deleted_any = false;
             for id in pending {
+                let _trace = super::composition::trace::Scope::new(c"NSH pending deletion");
                 if self.frozen(id) {
                     self.pending_delete.push(id);
                 } else {

@@ -1,3 +1,4 @@
+import { PicturePixels } from "./NativeViews";
 import {
   AbilityConstant,
   AbilityLifecycleCallback,
@@ -125,6 +126,7 @@ interface NshNativeModule {
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
+  nshNativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshViewAction(action: MenuActionPayload): boolean;
@@ -281,6 +283,12 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     } catch (error) {
       console.error(`[NSH] retireNativeNode(${targetId}) failed: ${String(error)}`);
       return false;
+    }
+  }
+
+  nativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void {
+    if (this.active) {
+      this.mod.nshNativePicture(targetId, generation, picture, error);
     }
   }
 

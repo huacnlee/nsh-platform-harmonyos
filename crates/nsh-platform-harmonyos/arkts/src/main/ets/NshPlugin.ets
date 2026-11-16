@@ -1,5 +1,5 @@
 import { NativeEditors, EditorSettings, EditorCommand, NshRuntimeContext } from "./NativeEditors";
-import { NativeViews, Settings } from "./NativeViews";
+import { NativeViews, Settings, PictureRequest } from "./NativeViews";
 import { NativeWebViews, WebSettings, WebCommand } from "./NativeWebViews";
 
 export interface Batch {
@@ -7,6 +7,7 @@ export interface Batch {
   commands: EditorCommand[];
   removeEditors: number[];
   views: Settings[];
+  pictures: PictureRequest[];
   removeViews: number[];
   webs: WebSettings[];
   webCommands: WebCommand[];
@@ -45,6 +46,7 @@ export class NshPlugin {
     if (failure) {
       throw failure;
     }
+    this.views.pictures(batch.pictures);
   }
 
   dispose(context: NshRuntimeContext): void {

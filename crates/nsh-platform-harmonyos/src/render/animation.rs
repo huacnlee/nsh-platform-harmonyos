@@ -197,6 +197,7 @@ impl Animator {
         Ok(())
     }
     pub(crate) fn tick(&self, timestamp: Option<u64>) -> Result<bool> {
+        let _trace = super::composition::trace::Scope::new(c"NSH animation tick");
         let now = self.frame_clock.borrow_mut().sample(timestamp, self.now());
         self.frame_time.set(now);
         let (was_animating, mut animating) = {
