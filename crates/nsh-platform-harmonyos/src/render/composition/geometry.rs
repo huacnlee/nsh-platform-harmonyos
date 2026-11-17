@@ -60,20 +60,51 @@ impl Coverage {
     }
 }
 
+/// CSS `blur(<radius>)` standard deviation in physical pixels (`radius * scale`).
 pub(crate) fn blur_sigma(radius: f32, scale: f32) -> f32 {
-    radius.max(0.0) * scale * 0.5
+    radius.max(0.0) * scale
 }
 
-pub(crate) fn requires_scene(style: &ViewStyle) -> bool {
-    style.blend_mode == nsh_core::BlendMode::PlusDarker
-        || style.effects.as_ref().is_some_and(|effects| {
-            !effects.mask_images.is_empty()
-                || effects.backdrop_filters.len() > 1
-                || effects
-                    .backdrop_filters
-                    .iter()
-                    .any(|filter| !matches!(filter, Filter::Blur(_)))
-        })
+/// ArkUI/Rosen `DrawingDecorationPainter::ConvertRadiusToSigma` slope (`1 / sqrt(3)`).
+const ARKUI_BLUR_SIGMA_SCALE: f32 = 0.57735;
+const ARKUI_BLUR_SIGMA_OFFSET: f32 = 0.5;
+
+/// Calibrates a CSS logical blur radius (`sigma = css_radius` in points) to the raw `f32`
+/// expected by ArkUI C-API `NODE_BLUR` (`Attribute::Blur`) and `NODE_BACKDROP_BLUR`
+/// (`Attribute::BackdropBlur`).
+///
+/// OpenHarmony 6.0 pipeline (`OpenHarmony-6.0-Release`):
+/// 1. `arkui_ace_engine/interfaces/native/node/style_modifier.cpp` (`SetBlur` / `SetBackdropBlur`)
+///    forwards `item->value[0].f32` to `frameworks/core/interfaces/native/node/node_common_modifier.cpp`
+///    (`SetBlur` / `SetNodeBackdropBlur`), which wraps the float in
+///    `CalcDimension(blur, DimensionUnit::PX)` — physical pixels, ignoring `LengthMetricUnit::Vp`
+///    (despite `native_node.h`'s `NODE_BLUR` comment saying `vp`).
+/// 2. `frameworks/core/components_ng/render/adapter/rosen_render_context.cpp`
+///    (`SetFrontBlurFilter` / `SetBackBlurFilter`) converts that pixel radius via
+///    `DrawingDecorationPainter::ConvertRadiusToSigma(r)` in `drawing_decoration_painter.h`:
+///    `r > 0.0 ? 0.57735 * r + 0.5 : 0.0`.
+/// 3. `graphic_graphic_2d/rosen/modules/render_service_base/src/render/rs_blur_filter.cpp`
+///    passes the converted value directly as Gaussian `(sigmaX, sigmaY)` to
+///    `Drawing::ImageFilter::CreateBlurImageFilter`.
+///
+/// Inverting `0.57735 * r + 0.5 = css_radius * scale` aligns native ArkUI blur with CSS
+/// `filter: blur(R)` / `backdrop-filter: blur(R)` and our GLES/Scene `blur_sigma` path.
+pub(crate) fn native_blur_value(css_radius: f32, scale: f32) -> f32 {
+    if !css_radius.is_finite() || !scale.is_finite() || css_radius <= 0.0 || scale <= 0.0 {
+        return 0.0;
+    }
+    let sigma_px = blur_sigma(css_radius, scale);
+    if sigma_px <= ARKUI_BLUR_SIGMA_OFFSET {
+        0.0
+    } else {
+        (sigma_px - ARKUI_BLUR_SIGMA_OFFSET) / ARKUI_BLUR_SIGMA_SCALE
+    }
+}
+
+/// CSS `drop-shadow` / `box-shadow` blur radius to Gaussian sigma (`radius * scale * 0.5`),
+/// matching W3C shadow blur and upstream Android/Apple/Windows implementations.
+pub(crate) fn shadow_blur_sigma(radius: f32, scale: f32) -> f32 {
+    radius.max(0.0) * scale * 0.5
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -142,6 +173,9 @@ impl Bounds {
     }
     pub(crate) fn filters(mut self, filters: &[Filter]) -> Self {
         for filter in filters {
+            if crate::render::effects::is_noop_filter(filter) {
+                continue;
+            }
             match *filter {
                 Filter::Blur(radius) => self.extend(0.0, 0.0, blur_sigma(radius.0, 1.0) * 3.0),
                 Filter::DropShadow {
@@ -149,7 +183,7 @@ impl Bounds {
                     offset_y,
                     blur,
                     ..
-                } => self.extend(offset_x.0, offset_y.0, blur_sigma(blur.0, 1.0) * 3.0),
+                } => self.extend(offset_x.0, offset_y.0, shadow_blur_sigma(blur.0, 1.0) * 3.0),
                 _ => {}
             }
         }
@@ -287,34 +321,43 @@ mod tests {
         assert_eq!(f32::from_bits(second[1]), 50.0);
     }
     #[test]
-    fn scene_requirements_follow_the_current_style() {
-        let mut style = ViewStyle {
-            blend_mode: nsh_core::BlendMode::PlusDarker,
-            ..ViewStyle::default()
-        };
-        assert!(requires_scene(&style));
-        style.blend_mode = nsh_core::BlendMode::Normal;
-        assert!(!requires_scene(&style));
-        let mut effects = nsh_core::Effects {
-            backdrop_filters: vec![Filter::Blur(Points(4.0)), Filter::Blur(Points(8.0))],
-            ..Default::default()
-        };
-        style.effects = Some(std::sync::Arc::new(effects.clone()));
-        assert!(requires_scene(&style));
-        effects.backdrop_filters.pop();
-        style.effects = Some(std::sync::Arc::new(effects));
-        assert!(!requires_scene(&style));
-    }
-    #[test]
-    fn css_blur_radius_becomes_half_a_physical_sigma() {
-        assert_eq!(blur_sigma(8.0, 3.0), 12.0);
+    fn css_blur_radius_uses_full_sigma_while_drop_shadow_halves_radius() {
+        assert_eq!(blur_sigma(8.0, 3.0), 24.0);
         assert_eq!(blur_sigma(-8.0, 3.0), 0.0);
+        assert_eq!(shadow_blur_sigma(8.0, 3.0), 12.0);
+        assert_eq!(shadow_blur_sigma(-8.0, 3.0), 0.0);
         assert_eq!(
             Bounds::new(10.0, 10.0)
                 .filters(&[Filter::Blur(Points(8.0))])
                 .0,
-            [-12.0, -12.0, 22.0, 22.0]
+            [-24.0, -24.0, 34.0, 34.0]
         );
+    }
+    #[test]
+    fn native_blur_value_inverts_rosen_convert_radius_to_sigma_in_device_pixels() {
+        let rosen_sigma = |r: f32| {
+            if r > 0.0 { 0.57735 * r + 0.5 } else { 0.0 }
+        };
+        for scale in [1.0_f32, 2.0, 3.0, 3.25] {
+            for css_radius in [1.0_f32, 4.0, 8.0, 16.0, 24.0] {
+                let raw = native_blur_value(css_radius, scale);
+                let expected_sigma = blur_sigma(css_radius, scale);
+                assert!(
+                    (rosen_sigma(raw) - expected_sigma).abs() < 1e-3,
+                    "css_radius={css_radius} scale={scale} raw={raw}"
+                );
+            }
+        }
+        assert_eq!(native_blur_value(0.0, 3.0), 0.0);
+        assert_eq!(native_blur_value(-4.0, 3.0), 0.0);
+        assert_eq!(native_blur_value(4.0, 0.0), 0.0);
+        assert_eq!(native_blur_value(f32::NAN, 3.0), 0.0);
+        assert_eq!(native_blur_value(4.0, f32::INFINITY), 0.0);
+        // Sub-0.5px target sigma clamps cleanly to 0 rather than producing negative radii
+        // or jumping to Rosen's >0.5px floor.
+        assert_eq!(native_blur_value(0.2, 2.0), 0.0);
+        assert_eq!(native_blur_value(0.25, 2.0), 0.0);
+        assert!(native_blur_value(0.3, 2.0) > 0.0);
     }
     #[test]
     fn nested_shadow_overflow_and_negative_translation() {
@@ -336,5 +379,23 @@ mod tests {
         let mut matrix = Matrix::IDENTITY;
         matrix.0[3] = -0.1;
         assert!(Bounds::new(20.0, 10.0).transformed(matrix).is_none());
+    }
+    #[test]
+    fn identity_filters_do_not_extend_bounds() {
+        assert_eq!(
+            Bounds::new(20.0, 20.0)
+                .filters(&[
+                    Filter::Brightness(1.0),
+                    Filter::Blur(Points(0.0)),
+                    Filter::DropShadow {
+                        offset_x: Points(10.0),
+                        offset_y: Points(10.0),
+                        blur: Points(8.0),
+                        color: Color::TRANSPARENT,
+                    },
+                ])
+                .0,
+            [0.0, 0.0, 20.0, 20.0]
+        );
     }
 }

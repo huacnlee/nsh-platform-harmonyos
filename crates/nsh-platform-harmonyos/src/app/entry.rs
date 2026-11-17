@@ -118,7 +118,9 @@ pub(crate) fn bind_session(env: &Env, ui_context: &Object<'_>) -> Result<Arc<Ser
     // SAFETY: a successful call initialized raw_result in this environment;
     // FromNapiValue checks the binder's session ID before converting it.
     let session_id = unsafe { u32::from_napi_value(env.raw(), raw_result) }?;
-    crate::app::session::get(session_id)
+    let host = crate::app::session::get(session_id)?;
+    host.bind_ui_context(env, ui_context)?;
+    Ok(host)
 }
 
 #[napi]
@@ -245,8 +247,12 @@ pub(crate) fn nsh_update_window(
     platform_window_id: i32,
     visual: Vec<AvoidArea>,
     keyboard: AvoidArea,
+    max_refresh_rate: Option<u32>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
+        if let Some(hz) = max_refresh_rate {
+            host.set_max_refresh_rate(hz);
+        }
         let visual = [
             visual.first().copied().unwrap_or_default(),
             visual.get(1).copied().unwrap_or_default(),

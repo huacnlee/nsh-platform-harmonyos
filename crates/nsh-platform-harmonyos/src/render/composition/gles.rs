@@ -122,20 +122,55 @@ impl Target {
     pub(super) fn picture(&self) -> Picture {
         (self.texture, self.width, self.height)
     }
-    pub(super) fn upload(gpu: &TextureContext, frame: &RgbaFrame) -> Result<Self> {
-        if frame.pixels.len() != frame.width as usize * frame.height as usize * 4 {
-            return Err("invalid shader picture storage".into());
+    pub(super) fn read(&self) -> Result<RgbaFrame> {
+        let _current = self.gpu.context.enter()?;
+        let mut pixels = vec![0; self.width as usize * self.height as usize * 4];
+        // SAFETY: the framebuffer and exact-size destination belong to this worker context.
+        unsafe {
+            let gl = &self.gpu.gl;
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(self.framebuffer));
+            gl.pixel_store_i32(glow::PACK_ALIGNMENT, 1);
+            gl.read_pixels(
+                0,
+                0,
+                self.width as i32,
+                self.height as i32,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelPackData::Slice(Some(&mut pixels)),
+            );
+            let code = gl.get_error();
+            if code != glow::NO_ERROR {
+                return Err(Error::Draw(code));
+            }
         }
+        Ok(RgbaFrame {
+            width: self.width,
+            height: self.height,
+            pixels,
+        })
+    }
+    pub(super) fn upload(gpu: &TextureContext, frame: &RgbaFrame) -> Result<Self> {
         if frame.width > 4096 || frame.height > 4096 {
             return Err("shader upload must be resampled before allocation".into());
         }
         let target = Self::new(gpu, frame.width, frame.height)?;
-        let _current = gpu.context.enter()?;
+        target.write(frame)?;
+        Ok(target)
+    }
+    pub(super) fn write(&self, frame: &RgbaFrame) -> Result<()> {
+        if (frame.width, frame.height) != (self.width, self.height)
+            || frame.pixels.len() != frame.width as usize * frame.height as usize * 4
+        {
+            return Err("invalid shader picture storage".into());
+        }
+        let _current = self.gpu.context.enter()?;
         // SAFETY: the live texture's exact-size RGBA source stays borrowed during upload.
         unsafe {
-            gpu.gl.bind_texture(glow::TEXTURE_2D, Some(target.texture));
-            gpu.gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            gpu.gl.tex_sub_image_2d(
+            let gl = &self.gpu.gl;
+            gl.bind_texture(glow::TEXTURE_2D, Some(self.texture));
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_sub_image_2d(
                 glow::TEXTURE_2D,
                 0,
                 0,
@@ -147,15 +182,15 @@ impl Target {
                 glow::PixelUnpackData::Slice(Some(&frame.pixels)),
             );
         }
-        Ok(target)
+        Ok(())
     }
     pub(super) fn copy(gpu: &TextureContext, picture: Picture) -> Result<Self> {
         let target = Self::new(gpu, picture.1, picture.2)?;
-        target.blit(picture, false)?;
+        target.blit(picture)?;
         Ok(target)
     }
-    fn blit(&self, picture: Picture, flip: bool) -> Result<()> {
-        self.blit_rect(picture, flip, [0, 0, self.width as i32, self.height as i32])
+    fn blit(&self, picture: Picture) -> Result<()> {
+        self.blit_rect(picture, [0, 0, self.width as i32, self.height as i32])
     }
     pub(super) fn reframe(
         &self,
@@ -165,17 +200,17 @@ impl Target {
     ) -> Result<()> {
         self.blit_rect(
             picture,
-            false,
             destination.destination(source, (self.width, self.height)),
         )
     }
-    fn blit_rect(&self, picture: Picture, flip: bool, rect: [i32; 4]) -> Result<()> {
+    fn blit_rect(&self, picture: Picture, rect: [i32; 4]) -> Result<()> {
         let _current = self.gpu.context.enter()?;
         let gl = &self.gpu.gl;
+        let full_rect = rect == [0, 0, self.width as i32, self.height as i32];
         // SAFETY: source and destination textures are owned on this context and
-        // never alias; the temporary read framebuffer is detached before deletion.
+        // never alias; the shared read framebuffer detaches its texture after blit.
         unsafe {
-            let read = gl.create_framebuffer()?;
+            let read = self.gpu.blit_framebuffer();
             gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(read));
             gl.framebuffer_texture_2d(
                 glow::READ_FRAMEBUFFER,
@@ -186,18 +221,15 @@ impl Target {
             );
             gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.framebuffer));
             gl.disable(glow::SCISSOR_TEST);
-            gl.clear_color(0.0, 0.0, 0.0, 0.0);
-            gl.clear(glow::COLOR_BUFFER_BIT);
-            let (y0, y1) = if flip {
-                (picture.2 as i32, 0)
-            } else {
-                (0, picture.2 as i32)
-            };
+            if !full_rect {
+                gl.clear_color(0.0, 0.0, 0.0, 0.0);
+                gl.clear(glow::COLOR_BUFFER_BIT);
+            }
             gl.blit_framebuffer(
                 0,
-                y0,
+                0,
                 picture.1 as i32,
-                y1,
+                picture.2 as i32,
                 rect[0],
                 rect[1],
                 rect[2],
@@ -205,7 +237,13 @@ impl Target {
                 glow::COLOR_BUFFER_BIT,
                 glow::LINEAR,
             );
-            gl.delete_framebuffer(read);
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                None,
+                0,
+            );
         }
         Ok(())
     }
@@ -245,6 +283,7 @@ impl Target {
                 // tree. Retry on the next VSync/created window; the logical shader
                 // remains visible. Clear only the failed window operation's GL
                 // errors so another layer does not inherit its OUT_OF_MEMORY flag.
+                window.on_present_unavailable();
                 let _current = self.gpu.context.enter()?;
                 // SAFETY: the surface's shared GLES context is current here.
                 unsafe { while self.gpu.gl.get_error() != glow::NO_ERROR {} }
@@ -291,7 +330,95 @@ struct Program {
     buffers: [glow::Buffer; 2],
     empty: Target,
 }
+pub(super) fn is_compiled(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
+    gpu.programs.borrow().contains_key(&layer.shader.hash())
+}
+pub(super) fn precompile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<()> {
+    Program::compile(gpu, layer).map(|_| ())
+}
+
 impl Program {
+    fn compile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Rc<Compiled>> {
+        let _current = gpu.context.enter()?;
+        let gl = &gpu.gl;
+        // SAFETY: validated core-generated GLSL and all program objects are
+        // compiled and used exclusively on this worker's current context.
+        unsafe {
+            if let Some(cached) = gpu.programs.borrow().get(&layer.shader.hash()).cloned() {
+                return Ok(cached);
+            }
+            let source = layer
+                .shader
+                .glsl_es()
+                .map_err(|e| Error::Shader(e.to_string()))?;
+            // Core's GLSL targets a displayed canvas. Our intermediate pictures
+            // have their first row at the top; adapt clip space in the vertex
+            // stage instead of copying and flipping every shader output.
+            let vertex = source
+                .vertex
+                .replacen('\n', "\n#define main nsh_ohos_vertex\n", 1)
+                + "\n#undef main\nvoid main() { nsh_ohos_vertex(); gl_Position.y = -gl_Position.y; }\n";
+            let native = gl.create_program()?;
+            let compile = || -> Result<()> {
+                for (kind, source) in [
+                    (glow::VERTEX_SHADER, &vertex),
+                    (glow::FRAGMENT_SHADER, &source.fragment),
+                ] {
+                    let shader = gl.create_shader(kind)?;
+                    gl.shader_source(shader, source);
+                    gl.compile_shader(shader);
+                    if !gl.get_shader_compile_status(shader) {
+                        let error = gl.get_shader_info_log(shader);
+                        gl.delete_shader(shader);
+                        return Err(Error::Shader(error));
+                    }
+                    gl.attach_shader(native, shader);
+                    gl.delete_shader(shader);
+                }
+                gl.link_program(native);
+                if !gl.get_program_link_status(native) {
+                    return Err(Error::Shader(gl.get_program_info_log(native)));
+                }
+                Ok(())
+            };
+            if let Err(error) = compile() {
+                gl.delete_program(native);
+                return Err(error);
+            }
+            for (binding, name) in [
+                source.builtins_block.as_deref(),
+                source.uniforms_block.as_deref(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if let Some(name) = name
+                    && let Some(index) = gl.get_uniform_block_index(native, name)
+                {
+                    gl.uniform_block_binding(native, index, binding as u32);
+                }
+            }
+            let pictures = source
+                .pictures
+                .iter()
+                .filter_map(|(name, input)| {
+                    gl.get_uniform_location(native, name)
+                        .map(|location| (location, *input))
+                })
+                .collect();
+            let compiled = Rc::new(Compiled {
+                context: gpu.context.clone(),
+                gl: gpu.gl.clone(),
+                native,
+                pictures,
+            });
+            gpu.programs
+                .borrow_mut()
+                .insert(layer.shader.hash(), compiled.clone());
+            Ok(compiled)
+        }
+    }
+
     fn new(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Self> {
         let empty = Target::upload(
             gpu,
@@ -301,78 +428,11 @@ impl Program {
                 pixels: vec![0; 4],
             },
         )?;
+        let compiled = Self::compile(gpu, layer)?;
         let _current = gpu.context.enter()?;
         let gl = &gpu.gl;
-        // SAFETY: validated core-generated GLSL and all program/buffer objects
-        // are compiled and used exclusively on this worker's current context.
+        // SAFETY: buffer objects belong exclusively to this worker's current context.
         unsafe {
-            let cached = gpu.programs.borrow().get(&layer.shader.hash()).cloned();
-            let compiled = if let Some(cached) = cached {
-                cached
-            } else {
-                let source = layer
-                    .shader
-                    .glsl_es()
-                    .map_err(|e| Error::Shader(e.to_string()))?;
-                let native = gl.create_program()?;
-                let compile = || -> Result<()> {
-                    for (kind, source) in [
-                        (glow::VERTEX_SHADER, &source.vertex),
-                        (glow::FRAGMENT_SHADER, &source.fragment),
-                    ] {
-                        let shader = gl.create_shader(kind)?;
-                        gl.shader_source(shader, source);
-                        gl.compile_shader(shader);
-                        if !gl.get_shader_compile_status(shader) {
-                            let error = gl.get_shader_info_log(shader);
-                            gl.delete_shader(shader);
-                            return Err(Error::Shader(error));
-                        }
-                        gl.attach_shader(native, shader);
-                        gl.delete_shader(shader);
-                    }
-                    gl.link_program(native);
-                    if !gl.get_program_link_status(native) {
-                        return Err(Error::Shader(gl.get_program_info_log(native)));
-                    }
-                    Ok(())
-                };
-                if let Err(error) = compile() {
-                    gl.delete_program(native);
-                    return Err(error);
-                }
-                for (binding, name) in [
-                    source.builtins_block.as_deref(),
-                    source.uniforms_block.as_deref(),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    if let Some(name) = name
-                        && let Some(index) = gl.get_uniform_block_index(native, name)
-                    {
-                        gl.uniform_block_binding(native, index, binding as u32);
-                    }
-                }
-                let pictures = source
-                    .pictures
-                    .iter()
-                    .filter_map(|(name, input)| {
-                        gl.get_uniform_location(native, name)
-                            .map(|location| (location, *input))
-                    })
-                    .collect();
-                let compiled = Rc::new(Compiled {
-                    context: gpu.context.clone(),
-                    gl: gpu.gl.clone(),
-                    native,
-                    pictures,
-                });
-                gpu.programs
-                    .borrow_mut()
-                    .insert(layer.shader.hash(), compiled.clone());
-                compiled
-            };
             let first = match gl.create_buffer() {
                 Ok(b) => b,
                 Err(e) => {
@@ -394,13 +454,15 @@ impl Program {
             })
         }
     }
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &self,
         target: &Target,
         words: &[u32],
         builtins: &[u32; 8],
-        input: Picture,
+        content: Picture,
         from: Option<Picture>,
+        to: Option<Picture>,
         backdrop: Option<Picture>,
     ) -> Result<()> {
         let _current = self.gpu.context.enter()?;
@@ -428,12 +490,12 @@ impl Program {
                 );
             }
             for (index, (location, slot)) in self.compiled.pictures.iter().enumerate() {
-                let picture = if *slot == ShaderInput::Backdrop {
-                    backdrop.unwrap_or_else(|| self.empty.picture())
-                } else if *slot == ShaderInput::From {
-                    from.unwrap_or(input)
-                } else {
-                    input
+                let picture = match *slot {
+                    ShaderInput::Content => content,
+                    ShaderInput::Backdrop => backdrop.unwrap_or_else(|| self.empty.picture()),
+                    ShaderInput::From => from.unwrap_or_else(|| self.empty.picture()),
+                    ShaderInput::To => to.unwrap_or_else(|| self.empty.picture()),
+                    _ => self.empty.picture(),
                 };
                 gl.active_texture(glow::TEXTURE0 + index as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(picture.0));
@@ -480,7 +542,6 @@ struct Effect {
     aligned: Option<Target>,
     backdrop: Option<Target>,
     input: Option<Target>,
-    scratch: Option<Target>,
     output: Option<Target>,
 }
 
@@ -504,6 +565,9 @@ impl Effects {
     pub(super) fn layers(&mut self, layers: &[(NodeId, Arc<ShaderLayer>)]) -> Result<()> {
         self.views
             .retain(|view| layers.iter().any(|(id, _)| *id == view.id));
+        if self.shown.is_some_and(|index| index >= self.views.len()) {
+            self.direct_output = false;
+        }
         for (index, (id, layer)) in layers.iter().enumerate() {
             if let Some(at) = self.views.iter().position(|view| view.id == *id) {
                 self.views.swap(index, at);
@@ -563,7 +627,6 @@ impl Effects {
                         aligned: None,
                         backdrop: None,
                         input: None,
-                        scratch: None,
                         output: None,
                     },
                 );
@@ -746,7 +809,7 @@ impl Effects {
                 {
                     view.input = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
                 }
-                view.input.as_ref().unwrap().blit(current, false)?;
+                view.input.as_ref().unwrap().blit(current)?;
             }
             if replaces
                 && (changed
@@ -754,13 +817,12 @@ impl Effects {
                     || transitioning
                     || view.layer.shader.animated() && !view.layer.paused)
             {
-                for target in [&mut view.scratch, &mut view.output] {
-                    if target
-                        .as_ref()
-                        .is_none_or(|t| (t.width, t.height) != layer_size)
-                    {
-                        *target = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
-                    }
+                if view
+                    .output
+                    .as_ref()
+                    .is_none_or(|t| (t.width, t.height) != layer_size)
+                {
+                    view.output = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
                 }
                 let time = view.elapsed
                     + if view.layer.paused {
@@ -768,7 +830,7 @@ impl Effects {
                     } else {
                         view.clock.elapsed()
                     };
-                let scratch = view.scratch.as_ref().unwrap();
+                let output = view.output.as_ref().unwrap();
                 if let Some(backdrop) = backdrop {
                     if view
                         .backdrop
@@ -782,8 +844,16 @@ impl Effects {
                         .unwrap()
                         .reframe(backdrop, coverage, layer_coverage)?;
                 }
+                let in_transition = transitioning || view.navigation;
+                let (from_pic, to_pic) = if !in_transition {
+                    (None, None)
+                } else if view.reverse_inputs {
+                    (Some(current), view.from.as_ref().map(Target::picture))
+                } else {
+                    (view.from.as_ref().map(Target::picture), Some(current))
+                };
                 view.program.draw(
-                    scratch,
+                    output,
                     &view.words,
                     &builtins(
                         coverage.box_size,
@@ -792,22 +862,11 @@ impl Effects {
                         nsh_core::geometry::Percentage(progress),
                         Points(view.layer.overflow.0.max(0.0)),
                     ),
-                    if view.reverse_inputs {
-                        view.from.as_ref().map_or(current, Target::picture)
-                    } else {
-                        current
-                    },
-                    if view.reverse_inputs {
-                        Some(current)
-                    } else {
-                        view.from.as_ref().map(Target::picture)
-                    },
+                    current,
+                    from_pic,
+                    to_pic,
                     backdrop.and_then(|_| view.backdrop.as_ref().map(Target::picture)),
                 )?;
-                view.output
-                    .as_ref()
-                    .unwrap()
-                    .blit(scratch.picture(), true)?;
                 changed = true;
             }
             if replaces && let Some(output) = &view.output {
@@ -849,6 +908,11 @@ impl Effects {
             return Ok(true);
         }
         Ok(false)
+    }
+    pub(super) fn clear_output(&mut self) {
+        self.shown = None;
+        self.direct_output = false;
+        self.output = None;
     }
     pub(super) fn output(&self) -> Option<&Target> {
         if self.direct_output {

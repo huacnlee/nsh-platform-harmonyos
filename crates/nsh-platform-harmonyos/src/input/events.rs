@@ -442,7 +442,7 @@ impl Interaction {
     pub(crate) fn pointer(&self, owner: &Rc<Node>, inherited: bool) -> Result<()> {
         self.inherited_block.set(inherited);
         let pointer = self.props.borrow().pointer_events;
-        let mode = if inherited || owner.export_repair.get() != 0 {
+        let mode = if inherited {
             HitTestMode::None
         } else {
             match pointer {
@@ -695,10 +695,12 @@ impl Interaction {
         self.opacity.set(None);
     }
     fn apply_opacity(&self, owner: &Node) -> Result<()> {
-        owner
-            .visual_node()
-            .borrow()
-            .opacity(self.opacity.get().unwrap_or(1.0))?;
+        let opacity = if owner.native_visibility_hidden() {
+            0.0
+        } else {
+            self.opacity.get().unwrap_or(1.0)
+        };
+        owner.visual_node().borrow().opacity(opacity)?;
         Ok(())
     }
 }

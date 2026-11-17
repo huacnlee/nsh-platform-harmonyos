@@ -68,13 +68,13 @@ impl Node {
             web: RefCell::default(),
             video: RefCell::default(),
             active: Cell::new(true),
-            export_repair: Cell::new(0),
             retained: Cell::new(false),
             retained_owner: RefCell::default(),
             retained_children: RefCell::default(),
             backface_away: Cell::new(false),
             interaction: Interaction::default(),
             style: RefCell::new(Box::default()),
+            animated_opacity: Cell::new(None),
             applied: Cell::new(AppliedStyle {
                 visual_ptr,
                 ..AppliedStyle::default()
@@ -86,8 +86,8 @@ impl Node {
             navigation_presentation: Cell::new((1.0, 0.0)),
             decoration: crate::render::decor::Decoration::default(),
             layout_callbacks: Cell::new(false),
-            drawing: Cell::new(false),
-            outlined: Cell::new(false),
+            drawing: RefCell::new(None),
+            outlined: RefCell::new(None),
             shadow_layer: RefCell::default(),
             text_drawing: RefCell::new(None),
             selection_area: RefCell::new(None),
@@ -159,9 +159,12 @@ impl Node {
             node.enable_layout();
         }
         if node.canvas.borrow().is_some() {
-            node.enable_drawing();
+            node.enable_drawing()?;
         }
-        if kind == ViewKind::Modal {
+        if kind == ViewKind::HeaderItem {
+            node.apply_z_index()?;
+        }
+        if matches!(kind, ViewKind::Modal | ViewKind::Screen) {
             node.ensure_wrapper()?;
         }
         Ok(node)
@@ -192,6 +195,7 @@ impl Node {
         if !self.active.replace(false) {
             return;
         }
+        self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));
         callback(|| self.selection_clear());
         self.invalidate_scene();
@@ -355,6 +359,8 @@ impl Drop for Node {
                 });
             }
         }
+        self.drawing.borrow_mut().take();
+        self.outlined.borrow_mut().take();
         self.shadow_layer.borrow_mut().take();
         // Struct fields otherwise outlive this Drop body. Release controller
         // handles before recursively disposing their mounted native descendants.
@@ -404,8 +410,8 @@ impl Drop for Node {
             }
             let wrapper = scroll.wrapper.clone();
             drop(scroll);
-            // Texture export replaces the wrapper in the mounted tree. Once
-            // the attachment releases it, this detached tree needs its own disposal.
+            // Once the overlay attachment releases this wrapper, its detached
+            // tree needs its own disposal.
             if wrapper.borrow().is_owned() && Rc::strong_count(&wrapper) == 1 {
                 callback(|| {
                     wrapper.borrow().remove_from_parent()?;

@@ -5,7 +5,10 @@ use std::{
 };
 
 use ohos_arkui_binding::{
-    component::{attribute::ArkUIEvent, built_in_component::Custom},
+    component::{
+        attribute::{ArkUICommonAttribute, ArkUIEvent},
+        built_in_component::Custom,
+    },
     types::advanced::{LengthMetricUnit, NodeDirtyFlag},
 };
 
@@ -53,13 +56,12 @@ impl Plane {
             .borrow()
             .set_length_metric_unit(LengthMetricUnit::Vp)?;
         let target = NativeAttachment::for_subtree(&outer, widget)?;
-        let composite = Composite::overlay(owner, target.id())?;
+        let composite = Composite::overlay(owner)?;
         let plane = Rc::new(Self {
             outer,
             route: RefCell::new(Some(crate::interop::sdk::ViewRoute::new(
                 target.id(),
                 Rc::downgrade(owner),
-                widget,
             ))),
             target: RefCell::new(Some(target)),
             inner: widget.clone(),
@@ -110,11 +112,8 @@ impl Plane {
     fn replace_target(&self, owner: &Node) -> Result<u32> {
         let target = NativeAttachment::for_subtree(&self.outer, &self.inner)?;
         let id = target.id();
-        *self.route.borrow_mut() = Some(crate::interop::sdk::ViewRoute::new(
-            id,
-            self.owner.clone(),
-            &self.inner,
-        ));
+        *self.route.borrow_mut() =
+            Some(crate::interop::sdk::ViewRoute::new(id, self.owner.clone()));
         if let Some(old) = self.target.replace(Some(target)) {
             owner.view_remove(old);
         }
@@ -125,49 +124,36 @@ impl Plane {
             return Ok(());
         }
         if !self.context_live.get() {
-            let id = self.replace_target(owner)?;
+            let _id = self.replace_target(owner)?;
             *self.composite.borrow_mut() = Some(Composite::overlay(
                 &self
                     .owner
                     .upgrade()
                     .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
-                id,
             )?);
             self.context_live.set(true);
         }
-        let composite = self.composite.borrow();
-        let Some(composite) = composite.as_ref() else {
-            return Ok(());
-        };
-        composite.update(owner)?;
-        let texture_surface = composite.surface();
-        if self
-            .settings
-            .borrow()
-            .as_ref()
-            .is_some_and(|previous| previous.texture_surface != texture_surface)
-        {
-            self.replace_target(owner)?;
+        if let Some(composite) = self.composite.borrow().as_ref() {
+            composite.update(owner)?;
         }
-        if let Some(route) = self.route.borrow().as_ref() {
-            route.texture(
-                texture_surface.is_some()
-                    || self
-                        .settings
-                        .borrow()
-                        .as_ref()
-                        .is_some_and(|previous| previous.texture_surface.is_some()),
-            );
-        }
+        self.outer.borrow().opacity(0.0)?;
         let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
             return Ok(());
         };
+        let texture_surface = self
+            .composite
+            .borrow()
+            .as_ref()
+            .and_then(Composite::surface_id);
+        if texture_surface.is_none() {
+            return Ok(());
+        }
         let frame = owner.frame.get();
         let settings = ViewOptions {
+            texture_surface,
             target_id,
             width: frame.width as f64,
             height: frame.height as f64,
-            texture_surface,
             ..ViewOptions::default()
         };
         let mut previous = self.settings.borrow_mut();
@@ -179,10 +165,15 @@ impl Plane {
         Ok(())
     }
     pub(crate) fn ready(&self, owner: &Node, generation: u32) -> Result<()> {
+        let mut drop_failed = false;
         if let Some(composite) = self.composite.borrow().as_ref()
             && composite.generation == generation
         {
             composite.ready();
+            drop_failed = composite.is_failed();
+        }
+        if drop_failed {
+            self.composite.borrow_mut().take();
         }
         self.update(owner)
     }

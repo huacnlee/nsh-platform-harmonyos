@@ -18,7 +18,6 @@ use nsh_core::{
         FillRule, Num, Paint, PathOp,
     },
 };
-use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
 use ohos_drawing_binding::{
     Bitmap, BlendMode, Brush, Canvas, ClipOperation, FilterMode, FontSlant, FontStyle, FontWeight,
     FontWidth, Matrix, MipmapMode, Path, PathEffect, PathFillType, Pen, Rect, SamplingOptions,
@@ -178,10 +177,7 @@ impl CanvasView {
             return Ok(());
         }
         if let Some(owner) = self.owner.upgrade() {
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+            owner.invalidate_paint()?;
             self.scheduled.set(true);
         }
         Ok(())

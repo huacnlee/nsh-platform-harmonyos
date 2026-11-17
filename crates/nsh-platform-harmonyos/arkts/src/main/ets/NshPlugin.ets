@@ -1,5 +1,5 @@
 import { NativeEditors, EditorSettings, EditorCommand, NshRuntimeContext } from "./NativeEditors";
-import { NativeViews, Settings } from "./NativeViews";
+import { NativeViews, Settings, PictureRequest } from "./NativeViews";
 import { NativeWebViews, WebSettings, WebCommand } from "./NativeWebViews";
 
 export interface Batch {
@@ -7,6 +7,7 @@ export interface Batch {
   commands: EditorCommand[];
   removeEditors: number[];
   views: Settings[];
+  pictures: PictureRequest[];
   removeViews: number[];
   webs: WebSettings[];
   webCommands: WebCommand[];
@@ -24,12 +25,28 @@ export class NshPlugin {
       throw new Error("NSH SDK session is inactive");
     }
     context.getUIContext();
-    this.editors.remove(batch.removeEditors, context);
-    this.views.remove(batch.removeViews, context, batch.views);
-    this.webs.remove(batch.removeWebs, context);
-    this.editors.update(batch.editors, batch.commands, context);
-    this.views.update(batch.views, context);
-    this.webs.update(batch.webs, batch.webCommands, context);
+    let failure: Error | undefined;
+    const runStep = (step: () => void): void => {
+      try {
+        step();
+      } catch (error) {
+        failure ??= error instanceof Error ? error : new Error(String(error));
+      }
+    };
+    runStep((): void => this.editors.remove(batch.removeEditors, context));
+    runStep((): void => this.webs.remove(batch.removeWebs, context));
+    runStep((): void =>
+      this.editors.update(batch.editors, failure ? [] : batch.commands, context),
+    );
+    runStep((): void => this.views.update(batch.views, context));
+    runStep((): void => this.views.remove(batch.removeViews, context));
+    runStep((): void =>
+      this.webs.update(batch.webs, failure ? [] : batch.webCommands, context),
+    );
+    if (failure) {
+      throw failure;
+    }
+    this.views.pictures(batch.pictures);
   }
 
   dispose(context: NshRuntimeContext): void {

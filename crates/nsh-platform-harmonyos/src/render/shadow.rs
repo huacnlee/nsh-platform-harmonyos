@@ -8,21 +8,13 @@ use std::{
 use nsh_core::ViewStyle;
 use ohos_arkui_binding::{
     api::node_custom_event::NodeCustomEvent,
-    component::{
-        attribute::{ArkUICommonAttribute, ArkUIEvent},
-        built_in_component::Custom,
-    },
-    types::{
-        advanced::{LengthMetricUnit, NodeDirtyFlag},
-        attribute::ArkUINodeAttributeType as A,
-        view::HitTestMode,
-    },
+    component::attribute::ArkUICommonAttribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as A},
 };
-use ohos_drawing_binding::Canvas;
 
 use super::{
     geometry::Size,
-    node::{NativeNode, Node, Result, callback},
+    node::{Node, Result},
     shadow_geometry::{PaintBounds, native_box_shadow},
 };
 
@@ -36,78 +28,40 @@ struct PaintKey {
 }
 
 pub(crate) struct ShadowLayer {
-    native: NativeNode,
-    bounds: Cell<PaintBounds>,
+    paint: super::paint_node::PaintNode,
+    bounds: Rc<Cell<PaintBounds>>,
     key: RefCell<Option<PaintKey>>,
 }
 impl ShadowLayer {
     pub(crate) fn new(owner: &Rc<Node>) -> Result<Rc<Self>> {
-        let native = Custom::new()?.into_node();
+        let bounds = Rc::new(Cell::new(PaintBounds::default()));
+        let draw_bounds = bounds.clone();
+        let weak = Rc::downgrade(owner);
+        let paint = super::paint_node::PaintNode::new(move |canvas| {
+            if let Some(owner) = weak.upgrade() {
+                let b = draw_bounds.get();
+                canvas.save();
+                canvas.translate(-b.x as f32, -b.y as f32);
+                owner.draw_outer_shadows(canvas);
+                canvas.restore();
+            }
+        })?;
+        paint
+            .native
+            .borrow()
+            .set_i32_attribute(A::ZIndex, -1_000_000)?;
         let layer = Rc::new(Self {
-            native,
-            bounds: Cell::default(),
+            paint,
+            bounds,
             key: RefCell::default(),
-        });
-        let setup = || -> Result<()> {
-            let native = layer.native.borrow();
-            native.set_length_metric_unit(LengthMetricUnit::Px)?;
-            native.set_attribute(A::HitTestBehavior, i32::from(HitTestMode::None).into())?;
-            native.set_bool_attribute(A::Clip, true)?;
-            native.set_f32_attribute(A::ZIndex, -1_000_000.0)?;
-            Ok(())
-        };
-        if let Err(error) = setup() {
-            callback(|| {
-                layer.native.borrow_mut().dispose()?;
-                Ok(())
-            });
-            return Err(error);
-        }
-        let weak = Rc::downgrade(&layer);
-        layer.native.borrow_mut().on_custom_measure(move |event| {
-            callback(|| {
-                if let Some(layer) = weak.upgrade() {
-                    let b = layer.bounds.get();
-                    event.set_measured_size(b.width, b.height)?;
-                }
-                Ok(())
-            });
-        });
-        let weak = Rc::downgrade(&layer);
-        let node = Rc::downgrade(owner);
-        layer.native.borrow_mut().on_custom_draw(move |event| {
-            callback(|| {
-                if let (Some(layer), Some(owner)) = (weak.upgrade(), node.upgrade()) {
-                    let b = layer.bounds.get();
-                    if b.width <= 0 || b.height <= 0 {
-                        return Ok(());
-                    }
-                    if let Some(raw) = event.draw_context_in_draw().and_then(|cx| cx.canvas()) {
-                        // SAFETY: ArkUI retains the canvas through this draw callback.
-                        let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
-                        canvas.save();
-                        canvas.translate(-b.x as f32, -b.y as f32);
-                        owner.draw_outer_shadows(&canvas);
-                        canvas.restore();
-                    }
-                }
-                Ok(())
-            });
         });
         // Decorations are appended after all logical children; insertion/removal
         // indexes remain those of the NSH tree. zIndex keeps the ink underneath.
         let index = owner.native.borrow().children().len();
-        if let Err(error) = owner
+        owner
             .native
             .borrow_mut()
-            .insert_child(layer.native.clone(), index)
-        {
-            callback(|| {
-                layer.native.borrow_mut().dispose()?;
-                Ok(())
-            });
-            return Err(error.into());
-        }
+            .insert_child(layer.paint.native.clone(), index)?;
         owner
             .native
             .borrow()
@@ -135,7 +89,13 @@ impl ShadowLayer {
             return Ok(());
         }
         if self.bounds.replace(bounds) != bounds {
-            self.native
+            // PaintNode places itself through native Position, which overrides
+            // the layout callback's offset. Keep the ink's negative origin so
+            // the canvas translation above cancels it at the owner's border box.
+            self.paint
+                .bounds([bounds.x, bounds.y, bounds.width, bounds.height])?;
+            self.paint
+                .native
                 .borrow()
                 .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             owner
@@ -143,21 +103,18 @@ impl ShadowLayer {
                 .borrow()
                 .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
         }
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+
+        self.paint.invalidate()?;
         *self.key.borrow_mut() = Some(next);
         Ok(())
     }
     pub(crate) fn measure(&self, event: &NodeCustomEvent) -> Result<()> {
-        crate::render::layout::ChildMeasure::new(event).child(&self.native.borrow())?;
+        crate::render::layout::ChildMeasure::new(event).child(&self.paint.native.borrow())?;
         Ok(())
     }
     pub(crate) fn layout(&self, event: &NodeCustomEvent) -> Result<()> {
         let b = self.bounds.get();
-        event.layout_child(&self.native.borrow(), b.x, b.y)?;
-        Ok(())
-    }
-    pub(crate) fn invalidate(&self) -> Result<()> {
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        event.layout_child(&self.paint.native.borrow(), b.x, b.y)?;
         Ok(())
     }
 }

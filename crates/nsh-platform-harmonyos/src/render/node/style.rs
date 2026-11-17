@@ -5,12 +5,11 @@ use std::rc::Rc;
 use nsh_core::{Points, ViewKind, ViewStyle};
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
-    component::attribute::{ArkUICommonAttribute, ArkUIEvent},
+    component::attribute::ArkUICommonAttribute,
     types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
-use ohos_drawing_binding::Canvas;
 
-use super::{NativeNode, Node, Result, callback};
+use super::{NativeNode, Node, Result};
 use crate::{render::geometry::Size, text::typography::argb};
 
 impl Node {
@@ -23,7 +22,7 @@ impl Node {
         self.native
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        self.invalidate_paint()?;
         Ok(())
     }
 
@@ -60,35 +59,33 @@ impl Node {
     }
     pub(crate) fn style(self: &Rc<Self>, style: &ViewStyle) -> Result<()> {
         self.invalidate_composites();
-        if style.outline.width.0 > 0.0 && !self.outlined.replace(true) {
+        if style.outline.width.0 > 0.0 && self.outlined.borrow().is_none() {
             let weak = Rc::downgrade(self);
-            self.native
-                .borrow_mut()
-                .on_custom_foreground_draw(move |event| {
-                    callback(|| {
-                        if let Some(node) = weak.upgrade()
-                            && !node.scene_active()
-                            && let Some(raw) =
-                                event.draw_context_in_draw().and_then(|ctx| ctx.canvas())
-                        {
-                            // SAFETY: ArkUI retains this drawing context for this callback.
-                            let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
-                            let frame = node.frame.get();
-                            node.decoration.outline(
-                                &canvas,
-                                &node.style.borrow(),
-                                Size::new(frame.width, frame.height),
-                                node.scale.get(),
-                            );
-                        }
-                        Ok(())
-                    })
-                });
+            let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
+                if let Some(node) = weak.upgrade()
+                    && !node.scene_active()
+                {
+                    let outset = (node.applied.get().ink_outset * node.scale.get()).ceil();
+                    canvas.save();
+                    canvas.translate(outset, outset);
+                    let frame = node.frame.get();
+                    node.decoration.outline(
+                        canvas,
+                        &node.style.borrow(),
+                        Size::new(frame.width, frame.height),
+                        node.scale.get(),
+                    );
+                    canvas.restore();
+                }
+            })?;
+            paint.native.borrow().z_index(i32::MAX)?;
+            self.native.borrow_mut().add_child(paint.native.clone())?;
+            *self.outlined.borrow_mut() = Some(paint);
         }
         if self.style.borrow().effects != style.effects
             || self.style.borrow().outline != style.outline
         {
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         let cursor_changed = self.style.borrow().cursor != style.cursor;
         let mut target = Box::new(style.clone());
@@ -126,26 +123,174 @@ impl Node {
             applied.visibility = 0;
             applied.transform = None;
             applied.transform_center = [f32::NAN; 3];
+            applied.blur = 0.0;
+            applied.blend = nsh_core::BlendMode::Normal;
+            applied.z_index = 0;
             self.applied.set(applied);
             self.interaction.invalidate_opacity();
-            self.decoration.invalidate_native();
         }
+    }
+    fn unhidden_for_effects(&self, style: &ViewStyle) -> bool {
+        if !self.active.get()
+            || self.retained.get()
+            || self.is_settled_popped_screen()
+            || style.hidden
+        {
+            return false;
+        }
+        let mut at = self.parent_node.borrow().upgrade();
+        while let Some(current) = at {
+            if !current.active.get()
+                || current.retained.get()
+                || current.is_settled_popped_screen()
+                || current.style.borrow().hidden
+            {
+                return false;
+            }
+            at = current.parent_node.borrow().upgrade();
+        }
+        true
+    }
+    pub(crate) fn effects_plan_for(
+        &self,
+        style: &ViewStyle,
+    ) -> crate::render::effects::EffectsPlan {
+        let surface_active = self.shaders.surface_active();
+        let hosts_retainable = self.shaders.hosts_retainable();
+        let unhidden = hosts_retainable && self.unhidden_for_effects(style);
+        let shaders = self.shader_layers.borrow();
+        let has_shaders = !shaders.is_empty()
+            && hosts_retainable
+            && (unhidden || (surface_active && self.shaders.has_navigation_layer(self.id)));
+        let shader_samples_backdrop = has_shaders
+            && self.id != nsh_core::ROOT_ID
+            && shaders.iter().any(|(_, layer)| {
+                layer
+                    .shader
+                    .inputs()
+                    .contains(nsh_core::shader::ShaderInput::Backdrop)
+            });
+        drop(shaders);
+        let composite_active = self
+            .wrapper
+            .borrow()
+            .as_ref()
+            .is_some_and(|wrapper| wrapper.composite.borrow().as_ref().is_some());
+        crate::render::effects::EffectsPlan::compute(
+            style,
+            crate::render::effects::EffectsContext {
+                has_shaders,
+                shader_samples_backdrop,
+                navigation_capture: surface_active && self.navigation_capture.get(),
+                scene_active: self.scene_active(),
+                composite_active,
+                has_native_paint: self.has_native_paint(style),
+            },
+        )
+    }
+    pub(crate) fn effects_plan(&self) -> crate::render::effects::EffectsPlan {
+        self.effects_plan_for(&self.style.borrow())
+    }
+    pub(crate) fn desired_z_index(&self) -> i32 {
+        if self.pinned.get() != (0.0, 0.0) {
+            1_000_000
+        } else if self.kind == ViewKind::HeaderItem {
+            2
+        } else {
+            0
+        }
+    }
+    pub(crate) fn apply_z_index(&self) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        let z_index = self.desired_z_index();
+        let mut applied = self.applied.get();
+        if applied.z_index != z_index {
+            visual
+                .borrow()
+                .set_i32_attribute(Attribute::ZIndex, z_index)?;
+            applied.z_index = z_index;
+            self.applied.set(applied);
+        }
+        Ok(())
+    }
+    pub(super) fn apply_effects(&self, style: &ViewStyle) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        let plan = self.effects_plan_for(style);
+        let mut applied = self.applied.get();
+        let scale = self.scale.get();
+        let blur = crate::render::composition::geometry::native_blur_value(plan.native_blur, scale);
+        if applied.blur != blur {
+            visual.borrow().set_f32_attribute(Attribute::Blur, blur)?;
+            applied.blur = blur;
+        }
+        let backdrop_blur = crate::render::composition::geometry::native_blur_value(
+            plan.native_backdrop_blur,
+            scale,
+        );
+        if applied.backdrop_blur != backdrop_blur {
+            self.native
+                .borrow()
+                .set_f32_attribute(Attribute::BackdropBlur, backdrop_blur)?;
+            applied.backdrop_blur = backdrop_blur;
+        }
+        if applied.blend != plan.native_blend {
+            let mode = crate::render::decor::arkui_blend_mode(plan.native_blend);
+            visual
+                .borrow()
+                .set_attribute(Attribute::BlendMode, vec![i32::from(mode), 1].into())?;
+            applied.blend = plan.native_blend;
+        }
+        self.applied.set(applied);
+        Ok(())
+    }
+    pub(crate) fn reset_visual_baseline(&self, node: &NativeNode) -> Result<()> {
+        let native = node.borrow();
+        native.reset_attribute(Attribute::LayoutRect)?;
+        native.reset_attribute(Attribute::Position)?;
+        native.reset_attribute(Attribute::Transform)?;
+        native.reset_attribute(Attribute::TransformCenter)?;
+        native.reset_attribute(Attribute::Blur)?;
+        native.reset_attribute(Attribute::BlendMode)?;
+        native.reset_attribute(Attribute::ZIndex)?;
+        native.opacity(1.0)?;
+        native.set_i32_attribute(Attribute::Visibility, 0)?;
+        Ok(())
+    }
+    pub(crate) fn apply_visual_style(&self, style: &ViewStyle) -> Result<()> {
+        let visual = self.visual_node();
+        self.sync_visual_node(&visual);
+        self.apply_effects(style)?;
+        self.apply_z_index()?;
+        self.transform(style, |_| None)?;
+        self.apply_opacity(style.opacity)?;
+        self.animator.apply_node(self)?;
+        Ok(())
+    }
+    pub(crate) fn visual_opacity_for(&self, style_opacity: f32) -> f32 {
+        crate::render::effects::resolve_visual_opacity(
+            style_opacity,
+            self.animated_opacity.get(),
+            self.presentation.get().0,
+            self.extra.get().0,
+            self.navigation_presentation.get().0,
+        )
     }
     pub(super) fn apply_opacity(&self, style_opacity: f32) -> Result<()> {
         let visual = self.visual_node();
         self.sync_visual_node(&visual);
+        let scene_active = self.scene_active();
+        if scene_active {
+            self.invalidate_scene();
+        }
         self.interaction.opacity(
             self,
-            if self.export_repair.get() != 0 {
-                0.0
-            } else if self.scene_active() {
-                1.0
-            } else {
-                style_opacity
-                    * self.presentation.get().0
-                    * self.extra.get().0
-                    * self.navigation_presentation.get().0
-            },
+            crate::render::effects::resolve_native_node_opacity(
+                self.native_visibility_hidden(),
+                scene_active,
+                self.visual_opacity_for(style_opacity),
+            ),
         )
     }
     pub(super) fn apply_background_color(&self, color: nsh_core::Color) -> Result<()> {
@@ -238,7 +383,7 @@ impl Node {
         self.applied.set(applied);
         Ok(())
     }
-    /// Outlines still use the foreground callback; box shadows own bounded nodes.
+    /// Outlines and box shadows own bounded retained paint nodes.
     pub(super) fn apply_ink_outset(&self, style: &ViewStyle) -> Result<()> {
         let mut outset = 0.0f32;
         if style.outline.is_visible() {
@@ -250,6 +395,7 @@ impl Node {
             applied.ink_outset = outset;
             self.applied.set(applied);
             self.invalidate_ink(outset.max(1.0))?;
+            self.invalidate_paint()?;
         }
         Ok(())
     }
@@ -395,14 +541,13 @@ impl Node {
         Ok(())
     }
     pub(super) fn ensure_shadow_layer(&self, style: &ViewStyle) -> Result<()> {
-        if self.shadow_layer.borrow().is_none()
+        let needs_shadow_layer = self.shadow_layer.borrow().is_none()
             && crate::render::shadow_geometry::native_box_shadow(style).is_none()
             && style
                 .effects
                 .as_ref()
-                .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()))
-            && let Some(owner) = self.weak.upgrade()
-        {
+                .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()));
+        if needs_shadow_layer && let Some(owner) = self.weak.upgrade() {
             self.enable_layout();
             *self.shadow_layer.borrow_mut() =
                 Some(crate::render::shadow::ShadowLayer::new(&owner)?);
@@ -417,11 +562,10 @@ impl Node {
                     .iter()
                     .any(|shadow| shadow.inset && shadow.is_visible())
         }) {
-            self.enable_drawing();
+            self.enable_drawing()?;
         }
+        crate::render::decor::warn_repeating_conic(self, style);
         self.ensure_shadow_layer(style)?;
-        let visual = self.visual_node();
-        self.sync_visual_node(&visual);
         if let Some(wrapper) = self.wrapper.borrow().as_ref()
             && let Some(composite) = wrapper.composite.borrow().as_ref()
         {
@@ -430,9 +574,6 @@ impl Node {
         if let Some(image) = self.image.borrow().as_ref() {
             image.style(style)?;
         }
-        self.decoration.native(self, style)?;
-        self.apply_opacity(style.opacity)?;
-        self.transform(style, |_| None)?;
         self.apply_background_color(style.background_color)?;
         self.apply_borders(style)?;
         self.apply_shadow(style)?;
@@ -441,48 +582,15 @@ impl Node {
         }
         self.apply_ink_outset(style)?;
         self.apply_clip()?;
-        self.animator.apply_node(self)?;
-        Ok(())
+        self.apply_visual_style(style)
     }
     pub(crate) fn reset_text_tint(&self) -> Result<()> {
         if self.tint.take().is_some() {
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         Ok(())
     }
-    pub(crate) fn export_hidden(&self) -> bool {
-        self.applied.get().visibility != 0 || self.export_repair.get() != 0
-    }
-    pub(crate) fn restore_after_export(self: &Rc<Self>) -> Result<()> {
-        if !self.active.get() {
-            return Ok(());
-        }
-        let mut applied = self.applied.get();
-        applied.visibility = -1;
-        self.applied.set(applied);
-        self.interaction.invalidate_opacity();
-        self.restore_style()?;
-        let inherited = self
-            .parent_node
-            .borrow()
-            .upgrade()
-            .is_some_and(|parent| parent.interaction.blocks_children());
-        self.interaction.pointer(self, inherited)?;
-        self.accessibility_state.changed(self);
-        Ok(())
-    }
-    pub(crate) fn restore_export_controls(&self) -> Result<()> {
-        if !self.active.get() {
-            return Ok(());
-        }
-        if let Some(screen) = self.screen.borrow().as_ref() {
-            screen.restore_visibility()?;
-        }
-        if let Some(video) = self.video.borrow().as_ref() {
-            video.restore_visibility()?;
-        }
-        Ok(())
-    }
+
     pub(crate) fn restore_style(&self) -> Result<()> {
         self.apply_style(&self.style.borrow())
     }

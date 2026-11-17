@@ -296,20 +296,109 @@ pub(crate) fn build(
         triple,
         "--message-format=json-render-diagnostics",
     ])
-    .current_dir(dir)
-    .stdout(Stdio::piped())
-    .stderr(if verbose {
+    .current_dir(dir);
+    if release {
+        cmd.arg("--release");
+    }
+    run_cargo(&mut cmd, abi, triple, verbose)
+}
+
+const STDERR_TAIL_LIMIT: usize = 64 * 1024;
+
+fn is_cargo_status_line(line: &str) -> bool {
+    const VERBS: &[&str] = &[
+        "Compiling ",
+        "Checking ",
+        "Downloading ",
+        "Downloaded ",
+        "Updating ",
+        "Locking ",
+        "Blocking ",
+        "Packaging ",
+        "Building ",
+        "Finished ",
+        "Fresh ",
+    ];
+    let trimmed = line.trim_start_matches(' ');
+    line.len().saturating_sub(trimmed.len()) >= 2 && VERBS.iter().any(|v| trimmed.starts_with(v))
+}
+
+fn push_bounded_tail(tail: &mut std::collections::VecDeque<u8>, bytes: &[u8]) {
+    if bytes.len() >= STDERR_TAIL_LIMIT {
+        tail.clear();
+        tail.extend(&bytes[bytes.len() - STDERR_TAIL_LIMIT..]);
+        return;
+    }
+    let overflow = (tail.len() + bytes.len()).saturating_sub(STDERR_TAIL_LIMIT);
+    if overflow > 0 {
+        tail.drain(..overflow);
+    }
+    tail.extend(bytes);
+}
+
+fn run_cargo(
+    cmd: &mut std::process::Command,
+    abi: &str,
+    triple: &str,
+    verbose: bool,
+) -> anyhow::Result<PathBuf> {
+    cmd.stdout(Stdio::piped()).stderr(if verbose {
         Stdio::inherit()
     } else {
         Stdio::piped()
     });
-    if release {
-        cmd.arg("--release");
-    }
     let mut child = cmd.spawn().context("running cargo")?;
+    let stdout = match child.stdout.take().context("cargo's output") {
+        Ok(stdout) => stdout,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        std::thread::spawn(move || -> std::collections::VecDeque<u8> {
+            use std::io::Write as _;
+            let mut tail = std::collections::VecDeque::with_capacity(8192);
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut buf = Vec::with_capacity(512);
+            let mut in_warning = false;
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        push_bounded_tail(&mut tail, &buf);
+                        let text = String::from_utf8_lossy(&buf);
+                        if text.starts_with("warning") {
+                            in_warning = true;
+                        } else if text.starts_with("error")
+                            || is_cargo_status_line(&text)
+                            || (in_warning && !text.starts_with(' ') && !text.trim().is_empty())
+                        {
+                            in_warning = false;
+                        }
+                        if in_warning {
+                            let _ = std::io::stderr().write_all(&buf);
+                        }
+                    }
+                }
+            }
+            tail
+        })
+    });
+
     let mut library = None;
-    for line in std::io::BufReader::new(child.stdout.take().context("cargo's output")?).lines() {
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line?) else {
+    let mut stdout_error = None;
+    for line in std::io::BufReader::new(stdout).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(err) => {
+                stdout_error = Some(err);
+                break;
+            }
+        };
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if message["reason"] == "compiler-artifact"
@@ -327,12 +416,34 @@ pub(crate) fn build(
                 .map(PathBuf::from);
         }
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        bail!("the native library did not build for {abi} (rustup target add {triple}?)\n{stderr}");
+
+    if let Some(err) = stdout_error {
+        let _ = child.kill();
+        let _ = child.wait();
+        if let Some(handle) = stderr_reader {
+            let _ = handle.join();
+        }
+        return Err(err).context("reading cargo output");
     }
-    library.context("cargo built no .so")
+
+    let status = child.wait().context("waiting for cargo")?;
+    let stderr_tail = stderr_reader
+        .and_then(|handle| handle.join().ok())
+        .map(|mut d| String::from_utf8_lossy(d.make_contiguous()).into_owned())
+        .unwrap_or_default();
+
+    if !status.success() {
+        bail!(
+            "the native library did not build for {abi} (exit {status}; rustup target add {triple}?)\n{stderr_tail}"
+        );
+    }
+    library.with_context(|| {
+        if stderr_tail.trim().is_empty() {
+            "cargo built no .so".to_string()
+        } else {
+            format!("cargo built no .so\n{stderr_tail}")
+        }
+    })
 }
 
 #[cfg(test)]
@@ -494,5 +605,45 @@ mod tests {
             "{dev_manifest}"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cargo_drains_large_stderr_without_deadlock_and_extracts_cdylib() {
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c").arg(
+            r#"import sys
+line = "   Compiling dep v0.1.0\n" * 4096
+for _ in range(16):
+    sys.stderr.write(line)
+    sys.stderr.flush()
+    sys.stdout.write('{"reason":"build-script-executed"}\n')
+    sys.stdout.flush()
+sys.stdout.write('{"reason":"compiler-artifact","target":{"name":"nsh_platform_harmonyos","kind":["cdylib"]},"filenames":["/tmp/out/libnsh_platform_harmonyos.so"]}\n')
+sys.stdout.flush()
+"#,
+        );
+        let so = run_cargo(&mut cmd, "arm64-v8a", "aarch64-unknown-linux-ohos", false).unwrap();
+        assert_eq!(so, PathBuf::from("/tmp/out/libnsh_platform_harmonyos.so"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_cargo_preserves_failure_diagnostics_with_bounded_stderr() {
+        let mut cmd = std::process::Command::new("python3");
+        cmd.arg("-c").arg(
+            r#"import sys
+sys.stderr.write("   Compiling big v0.1.0\n" * 8000)
+sys.stderr.write("error[E0425]: cannot find value `missing_sym` in this scope\n --> src/lib.rs:42:9\n")
+sys.stderr.flush()
+sys.exit(101)
+"#,
+        );
+        let err = run_cargo(&mut cmd, "arm64-v8a", "aarch64-unknown-linux-ohos", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("error[E0425]"), "{err}");
+        assert!(err.contains("src/lib.rs:42:9"), "{err}");
+        assert!(err.len() <= STDERR_TAIL_LIMIT + 512, "len={}", err.len());
     }
 }

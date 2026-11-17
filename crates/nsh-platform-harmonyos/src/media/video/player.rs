@@ -5,7 +5,7 @@ use std::{
     ptr::NonNull,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         mpsc,
     },
     time::{Duration, Instant},
@@ -16,7 +16,7 @@ use nsh_engine::EngineControl;
 use ohos_avplayer_binding::{self as av, AvPlayer, InfoField, InfoRef};
 use ohos_native_window_binding::NativeWindow;
 
-use super::{Operation, UiState, source::SourceFile};
+use super::{SharedMailbox, UiState, mailbox::WindowChange, source::SourceFile};
 use crate::{
     app::{
         runtime::{Dispatcher, Message},
@@ -26,12 +26,14 @@ use crate::{
     services::assets::StreamAssets,
 };
 
+type LoadedSource = (Option<SourceFile>, Option<CString>);
+
 struct Callbacks {
     sender: mpsc::Sender<Notice>,
     epoch: u64,
     generation: u64,
     position_queued: AtomicBool,
-    wake: mpsc::SyncSender<Operation>,
+    mailbox: SharedMailbox,
 }
 struct Notice {
     epoch: u64,
@@ -39,6 +41,7 @@ struct Notice {
     kind: NoticeKind,
 }
 enum NoticeKind {
+    SourceLoaded(std::result::Result<LoadedSource, String>),
     State(i32),
     Position,
     Seek,
@@ -71,11 +74,13 @@ pub(super) struct Worker {
     assets: Arc<dyn StreamAssets>,
     access: Arc<nsh_engine::Access>,
     agent: ureq::Agent,
-    active: Arc<AtomicBool>,
-    source_epoch: Arc<AtomicU64>,
+    mailbox: SharedMailbox,
     epoch: u64,
     props: Option<VideoProps>,
     paused: bool,
+    pending_seek: Option<i32>,
+    loading_cancel: Option<Arc<AtomicBool>>,
+    loaded_source: Option<(u64, Option<SourceFile>, Option<CString>)>,
     window: Option<NativeWindow>,
     playback: Option<Playback>,
     generation: u64,
@@ -86,16 +91,9 @@ pub(super) struct Worker {
     ui: UiState,
     last_progress: Instant,
     progress_failed: bool,
-    wake: mpsc::SyncSender<Operation>,
 }
 impl Worker {
-    pub(super) fn new(
-        owner: &Node,
-        token: u64,
-        active: Arc<AtomicBool>,
-        source_epoch: Arc<AtomicU64>,
-        wake: mpsc::SyncSender<Operation>,
-    ) -> Result<Self> {
+    pub(super) fn new(owner: &Node, token: u64, mailbox: SharedMailbox) -> Result<Self> {
         let route = owner
             .dispatcher
             .upgrade()
@@ -117,11 +115,13 @@ impl Worker {
                 .timeout_recv_response(Some(Duration::from_secs(60)))
                 .build()
                 .into(),
-            active,
-            source_epoch,
+            mailbox,
             epoch: 0,
             props: None,
             paused: true,
+            pending_seek: None,
+            loading_cancel: None,
+            loaded_source: None,
             window: None,
             playback: None,
             generation: 0,
@@ -132,162 +132,215 @@ impl Worker {
             ui: UiState::default(),
             last_progress: Instant::now(),
             progress_failed: false,
-            wake,
         })
     }
     fn live(&self) -> bool {
-        self.active.load(Ordering::Acquire) && self.route.live.load(Ordering::Acquire)
+        self.mailbox.is_active() && self.route.live.load(Ordering::Acquire)
     }
     fn load_live(&self) -> bool {
-        self.live() && self.ui_ready && self.epoch == self.source_epoch.load(Ordering::Acquire)
+        self.live() && self.ui_ready && self.epoch == self.mailbox.current_epoch()
     }
-    pub(super) fn run(mut self, receiver: mpsc::Receiver<Operation>) {
+    fn cancel_loading(&mut self) {
+        if let Some(cancel) = self.loading_cancel.take() {
+            cancel.store(true, Ordering::Release);
+        }
+        self.loaded_source = None;
+    }
+    pub(super) fn run(mut self) {
         while self.live() && !self.failed {
-            let result = match receiver.recv_timeout(self.next_progress_wait()) {
-                Ok(Operation::Close) => break,
-                Ok(operation) => self.operation(operation),
-                Err(mpsc::RecvTimeoutError::Timeout) => Ok(()),
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-            if let Err(error) = result
+            self.drain_notices();
+            if !self.live() || self.failed {
+                break;
+            }
+            let batch = self.mailbox.wait_and_take(self.next_progress_wait());
+            if batch.closed || !self.live() {
+                break;
+            }
+            if !batch.is_empty()
+                && let Err(error) = self.apply_batch(batch)
                 && self.load_live()
             {
                 self.error(error);
             }
-            while let Ok(notice) = self.notices.try_recv() {
-                if matches!(notice.kind, NoticeKind::Position)
-                    && let Some(playback) = self
-                        .playback
-                        .as_ref()
-                        .filter(|p| p.generation == notice.generation)
-                {
-                    playback
-                        ._callbacks
-                        .position_queued
-                        .store(false, Ordering::Release);
-                }
-                if !self.accepts(&notice) {
-                    continue;
-                }
-                if let Err(error) = self.notice(notice.kind)
-                    && self.load_live()
-                {
-                    self.error(error);
-                }
-            }
+            self.drain_notices();
             if self.load_live()
                 && let Err(error) = self.progress(false)
             {
                 self.error(error);
             }
         }
+        self.cancel_loading();
         if self.retire_player() && !self.failed {
             // This strong dispatcher remains alive through queued UI acknowledgement,
             // which State handles even after its engine has stopped.
             self.route.send(Message::VideoRetired(self.token));
         }
     }
-    fn accepts(&self, notice: &Notice) -> bool {
-        self.load_live()
-            && notice.epoch == self.epoch
-            && self
-                .playback
-                .as_ref()
-                .is_some_and(|player| player.generation == notice.generation)
-    }
-    fn operation(&mut self, operation: Operation) -> std::result::Result<(), String> {
-        match operation {
-            Operation::Configure(props, epoch) => {
-                if epoch != self.source_epoch.load(Ordering::Acquire) {
-                    return Ok(());
-                }
-                let changed = self
-                    .props
-                    .as_ref()
-                    .is_none_or(|old| old.source != props.source)
-                    || self.epoch != epoch;
-                self.epoch = epoch;
-                validate_props(&props)?;
-                if self
-                    .props
-                    .as_ref()
-                    .is_none_or(|old| old.paused != props.paused)
-                    || changed
-                {
-                    self.paused = props.paused;
-                }
-                self.props = Some(*props);
-                if changed || self.playback.is_none() {
-                    self.load()?;
-                } else {
-                    self.apply()?;
-                }
+    fn drain_notices(&mut self) {
+        while let Ok(notice) = self.notices.try_recv() {
+            if !self.live() || self.failed {
+                break;
             }
-            Operation::Context(ready) => {
-                self.ui_ready = ready;
-                if !ready {
-                    if !self.retire_player() {
-                        return Err("Video context retirement failed".into());
-                    }
-                    self.window = None;
-                    self.ui.playing = false;
-                    self.publish_ui();
-                } else if self.playback.is_none() {
-                    self.load()?;
-                } else {
-                    self.apply()?;
-                }
-            }
-            Operation::Window(window) => {
-                let same =
-                    self.window.as_ref().map(|w| w.raw()) == window.as_ref().map(|w| w.raw());
-                if same {
-                    return Ok(());
-                }
-                self.window = window;
-                if self.playback.is_none() {
-                    self.load()?;
-                } else {
-                    self.bind_window()?;
-                }
-            }
-            Operation::WindowGone(raw) => {
-                if self
-                    .window
-                    .as_ref()
-                    .is_some_and(|window| window.raw() as usize == raw)
-                {
-                    // Reparenting may recreate the XComponent's surface. The
-                    // same player keeps its position and paused/playing state
-                    // while waiting for the replacement window.
-                    self.window = None;
-                }
-            }
-            Operation::Wake => {}
-            Operation::Seek(seconds) => {
-                let milliseconds = seek_time(seconds)?;
-                if let Some(playback) = self.playback.as_mut().filter(|p| p.prepared) {
-                    playback
-                        .player
-                        .seek(milliseconds, av::SeekMode::Closest)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
-            Operation::Toggle => {
-                // What the user means is the opposite of what they see: the
-                // player's own state, not the glyph's last update.
-                let playing = self
+            if matches!(notice.kind, NoticeKind::Position)
+                && let Some(playback) = self
                     .playback
-                    .as_mut()
-                    .filter(|playback| playback.prepared)
-                    .and_then(|playback| playback.player.state().ok())
-                    .map_or(self.ui.playing, |state| state == av::STATE_PLAYING);
-                self.paused = playing;
-                self.apply()?;
+                    .as_ref()
+                    .filter(|p| p.generation == notice.generation)
+            {
+                playback
+                    ._callbacks
+                    .position_queued
+                    .store(false, Ordering::Release);
             }
-            Operation::Close => {}
+            if !self.accepts(&notice) {
+                continue;
+            }
+            if let Err(error) = self.notice(notice.kind)
+                && self.load_live()
+            {
+                self.error(error);
+            }
+        }
+    }
+    fn accepts(&self, notice: &Notice) -> bool {
+        if !self.load_live() || notice.epoch != self.epoch {
+            return false;
+        }
+        if matches!(notice.kind, NoticeKind::SourceLoaded(_)) {
+            return true;
+        }
+        self.playback
+            .as_ref()
+            .is_some_and(|player| player.generation == notice.generation)
+    }
+    fn apply_batch(
+        &mut self,
+        batch: super::mailbox::ControlBatch<NativeWindow>,
+    ) -> std::result::Result<(), String> {
+        if batch.context_retired {
+            self.set_context(false)?;
+        }
+        if let Some(window) = batch.window {
+            match window {
+                WindowChange::Set(next) => self.set_window(next)?,
+                WindowChange::GoneIfRaw(raw) => self.window_gone(raw),
+            }
+        }
+        if let Some(ready) = batch.context_ready
+            && (ready || !batch.context_retired)
+        {
+            self.set_context(ready)?;
+        }
+        if let Some((props, epoch)) = batch.config {
+            self.configure(props, epoch)?;
+        }
+        for _ in 0..batch.toggles {
+            self.toggle()?;
+        }
+        if let Some(seconds) = batch.seek {
+            self.seek(seconds)?;
         }
         Ok(())
+    }
+    fn configure(&mut self, props: Box<VideoProps>, epoch: u64) -> std::result::Result<(), String> {
+        if epoch != self.mailbox.current_epoch() {
+            return Ok(());
+        }
+        let changed = self
+            .props
+            .as_ref()
+            .is_none_or(|old| old.source != props.source)
+            || self.epoch != epoch;
+        if changed {
+            self.cancel_loading();
+            self.pending_seek = None;
+        }
+        self.epoch = epoch;
+        validate_props(&props)?;
+        if self
+            .props
+            .as_ref()
+            .is_none_or(|old| old.paused != props.paused)
+            || changed
+        {
+            self.paused = props.paused;
+        }
+        self.props = Some(*props);
+        if changed || (self.playback.is_none() && self.loading_cancel.is_none()) {
+            self.load()?;
+        } else {
+            self.apply()?;
+        }
+        Ok(())
+    }
+    fn set_context(&mut self, ready: bool) -> std::result::Result<(), String> {
+        self.ui_ready = ready;
+        if !ready {
+            self.cancel_loading();
+            if !self.retire_player() {
+                return Err("Video context retirement failed".into());
+            }
+            self.window = None;
+            self.ui.playing = false;
+            self.publish_ui();
+        } else if self.playback.is_none() {
+            self.load()?;
+        } else {
+            self.apply()?;
+        }
+        Ok(())
+    }
+    fn set_window(&mut self, window: Option<NativeWindow>) -> std::result::Result<(), String> {
+        let same = self.window.as_ref().map(|w| w.raw()) == window.as_ref().map(|w| w.raw());
+        if same {
+            return Ok(());
+        }
+        self.window = window;
+        if self.playback.is_none() {
+            self.load()?;
+        } else {
+            self.bind_window()?;
+        }
+        Ok(())
+    }
+    fn window_gone(&mut self, raw: usize) {
+        if self
+            .window
+            .as_ref()
+            .is_some_and(|window| window.raw() as usize == raw)
+        {
+            // Reparenting may recreate the XComponent's surface. The
+            // same player keeps its position and paused/playing state
+            // while waiting for the replacement window.
+            self.window = None;
+        }
+    }
+    fn seek(&mut self, seconds: f64) -> std::result::Result<(), String> {
+        let milliseconds = seek_time(seconds)?;
+        if let Some(playback) = self.playback.as_mut().filter(|p| p.prepared) {
+            self.pending_seek = None;
+            playback
+                .player
+                .seek(milliseconds, av::SeekMode::Closest)
+                .map_err(|e| e.to_string())?;
+        } else {
+            self.pending_seek = Some(milliseconds);
+            self.ui.time = milliseconds;
+            self.publish_ui();
+        }
+        Ok(())
+    }
+    fn toggle(&mut self) -> std::result::Result<(), String> {
+        // What the user means is the opposite of what they see: the
+        // player's own state, not the glyph's last update.
+        let playing = self
+            .playback
+            .as_mut()
+            .filter(|playback| playback.prepared)
+            .and_then(|playback| playback.player.state().ok())
+            .map_or(self.ui.playing, |state| state == av::STATE_PLAYING);
+        self.paused = playing;
+        self.apply()
     }
     fn bind_window(&mut self) -> std::result::Result<(), String> {
         let Some(window) = self.window.as_ref() else {
@@ -329,17 +382,75 @@ impl Worker {
             return Ok(());
         }
         let Some(source) = self.props.as_ref().and_then(|props| props.source.clone()) else {
+            self.cancel_loading();
+            self.pending_seek = None;
             self.ui = UiState::default();
             self.publish_ui();
             return Ok(());
         };
+        if let Some((epoch, file, url)) = self.loaded_source.take()
+            && epoch == self.epoch
+        {
+            return self.start_playback(file, url);
+        }
+        if self.loading_cancel.is_some() {
+            return Ok(());
+        }
+        let permit = self.host.reserve_load().map_err(|e| e.to_string())?;
         self.control
             .dispatch_event(self.node, EventKind::LoadStart, EventPayload::None);
-        let _permit = self.host.reserve_load().map_err(|e| e.to_string())?;
-        let (file, url) = self.read_source(&source)?;
+        self.ui = UiState {
+            time: self.pending_seek.unwrap_or(0),
+            ..UiState::default()
+        };
+        self.publish_ui();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.loading_cancel = Some(cancel.clone());
+        let host = self.host.clone();
+        let assets = self.assets.clone();
+        let access = self.access.clone();
+        let agent = self.agent.clone();
+        let mailbox = self.mailbox.clone();
+        let route = self.route.clone();
+        let sender = self.notice_send.clone();
+        let epoch = self.epoch;
+        if let Err(error) = crate::services::executor::Executor::stream(move || {
+            let _permit = permit;
+            let is_live = || {
+                !cancel.load(Ordering::Acquire)
+                    && mailbox.is_active()
+                    && route.live.load(Ordering::Acquire)
+                    && mailbox.current_epoch() == epoch
+            };
+            let result =
+                read_source_task(&host, assets.as_ref(), &access, &agent, &source, is_live);
+            if !cancel.load(Ordering::Acquire) {
+                let _ = sender.send(Notice {
+                    epoch,
+                    generation: 0,
+                    kind: NoticeKind::SourceLoaded(result),
+                });
+                mailbox.wake();
+            }
+        }) {
+            self.loading_cancel = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+    fn start_playback(
+        &mut self,
+        file: Option<SourceFile>,
+        url: Option<CString>,
+    ) -> std::result::Result<(), String> {
         if !self.load_live() {
             return Ok(());
         }
+        let Some(window) = self.window.as_ref() else {
+            self.loaded_source = Some((self.epoch, file, url));
+            return Ok(());
+        };
         let player = AvPlayer::new().map_err(|e| e.to_string())?;
         self.generation = self
             .generation
@@ -350,10 +461,9 @@ impl Worker {
             epoch: self.epoch,
             generation: self.generation,
             position_queued: AtomicBool::new(false),
-            wake: self.wake.clone(),
+            mailbox: self.mailbox.clone(),
         });
         let userdata = std::ptr::from_mut(callbacks.as_mut()).cast::<c_void>();
-        let window = self.window.as_ref().unwrap();
         let raw = NonNull::new(window.raw().cast()).ok_or("Video window is null")?;
         // SAFETY: this worker already owns a live reference, and the UI producer
         // remains retained until successful player release and its UI ack.
@@ -402,7 +512,10 @@ impl Worker {
             self.retire_player();
             return Err(error);
         }
-        self.ui = UiState::default();
+        self.ui = UiState {
+            time: self.pending_seek.unwrap_or(0),
+            ..UiState::default()
+        };
         self.publish_ui();
         Ok(())
     }
@@ -471,6 +584,11 @@ impl Worker {
             self.progress_failed = false;
         }
         match notice {
+            NoticeKind::SourceLoaded(result) => {
+                self.loading_cancel = None;
+                let (file, url) = result?;
+                self.start_playback(file, url)?;
+            }
             NoticeKind::State(state) if state == av::STATE_INITIALIZED as i32 => {
                 if let Some(playback) = self.playback.as_mut() {
                     Self::initialize_playback(playback)?;
@@ -489,6 +607,18 @@ impl Worker {
                     .max(0);
                 (self.ui.width, self.ui.height) =
                     playback.player.video_size().map_err(|e| e.to_string())?;
+                if let Some(target_ms) = self.pending_seek.take() {
+                    let clamped = if self.ui.duration > 0 {
+                        target_ms.min(self.ui.duration)
+                    } else {
+                        target_ms
+                    };
+                    self.ui.time = clamped;
+                    playback
+                        .player
+                        .seek(clamped, av::SeekMode::Closest)
+                        .map_err(|e| e.to_string())?;
+                }
                 self.control.dispatch_event(
                     self.node,
                     EventKind::Load,
@@ -638,94 +768,93 @@ impl Worker {
             EventPayload::Map(vec![("message", PayloadValue::Str(message))]),
         );
     }
-    fn read_source(
-        &self,
-        source: &str,
-    ) -> std::result::Result<(Option<SourceFile>, Option<CString>), String> {
-        if let Some(path) = source.strip_prefix("file://") {
-            if !self.access.is_unrestricted() {
-                return Err("local video files require an unrestricted host policy".into());
-            }
-            use std::os::unix::ffi::OsStringExt;
-            let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
-                percent_encoding::percent_decode_str(path).collect(),
-            ));
-            if !path.is_absolute() {
-                return Err("local video URL must have an absolute path".into());
-            }
-            return SourceFile::open(&path)
-                .map(|file| (Some(file), None))
-                .map_err(|e| e.to_string());
-        }
-        if !self.access.allows_media(source) {
-            return Err("video URL is not granted by capabilities.network".into());
-        }
-        if source.starts_with("asset:/") {
-            if let Some(file) = self.assets.open_file(source) {
-                let file = file?;
-                return SourceFile::from_file(file, std::path::PathBuf::new())
-                    .map(|file| (Some(file), None))
-                    .map_err(|e| e.to_string());
-            }
-            let directory = self
-                .host
-                .video_cache_directory()
-                .map_err(|e| e.to_string())?;
-            let reader = self.assets.reader(source)?;
-            return SourceFile::copy(&directory, reader, || self.load_live())
-                .map(|file| (Some(file), None))
-                .map_err(|e| e.to_string());
-        }
-        if !source.starts_with("https://") && !source.starts_with("http://") {
-            return Err("videos require asset:/, file:// or HTTP(S) URLs".into());
-        }
-        // Native streaming can follow redirects and HLS segment URLs. Restricted
-        // capabilities retain Rust-checked redirects and a streaming disk cache.
-        if self.access.is_unrestricted() {
-            return CString::new(source)
-                .map(|url| (None, Some(url)))
-                .map_err(|e| e.to_string());
-        }
-        let proxy = crate::services::net::SystemProxy::read().map_err(|e| e.to_string())?;
-        let mut url = source.to_owned();
-        for hop in 0..=20 {
-            if !self.load_live() {
-                return Err("video load was cancelled".into());
-            }
-            let mut response = self
-                .agent
-                .get(&url)
-                .config()
-                .proxy(proxy.value())
-                .build()
-                .call()
-                .map_err(|e| e.to_string())?;
-            let status = response.status().as_u16();
-            if matches!(status, 301 | 302 | 303 | 307 | 308)
-                && let Some(location) = response.headers().get("location")
-            {
-                if hop == 20 {
-                    return Err("too many video redirects".into());
-                }
-                url = self
-                    .access
-                    .media_redirect(&url, location.to_str().map_err(|e| e.to_string())?)?;
-                continue;
-            }
-            if !(200..300).contains(&status) {
-                return Err(format!("video HTTP status {status}"));
-            }
-            let directory = self
-                .host
-                .video_cache_directory()
-                .map_err(|e| e.to_string())?;
-            let reader = response.body_mut().with_config().limit(u64::MAX).reader();
-            return SourceFile::copy(&directory, reader, || self.load_live())
-                .map(|file| (Some(file), None))
-                .map_err(|e| e.to_string());
-        }
-        Err("no video response".into())
+}
+
+fn read_source_task(
+    host: &Services,
+    assets: &dyn StreamAssets,
+    access: &nsh_engine::Access,
+    agent: &ureq::Agent,
+    source: &str,
+    is_live: impl Fn() -> bool,
+) -> std::result::Result<LoadedSource, String> {
+    if !is_live() {
+        return Err("video load was cancelled".into());
     }
+    if let Some(path) = source.strip_prefix("file://") {
+        if !access.is_unrestricted() {
+            return Err("local video files require an unrestricted host policy".into());
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let path = std::path::PathBuf::from(std::ffi::OsString::from_vec(
+            percent_encoding::percent_decode_str(path).collect(),
+        ));
+        if !path.is_absolute() {
+            return Err("local video URL must have an absolute path".into());
+        }
+        return SourceFile::open(&path)
+            .map(|file| (Some(file), None))
+            .map_err(|e| e.to_string());
+    }
+    if !access.allows_media(source) {
+        return Err("video URL is not granted by capabilities.network".into());
+    }
+    if source.starts_with("asset:/") {
+        if let Some(file) = assets.open_file(source) {
+            let file = file?;
+            return SourceFile::from_file(file, std::path::PathBuf::new())
+                .map(|file| (Some(file), None))
+                .map_err(|e| e.to_string());
+        }
+        let directory = host.video_cache_directory().map_err(|e| e.to_string())?;
+        let reader = assets.reader(source)?;
+        return SourceFile::copy(&directory, reader, &is_live)
+            .map(|file| (Some(file), None))
+            .map_err(|e| e.to_string());
+    }
+    if !source.starts_with("https://") && !source.starts_with("http://") {
+        return Err("videos require asset:/, file:// or HTTP(S) URLs".into());
+    }
+    // Native streaming can follow redirects and HLS segment URLs. Restricted
+    // capabilities retain Rust-checked redirects and a streaming disk cache.
+    if access.is_unrestricted() {
+        return CString::new(source)
+            .map(|url| (None, Some(url)))
+            .map_err(|e| e.to_string());
+    }
+    let proxy = crate::services::net::SystemProxy::read().map_err(|e| e.to_string())?;
+    let mut url = source.to_owned();
+    for hop in 0..=20 {
+        if !is_live() {
+            return Err("video load was cancelled".into());
+        }
+        let mut response = agent
+            .get(&url)
+            .config()
+            .proxy(proxy.value())
+            .build()
+            .call()
+            .map_err(|e| e.to_string())?;
+        let status = response.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308)
+            && let Some(location) = response.headers().get("location")
+        {
+            if hop == 20 {
+                return Err("too many video redirects".into());
+            }
+            url = access.media_redirect(&url, location.to_str().map_err(|e| e.to_string())?)?;
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return Err(format!("video HTTP status {status}"));
+        }
+        let directory = host.video_cache_directory().map_err(|e| e.to_string())?;
+        let reader = response.body_mut().with_config().limit(u64::MAX).reader();
+        return SourceFile::copy(&directory, reader, &is_live)
+            .map(|file| (Some(file), None))
+            .map_err(|e| e.to_string());
+    }
+    Err("no video response".into())
 }
 fn progress_wait(
     live: bool,
@@ -796,7 +925,7 @@ unsafe extern "C" fn info(
                 generation: callbacks.generation,
                 kind,
             });
-            let _ = callbacks.wake.try_send(Operation::Wake);
+            callbacks.mailbox.wake();
         }
     }));
 }
@@ -824,7 +953,7 @@ unsafe extern "C" fn error(
             generation: callbacks.generation,
             kind: NoticeKind::Error(message),
         });
-        let _ = callbacks.wake.try_send(Operation::Wake);
+        callbacks.mailbox.wake();
     }));
 }
 #[cfg(test)]

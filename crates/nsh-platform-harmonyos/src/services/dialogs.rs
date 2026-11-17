@@ -1,50 +1,30 @@
-//! Native alert/action-sheet queue. Results and reclamation run in a later
-//! UI turn so a button callback never destroys its own native stack.
-use std::{collections::VecDeque, rc::Rc};
+//! System AlertDialog/ActionSheet, called from Rust on the owning UI thread.
+//! ArkUI owns all content, styling, input and exit animations. The queue advances
+//! only after onDidDisappear, never while a system button is on the native stack.
+use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
+use napi_ohos::bindgen_prelude::{Function, JsObjectValue, Object};
 use nsh_core::{DialogButtonStyle, EventKind, EventPayload, PayloadValue};
-use ohos_arkui_binding::{
-    component::{
-        attribute::{ArkUICommonAttribute, ArkUIEvent},
-        built_in_component::{Column, Scroll, Text},
-    },
-    dialog::Dialog,
-    types::{
-        advanced::LengthMetricUnit, attribute::ArkUINodeAttributeType as A,
-        node_type::ArkUINodeType,
-    },
-};
 
 use crate::{
     app::runtime::Message,
-    render::{
-        mount::UiContext,
-        node::{NativeNode, Result},
-    },
+    render::{mount::UiContext, node::Result},
 };
+
 struct Alert {
+    request: nsh_core::Dialog,
+    active: Rc<Cell<bool>>,
     #[cfg(feature = "dev")]
-    buttons: Vec<(String, NativeNode)>,
-    id: u32,
-    dialog: Dialog,
-    root: NativeNode,
-    cancelable: bool,
+    appeared: Rc<Cell<bool>>,
 }
 impl Drop for Alert {
     fn drop(&mut self) {
-        crate::render::node::callback(|| {
-            let close = self.dialog.close();
-            let remove = self.dialog.remove_content();
-            let dispose = self.root.borrow_mut().dispose();
-            // Queued alerts have never been shown; close may reject that state.
-            let _ = close;
-            remove?;
-            dispose?;
-            self.dialog.dispose()?;
-            Ok(())
-        });
+        // System dialogs have window lifetime and no programmatic close API.
+        // Retiring a surface must not let its later callbacks reach a new engine.
+        self.active.set(false);
     }
 }
+
 pub(crate) struct Dialogs {
     context: Rc<UiContext>,
     alerts: VecDeque<Alert>,
@@ -52,35 +32,37 @@ pub(crate) struct Dialogs {
 }
 impl Dialogs {
     #[cfg(feature = "dev")]
+    pub(crate) fn animating(&self) -> bool {
+        self.alerts
+            .front()
+            .is_some_and(|alert| !alert.appeared.get())
+    }
+
+    #[cfg(feature = "dev")]
     pub(crate) fn test_point(
         &self,
         button: Option<&str>,
-        origin: (i32, i32),
-        scale: f32,
     ) -> std::result::Result<Option<[f32; 2]>, String> {
         let alert = self.alerts.front().ok_or("no dialog is open")?;
-        let Some(label) = button else {
-            return if alert.cancelable {
-                Ok(None)
-            } else {
+        match button {
+            None if !alert.request.cancelable => {
                 Err("the dialog cannot be dismissed without choosing a button".into())
-            };
-        };
-        let (_, node) = alert
-            .buttons
-            .iter()
-            .find(|(text, _)| text == label)
-            .ok_or_else(|| format!("no dialog button {label:?}"))?;
-        let node = node.borrow();
-        let position = node
-            .layout_position_in_screen()
-            .map_err(|e| e.to_string())?;
-        let size = node.layout_size().map_err(|e| e.to_string())?;
-        Ok(Some([
-            (position.x as f32 - origin.0 as f32 + size.width as f32 * 0.5) / scale,
-            (position.y as f32 - origin.1 as f32 + size.height as f32 * 0.5) / scale,
-        ]))
+            }
+            Some(label)
+                if !alert
+                    .request
+                    .buttons
+                    .iter()
+                    .any(|button| button.text == label) =>
+            {
+                Err(format!("no dialog button {label:?}"))
+            }
+            // System content is outside the NSH surface. The device test runner
+            // resolves its real button through the system accessibility tree.
+            _ => Ok(None),
+        }
     }
+
     pub(crate) fn new(context: Rc<UiContext>) -> Self {
         Self {
             context,
@@ -91,184 +73,157 @@ impl Dialogs {
     pub(crate) fn visible(&self) -> bool {
         !self.alerts.is_empty()
     }
-    pub(crate) fn request_close(&mut self) -> Result<()> {
-        if let Some(alert) = self.alerts.front()
-            && alert.cancelable
-        {
-            self.finish(alert.id, -1)?;
-        }
-        Ok(())
-    }
     pub(crate) fn show(&mut self, request: nsh_core::Dialog) -> Result<()> {
         if request.buttons.is_empty() || self.alerts.len() >= 32 {
             self.reply(request.id, -1);
             return Ok(());
         }
-        let dialog = Dialog::new()?;
-        // The system card's blur can override its background on device. Own the
-        // content decoration so an app's dark palette also applies in a light host.
-        dialog.custom_style(true)?;
-        if request.sheet {
-            dialog.content_alignment(ohos_arkui_binding::types::alignment::Alignment::Bottom)?;
+        if self.alerts.is_empty() {
+            self.overlay = Some(self.context.host.overlay(self.context.dispatcher.clone())?);
         }
-        let root = Scroll::new()?.into_node();
-        let column = Column::new()?.into_node();
-        for node in [&root, &column] {
-            node.borrow().set_length_metric_unit(LengthMetricUnit::Vp)?;
-        }
-        let dark = self
-            .context
-            .appearance
-            .get()
-            .resolve(self.context.platform.get().color_scheme)
-            == nsh_engine::ColorScheme::Dark;
-        let width = (self.context.platform.get().window.width.0 - 32.0).clamp(120.0, 360.0);
-        let fg = self
-            .context
-            .theme
-            .borrow()
-            .color("popover-foreground", dark);
-        let font_scale = self.context.platform.get().font_scale.max(0.1);
-        let mut height = 16.0;
-        let make_text = |text: &str, size: f32, h: f32, color: u32| -> Result<NativeNode> {
-            let node = Text::new()?.into_node();
-            node.borrow().set_length_metric_unit(LengthMetricUnit::Vp)?;
-            node.borrow()
-                .set_string_attribute(A::TextContent, text.replace('\0', "\u{fffd}"))?;
-            node.borrow()
-                .set_f32_attribute(A::FontSize, size * font_scale)?;
-            node.borrow().set_u32_attribute(A::FontColor, color)?;
-            node.borrow().set_i32_attribute(A::TextAlign, 1)?;
-            node.borrow().width(width)?;
-            node.borrow().height(h)?;
-            Ok(node)
-        };
-        for (text, size) in [
-            (request.title.as_deref(), 20.0),
-            (request.message.as_deref(), 16.0),
-        ] {
-            if let Some(text) = text {
-                use ohos_drawing_binding::{
-                    FontCollection, TextStyle, TypographyBuilder, TypographyStyle,
-                };
-                let mut fonts = FontCollection::shared();
-                let mut paragraph_style = TypographyStyle::new();
-                let mut builder = TypographyBuilder::new(&mut paragraph_style, &mut fonts);
-                let mut style = TextStyle::new();
-                style.set_font_size(f64::from(size * font_scale));
-                builder.push_text_style(&mut style);
-                builder.add_text(text);
-                builder.pop_text_style();
-                let mut paragraph = builder.build();
-                paragraph.layout(f64::from(width));
-                let h = paragraph.height().ceil() as f32 + size * font_scale + 4.0;
-                column
-                    .borrow_mut()
-                    .add_child(make_text(text, size, h, fg)?)?;
-                height += h;
-            }
-        }
-        let mut ordered: Vec<_> = request.buttons.iter().enumerate().collect();
-        ordered.sort_by_key(|(_, button)| button.style == DialogButtonStyle::Cancel);
-        #[cfg(feature = "dev")]
-        let mut test_buttons = Vec::new();
-        for (index, button) in ordered {
-            if request.sheet && button.style == DialogButtonStyle::Cancel {
-                let gap = Column::new()?.into_node();
-                gap.borrow().set_length_metric_unit(LengthMetricUnit::Vp)?;
-                gap.borrow().height(8.0)?;
-                column.borrow_mut().add_child(gap)?;
-                height += 8.0;
-            }
-            let color = if button.style == DialogButtonStyle::Destructive {
-                self.context.theme.borrow().color("destructive", dark)
-            } else {
-                self.context.theme.borrow().color("primary", dark)
-            };
-            let action_height = (48.0 * font_scale).max(48.0);
-            let node = make_text(&button.text, 18.0, action_height, color)?;
-            node.borrow()
-                .set_u32_attribute(A::AccessibilityRole, ArkUINodeType::Button.into())?;
-            node.borrow().set_i32_attribute(
-                A::AccessibilityMode,
-                ohos_arkui_binding::types::view::AccessibilityMode::Enabled.into(),
-            )?;
-            node.borrow()
-                .id(format!("nsh-dialog-{}-{index}", request.id))?;
-            let route = self.context.dispatcher.clone();
-            let id = request.id;
-            node.borrow_mut().on_click(move || {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::DialogResult {
-                        id,
-                        index: index as i32,
-                    });
-                }
-            });
-            #[cfg(feature = "dev")]
-            test_buttons.push((button.text.to_string(), node.clone()));
-            column.borrow_mut().add_child(node)?;
-            height += action_height;
-        }
-        column.borrow().width(width)?;
-        column.borrow().height(height)?;
-        root.borrow().width(width)?;
-        root.borrow()
-            .height(height.min((self.context.platform.get().window.height.0 * 0.8).max(96.0)))?;
-        root.borrow_mut().add_child(column)?;
-        root.borrow().set_u32_attribute(
-            A::BackgroundColor,
-            self.context.theme.borrow().color("popover", dark),
-        )?;
-        root.borrow().set_f32_attribute(A::BorderRadius, 16.0)?;
-        root.borrow().set_i32_attribute(A::Clip, 1)?;
-        dialog.content_node(&root)?;
-        let route = self.context.dispatcher.clone();
-        let id = request.id;
-        dialog.dismiss_handler(move |_| {
-            if request.cancelable
-                && let Some(route) = route.upgrade()
-            {
-                route.send(Message::DialogResult { id, index: -1 });
-            }
-            true
-        })?;
         self.alerts.push_back(Alert {
+            request,
+            active: Rc::new(Cell::new(true)),
             #[cfg(feature = "dev")]
-            buttons: test_buttons,
-            id,
-            dialog,
-            root,
-            cancelable: request.cancelable,
+            appeared: Rc::new(Cell::new(false)),
         });
         if self.alerts.len() == 1 {
-            let overlay = self.context.host.overlay(self.context.dispatcher.clone())?;
-            if let Err(error) = self.alerts.front().unwrap().dialog.show() {
-                self.alerts.pop_front();
-                return Err(error.into());
-            }
-            self.overlay = Some(overlay);
+            self.show_next();
         }
         Ok(())
     }
-    pub(crate) fn finish(&mut self, id: u32, index: i32) -> Result<()> {
-        if self.alerts.front().is_none_or(|alert| alert.id != id) {
-            return Ok(());
-        }
-        self.alerts.pop_front();
-        self.reply(id, index);
-        while let Some(next) = self.alerts.front() {
-            match next.dialog.show() {
-                Ok(()) => return Ok(()),
+    fn show_next(&mut self) {
+        while let Some(alert) = self.alerts.front() {
+            match self.present(alert) {
+                Ok(()) => return,
                 Err(error) => {
-                    log::error!("OHOS queued dialog: {error}");
-                    let id = next.id;
+                    log::error!("OHOS system dialog: {error}");
+                    let id = alert.request.id;
                     self.alerts.pop_front();
                     self.reply(id, -1);
                 }
             }
         }
         self.overlay = None;
+    }
+    fn present(&self, alert: &Alert) -> Result<()> {
+        let env = &self.context.env;
+        env.run_in_scope(|| {
+            let request = &alert.request;
+            let ui = self.context.host.ui_context(env)?;
+            let mut options = Object::new(env)?;
+            if let Some(title) = &request.title {
+                options.set("title", title.as_str())?;
+            } else if request.sheet {
+                options.set("title", "")?;
+            }
+            options.set("message", request.message.as_deref().unwrap_or(""))?;
+            options.set("autoCancel", request.cancelable)?;
+            #[cfg(feature = "dev")]
+            for (event, visible) in [("onDidAppear", true), ("onWillDisappear", false)] {
+                let appeared = alert.appeared.clone();
+                options.set(
+                    event,
+                    env.create_function_from_closure::<(), (), _>(event, move |_| {
+                        appeared.set(visible);
+                        Ok(())
+                    })?,
+                )?;
+            }
+            let result = Rc::new(Cell::new(None));
+            let mut buttons = Vec::new();
+            let cancel = request
+                .sheet
+                .then(|| {
+                    request
+                        .buttons
+                        .iter()
+                        .position(|button| button.style == DialogButtonStyle::Cancel)
+                })
+                .flatten();
+            for (index, button) in request.buttons.iter().enumerate() {
+                let mut option = Object::new(env)?;
+                option.set(
+                    if request.sheet && cancel != Some(index) {
+                        "title"
+                    } else {
+                        "value"
+                    },
+                    button.text.as_str(),
+                )?;
+                let selected = result.clone();
+                let active = alert.active.clone();
+                option.set(
+                    "action",
+                    env.create_function_from_closure::<(), (), _>("nshDialogAction", move |_| {
+                        if active.get() && selected.get().is_none() {
+                            selected.set(Some(index as i32));
+                        }
+                        Ok(())
+                    })?,
+                )?;
+                if cancel == Some(index) {
+                    options.set("confirm", option)?;
+                } else {
+                    buttons.push(option);
+                }
+            }
+            options.set(if request.sheet { "sheets" } else { "buttons" }, buttons)?;
+            let active = alert.active.clone();
+            let cancelable = request.cancelable;
+            options.set(
+                "onWillDismiss",
+                env.create_function_from_closure::<Object<'_>, (), _>(
+                    "nshDialogDismiss",
+                    move |ctx| {
+                        // An orphaned window-owned dialog must always be dismissible.
+                        if cancelable || !active.get() {
+                            let action: Object<'_> = ctx.first_arg()?;
+                            let dismiss: Function<'_, (), ()> =
+                                action.get_named_property("dismiss")?;
+                            dismiss.apply(action, ())?;
+                        }
+                        Ok(())
+                    },
+                )?,
+            )?;
+            let active = alert.active.clone();
+            let route = self.context.dispatcher.clone();
+            let id = request.id;
+            options.set(
+                "onDidDisappear",
+                env.create_function_from_closure::<(), (), _>("nshDialogClosed", move |_| {
+                    if active.replace(false)
+                        && let Some(route) = route.upgrade()
+                    {
+                        route.send(Message::DialogResult {
+                            id,
+                            index: result.get().unwrap_or(-1),
+                        });
+                    }
+                    Ok(())
+                })?,
+            )?;
+            let show: Function<'_, Object<'_>, ()> = ui.get_named_property(if request.sheet {
+                "showActionSheet"
+            } else {
+                "showAlertDialog"
+            })?;
+            show.apply(ui, options)
+        })?;
+        Ok(())
+    }
+    pub(crate) fn finish(&mut self, id: u32, index: i32) -> Result<()> {
+        if self
+            .alerts
+            .front()
+            .is_none_or(|alert| alert.request.id != id)
+        {
+            return Ok(());
+        }
+        self.alerts.pop_front();
+        self.reply(id, index);
+        self.show_next();
         Ok(())
     }
     fn reply(&self, id: u32, index: i32) {

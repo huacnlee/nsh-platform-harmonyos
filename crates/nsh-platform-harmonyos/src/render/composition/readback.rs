@@ -33,15 +33,16 @@ pub(super) struct Context {
     // EGL contexts must remain on their creating thread, even if glow is Send.
     _thread: PhantomData<Rc<()>>,
 }
+struct ForeignEglBinding {
+    display: Option<egl::Display>,
+    context: egl::Context,
+    draw: Option<egl::Surface>,
+    read: Option<egl::Surface>,
+}
 pub(super) struct Current<'a> {
     context: &'a Context,
-    previous: (
-        Option<egl::Display>,
-        Option<egl::Context>,
-        Option<egl::Surface>,
-        Option<egl::Surface>,
-    ),
-    previous_api: egl::Enum,
+    restore_foreign: Option<ForeignEglBinding>,
+    previous_api: Option<egl::Enum>,
 }
 struct ClientApi<'a> {
     egl: &'a egl::Instance<egl::Static>,
@@ -64,14 +65,17 @@ impl Drop for ClientApi<'_> {
 }
 impl Drop for Current<'_> {
     fn drop(&mut self) {
-        let (display, context, draw, read) = self.previous;
-        let _ = self.context.egl.make_current(
-            display.unwrap_or(self.context.display),
-            draw,
-            read,
-            context,
-        );
-        let _ = self.context.egl.bind_api(self.previous_api);
+        if let Some(foreign) = self.restore_foreign.take() {
+            let _ = self.context.egl.make_current(
+                foreign.display.unwrap_or(self.context.display),
+                foreign.draw,
+                foreign.read,
+                Some(foreign.context),
+            );
+        }
+        if let Some(previous_api) = self.previous_api {
+            let _ = self.context.egl.bind_api(previous_api);
+        }
     }
 }
 impl Context {
@@ -150,20 +154,34 @@ impl Context {
     }
     pub(super) fn enter(&self) -> Result<Current<'_>, Error> {
         let previous_api = self.egl.query_api();
-        self.egl.bind_api(egl::OPENGL_ES_API).map_err(egl_error)?;
+        let switched_api = if previous_api != egl::OPENGL_ES_API {
+            self.egl.bind_api(egl::OPENGL_ES_API).map_err(egl_error)?;
+            Some(previous_api)
+        } else {
+            None
+        };
         let mut client_api = ClientApi {
             egl: &self.egl,
             previous: previous_api,
-            active: true,
+            active: switched_api.is_some(),
         };
-        // EGL current state is per client API. Preserve the ES context before
-        // replacing it, then restore the caller's selected API on exit.
-        let previous = (
-            self.egl.get_current_display(),
-            self.egl.get_current_context(),
-            self.egl.get_current_surface(egl::DRAW),
-            self.egl.get_current_surface(egl::READ),
-        );
+        let current_context = self.egl.get_current_context();
+        if current_context == Some(self.context) {
+            client_api.active = false;
+            return Ok(Current {
+                context: self,
+                restore_foreign: None,
+                previous_api: switched_api,
+            });
+        }
+        // EGL current state is per client API. Preserve any foreign ES context
+        // before replacing it, while keeping this worker's own context resident.
+        let restore_foreign = current_context.map(|context| ForeignEglBinding {
+            display: self.egl.get_current_display(),
+            context,
+            draw: self.egl.get_current_surface(egl::DRAW),
+            read: self.egl.get_current_surface(egl::READ),
+        });
         self.egl
             .make_current(
                 self.display,
@@ -175,17 +193,52 @@ impl Context {
         client_api.active = false;
         Ok(Current {
             context: self,
-            previous,
-            previous_api,
+            restore_foreign,
+            previous_api: switched_api,
         })
+    }
+    pub(super) fn bind_pbuffer(&self) {
+        if self.egl.query_api() == egl::OPENGL_ES_API
+            && self.egl.get_current_context() == Some(self.context)
+            && (self.egl.get_current_surface(egl::DRAW) != Some(self.surface)
+                || self.egl.get_current_surface(egl::READ) != Some(self.surface))
+        {
+            let _ = self.egl.make_current(
+                self.display,
+                Some(self.surface),
+                Some(self.surface),
+                Some(self.context),
+            );
+        }
     }
 }
 impl Drop for Context {
     fn drop(&mut self) {
+        if self.egl.query_api() == egl::OPENGL_ES_API
+            && self.egl.get_current_context() == Some(self.context)
+        {
+            let _ = self.egl.make_current(self.display, None, None, None);
+        }
         let _ = self.egl.destroy_surface(self.display, self.surface);
         let _ = self.egl.destroy_context(self.display, self.context);
         // The default EGL display is shared with the embedding app. Terminating
         // it here would invalidate that app's independent rendering contexts.
+    }
+}
+
+pub(super) struct BlitFramebuffer {
+    context: Rc<Context>,
+    gl: Rc<glow::Context>,
+    raw: glow::Framebuffer,
+}
+impl Drop for BlitFramebuffer {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            // SAFETY: framebuffer belongs to this worker's owned context.
+            unsafe {
+                self.gl.delete_framebuffer(self.raw);
+            }
+        }
     }
 }
 
@@ -194,38 +247,24 @@ impl Drop for Context {
 pub(crate) struct TextureContext {
     pub(super) context: Rc<Context>,
     pub(super) gl: Rc<glow::Context>,
+    blit_fbo: Rc<BlitFramebuffer>,
     max_texture_size: u32,
     pub(super) programs:
         Rc<std::cell::RefCell<rustc_hash::FxHashMap<u64, Rc<super::gles::Compiled>>>>,
 }
 impl TextureContext {
-    pub(super) fn window(
-        &self,
-        native: ohos_native_window_binding::NativeWindow,
-    ) -> Result<Window, Error> {
-        let current = self.context.enter()?;
-        // SAFETY: both handles belong to OHOS's default display; Window owns
-        // the retained native window until after its EGL surface is destroyed.
-        let surface = unsafe {
-            self.context.egl.create_window_surface(
-                self.context.display,
-                self.context.config,
-                native.raw().cast(),
-                None,
-            )
-        }
-        .map_err(|error| Error {
-            operation: "eglCreateWindowSurface",
-            code: error.into(),
-        })?;
-        drop(current);
-        Ok(Window {
+    pub(super) fn blit_framebuffer(&self) -> glow::Framebuffer {
+        self.blit_fbo.raw
+    }
+    pub(super) fn window(&self, native: ohos_native_window_binding::NativeWindow) -> Window {
+        Window {
             context: self.context.clone(),
-            surface,
+            surface: std::cell::Cell::new(None),
             native,
             size: std::cell::Cell::new((0, 0)),
+            swap_interval_zero: std::cell::Cell::new(false),
             waiting: std::cell::Cell::new(false),
-        })
+        }
     }
     /// Creates an offscreen GLES context on the calling rendering worker.
     pub(super) fn new() -> Result<Self, Error> {
@@ -247,10 +286,19 @@ impl TextureContext {
             .ok()
             .filter(|limit| *limit > 0)
             .ok_or(failed("GLES texture limit"))?;
+        // SAFETY: persistent read-only blit FBO created in the owned GLES context.
+        let blit_raw = unsafe { gl.create_framebuffer() }.map_err(|_| failed("blit FBO"))?;
+        let gl = Rc::new(gl);
+        let blit_fbo = Rc::new(BlitFramebuffer {
+            context: context.clone(),
+            gl: gl.clone(),
+            raw: blit_raw,
+        });
         drop(current);
         Ok(Self {
             context,
-            gl: Rc::new(gl),
+            gl,
+            blit_fbo,
             max_texture_size,
             programs: Rc::default(),
         })
@@ -260,14 +308,33 @@ impl TextureContext {
 /// Worker-owned output queue. Entering it preserves the caller's EGL binding.
 pub(super) struct Window {
     context: Rc<Context>,
-    surface: egl::Surface,
+    surface: std::cell::Cell<Option<egl::Surface>>,
     native: ohos_native_window_binding::NativeWindow,
     size: std::cell::Cell<(u32, u32)>,
+    swap_interval_zero: std::cell::Cell<bool>,
     pub(super) waiting: std::cell::Cell<bool>,
 }
 impl Window {
     pub(super) fn raw(&self) -> usize {
         self.native.raw() as usize
+    }
+    pub(super) fn invalidate_geometry(&self) {
+        self.size.set((0, 0));
+        self.swap_interval_zero.set(false);
+    }
+    pub(super) fn on_present_unavailable(&self) {
+        self.swap_interval_zero.set(false);
+        self.context.bind_pbuffer();
+    }
+    pub(super) fn release_egl(&self) {
+        if let Some(surface) = self.surface.take() {
+            self.context.bind_pbuffer();
+            let _ = self
+                .context
+                .egl
+                .destroy_surface(self.context.display, surface);
+            self.invalidate_geometry();
+        }
     }
     pub(super) fn enter(&self, width: u32, height: u32) -> Result<Current<'_>, Error> {
         if self.size.get() != (width, height) {
@@ -277,31 +344,66 @@ impl Window {
             self.size.set((width, height));
         }
         let current = self.context.enter()?;
-        self.context
-            .egl
-            .make_current(
-                self.context.display,
-                Some(self.surface),
-                Some(self.surface),
-                Some(self.context.context),
-            )
-            .map_err(|error| Error {
-                operation: "eglMakeCurrent(window)",
-                code: error.into(),
-            })?;
-        self.context
-            .egl
-            .swap_interval(self.context.display, 0)
-            .map_err(|error| Error {
-                operation: "eglSwapInterval",
-                code: error.into(),
-            })?;
+        let surface = match self.surface.get() {
+            Some(surface) => surface,
+            None => {
+                // SAFETY: this worker owns the context and the retained native
+                // output queue. EGL owns it only while shader output is active.
+                let surface = unsafe {
+                    self.context.egl.create_window_surface(
+                        self.context.display,
+                        self.context.config,
+                        self.native.raw().cast(),
+                        None,
+                    )
+                }
+                .map_err(|error| Error {
+                    operation: "eglCreateWindowSurface",
+                    code: error.into(),
+                })?;
+                self.surface.set(Some(surface));
+                surface
+            }
+        };
+        if self.context.egl.get_current_surface(egl::DRAW) != Some(surface)
+            || self.context.egl.get_current_surface(egl::READ) != Some(surface)
+        {
+            self.context
+                .egl
+                .make_current(
+                    self.context.display,
+                    Some(surface),
+                    Some(surface),
+                    Some(self.context.context),
+                )
+                .map_err(|error| {
+                    self.swap_interval_zero.set(false);
+                    Error {
+                        operation: "eglMakeCurrent(window)",
+                        code: error.into(),
+                    }
+                })?;
+        }
+        if !self.swap_interval_zero.get() {
+            self.context
+                .egl
+                .swap_interval(self.context.display, 0)
+                .map_err(|error| Error {
+                    operation: "eglSwapInterval",
+                    code: error.into(),
+                })?;
+            self.swap_interval_zero.set(true);
+        }
         Ok(current)
     }
     pub(super) fn present(&self) -> Result<(), Error> {
+        let _trace = super::trace::Scope::new(c"NSH present");
         self.context
             .egl
-            .swap_buffers(self.context.display, self.surface)
+            .swap_buffers(
+                self.context.display,
+                self.surface.get().ok_or(failed("missing output surface"))?,
+            )
             .map_err(|error| Error {
                 operation: "eglSwapBuffers",
                 code: error.into(),
@@ -310,12 +412,10 @@ impl Window {
 }
 impl Drop for Window {
     fn drop(&mut self) {
-        let _ = self
-            .context
-            .egl
-            .destroy_surface(self.context.display, self.surface);
+        self.release_egl();
     }
 }
+
 struct Objects {
     context: Rc<Context>,
     gl: Rc<glow::Context>,
@@ -367,9 +467,15 @@ pub(crate) struct TextureReader {
     target: glow::Texture,
     framebuffer: glow::Framebuffer,
     program: glow::Program,
+    transform_loc: Option<glow::UniformLocation>,
+    y_scale_loc: Option<glow::UniformLocation>,
+    image_loc: Option<glow::UniformLocation>,
     vertices: glow::Buffer,
     size: (u32, u32),
     allocated: (u32, u32),
+    last_transform: [f32; 16],
+    has_oes_frame: bool,
+    target_dirty: bool,
     max_texture_size: u32,
 }
 impl TextureReader {
@@ -392,7 +498,16 @@ impl TextureReader {
         };
         // SAFETY: all objects belong to the current owned context. The construction
         // guard deletes every allocated object if any later step fails.
-        let (texture, target, framebuffer, program, vertices) = unsafe {
+        let (
+            texture,
+            target,
+            framebuffer,
+            program,
+            transform_loc,
+            y_scale_loc,
+            image_loc,
+            vertices,
+        ) = unsafe {
             let texture = gl
                 .create_texture()
                 .map_err(|_| failed("external texture"))?;
@@ -419,7 +534,7 @@ impl TextureReader {
             for (kind, source) in [
                 (
                     glow::VERTEX_SHADER,
-                    "attribute vec2 position; uniform mat4 transform; varying vec2 uv; void main() { gl_Position = vec4(position, 0.0, 1.0); uv = (transform * vec4(position.x * 0.5 + 0.5, 0.5 - position.y * 0.5, 0.0, 1.0)).xy; }",
+                    "attribute vec2 position; uniform mat4 transform; uniform float y_scale; varying vec2 uv; void main() { gl_Position = vec4(position, 0.0, 1.0); uv = (transform * vec4(position.x * 0.5 + 0.5, 0.5 + position.y * y_scale, 0.0, 1.0)).xy; }",
                 ),
                 (
                     glow::FRAGMENT_SHADER,
@@ -445,6 +560,9 @@ impl TextureReader {
             if !gl.get_program_link_status(program) {
                 return Err(failed("link readback program"));
             }
+            let transform_loc = gl.get_uniform_location(program, "transform");
+            let y_scale_loc = gl.get_uniform_location(program, "y_scale");
+            let image_loc = gl.get_uniform_location(program, "image");
             let vertices = gl
                 .create_buffer()
                 .map_err(|_| failed("readback vertices"))?;
@@ -454,7 +572,16 @@ impl TextureReader {
             let bytes =
                 std::slice::from_raw_parts(points.as_ptr().cast(), std::mem::size_of_val(&points));
             gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-            (texture, target, framebuffer, program, vertices)
+            (
+                texture,
+                target,
+                framebuffer,
+                program,
+                transform_loc,
+                y_scale_loc,
+                image_loc,
+                vertices,
+            )
         };
         // SAFETY: this worker restores this same context for updates and Drop;
         // the image is always destroyed before its external texture.
@@ -483,9 +610,20 @@ impl TextureReader {
             target,
             framebuffer,
             program,
+            transform_loc,
+            y_scale_loc,
+            image_loc,
             vertices,
             size: (0, 0),
             allocated: (0, 0),
+            last_transform: [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            has_oes_frame: false,
+            target_dirty: false,
             max_texture_size: gpu.max_texture_size,
         })
     }
@@ -500,6 +638,9 @@ impl TextureReader {
     /// Updates future dimensions within native signed and GLES texture limits.
     pub(super) fn resize(&mut self, width: u32, height: u32) -> Result<(), Error> {
         let (width, height, _) = super::geometry::target_size(width as f32, height as f32, 1.0);
+        if self.size == (width, height) {
+            return Ok(());
+        }
         self.layout(width, height)?;
         self.surface
             .as_mut()
@@ -507,6 +648,7 @@ impl TextureReader {
             .resize(width, height)
             .map_err(native_error)?;
         self.size = (width, height);
+        self.target_dirty = true;
         Ok(())
     }
     fn layout(&self, width: u32, height: u32) -> Result<Layout, Error> {
@@ -516,8 +658,7 @@ impl TextureReader {
         }
         Ok(layout)
     }
-    /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
-    pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
+    fn poll_oes(&mut self) -> Result<bool, Error> {
         let _current = self.context.enter()?;
         let (width, height) = self.size;
         self.layout(width, height)?;
@@ -525,13 +666,73 @@ impl TextureReader {
         if !surface.update().map_err(native_error)? {
             return Ok(false);
         }
-        let transform = surface.transform().map_err(native_error)?;
-        // SAFETY: the context and every GL object are live on this thread;
-        // storage and the readback slice have exactly width*height*4 bytes.
+        self.last_transform = surface.transform().map_err(native_error)?;
+        self.has_oes_frame = true;
+        self.target_dirty = true;
+        Ok(true)
+    }
+    /// Consume the available producer buffers before resolving the newest one.
+    /// Notifications can coalesce while this worker is busy; stopping after an
+    /// arbitrary number would leave stale content queued without another wake.
+    pub(super) fn drain_oes(&mut self) -> Result<bool, Error> {
+        let mut updated = false;
+        while self.poll_oes()? {
+            updated = true;
+        }
+        Ok(updated)
+    }
+    /// Draws the currently bound `TEXTURE_EXTERNAL_OES` frame into the active
+    /// draw framebuffer (`y_scale = -0.5` for top-left offscreen FBOs, `+0.5`
+    /// for bottom-left native windows).
+    ///
+    /// # Safety
+    /// Caller must hold `self.context` (or a `Window` sharing `self.context`)
+    /// current on this thread and have bound the destination framebuffer.
+    unsafe fn draw_oes(&self, width: u32, height: u32, y_scale: f32) -> Result<(), Error> {
+        // SAFETY: upheld by caller; GL objects belong to `self.context`.
         unsafe {
             let gl = &self.gl;
-            gl.bind_texture(glow::TEXTURE_2D, Some(self.target));
+            gl.viewport(0, 0, width as i32, height as i32);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::DEPTH_TEST);
+            gl.use_program(Some(self.program));
+            gl.uniform_matrix_4_f32_slice(self.transform_loc.as_ref(), false, &self.last_transform);
+            gl.uniform_1_f32(self.y_scale_loc.as_ref(), y_scale);
+            gl.uniform_1_i32(self.image_loc.as_ref(), 0);
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(self.texture));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+            gl.enable_vertex_attrib_array(0);
+            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
+            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
+            let code = gl.get_error();
+            if code != glow::NO_ERROR {
+                return Err(Error {
+                    operation: "GLES texture resolve",
+                    code: code as i32,
+                });
+            }
+        }
+        Ok(())
+    }
+    /// Ensures `self.target` holds the latest acquired OES frame as a top-left
+    /// RGBA texture, resolving on demand if passthrough skipped FBO updates.
+    pub(super) fn ensure_texture(&mut self) -> Result<Option<(glow::Texture, u32, u32)>, Error> {
+        if !self.has_oes_frame {
+            return Ok(None);
+        }
+        let (width, height) = self.size;
+        self.layout(width, height)?;
+        if !self.target_dirty && self.allocated == (width, height) {
+            return Ok(Some((self.target, width, height)));
+        }
+        let _current = self.context.enter()?;
+        // SAFETY: the context and every GL object are live on this thread.
+        unsafe {
+            let gl = &self.gl;
             if self.allocated != (width, height) {
+                gl.bind_texture(glow::TEXTURE_2D, Some(self.target));
                 for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
                     gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::LINEAR as i32);
                 }
@@ -558,38 +759,30 @@ impl TextureReader {
                 Some(self.target),
                 0,
             );
-            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+            if self.allocated != (width, height)
+                && gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE
+            {
                 return Err(failed("incomplete readback framebuffer"));
             }
-            gl.viewport(0, 0, width as i32, height as i32);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(
-                gl.get_uniform_location(self.program, "transform").as_ref(),
-                false,
-                &transform,
-            );
-            gl.uniform_1_i32(gl.get_uniform_location(self.program, "image").as_ref(), 0);
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(self.texture));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
-            gl.enable_vertex_attrib_array(0);
-            gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-            let code = gl.get_error();
-            if code != glow::NO_ERROR {
-                return Err(Error {
-                    operation: "GLES texture resolve",
-                    code: code as i32,
-                });
-            }
+            self.draw_oes(width, height, -0.5)?;
         }
         self.allocated = (width, height);
-        Ok(true)
+        self.target_dirty = false;
+        Ok(Some((self.target, width, height)))
+    }
+    /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
+    pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
+        let _trace = super::trace::Scope::new(c"NSH acquire input");
+        let updated = self.drain_oes()?;
+        let dirty = self.target_dirty || self.allocated != self.size;
+        Ok(self.ensure_texture()?.is_some() && (updated || dirty))
     }
     pub(super) fn texture(&self) -> Option<(glow::Texture, u32, u32)> {
-        (self.allocated != (0, 0)).then_some((self.target, self.allocated.0, self.allocated.1))
+        (!self.target_dirty && self.allocated != (0, 0)).then_some((
+            self.target,
+            self.allocated.0,
+            self.allocated.1,
+        ))
     }
     /// CPU consumers (CSS composition) read only after the GPU resolve.
     pub(super) fn read(&mut self) -> Result<Option<RgbaFrame>, Error> {

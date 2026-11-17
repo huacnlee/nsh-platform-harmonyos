@@ -108,8 +108,9 @@ nsh-platform-harmonyos-cli
 
 CLI 写出的是标准的 Stage 模型应用：`EntryAbility` 加载 `pages/Index`，页面里一个铺满窗口的 `ContentSlot` 放着 `NshSurface` 的
 `content`。Rust 写的应用链接进库里，启动时调用 `surface.runApp()`；TSX 应用的 bundle 作为 HAP 的 raw file，用
-`surface.loadResource("bundle.js")` 加载。同一个 `@nsh/harmonyos` 包也能把 NSH 应用嵌进已有的鸿蒙应用，见
-[docs/embedding.md](docs/embedding.md)。后端各部分的说明见 [docs/architecture.md](docs/architecture.md)。
+`surface.loadResource("bundle.js")` 加载。从空仓库创建或接入已有 OHOS 工程的完整步骤见
+[docs/development.zh-CN.md](docs/development.zh-CN.md)；同一个 `@nsh/harmonyos` 包嵌入已有鸿蒙应用的 API 见
+[docs/embedding.md](docs/embedding.md)；后端各部分的说明见 [docs/architecture.md](docs/architecture.md)。
 
 ## 状态
 

@@ -12,6 +12,9 @@ pub(crate) struct Pixels {
     pub(crate) id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) scale: f32,
     pub(crate) pixels: Vec<u8>,
 }
 #[derive(Default)]
@@ -24,7 +27,7 @@ pub(crate) struct Scene {
     pub(crate) shared: Arc<Shared>,
 }
 impl Scene {
-    pub(super) fn render(&self, source: &mut impl Sources, route: &Dispatcher) {
+    pub(super) fn render(&self, source: &mut impl Sources, route: Option<&Dispatcher>) -> bool {
         match self.plan.render(source) {
             Ok(Some(frames)) => {
                 *self.shared.output.lock().unwrap() = Some(
@@ -34,16 +37,27 @@ impl Scene {
                             id: frame.id,
                             width: frame.image.bitmap.width(),
                             height: frame.image.bitmap.height(),
+                            x: frame.image.x,
+                            y: frame.image.y,
+                            scale: frame.scale,
                             pixels: frame.image.bitmap.pixels().to_vec(),
                         })
                         .collect(),
                 );
-                if !self.shared.posted.swap(true, Ordering::AcqRel) {
+                if let Some(route) = route
+                    && !self.shared.posted.swap(true, Ordering::AcqRel)
+                {
                     route.send(Message::Scene);
                 }
+                false
             }
-            Ok(None) => {}
-            Err(error) => route.send(Message::Error(format!("scene compositor: {error}"))),
+            Ok(None) => false,
+            Err(error) => {
+                if let Some(route) = route {
+                    route.send(Message::Error(format!("scene compositor: {error}")));
+                }
+                true
+            }
         }
     }
 }

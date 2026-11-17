@@ -1,3 +1,4 @@
+import { PicturePixels } from "./NativeViews";
 import {
   AbilityConstant,
   AbilityLifecycleCallback,
@@ -50,6 +51,7 @@ interface HostInitPayload {
   cacheDir: string;
   filesDir: string;
   pixelRatio: number;
+  maxRefreshRate: number;
   rtl: boolean;
   lifecycle: string;
   colorMode: number;
@@ -117,12 +119,14 @@ interface NshNativeModule {
     platformWindowId: number,
     visual: AvoidAreaPayload[],
     keyboard: AvoidAreaPayload,
+    maxRefreshRate?: number,
   ): void;
   nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void;
   nshPickImagesResult(sessionId: number, pickId: number, files: PickedDescriptor[]): void;
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
+  nshNativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshViewAction(action: MenuActionPayload): boolean;
@@ -279,6 +283,12 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     } catch (error) {
       console.error(`[NSH] retireNativeNode(${targetId}) failed: ${String(error)}`);
       return false;
+    }
+  }
+
+  nativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void {
+    if (this.active) {
+      this.mod.nshNativePicture(targetId, generation, picture, error);
     }
   }
 
@@ -508,6 +518,7 @@ class HostSession {
         is24HourClock: localeDetails.is24HourClock,
         rtl: i18n.isRTL(language),
         pixelRatio,
+        maxRefreshRate: maximumRefreshRate(mainWindow),
         lifecycle,
         screenReader,
         reduceMotion,
@@ -757,7 +768,7 @@ class HostSession {
     ];
     const keyboard = safeAvoidArea(this.mainWindow, window.AvoidAreaType.TYPE_KEYBOARD);
     try {
-      this.mod.nshUpdateWindow(this.sessionId, this.windowId, visual, keyboard);
+      this.mod.nshUpdateWindow(this.sessionId, this.windowId, visual, keyboard, maximumRefreshRate(this.mainWindow));
     } catch {}
   }
 
@@ -1065,3 +1076,9 @@ getNativeModule().nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
 );
+
+function maximumRefreshRate(mainWindow: window.Window): number {
+  const id = mainWindow.getWindowProperties().displayId;
+  const screen = id === undefined ? display.getDefaultDisplaySync() : display.getDisplayByIdSync(id);
+  return (screen.supportedRefreshRates ?? []).reduce((maximum: number, hz: number): number => Math.max(maximum, hz), screen.refreshRate);
+}
