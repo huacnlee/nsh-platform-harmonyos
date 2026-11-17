@@ -3,8 +3,9 @@
 // (`nsh.json` "root").
 import { open, test } from "nsh/test";
 
-test("pixel buffers reach the screen every frame", async () => {
+test("animation-loop liveness during RGBA updates", async () => {
   const app = await open(".");
-  // Three digits: a hundred frames went through the image element.
+  // The counter is advanced before each image update. This proves the
+  // animation loop stays live, but does not independently assert painted pixels.
   await app.waitFor("text:/^frame \\d{3,} · \\d+ fps$/");
 });

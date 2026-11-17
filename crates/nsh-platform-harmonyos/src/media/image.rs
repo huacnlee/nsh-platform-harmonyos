@@ -41,6 +41,8 @@ use crate::{
 };
 
 const MAX_DATA: usize = 16 << 20;
+const MAX_IMAGE_PIXELS: u64 = 16_777_216;
+const MAX_ANIMATED_IMAGE_PIXELS: u64 = 67_108_864;
 
 #[derive(Clone, Copy)]
 pub(crate) enum Target {
@@ -209,7 +211,7 @@ impl Loader {
         // caches: every buffer is a new image, shown as it is.
         if let Some(data) = inline.as_ref().filter(|data| data.rgba().is_some()) {
             let (width, height, _) = data.rgba().expect("rgba data keeps its pixels");
-            let result = if u64::from(width) * u64::from(height) > 16_777_216 {
+            let result = if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
                 Err("image dimensions exceed 16 megapixels".into())
             } else {
                 Ok(Arc::new(Data {
@@ -388,8 +390,8 @@ impl Loader {
             let frame_pixels = u64::from(width) * u64::from(height);
             if width == 0
                 || height == 0
-                || frame_pixels > 16_777_216
-                || frame_pixels.saturating_mul(frames) > 67_108_864
+                || frame_pixels > MAX_IMAGE_PIXELS
+                || frame_pixels.saturating_mul(frames) > MAX_ANIMATED_IMAGE_PIXELS
             {
                 return Err("image dimensions exceed 16 megapixels".into());
             }
