@@ -1,0 +1,8 @@
+{
+  "name": "RGBA",
+  "id": "com.example.nsh.rgba",
+  "version": "1.0.0",
+  "build": 1,
+  "rust": ".",
+  "root": "App"
+}
