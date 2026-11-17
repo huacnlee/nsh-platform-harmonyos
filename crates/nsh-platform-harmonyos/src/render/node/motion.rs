@@ -6,7 +6,7 @@ use nsh_core::ViewKind;
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
     component::attribute::ArkUICommonAttribute,
-    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
+    types::attribute::ArkUINodeAttributeType as Attribute,
 };
 
 use super::{Node, Result};
@@ -133,9 +133,8 @@ impl Node {
         Ok(true)
     }
     pub(crate) fn tick_transition(&self, now: f64) -> Result<(bool, bool)> {
-        let (navigation_active, navigation_removed) = self
-            .screen
-            .borrow()
+        let screen = self.screen.borrow().clone();
+        let (navigation_active, navigation_removed) = screen
             .as_ref()
             .map(|screen| screen.frame(now))
             .transpose()?
@@ -166,7 +165,7 @@ impl Node {
             live.step(now, self.frame.get(), &mut self.style.borrow_mut())
         };
         if live.recolor {
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
             self.invalidate_scene();
         }
         if step.active {
@@ -176,31 +175,27 @@ impl Node {
             self.set_frame(frame)?;
         }
         let previous = self.extra.replace((step.opacity, step.extra));
-        let style = self.style.borrow();
         if step.restyled {
             self.invalidate_composites();
-            self.ensure_shadow_layer(&style)?;
-            self.apply_background_color(style.background_color)?;
-            self.apply_borders(&style)?;
-            self.apply_shadow(&style)?;
-            self.decoration.native(self, &style)?;
-            if let Some(image) = self.image.borrow().as_ref() {
-                image.style(&style)?;
+            if let Some(owner) = self.weak.upgrade() {
+                if let Some(scene) = self.scene.borrow().as_ref() {
+                    scene.require(&owner);
+                }
+                owner.ensure_wrapper()?;
             }
-            if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-                layer.update(self, &style)?;
+            self.restore_style()?;
+            self.invalidate_paint()?;
+        } else {
+            let style = self.style.borrow();
+            if previous.0 != step.opacity {
+                self.apply_opacity(style.opacity)?;
             }
-            self.apply_ink_outset(&style)?;
-            self.apply_clip()?;
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            if previous.1 != step.extra {
+                self.transform(&style, |_| None)?;
+            }
+            drop(style);
+            self.animator.apply_node(self)?;
         }
-        if step.restyled || previous.0 != step.opacity {
-            self.apply_opacity(style.opacity)?;
-        }
-        if step.restyled || previous.1 != step.extra {
-            self.transform(&style, |_| None)?;
-        }
-        self.animator.apply_node(self)?;
         Ok((
             step.active || image_active || navigation_active || video_active,
             step.removed || navigation_removed,
@@ -265,7 +260,7 @@ impl Node {
                 P::Color => {
                     let color = Some(crate::render::animation::color(*value));
                     if self.tint.replace(color) != color {
-                        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                        self.invalidate_paint()?;
                     }
                 }
                 P::Opacity => opacity = Some(value.number().clamp(0.0, 1.0)),
@@ -275,8 +270,8 @@ impl Node {
                 _ => {}
             }
         }
-        if let Some(opacity) = opacity {
-            self.apply_opacity(opacity)?;
+        if self.animated_opacity.replace(opacity) != opacity {
+            self.apply_opacity(style.opacity)?;
         }
         if let Some(bg) = bg {
             self.apply_background_color(bg)?;

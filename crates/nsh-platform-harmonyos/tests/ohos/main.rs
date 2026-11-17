@@ -13,11 +13,16 @@ mod composite_blend;
 #[path = "../../src/render/composition/geometry.rs"]
 #[allow(dead_code)]
 mod composite_geometry;
+#[path = "../../src/render/effects.rs"]
+#[allow(dead_code)]
+mod effects;
 #[path = "../../src/app/features.rs"]
 #[allow(unreachable_pub)]
 mod features;
 #[path = "../../src/render/geometry.rs"]
 mod geometry;
+#[path = "../../src/render/gradient.rs"]
+mod gradient;
 #[path = "../../src/media/request.rs"]
 mod image_request;
 #[path = "../../src/navigation/motion.rs"]
@@ -63,3 +68,21 @@ mod system;
 
 #[path = "../../src/media/web_evaluation.rs"]
 mod web_evaluation;
+
+#[path = "../../src/app/frame_rate.rs"]
+#[allow(dead_code)]
+mod frame_rate;
+#[path = "../../src/render/composition/picture.rs"]
+mod picture;
+
+#[path = "../../src/render/composition/mailbox.rs"]
+#[allow(dead_code)]
+mod composition_mailbox;
+
+#[path = "../../src/media/video/mailbox.rs"]
+#[allow(dead_code)]
+mod video_mailbox;
+
+#[path = "../../src/render/composition/scene_policy.rs"]
+#[allow(dead_code)]
+mod scene_policy;

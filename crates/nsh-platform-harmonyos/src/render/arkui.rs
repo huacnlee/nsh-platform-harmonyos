@@ -40,7 +40,11 @@ impl crate::render::mount::UiContext {
         drop(pending);
         let target = self.retire_unattached(target);
         if let Some(target) = target {
-            self.arkui.borrow_mut().remove_editors.push(id);
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_editors.contains(&id) {
+                pending.remove_editors.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
         }
         self.editor_wake();
@@ -81,7 +85,11 @@ impl crate::render::mount::UiContext {
         drop(pending);
         let target = self.retire_unattached(target);
         if let Some(target) = target {
-            self.arkui.borrow_mut().remove_webs.push(id);
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_webs.contains(&id) {
+                pending.remove_webs.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
         }
         self.editor_wake();
@@ -106,11 +114,12 @@ impl crate::render::mount::UiContext {
         }
     }
     pub(crate) fn flush_arkui(&self) -> crate::render::node::Result<()> {
+        let _trace = super::composition::trace::Scope::new(c"NSH ArkUI flush");
         if self.host.check().is_err() {
             return Ok(());
         }
         if let Some(scene) = self.scene.borrow().as_ref() {
-            scene.prepare()?;
+            scene.prepare();
         }
         let owners: Vec<_> = {
             let mut nodes = self.composite_nodes.borrow_mut();
@@ -158,6 +167,16 @@ impl crate::render::mount::UiContext {
                         pending.views.push(update);
                     }
                 }
+                for picture in batch.pictures {
+                    if !pending
+                        .pictures
+                        .iter()
+                        .any(|next| next.target_id == picture.target_id)
+                        && !pending.remove_views.contains(&picture.target_id)
+                    {
+                        pending.pictures.push(picture);
+                    }
+                }
                 for update in batch.webs {
                     if !pending
                         .webs
@@ -174,9 +193,21 @@ impl crate::render::mount::UiContext {
                 let mut web_commands = batch.web_commands;
                 web_commands.append(&mut pending.web_commands);
                 pending.web_commands = web_commands;
-                pending.remove_editors.extend(batch.remove_editors);
-                pending.remove_views.extend(batch.remove_views);
-                pending.remove_webs.extend(batch.remove_webs);
+                for id in batch.remove_editors {
+                    if !pending.remove_editors.contains(&id) {
+                        pending.remove_editors.push(id);
+                    }
+                }
+                for id in batch.remove_views {
+                    if !pending.remove_views.contains(&id) {
+                        pending.remove_views.push(id);
+                    }
+                }
+                for id in batch.remove_webs {
+                    if !pending.remove_webs.contains(&id) {
+                        pending.remove_webs.push(id);
+                    }
+                }
                 self.arkui_views.borrow_mut().extend(retired);
                 return Err(error);
             }
@@ -212,14 +243,25 @@ impl crate::render::mount::UiContext {
             self.editor_wake();
         }
     }
+    pub(crate) fn picture_request(&self, request: crate::interop::sdk::PictureRequest) {
+        let mut pending = self.arkui.borrow_mut();
+        pending
+            .pictures
+            .retain(|old| old.target_id != request.target_id);
+        pending.pictures.push(request);
+    }
     pub(crate) fn view_remove(&self, target: NativeAttachment) {
         let id = target.id();
-        let mut pending = self.arkui.borrow_mut();
-        pending.views.retain(|update| update.target_id != id);
-        drop(pending);
-        let target = self.retire_unattached(target);
-        if let Some(target) = target {
-            self.arkui.borrow_mut().remove_views.push(id);
+        self.arkui
+            .borrow_mut()
+            .views
+            .retain(|update| update.target_id != id);
+        if let Some(target) = self.retire_unattached(target) {
+            let mut pending = self.arkui.borrow_mut();
+            if !pending.remove_views.contains(&id) {
+                pending.remove_views.push(id);
+            }
+            drop(pending);
             self.arkui_views.borrow_mut().push(target);
         }
         self.editor_wake();

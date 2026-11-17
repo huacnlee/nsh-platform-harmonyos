@@ -27,14 +27,16 @@ pub(crate) struct Root {
     pub(crate) id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
+    pub(crate) origin: (f32, f32),
+    pub(crate) scale: f32,
     pub(crate) node: PaintNode,
 }
 pub(crate) struct Plan {
-    pub(crate) scale: f32,
     pub(crate) roots: Vec<Root>,
 }
 pub(crate) struct Frame {
     pub(crate) id: u32,
+    pub(crate) scale: f32,
     pub(crate) image: Image,
 }
 
@@ -64,13 +66,14 @@ impl Plan {
         if !self.roots.iter().all(|root| ready(&root.node, source)) {
             return Ok(None);
         }
-        let mut renderer = Renderer {
-            source,
-            scale: self.scale,
-            pixels: 0,
-        };
+        let mut total_pixels: u64 = 0;
         let mut frames = Vec::with_capacity(self.roots.len());
         for root in &self.roots {
+            let mut renderer = Renderer {
+                source,
+                scale: root.scale,
+                pixels: total_pixels,
+            };
             let pixels = u64::from(root.width) * u64::from(root.height);
             renderer.reserve(pixels)?;
             let mut canvas = Canvas::with_bitmap(Bitmap::new(
@@ -79,10 +82,15 @@ impl Plan {
                 BitmapFormat::default(),
             ));
             canvas.clear(0);
+            if root.origin != (0.0, 0.0) {
+                canvas.translate(-root.origin.0, -root.origin.1);
+            }
             renderer.node(&root.node, &mut canvas, 0)?;
+            total_pixels = renderer.pixels;
             frames.push(Frame {
                 id: root.id,
-                image: Image::copy(canvas.bitmap().unwrap(), 0.0, 0.0),
+                scale: root.scale,
+                image: Image::copy(canvas.bitmap().unwrap(), root.origin.0, root.origin.1),
             });
             // Frames remain live until publication, and count against the same budget.
         }
@@ -119,12 +127,14 @@ impl<S: Sources> Renderer<'_, S> {
         let masks = effects.map_or(&[][..], |effects| effects.mask_images.as_slice());
         let backdrop = effects.map_or(&[][..], |effects| effects.backdrop_filters.as_slice());
         // These are precisely the properties that establish a backdrop root.
+        let has_filters = crate::render::effects::has_active_filters(filters);
+        let has_backdrop = crate::render::effects::has_active_filters(backdrop);
         let grouped = node.shaders
             || node.capture
             || !masks.is_empty()
             || node.opacity < 1.0
-            || !filters.is_empty()
-            || !backdrop.is_empty()
+            || has_filters
+            || has_backdrop
             || node.style.blend_mode != BlendMode::Normal;
         if grouped {
             let [left, top, right, bottom] = node.bounds.0.map(|v| v * self.scale);
@@ -140,7 +150,7 @@ impl<S: Sources> Renderer<'_, S> {
             layer.clear(0);
             layer.translate(-left, -top);
             let mut shader_backdrop = None;
-            if !backdrop.is_empty() || node.shader_backdrop {
+            if has_backdrop || node.shader_backdrop {
                 let matrix = destination.total_matrix();
                 if let Some(inverse) = matrix.inverted() {
                     let prefix =
@@ -154,7 +164,7 @@ impl<S: Sources> Renderer<'_, S> {
                     if node.shader_backdrop {
                         shader_backdrop = Some(Image::copy(&prefix.bitmap, prefix.x, prefix.y));
                     }
-                    if !backdrop.is_empty() {
+                    if has_backdrop {
                         let prefix = prefix
                             .backdrop(backdrop, self.scale)
                             .map_err(str::to_owned)?;
@@ -170,30 +180,27 @@ impl<S: Sources> Renderer<'_, S> {
             let image = Image::copy(layer.bitmap().unwrap(), left, top)
                 .filtered(filters, self.scale)
                 .map_err(str::to_owned)?;
-            let image = if masks.is_empty() {
-                image
-            } else {
+            let image = if let Some(mask) = masks.first() {
                 let canvas = Canvas::with_bitmap(image.bitmap);
                 let mut blend = Brush::new();
                 blend.set_blend_mode(ohos_drawing_binding::BlendMode::DstIn);
-                // All mask layers compose together before their alpha masks
-                // the filtered group; no pixels persist between scene frames.
+                // Align with upstream NSH platforms: apply the primary mask gradient.
                 canvas.save_layer(None, Some(&blend));
                 canvas.translate(-image.x, -image.y);
                 canvas.scale(self.scale, self.scale);
-                for mask in masks.iter().rev() {
-                    let brush = crate::render::decor::gradient(mask, node.size);
-                    canvas.attach_brush(&brush);
-                    canvas.draw_rect(&ohos_drawing_binding::Rect::new(
-                        0.0,
-                        0.0,
-                        node.size.width,
-                        node.size.height,
-                    ));
-                    canvas.detach_brush();
-                }
+                let brush = crate::render::decor::gradient(mask, node.size);
+                canvas.attach_brush(&brush);
+                canvas.draw_rect(&ohos_drawing_binding::Rect::new(
+                    0.0,
+                    0.0,
+                    node.size.width,
+                    node.size.height,
+                ));
+                canvas.detach_brush();
                 canvas.restore();
                 Image::copy(canvas.bitmap().unwrap(), image.x, image.y)
+            } else {
+                image
             };
             let image = if (node.shaders || node.capture)
                 && let Some(key) = node.source

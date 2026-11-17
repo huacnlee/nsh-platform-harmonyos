@@ -29,6 +29,7 @@ pub(crate) struct Modal {
     config: Cell<ModalConfig>,
     pending_present: Cell<bool>,
     shown: Cell<bool>,
+    show_emitted: Cell<bool>,
     progress: Cell<f32>,
     transition: RefCell<Option<Transition>>,
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
@@ -55,6 +56,7 @@ impl Modal {
             config: Cell::new(ModalConfig::default()),
             pending_present: Cell::new(false),
             shown: Cell::new(false),
+            show_emitted: Cell::new(false),
             progress: Cell::new(0.0),
             transition: RefCell::default(),
             shader: RefCell::default(),
@@ -166,7 +168,10 @@ impl Modal {
         };
         self.sync_metrics();
         owner.set_frame(owner.raw_frame.get())?;
-        if !self.shown.replace(true) {
+        let was_shown = self.shown.replace(true);
+        let was_closing = self.closing.replace(false);
+        if !was_shown {
+            self.show_emitted.set(false);
             self.theme()?;
             self.dialog.borrow().content_node(&owner.mounted())?;
             self.dialog.borrow().show()?;
@@ -188,8 +193,9 @@ impl Modal {
             .native
             .borrow()
             .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
-        self.closing.set(false);
-        self.begin(1.0)?;
+        if !was_shown || was_closing {
+            self.begin(1.0)?;
+        }
         Ok(())
     }
     pub(crate) fn request_close(&self) -> Result<()> {
@@ -237,16 +243,27 @@ impl Modal {
         }
         Ok(())
     }
-    fn begin(&self, to: f32) -> Result<()> {
-        if let Some(owner) = self.owner.upgrade()
-            && let Some(navigation) = owner.shaders.begin_navigation(&owner, None, to == 0.0)?
-        {
-            self.transition.borrow_mut().take();
-            *self.shader.borrow_mut() = Some(navigation);
-            owner.presentation(1.0, 0.0)?;
-            owner.animator.request_frame();
-            return Ok(());
+    pub(crate) fn on_shader_captured(
+        &self,
+        navigation: &crate::render::shader::navigation::Navigation,
+    ) -> Result<()> {
+        let matches = self
+            .shader
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.key == navigation.key);
+        if matches && !navigation.backwards {
+            self.progress.set(1.0);
         }
+        Ok(())
+    }
+    pub(crate) fn refresh_presentation(&self) -> Result<()> {
+        if self.shader.borrow().is_some() {
+            self.paint()?;
+        }
+        Ok(())
+    }
+    fn start_transition(&self, to: f32) -> Result<()> {
         let reduced = self
             .owner
             .upgrade()
@@ -273,18 +290,55 @@ impl Modal {
         }
         Ok(())
     }
+    fn begin(&self, to: f32) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade()
+            && let Some(navigation) = owner.shaders.begin_navigation(&owner, None, to == 0.0)?
+        {
+            self.transition.borrow_mut().take();
+            *self.shader.borrow_mut() = Some(navigation);
+            self.paint()?;
+            owner.animator.request_frame();
+            return Ok(());
+        }
+        let had_shader = self.shader.borrow_mut().take().is_some();
+        if let Some(owner) = self.owner.upgrade() {
+            if to == 0.0 {
+                owner.shaders.finish_modal_close(&owner, had_shader)?;
+            } else if had_shader {
+                owner.shaders.end_navigation(owner.id)?;
+            }
+        }
+        self.start_transition(to)
+    }
     pub(crate) fn frame(&self, now: f64) -> Result<bool> {
         let shader = self
             .shader
             .borrow()
             .as_ref()
-            .map(|n| (n.running(), n.backwards));
-        if let Some((running, backwards)) = shader {
+            .map(|n| (n.running(), n.take_fallback(), n.backwards));
+        if let Some((running, fallback, backwards)) = shader {
             if running {
+                self.paint()?;
                 return Ok(true);
             }
-            self.finish(if backwards { 0.0 } else { 1.0 })?;
-            return Ok(false);
+            let to = if backwards { 0.0 } else { 1.0 };
+            if fallback {
+                self.shader.borrow_mut().take();
+                if let Some(owner) = self.owner.upgrade() {
+                    if backwards {
+                        owner.shaders.finish_modal_close(&owner, true)?;
+                    } else {
+                        owner.shaders.end_navigation(owner.id)?;
+                    }
+                }
+                if !backwards && self.progress.get() == 1.0 {
+                    self.progress.set(0.0);
+                }
+                self.start_transition(to)?;
+            } else {
+                self.finish(to)?;
+                return Ok(false);
+            }
         }
         let state = self.transition.borrow().as_ref().map(|transition| {
             let t = ((now - transition.start) / transition.duration).clamp(0.0, 1.0);
@@ -306,8 +360,17 @@ impl Modal {
     }
     fn paint(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
-            if self.shader.borrow().is_some() {
-                return owner.presentation(1.0, 0.0);
+            if let Some(nav) = self.shader.borrow().as_ref() {
+                let has_presented = owner.wrapper.borrow().as_ref().is_some_and(|wrapper| {
+                    wrapper
+                        .composite
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|composite| composite.has_presented(&owner))
+                });
+                let waiting_open =
+                    crate::render::shader::navigation::modal_open_waiting(nav, has_presented);
+                return owner.presentation(if waiting_open { 0.0 } else { 1.0 }, 0.0);
             }
             let progress = self.progress.get();
             let crossfade = nsh_core::navigation::modal_motion(
@@ -326,29 +389,33 @@ impl Modal {
         Ok(())
     }
     fn finish(&self, to: f32) -> Result<()> {
-        let shader = self.shader.borrow_mut().take();
-        if shader.is_some()
-            && let Some(owner) = self.owner.upgrade()
-        {
-            owner.shaders.end_navigation(owner.id)?;
-        }
+        let had_shader = self.shader.borrow_mut().take().is_some();
         self.transition.borrow_mut().take();
         self.progress.set(to);
         if to == 0.0 {
-            if self.shown.replace(false) {
+            self.closing.set(false);
+            self.show_emitted.set(false);
+            let was_shown = self.shown.replace(false);
+            if was_shown {
                 self.dialog.borrow().close()?;
                 self.overlay.borrow_mut().take();
                 self.dialog.borrow().remove_content()?;
-                if let Some(owner) = self.owner.upgrade() {
-                    owner.presentation(1.0, 0.0)?;
+            }
+            if let Some(owner) = self.owner.upgrade() {
+                owner.shaders.finish_modal_close(&owner, had_shader)?;
+                owner.presentation(1.0, 0.0)?;
+                if was_shown {
                     owner.emit(EventKind::Dismiss, EventPayload::None);
                 }
-            } else if let Some(owner) = self.owner.upgrade() {
-                owner.presentation(1.0, 0.0)?;
             }
         } else {
+            if had_shader && let Some(owner) = self.owner.upgrade() {
+                owner.shaders.end_navigation(owner.id)?;
+            }
             self.paint()?;
-            if let Some(owner) = self.owner.upgrade() {
+            if !self.show_emitted.replace(true)
+                && let Some(owner) = self.owner.upgrade()
+            {
                 owner.emit(EventKind::Show, EventPayload::None);
             }
         }

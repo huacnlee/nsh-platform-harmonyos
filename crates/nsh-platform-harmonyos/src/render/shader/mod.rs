@@ -13,9 +13,9 @@ use std::{
 
 use nsh_core::{NodeId, animation::AnimationValue, shader::ShaderLayer};
 use ohos_arkui_binding::{
-    component::attribute::ArkUICommonAttribute, types::advanced::NodeDirtyFlag,
+    component::attribute::ArkUICommonAttribute,
+    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
 };
-use ohos_vsync_binding::Vsync;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -52,6 +52,9 @@ struct State {
     size: Option<(Size, f32)>,
     shown: Option<bool>,
     overflow: f32,
+    /// Latest uniform slot updates coalesced while `shown == Some(false)` so
+    /// off-screen looping uniform animations do not wake the compositor thread.
+    deferred_slots: Vec<(u16, AnimationValue)>,
 }
 
 /// A view's surface kept after it went, with the view's native node it is
@@ -96,10 +99,10 @@ impl Shaders {
         self.effects.animating()
     }
 
-    pub(crate) fn new(vsync: Arc<Vsync>) -> Shaders {
+    pub(crate) fn new(rate: Arc<FrameRate>) -> Shaders {
         Shaders {
             effects: effects::Effects::default(),
-            rate: FrameRate::new(vsync),
+            rate,
             worker: RefCell::default(),
             generation: Cell::new(0),
             visibility_generation: Cell::new(1),
@@ -107,6 +110,23 @@ impl Shaders {
             views: RefCell::default(),
             retiring: RefCell::default(),
         }
+    }
+
+    pub(crate) fn surface_active(&self) -> bool {
+        self.effects.surface_active()
+    }
+    pub(crate) fn hosts_retainable(&self) -> bool {
+        self.effects.hosts_retainable()
+    }
+
+    pub(crate) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
+        self.effects.has_navigation_layer(target_id)
+    }
+    pub(crate) fn reconcile_hosts_now(&self) -> Result<()> {
+        self.reconcile_hosts()
+    }
+    fn reconcile_hosts(&self) -> Result<()> {
+        self.effects.reconcile_hosts()
     }
 
     pub(crate) fn set(&self, owner: &Rc<Node>, layer: Option<Arc<ShaderLayer>>) -> Result<()> {
@@ -118,7 +138,11 @@ impl Shaders {
             if self.views.borrow().contains_key(&owner.id) {
                 self.remove(owner.id);
             }
-            return self.effects.set(owner, layer);
+            self.effects.set(owner, layer)?;
+            if !owner.flushing_batch.get() {
+                self.reconcile_hosts()?;
+            }
+            return Ok(());
         }
         self.effects.remove(owner.id)?;
         if !self.views.borrow().contains_key(&owner.id)
@@ -144,6 +168,7 @@ impl Shaders {
                 }
             });
         let overflow = layer.overflow.0.max(0.0);
+        worker.precompile(layer.clone());
         worker.fill(Command::Layer(key, layer));
         if !self.views.borrow().contains_key(&owner.id) {
             let surface = match surface::Surface::new(
@@ -178,16 +203,21 @@ impl Shaders {
                     size: None,
                     shown: None,
                     overflow,
+                    deferred_slots: Vec::new(),
                 },
             );
             owner.enable_layout();
         }
         if let Some(state) = self.views.borrow_mut().get_mut(&owner.id) {
             state.overflow = overflow;
+            state.deferred_slots.clear();
             state.surface.native.borrow().set_clip(overflow <= 0.0)?;
         }
         owner.invalidate_composites();
         owner.animator.request_frame();
+        if !owner.flushing_batch.get() {
+            self.reconcile_hosts()?;
+        }
         Ok(())
     }
 
@@ -208,11 +238,41 @@ impl Shaders {
     ) -> Result<Option<Rc<navigation::Navigation>>> {
         self.effects.begin_navigation(owner, lower, backwards)
     }
-    pub(crate) fn navigation_complete(&self, key: navigation::Key) {
-        self.effects.navigation_complete(key);
+    pub(crate) fn navigation_event(&self, event: navigation::Event) -> Result<()> {
+        self.effects.navigation_event(event)
     }
     pub(crate) fn end_navigation(&self, id: NodeId) -> Result<()> {
-        self.effects.remove(id)
+        let end = self.effects.end_navigation(id);
+        let hosts = if self
+            .effects
+            .root_node()
+            .is_some_and(|root| !root.flushing_batch.get())
+        {
+            self.reconcile_hosts()
+        } else {
+            Ok(())
+        };
+        end.and(hosts)
+    }
+    pub(crate) fn finish_modal_close(&self, owner: &Rc<Node>, had_shader: bool) -> Result<()> {
+        let close = self.effects.finish_modal_close(owner, had_shader);
+        let hosts = if !owner.flushing_batch.get() {
+            self.reconcile_hosts()
+        } else {
+            Ok(())
+        };
+        close.and(hosts)
+    }
+    pub(crate) fn reconcile_navigation_capture(&self, reduce_motion: bool) -> Result<()> {
+        let capture = self.effects.reconcile_navigation_capture(reduce_motion);
+        let hosts = self.reconcile_hosts();
+        capture.and(hosts)
+    }
+    pub(crate) fn cancel_navigation(&self, reason: &str) -> Result<()> {
+        self.effects.cancel_navigation(reason)
+    }
+    pub(crate) fn log_idle_configured(&self) {
+        self.effects.log_idle_configured();
     }
 
     /// The native node of `id`'s surface, which its view lays out.
@@ -221,6 +281,7 @@ impl Shaders {
             .borrow()
             .get(&id)
             .map_or(0.0, |state| state.overflow)
+            .max(self.effects.max_overflow(id))
     }
     pub(crate) fn native(&self, id: NodeId) -> Option<NativeNode> {
         self.views
@@ -229,35 +290,54 @@ impl Shaders {
             .map(|state| state.surface.native.clone())
     }
 
+    fn retire_fill_view(&self, id: NodeId) {
+        if let Some(state) = self.views.borrow_mut().remove(&id) {
+            if let Some(owner) = state.owner.upgrade() {
+                owner.invalidate_composites();
+            }
+            if state.surface.native.borrow().is_owned() {
+                let node = state.surface.native.borrow();
+                let _ = node.opacity(0.0);
+                let _ = node.set_i32_attribute(Attribute::Visibility, 2);
+            }
+            if let Some(worker) = self.worker.borrow().as_ref() {
+                worker.fill(Command::Remove(state.key));
+                self.retiring.borrow_mut().push((
+                    state.key,
+                    Retiring {
+                        surface: state.surface,
+                        parent: state.parent,
+                    },
+                ));
+            } else {
+                callback(|| state.surface.dispose(Some(&state.parent)));
+            }
+        }
+    }
+
     pub(crate) fn remove(&self, id: NodeId) {
         self.visibility.borrow_mut().remove(&id);
         callback(|| self.effects.remove(id));
-        let Some(state) = self.views.borrow_mut().remove(&id) else {
-            return;
-        };
-        if let Some(owner) = state.owner.upgrade() {
-            owner.invalidate_composites();
-        }
-        if let Some(worker) = self.worker.borrow().as_ref() {
-            worker.fill(Command::Remove(state.key));
-            self.retiring.borrow_mut().push((
-                state.key,
-                Retiring {
-                    surface: state.surface,
-                    parent: state.parent,
-                },
-            ));
-        } else {
-            callback(|| state.surface.dispose(Some(&state.parent)));
+        self.retire_fill_view(id);
+        if self
+            .effects
+            .root_node()
+            .is_some_and(|root| !root.flushing_batch.get())
+        {
+            callback(|| self.reconcile_hosts());
         }
     }
 
     pub(crate) fn slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
         self.effects.slot(id, slot, value);
-        if let Some(state) = self.views.borrow().get(&id)
-            && let Some(worker) = self.worker.borrow().as_ref()
-        {
-            worker.fill(Command::Slot(state.key, slot, value));
+        if let Some(state) = self.views.borrow_mut().get_mut(&id) {
+            if state.shown == Some(false) {
+                coalesce_deferred_slot(&mut state.deferred_slots, slot, value);
+                return;
+            }
+            if let Some(worker) = self.worker.borrow().as_ref() {
+                worker.fill(Command::Slot(state.key, slot, value));
+            }
         }
     }
 
@@ -278,6 +358,11 @@ impl Shaders {
             let shown = in_sight(&owner);
             if state.shown != Some(shown) {
                 state.shown = Some(shown);
+                if shown {
+                    for (slot, value) in state.deferred_slots.drain(..) {
+                        worker.fill(Command::Slot(state.key, slot, value));
+                    }
+                }
                 worker.fill(Command::Shown(state.key, shown));
             }
             let frame = owner.frame.get();
@@ -310,7 +395,13 @@ impl Shaders {
     /// away left the worker waiting for a command.
     pub(crate) fn wake(&self) {
         self.effects.wake();
-        if let Some(worker) = self.worker.borrow().as_ref() {
+        let _ = self.reconcile_hosts();
+        if let Some(root) = self.effects.root_node() {
+            let _ = root.flush_arkui();
+        }
+        if self.effects.surface_active()
+            && let Some(worker) = self.worker.borrow().as_ref()
+        {
             worker.wake();
         }
     }
@@ -322,14 +413,13 @@ impl Shaders {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
+        self.effects.cancel_navigation("close")?;
         let ids: Vec<_> = self.views.borrow().keys().copied().collect();
         for id in ids {
             self.remove(id);
         }
         self.collect()
     }
-    /// `Message::Shader`: releases the surfaces of views the worker has let
-    /// go of.
     pub(crate) fn collect(&self) -> Result<()> {
         let worker = self.worker.borrow();
         let Some(worker) = worker.as_ref() else {
@@ -356,6 +446,40 @@ impl Shaders {
     }
 }
 
+fn coalesce_deferred_slot(
+    deferred: &mut Vec<(u16, AnimationValue)>,
+    slot: u16,
+    value: AnimationValue,
+) {
+    if let Some((_, existing)) = deferred.iter_mut().find(|(s, _)| *s == slot) {
+        *existing = value;
+    } else {
+        deferred.push((slot, value));
+    }
+}
+
+#[cfg(test)]
+mod slot_coalesce_tests {
+    use nsh_core::animation::AnimationValue;
+
+    use super::coalesce_deferred_slot;
+
+    #[test]
+    fn offscreen_slot_updates_coalesce_in_place_per_slot_index() {
+        let mut deferred = Vec::new();
+        coalesce_deferred_slot(&mut deferred, 1, AnimationValue::Number(0.2));
+        coalesce_deferred_slot(&mut deferred, 3, AnimationValue::Number(0.5));
+        coalesce_deferred_slot(&mut deferred, 1, AnimationValue::Number(0.9));
+        assert_eq!(
+            deferred,
+            vec![
+                (1, AnimationValue::Number(0.9)),
+                (3, AnimationValue::Number(0.5)),
+            ]
+        );
+    }
+}
+
 /// Whether `node` can be seen: in the tree and shown, and its box (as
 /// ArkUI places it, translations and scroll offsets included) within the
 /// surface's root and within every scroll view around it, which clip their
@@ -366,6 +490,13 @@ fn in_sight(node: &Rc<Node>) -> bool {
 fn in_sight_uncached(node: &Rc<Node>) -> bool {
     if !node.visible_in_tree() {
         return false;
+    }
+    if node.kind == nsh_core::ViewKind::Modal {
+        return node
+            .modal
+            .try_borrow()
+            .ok()
+            .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
     }
     let rect = |n: &Node| -> Option<(i32, i32, i32, i32)> {
         let native = n.mounted();
@@ -387,6 +518,13 @@ fn in_sight_uncached(node: &Rc<Node>) -> bool {
     }
     let mut at = node.parent_node.borrow().upgrade();
     while let Some(ancestor) = at {
+        if ancestor.kind == nsh_core::ViewKind::Modal {
+            return ancestor
+                .modal
+                .try_borrow()
+                .ok()
+                .is_some_and(|modal| modal.as_ref().is_some_and(|m| m.is_visible()));
+        }
         let clips = ancestor.id == nsh_core::ROOT_ID || ancestor.scroll.borrow().is_some();
         if clips
             && let Some(r) = rect(&ancestor)

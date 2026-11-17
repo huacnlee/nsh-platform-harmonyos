@@ -136,7 +136,7 @@ pub(crate) enum Message {
         generation: u32,
     },
     Scene,
-    Navigation(crate::render::shader::navigation::Key),
+    Navigation(crate::render::shader::navigation::Event),
     /// The shader thread left frames (`render::shader`).
     Shader,
     #[cfg(feature = "api-23")]
@@ -339,56 +339,17 @@ impl MountSink for Sink {
     }
 }
 
-struct VsyncVote {
-    remaining: std::sync::atomic::AtomicU8,
-    armed: std::sync::atomic::AtomicBool,
-}
-
-fn arm_vsync_vote(vsync: &Arc<Vsync>, vote: &Arc<VsyncVote>) {
-    use std::sync::atomic::Ordering;
-    let weak = Arc::downgrade(vsync);
-    let vote_cb = vote.clone();
-    if vsync.request_frame_once(move |_| {
-        let prev = vote_cb
-            .remaining
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
-                Some(n.saturating_sub(1))
-            })
-            .unwrap_or(0);
-        if prev > 1
-            && let Some(vsync) = weak.upgrade()
-        {
-            arm_vsync_vote(&vsync, &vote_cb);
-        } else {
-            vote_cb.armed.store(false, Ordering::Release);
-            if vote_cb.remaining.load(Ordering::Acquire) > 0
-                && let Some(vsync) = weak.upgrade()
-                && vote_cb
-                    .armed
-                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                    .is_ok()
-            {
-                arm_vsync_vote(&vsync, &vote_cb);
-            }
-        }
-    }) != 0
-    {
-        vote.armed.store(false, Ordering::Release);
-    }
-}
-
 struct State {
     #[cfg(feature = "dev")]
     testing: Option<Arc<crate::app::testing::Session>>,
     #[cfg(feature = "dev")]
     test_closed: Arc<std::sync::atomic::AtomicBool>,
-    self_ref: std::rc::Weak<RefCell<Self>>,
     parent: std::rc::Weak<RefCell<ohos_arkui_binding::common::node::ArkUINode>>,
     engine: Option<Engine>,
     mounter: Option<Mounter>,
     dispatcher: Weak<Dispatcher>,
     vsync: Arc<Vsync>,
-    vsync_vote: Arc<VsyncVote>,
+    frame_rate: Arc<crate::app::frame_rate::FrameRate>,
     environment: Environment,
     errors: Errors,
     frame_pending: bool,
@@ -396,7 +357,6 @@ struct State {
     attached: bool,
     visible: bool,
     frame_wanted: bool,
-    vsync_hz: i32,
     retiring_dispatcher: Option<Arc<Dispatcher>>,
     #[cfg(feature = "dev")]
     reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
@@ -411,6 +371,13 @@ impl State {
         if let Message::Reclaim(epoch) = message {
             if let Some(mounter) = &mut self.mounter {
                 mounter.reclaim(epoch);
+            }
+            if let Some(parent) = self.parent.upgrade()
+                && let Ok(node) = parent.try_borrow()
+                && node.is_owned()
+            {
+                let _ =
+                    node.mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender);
             }
             return Ok(());
         }
@@ -446,18 +413,10 @@ impl State {
         }
         match message {
             Message::Scene => self.mounter.as_ref().unwrap().scene_ready()?,
-            Message::Navigation(key) => self
-                .mounter
-                .as_ref()
-                .unwrap()
-                .shaders
-                .navigation_complete(key),
+            Message::Navigation(event) => self.mounter.as_ref().unwrap().navigation_event(event)?,
             Message::Shader => self.mounter.as_ref().unwrap().shaders.collect()?,
             Message::Arkui => self.mounter.as_ref().unwrap().flush_arkui()?,
-            Message::ScrollReports => {
-                self.pulse_frame_rate_vote();
-                self.mounter.as_ref().unwrap().flush_scroll_reports()?;
-            }
+            Message::ScrollReports => self.mounter.as_ref().unwrap().flush_scroll_reports()?,
             Message::TextSelection(id, command) => {
                 self.mounter.as_ref().unwrap().text_selection(id, command)?
             }
@@ -489,7 +448,10 @@ impl State {
                 }
             }
             Message::Back => {
-                self.mounter.as_mut().unwrap().back()?;
+                let mounter = self.mounter.as_mut().unwrap();
+                mounter.back()?;
+                mounter.flush_arkui()?;
+                self.request_frame()?;
             }
             Message::UpdateBack => {}
             Message::DismissKeyboard => {
@@ -514,7 +476,10 @@ impl State {
                 report_only,
             )?,
             Message::ReconcileNavigation => {
-                self.mounter.as_mut().unwrap().reconcile_navigation()?;
+                let mounter = self.mounter.as_mut().unwrap();
+                mounter.reconcile_navigation()?;
+                mounter.flush_arkui()?;
+                self.request_frame()?;
             }
             Message::DialogResult { id, index } => {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;
@@ -563,7 +528,6 @@ impl State {
                     // native batch below finishes. No batch clone is needed.
                     testing.model.apply(&batch);
                 }
-                self.pulse_frame_rate_vote();
                 let mounter = self
                     .mounter
                     .as_mut()
@@ -616,6 +580,10 @@ impl State {
     }
     fn update_back(&self) {
         let active = self.is_active();
+        if !active {
+            self.frame_rate
+                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
+        }
         if let Some(dispatcher) = self.dispatcher.upgrade() {
             if dispatcher
                 .active
@@ -665,25 +633,8 @@ impl State {
     fn report(&self, error: String) {
         self.errors.report(error);
     }
-    fn pulse_frame_rate_vote(&self) {
-        use std::sync::atomic::Ordering;
-        if !self.is_active() {
-            return;
-        }
-        // Keep the window-associated VSync active for ~33 ms (4 frames at 120 Hz)
-        // across scroll batches and live ticks so LTPO stays at the preferred
-        // refresh rate without waking the UI thread when idle.
-        self.vsync_vote.remaining.store(4, Ordering::Release);
-        if self
-            .vsync_vote
-            .armed
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            arm_vsync_vote(&self.vsync, &self.vsync_vote);
-        }
-    }
     fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
+        let _trace = crate::render::composition::trace::Scope::new(c"NSH UI frame");
         self.frame_pending = false;
         if !self.is_active() {
             self.frame_wanted = true;
@@ -699,27 +650,20 @@ impl State {
         }
         let mounter_wants = self.mounter.as_mut().unwrap().frame(timestamp)?;
         if mounter_wants || self.frame_wanted {
-            let max = crate::app::frame_rate::display_hz() as i32;
-            let capped = if !self.frame_wanted {
+            let demand = if !self.frame_wanted {
                 self.mounter
                     .as_ref()
                     .and_then(|m| m.animator.frame_rate())
-                    .map(|hz| (hz.round() as i32).clamp(1, max))
+                    .map(|hz| crate::app::frame_rate::UiDemand::Capped((hz.round() as i32).max(1)))
+                    .unwrap_or(crate::app::frame_rate::UiDemand::Uncapped)
             } else {
-                None
+                crate::app::frame_rate::UiDemand::Uncapped
             };
-            let expected = capped.unwrap_or_else(|| max.min(60));
-            if expected != self.vsync_hz {
-                self.vsync_hz = expected;
-                let _ = self.vsync.set_expected_frame_rate_range(
-                    ohos_vsync_binding::OH_NativeVSync_ExpectedRateRange {
-                        min: 0,
-                        max: capped.unwrap_or(max),
-                        expected,
-                    },
-                );
-            }
+            self.frame_rate.set_ui_demand(demand);
             self.request_frame()?;
+        } else {
+            self.frame_rate
+                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         }
         self.retire()?;
         self.update_back();
@@ -730,41 +674,12 @@ impl State {
         if !self.is_active() {
             return Ok(());
         }
-        self.pulse_frame_rate_vote();
         if !self.frame_pending {
             self.frame_wanted = false;
-            let state = self.self_ref.clone();
-            // Run UI-thread frame updates inside ArkUI's UIVsyncTask before
-            // layout/render flush via OH_ArkUI_PostFrameCallback, falling back
-            // to NativeVSync if the root node is not yet attached to a context.
-            if self.parent.upgrade().is_none_or(|parent| {
-                parent
-                    .borrow()
-                    .post_frame_callback(move |timestamp, _| {
-                        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            let Some(state) = state.upgrade() else {
-                                return;
-                            };
-                            if let Ok(mut state) = state.try_borrow_mut() {
-                                if let Err(error) = state.step_frame(true, Some(timestamp)) {
-                                    state.report(error.to_string());
-                                    log::error!("OHOS surface frame: {error}");
-                                }
-                            } else if let Some(dispatcher) =
-                                state.try_borrow().ok().and_then(|s| s.dispatcher.upgrade())
-                            {
-                                dispatcher.send(Message::Frame(Some(timestamp)));
-                            }
-                        }))
-                        .is_err()
-                        {
-                            log::error!("panic in OHOS frame callback");
-                        }
-                    })
-                    .is_err()
-            }) {
-                self.schedule(Message::Frame(None))?;
-            }
+            // The rate request and the frame source must use the same VSync
+            // connection. Its callback posts UI mutations through the existing
+            // dispatcher; it never accesses ArkUI from the VSync thread.
+            self.schedule(Message::Frame(None))?;
             self.frame_pending = true;
         }
         Ok(())
@@ -808,6 +723,8 @@ impl State {
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        self.frame_rate
+            .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         if let Some(dispatcher) = self.dispatcher.upgrade() {
             if self
                 .mounter
@@ -932,52 +849,42 @@ impl Runtime {
                     napi_ohos::Error::from_reason("failed to create OHOS native VSync")
                 })?,
         );
-        let status = vsync.set_expected_frame_rate_range(
-            ohos_vsync_binding::OH_NativeVSync_ExpectedRateRange {
-                min: 0,
-                max: crate::app::frame_rate::display_hz() as i32,
-                expected: crate::app::frame_rate::display_hz().min(60) as i32,
-            },
-        );
+        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone())
+            .map_err(|error| {
+                napi_ohos::Error::from_reason(format!("failed to start VSync rate worker: {error}"))
+            })?;
+        let status = frame_rate.apply_initial();
         if status != 0 {
             return Err(napi_ohos::Error::from_reason(format!(
                 "failed to configure OHOS native VSync rate: {status}"
             )));
         }
-        let vsync_vote = Arc::new(VsyncVote {
-            remaining: std::sync::atomic::AtomicU8::new(0),
-            armed: std::sync::atomic::AtomicBool::new(false),
-        });
-        // The shader thread paces itself on the surface's VSync too.
-        let shader_vsync = vsync.clone();
-        let state = Rc::new_cyclic(|weak| {
-            RefCell::new(State {
-                #[cfg(feature = "dev")]
-                testing: app.testing.clone(),
-                #[cfg(feature = "dev")]
-                test_closed: Arc::default(),
-                self_ref: weak.clone(),
-                parent: Rc::downgrade(&parent),
-                engine: None,
-                mounter: None,
-                dispatcher: Weak::new(),
-                vsync,
-                vsync_vote,
-                errors,
-                frame_pending: false,
-                laid_out: false,
-                attached: true,
-                visible: true,
-                frame_wanted: false,
-                vsync_hz: crate::app::frame_rate::display_hz().min(60) as i32,
-                retiring_dispatcher: None,
-                environment: Environment::default(),
-                #[cfg(feature = "dev")]
-                reload: app.reload,
-                #[cfg(feature = "dev")]
-                hot_version: None,
-            })
-        });
+        // The shader thread paces itself on the surface's shared FrameRate too.
+        let shader_rate = frame_rate.clone();
+        let state = Rc::new(RefCell::new(State {
+            #[cfg(feature = "dev")]
+            testing: app.testing.clone(),
+            #[cfg(feature = "dev")]
+            test_closed: Arc::default(),
+            parent: Rc::downgrade(&parent),
+            engine: None,
+            mounter: None,
+            dispatcher: Weak::new(),
+            vsync,
+            frame_rate,
+            errors,
+            frame_pending: false,
+            laid_out: false,
+            attached: true,
+            visible: true,
+            frame_wanted: false,
+            retiring_dispatcher: None,
+            environment: Environment::default(),
+            #[cfg(feature = "dev")]
+            reload: app.reload,
+            #[cfg(feature = "dev")]
+            hot_version: None,
+        }));
         let ui_state = state.clone();
         let wake = env.create_function_from_closure::<(), (), _>("nshCommit", |_| Ok(()))?;
         let dispatcher = Arc::new(Dispatcher {
@@ -1109,7 +1016,7 @@ impl Runtime {
         let context = Rc::new(crate::render::mount::UiContext {
             theme: RefCell::default(),
             cursor: Default::default(),
-            shaders: crate::render::shader::Shaders::new(shader_vsync),
+            shaders: crate::render::shader::Shaders::new(shader_rate),
             fullscreen_video: RefCell::default(),
             scroll_reports: RefCell::default(),
             scroll_watchers,
@@ -1123,6 +1030,8 @@ impl Runtime {
             accessibility_live_regions: std::cell::Cell::new(0),
             accessibility_wrappers: std::cell::Cell::new(0),
             leaving_nodes: std::cell::Cell::new(0),
+            pending_delete_count: std::cell::Cell::new(0),
+            unreclaimed_delete_count: std::cell::Cell::new(0),
             arkui: crate::render::arkui::empty_batch(),
             arkui_views: Default::default(),
             host: config.host.clone(),

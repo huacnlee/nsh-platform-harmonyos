@@ -33,12 +33,13 @@ pub(crate) struct Screen {
     header: NativeNode,
     title: NativeNode,
     back: NativeNode,
+    back_paint: RefCell<Option<crate::render::paint_node::PaintNode>>,
     has_back: Cell<bool>,
     top: Cell<bool>,
     revealed: Cell<bool>,
     entered: Cell<bool>,
     progress: Cell<f32>,
-    peer: RefCell<Weak<Node>>,
+    pub(crate) peer: RefCell<Weak<Node>>,
     motion: RefCell<Option<Motion>>,
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     immediate_removal: Cell<bool>,
@@ -90,6 +91,7 @@ impl Screen {
             header,
             title,
             back,
+            back_paint: RefCell::new(None),
             has_back: Cell::new(false),
             top: Cell::new(false),
             revealed: Cell::new(false),
@@ -102,7 +104,7 @@ impl Screen {
             insets: Cell::new(None),
         });
         let weak = Rc::downgrade(&screen);
-        screen.back.borrow_mut().on_custom_draw(move |event| {
+        let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
             crate::render::node::callback(|| {
                 let Some(screen) = weak.upgrade() else {
                     return Ok(());
@@ -110,18 +112,9 @@ impl Screen {
                 let Some(owner) = screen.owner.upgrade() else {
                     return Ok(());
                 };
-                let Some(context) = event.draw_context_in_draw() else {
-                    return Ok(());
-                };
-                let Some(raw) = context.canvas() else {
-                    return Ok(());
-                };
-                // SAFETY: ArkUI owns this canvas throughout the draw callback.
-                let canvas = unsafe { ohos_drawing_binding::Canvas::from_raw_borrowed(raw) };
                 use ohos_drawing_binding::{LineCap, LineJoin, Path, Pen};
-                let size = context.size();
                 let scale = owner.scale.get();
-                let (x, y) = (size.width as f32 / 2.0, size.height as f32 / 2.0);
+                let (x, y) = (22.0 * scale, 22.0 * scale);
                 let direction = if owner.platform.get().rtl { -1.0 } else { 1.0 };
                 let mut path = Path::new();
                 path.move_to(x + 4.0 * scale * direction, y - 8.0 * scale);
@@ -149,7 +142,9 @@ impl Screen {
                 canvas.detach_pen();
                 Ok(())
             });
-        });
+        })?;
+        screen.back.borrow_mut().add_child(paint.native.clone())?;
+        *screen.back_paint.borrow_mut() = Some(paint);
         let weak = Rc::downgrade(&screen);
         screen.back.borrow_mut().on_click(move || {
             if let Some(screen) = weak.upgrade() {
@@ -168,13 +163,31 @@ impl Screen {
         self.insets.get().is_some()
     }
     pub(crate) fn paint_visible(&self) -> bool {
-        if self.shader.borrow().as_ref().is_some_and(|n| n.backwards) {
-            return false;
+        crate::render::shader::navigation::screen_paint_visible(
+            self.shader.borrow().as_deref(),
+            self.is_top(),
+            self.revealed.get(),
+            self.motion.borrow().is_some(),
+        )
+    }
+
+    pub(crate) fn on_shader_captured(
+        &self,
+        navigation: &crate::render::shader::navigation::Navigation,
+    ) -> Result<()> {
+        let matches = self
+            .shader
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.key == navigation.key);
+        if !matches {
+            return Ok(());
         }
-        self.is_top()
-            || self.revealed.get()
-            || self.motion.borrow().is_some()
-            || self.shader.borrow().is_some()
+        if !navigation.backwards {
+            self.progress.set(0.0);
+        }
+        self.show()?;
+        self.paint()
     }
     pub(crate) fn large_title_offset(&self) -> f32 {
         let c = self.config.borrow();
@@ -272,7 +285,7 @@ impl Screen {
             },
             4.0 + overlap,
         ])?;
-        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        self.invalidate_back()?;
         let label = self.previous().and_then(|previous| {
             let screen = previous.screen.borrow();
             let config = screen.as_ref()?.config.borrow();
@@ -287,7 +300,6 @@ impl Screen {
         drop(c);
         for child in owner.children.borrow().iter().filter_map(Weak::upgrade) {
             if child.kind == ViewKind::HeaderItem {
-                child.mounted().borrow().z_index(2)?;
                 child.restore_style()?;
             } else {
                 child.set_frame(child.raw_frame.get())?;
@@ -333,23 +345,14 @@ impl Screen {
             .set_position(vec![x, 4.0 + owner.top_overlap()])?;
         Ok(())
     }
-    pub(crate) fn restore_visibility(&self) -> Result<()> {
-        let c = self.config.borrow();
-        self.header
-            .borrow()
-            .set_i32_attribute(A::Visibility, i32::from(!c.header_visible))?;
-        self.title
-            .borrow()
-            .set_i32_attribute(A::Visibility, i32::from(c.title_view.is_some()))?;
-        self.back.borrow().set_i32_attribute(
-            A::Visibility,
-            i32::from(!self.has_back.get() || !c.back_visible),
-        )?;
-        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
-        Ok(())
-    }
-    pub(crate) fn invalidate_paint(&self) -> Result<()> {
-        self.back.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+    fn invalidate_back(&self) -> Result<()> {
+        if let Some(paint) = self.back_paint.borrow().as_ref()
+            && let Some(owner) = self.owner.upgrade()
+        {
+            let side = (44.0 * owner.scale.get()).round() as i32;
+            paint.bounds([0, 0, side, side])?;
+            paint.invalidate()?;
+        }
         Ok(())
     }
     pub(crate) fn request_back(&self) -> Result<()> {
@@ -396,6 +399,9 @@ impl Screen {
         }
         None
     }
+    pub(crate) fn is_unanimated(&self) -> bool {
+        self.motion.borrow().is_none() && self.shader.borrow().is_none()
+    }
     fn show(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             owner.restore_style()?;
@@ -434,10 +440,9 @@ impl Screen {
         let sign = if owner.platform.get().rtl { -1.0 } else { 1.0 };
         let (enter_x, _) =
             nsh_core::navigation::push_offsets(nsh_core::Points(owner.frame.get().width), 1.0 - p);
-        owner.navigation_presentation(
-            if fade { 1.0 - p } else { 1.0 },
-            if fade { 0.0 } else { enter_x.0 * sign },
-        )?;
+        let alpha = if fade { 1.0 - p } else { 1.0 };
+        let dx = if fade { 0.0 } else { enter_x.0 * sign };
+        owner.navigation_presentation(alpha, dx)?;
         if let Some(peer) = self.peer.borrow().upgrade() {
             let (_, below_x) = nsh_core::navigation::push_offsets(
                 nsh_core::Points(peer.frame.get().width),
@@ -445,6 +450,22 @@ impl Screen {
             );
             peer.navigation_presentation(1.0, if fade { 0.0 } else { below_x.0 * sign })?;
         }
+        Ok(())
+    }
+    fn start_motion(&self, owner: &Rc<Node>, to: f32) -> Result<()> {
+        let motion = nsh_core::navigation::screen_motion(
+            self.config.borrow().animation,
+            owner.platform.get().reduce_motion,
+        );
+        *self.motion.borrow_mut() = Some(Motion::new(
+            None,
+            self.progress.get(),
+            to,
+            motion.map(|motion| motion.0),
+        ));
+        self.show()?;
+        self.paint()?;
+        owner.animator.track(owner);
         Ok(())
     }
     fn animate(&self, to: f32) -> Result<()> {
@@ -466,21 +487,12 @@ impl Screen {
             owner.animator.track(&owner);
             return Ok(());
         }
-        let motion = nsh_core::navigation::screen_motion(
-            self.config.borrow().animation,
-            owner.platform.get().reduce_motion,
-        );
-        *self.motion.borrow_mut() = Some(Motion::new(
-            owner.animator.now(),
-            self.progress.get(),
-            to,
-            motion.map(|motion| motion.0),
-        ));
-        self.show()?;
-        self.paint()?;
-        owner.animator.track(&owner);
-        Ok(())
+        if self.shader.borrow_mut().take().is_some() {
+            owner.shaders.end_navigation(owner.id)?;
+        }
+        self.start_motion(&owner, to)
     }
+
     fn push(&self) -> Result<()> {
         let shader = self
             .owner
@@ -496,6 +508,7 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(false);
         };
+
         if self.immediate_removal.get() {
             return Ok(false);
         }
@@ -512,6 +525,9 @@ impl Screen {
             && owner.navigation_shader.borrow().is_none())
             || !self.reveal()?
         {
+            self.progress.set(1.0);
+            let sign = if owner.platform.get().rtl { -1.0 } else { 1.0 };
+            owner.navigation_presentation(0.0, owner.frame.get().width * sign)?;
             self.show()?;
             return Ok(false);
         }
@@ -540,9 +556,10 @@ impl Screen {
         Ok(())
     }
     fn settle(&self) -> Result<()> {
+        let popped = self.popped.get();
         let shader = self.shader.borrow_mut().take();
         self.motion.borrow_mut().take();
-        self.progress.set(0.0);
+        self.progress.set(if popped { 1.0 } else { 0.0 });
         if let Some(peer) = self.peer.replace(Weak::new()).upgrade() {
             let shared = self
                 .owner
@@ -575,12 +592,17 @@ impl Screen {
                 peer.invalidate_scene();
             }
         }
-        self.show()?;
+
         if let Some(owner) = self.owner.upgrade() {
-            owner.navigation_presentation(1.0, 0.0)?;
+            if popped {
+                let sign = if owner.platform.get().rtl { -1.0 } else { 1.0 };
+                owner.navigation_presentation(0.0, owner.frame.get().width * sign)?;
+            } else {
+                owner.navigation_presentation(1.0, 0.0)?;
+            }
         }
-        // Establish final native visibility before switching the root out of
-        // export, so its attachment repair includes every newly hidden screen.
+        self.show()?;
+
         if shader.is_some()
             && let Some(owner) = self.owner.upgrade()
         {
@@ -593,13 +615,27 @@ impl Screen {
             .shader
             .borrow()
             .as_ref()
-            .map(|n| (n.running(), n.backwards));
-        if let Some((running, backwards)) = shader {
+            .map(|n| (n.running(), n.take_fallback(), n.backwards));
+        if let Some((running, fallback, backwards)) = shader {
             if running {
                 return Ok((true, false));
             }
-            self.settle()?;
-            return Ok((false, backwards));
+            if fallback {
+                self.shader.borrow_mut().take();
+                if let Some(owner) = self.owner.upgrade() {
+                    owner.shaders.end_navigation(owner.id)?;
+                    if !backwards && self.progress.get() == 0.0 {
+                        self.progress.set(1.0);
+                    }
+                    self.start_motion(&owner, if backwards { 1.0 } else { 0.0 })?;
+                } else {
+                    self.settle()?;
+                    return Ok((false, backwards));
+                }
+            } else {
+                self.settle()?;
+                return Ok((false, backwards));
+            }
         }
         let state = self.motion.borrow().as_ref().map(|motion| motion.step(now));
         let Some((progress, done, to)) = state else {
@@ -663,7 +699,7 @@ impl Screen {
         if let Some(owner) = self.owner.upgrade() {
             self.layout_title(&owner, &self.config.borrow())?;
             // These slots are explicitly laid out below. A newly attached
-            // export wrapper needs measurement in the same parent pass, even
+            // content wrapper needs measurement in the same parent pass, even
             // when its engine-resolved size has not changed.
             for child in owner
                 .children

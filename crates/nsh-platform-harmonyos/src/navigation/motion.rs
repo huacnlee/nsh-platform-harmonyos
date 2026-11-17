@@ -1,20 +1,28 @@
 //! Pure push/pop interpolation and edge-swipe completion decisions.
 
+use std::cell::Cell;
+
+/// One 120 Hz VSync interval (`~8.33 ms`) of initial lead when an unanchored
+/// `Motion` samples its first VSync. Keeps cold-mount delays out of the curve
+/// while ensuring VSync 1 always produces a non-zero transform/alpha delta so
+/// ArkUI's `FlushRenderTask` commits frame 1 and schedules VSync 2.
+const INITIAL_VSYNC_LEAD_MS: f64 = 1000.0 / 120.0;
+
 pub(crate) struct Motion {
-    start: f64,
+    start: Cell<Option<f64>>,
     duration: f64,
     from: f32,
     pub(crate) to: f32,
 }
 impl Motion {
     pub(crate) fn new(
-        start: f64,
+        start: Option<f64>,
         from: f32,
         to: f32,
         duration: Option<std::time::Duration>,
     ) -> Self {
         Self {
-            start,
+            start: Cell::new(start),
             from,
             to,
             duration: duration.map_or(0.0, |duration| {
@@ -23,10 +31,23 @@ impl Motion {
         }
     }
     pub(crate) fn step(&self, now: f64) -> (f32, bool, f32) {
+        let start = match self.start.get() {
+            Some(start) => start,
+            None => {
+                let lead = if self.duration > 0.0 {
+                    INITIAL_VSYNC_LEAD_MS.min(self.duration * 0.25)
+                } else {
+                    0.0
+                };
+                let anchored = now - lead;
+                self.start.set(Some(anchored));
+                anchored
+            }
+        };
         let t = if self.duration <= 0.0 {
             1.0
         } else {
-            ((now - self.start) / self.duration).clamp(0.0, 1.0) as f32
+            ((now - start) / self.duration).clamp(0.0, 1.0) as f32
         };
         (
             self.from + (self.to - self.from) * nsh_core::navigation::ease(t as f64),
@@ -73,7 +94,7 @@ mod tests {
     }
     #[test]
     fn cancelling_a_partial_swipe_preserves_position_and_finishes_at_rest() {
-        let cancel = Motion::new(100.0, 0.4, 0.0, Some(nsh_core::navigation::SLIDE));
+        let cancel = Motion::new(Some(100.0), 0.4, 0.0, Some(nsh_core::navigation::SLIDE));
         assert_eq!(cancel.step(100.0), (0.4, false, 0.0));
         let middle = cancel.step(160.0);
         assert!(middle.0 > 0.0 && middle.0 < 0.4 && !middle.1);
@@ -85,11 +106,32 @@ mod tests {
             let motion =
                 nsh_core::navigation::screen_motion(nsh_core::ScreenAnimation::Fade, reduced)
                     .map(|m| m.0);
-            let fade = Motion::new(0.0, 0.0, 1.0, motion);
+            let fade = Motion::new(Some(0.0), 0.0, 1.0, motion);
             assert!(!fade.step(100.0).1);
             assert_eq!(fade.step(200.0), (1.0, true, 1.0));
         }
-        assert_eq!(Motion::new(0.0, 1.0, 0.0, None).step(0.0), (0.0, true, 0.0));
+        assert_eq!(
+            Motion::new(Some(0.0), 1.0, 0.0, None).step(0.0),
+            (0.0, true, 0.0)
+        );
+    }
+    #[test]
+    fn unanchored_motion_starts_on_first_vsync_sample() {
+        // Push (1.0 -> 0.0): advances off 1.0 on VSync 1 even after a 540ms cold stall,
+        // while preserving >97% of the 300ms curve.
+        let slide = Motion::new(None, 1.0, 0.0, Some(nsh_core::navigation::SLIDE));
+        let first = slide.step(540.0);
+        assert!(first.0 < 1.0 && first.0 > 0.9 && !first.1);
+        let mid = slide.step(680.0);
+        assert!(mid.0 > 0.0 && mid.0 < first.0 && !mid.1);
+        assert_eq!(slide.step(840.0), (0.0, true, 0.0));
+
+        // Pop (0.0 -> 1.0, e.g. hardware back): steps > 0.0 on VSync 1 so Transform
+        // immediately mutates and keeps ArkUI's VSync loop running.
+        let pop = Motion::new(None, 0.0, 1.0, Some(nsh_core::navigation::SLIDE));
+        let pop_first = pop.step(1000.0);
+        assert!(pop_first.0 > 0.0 && pop_first.0 < 0.1 && !pop_first.1);
+        assert_eq!(pop.step(1300.0), (1.0, true, 1.0));
     }
     #[test]
     fn completion_accounts_for_fling_direction_and_invalid_geometry() {

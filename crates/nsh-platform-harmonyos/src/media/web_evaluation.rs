@@ -27,16 +27,48 @@ pub(crate) type Reply = Box<dyn Fn(NodeId, EventKind, EventPayload)>;
 pub(crate) type Schedule = Box<dyn Fn(Duration, Box<dyn FnOnce()>)>;
 pub(crate) type JsDone = Box<dyn FnOnce(Option<&[u8]>)>;
 
+#[derive(Clone)]
+pub(crate) struct EvalGuard {
+    alive: Rc<Cell<bool>>,
+    dispatched: Rc<Cell<bool>>,
+}
+
+impl EvalGuard {
+    fn new() -> Self {
+        Self {
+            alive: Rc::new(Cell::new(true)),
+            dispatched: Rc::new(Cell::new(false)),
+        }
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.get()
+    }
+
+    pub(crate) fn mark_dispatched(&self) {
+        self.dispatched.set(true);
+    }
+
+    fn was_dispatched(&self) -> bool {
+        self.dispatched.get()
+    }
+
+    fn cancel(&self) {
+        self.alive.set(false);
+    }
+}
+
 pub(crate) trait ScriptHost {
-    fn evaluate(&self, script: &str, done: JsDone);
+    fn evaluate(&self, script: &str, guard: EvalGuard, done: JsDone);
 
     fn execute(&self, script: &str) {
-        self.evaluate(script, Box::new(|_| {}));
+        self.evaluate(script, EvalGuard::new(), Box::new(|_| {}));
     }
 }
 
 struct Pending {
     serial: u64,
+    guard: EvalGuard,
     poll: String,
     cleanup: String,
 }
@@ -81,15 +113,22 @@ impl Evaluations {
         let serial = self.serial.get().wrapping_add(1);
         self.serial.set(serial);
         let key = format!("__nsh_evaluation_{}_{}_{}", self.id, request, serial);
+        let guard = EvalGuard::new();
         self.pending.borrow_mut().insert(
             request,
             Pending {
                 serial,
+                guard: guard.clone(),
                 poll: script::poll_script(&key),
                 cleanup: script::cleanup_script(&key),
             },
         );
-        self.run(request, serial, &script::start_script(script_source, &key));
+        self.run(
+            request,
+            serial,
+            guard,
+            &script::start_script(script_source, &key),
+        );
     }
 
     pub(crate) fn cancel(&self, request: u32) {
@@ -144,7 +183,10 @@ impl Evaluations {
     }
 
     fn cleanup(&self, entry: Pending) {
-        if let Some(web) = self.web() {
+        entry.guard.cancel();
+        if entry.guard.was_dispatched()
+            && let Some(web) = self.web()
+        {
             web.execute(&entry.cleanup);
         }
     }
@@ -176,8 +218,8 @@ impl Evaluations {
         self.error(request, code, message);
     }
 
-    fn run(self: &Rc<Self>, request: u32, serial: u64, source: &str) {
-        if !self.active(request, serial) {
+    fn run(self: &Rc<Self>, request: u32, serial: u64, guard: EvalGuard, source: &str) {
+        if !self.active(request, serial) || !guard.is_alive() {
             return;
         }
         let Some(web) = self.web() else {
@@ -192,6 +234,7 @@ impl Evaluations {
         let state = Rc::downgrade(self);
         web.evaluate(
             source,
+            guard,
             Box::new(move |raw| {
                 let Some(state) = state.upgrade() else {
                     return;
@@ -255,14 +298,14 @@ impl Evaluations {
                                 let Some(state) = weak.upgrade() else {
                                     return;
                                 };
-                                let poll = state
+                                let next = state
                                     .pending
                                     .borrow()
                                     .get(&request)
                                     .filter(|entry| entry.serial == serial)
-                                    .map(|entry| entry.poll.clone());
-                                if let Some(poll) = poll {
-                                    state.run(request, serial, &poll);
+                                    .map(|entry| (entry.guard.clone(), entry.poll.clone()));
+                                if let Some((guard, poll)) = next {
+                                    state.run(request, serial, guard, &poll);
                                 }
                             }),
                         );
@@ -322,9 +365,20 @@ mod tests {
     type JsCall = (String, JsDone);
     type ScheduledTimer = (Duration, Box<dyn FnOnce()>);
 
-    #[derive(Default)]
     struct MockWeb {
+        ready: Cell<bool>,
+        queued: RefCell<VecDeque<(EvalGuard, String, JsDone)>>,
         calls: RefCell<VecDeque<JsCall>>,
+    }
+
+    impl Default for MockWeb {
+        fn default() -> Self {
+            Self {
+                ready: Cell::new(true),
+                queued: RefCell::new(VecDeque::new()),
+                calls: RefCell::new(VecDeque::new()),
+            }
+        }
     }
 
     impl MockWeb {
@@ -334,11 +388,29 @@ mod tests {
                 .pop_front()
                 .expect("expected queued run_javascript call")
         }
+
+        fn flush_ready(&self) {
+            self.ready.set(true);
+            let queued = std::mem::take(&mut *self.queued.borrow_mut());
+            for (guard, script, done) in queued {
+                if guard.is_alive() {
+                    guard.mark_dispatched();
+                    self.calls.borrow_mut().push_back((script, done));
+                }
+            }
+        }
     }
 
     impl ScriptHost for MockWeb {
-        fn evaluate(&self, script: &str, done: JsDone) {
-            self.calls.borrow_mut().push_back((script.to_owned(), done));
+        fn evaluate(&self, script: &str, guard: EvalGuard, done: JsDone) {
+            if self.ready.get() {
+                guard.mark_dispatched();
+                self.calls.borrow_mut().push_back((script.to_owned(), done));
+            } else {
+                let mut queued = self.queued.borrow_mut();
+                queued.retain(|(g, _, _)| g.is_alive());
+                queued.push_back((guard, script.to_owned(), done));
+            }
         }
     }
 
@@ -513,5 +585,25 @@ mod tests {
             panic!("expected map");
         };
         assert_eq!(fields.len(), 2);
+    }
+
+    #[test]
+    fn cancelling_before_controller_ready_never_executes_script_or_cleanup() {
+        let h = Harness::new();
+        h.web.ready.set(false);
+        h.evals.start(1, "sideEffect()", true);
+        h.evals.start(2, "liveCall()", true);
+        assert_eq!(h.web.queued.borrow().len(), 2);
+
+        // Cancel request 1 before controller becomes ready: neither start nor cleanup runs.
+        h.evals.cancel(1);
+        h.web.flush_ready();
+        assert_eq!(h.web.calls.borrow().len(), 1);
+        let (ran_script, done) = h.web.pop_script();
+        assert!(ran_script.contains("liveCall()"), "{ran_script}");
+        done(Some(br#"{"status":"ok","value":7}"#));
+        let replies = h.take_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, 2);
     }
 }

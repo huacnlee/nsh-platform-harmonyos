@@ -90,6 +90,7 @@ impl Native {
 
 // Only the binding API used by the production controller is doubled here.
 pub(crate) mod render {
+    pub(crate) use crate::effects;
     pub(crate) use crate::geometry;
     pub(crate) mod node {
         pub(crate) type NativeNode = super::super::NativeNode;

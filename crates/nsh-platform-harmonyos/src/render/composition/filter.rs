@@ -37,7 +37,7 @@ impl Image {
         self.filter_chain(effects, scale, TileMode::Decal)
     }
     pub(crate) fn backdrop(&self, effects: &[Effect], scale: f32) -> Result<Self, &'static str> {
-        self.filter_chain(effects, scale, TileMode::Mirror)
+        self.filter_chain(effects, scale, TileMode::Clamp)
     }
     fn filter_chain(
         &self,
@@ -46,8 +46,12 @@ impl Image {
         tile: TileMode,
     ) -> Result<Self, &'static str> {
         let mut image = Self::copy(&self.bitmap, self.x, self.y);
-        for effect in effects {
-            image = image.apply(*effect, scale, tile)?;
+        for effect in effects
+            .iter()
+            .copied()
+            .filter(|effect| !crate::render::effects::is_noop_filter(effect))
+        {
+            image = image.apply(effect, scale, tile)?;
         }
         Ok(image)
     }
@@ -106,7 +110,7 @@ impl Image {
             } => (
                 offset_x.0 * scale,
                 offset_y.0 * scale,
-                super::geometry::blur_sigma(blur.0, scale),
+                super::geometry::shadow_blur_sigma(blur.0, scale),
                 Some(color),
             ),
             Effect::Blur(radius) => (0.0, 0.0, super::geometry::blur_sigma(radius.0, scale), None),

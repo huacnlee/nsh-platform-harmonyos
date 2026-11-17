@@ -4,27 +4,20 @@ use std::{cell::RefCell, sync::Arc};
 use nsh_core::{
     BorderStyle, Gradient, GradientKind, GradientSize, Points, Size as CoreSize, ViewStyle,
 };
-use ohos_arkui_binding::{
-    component::attribute::ArkUICommonAttribute,
-    types::{attribute::ArkUINodeAttributeType as A, view::BlendMode as B},
-};
+use ohos_arkui_binding::types::view::BlendMode as ArkUiBlendMode;
 use ohos_drawing_binding::{
     Brush, Canvas, ClipOperation, CornerPosition, Filter, MaskFilter, Matrix, Path, PathDirection,
     PathEffect, PathFillType, Pen, Rect, RoundRect, ShaderEffect, TileMode,
 };
 
-use super::shadow_geometry::visible_shadow;
+use super::{gradient::NativeStops, shadow_geometry::visible_shadow};
 use crate::{
-    render::{
-        geometry::Size,
-        node::{Node, Result},
-    },
+    render::{geometry::Size, node::Node},
     text::typography::argb,
 };
 #[derive(Default)]
 pub(crate) struct Decoration {
     backgrounds: RefCell<Option<Backgrounds>>,
-    native: RefCell<Option<NativeEffects>>,
     shadows: RefCell<[Option<Shadows>; 2]>,
 }
 struct Shadows {
@@ -51,122 +44,52 @@ struct Backgrounds {
     path: Path,
     paints: Vec<Brush>,
 }
-#[derive(Clone, PartialEq)]
-struct NativeEffects {
-    blur: f32,
-    backdrop_blur: f32,
-    blend: nsh_core::BlendMode,
-}
-impl Default for NativeEffects {
-    fn default() -> Self {
-        Self {
-            blur: 0.0,
-            backdrop_blur: 0.0,
-            blend: nsh_core::BlendMode::Normal,
+pub(crate) fn warn_repeating_conic(owner: &Node, style: &ViewStyle) {
+    for g in style
+        .effects
+        .as_ref()
+        .into_iter()
+        .flat_map(|e| &e.background_images)
+    {
+        if matches!(g.kind, GradientKind::Conic { .. }) && g.repeating && !g.stops.is_empty() {
+            let frame = owner.frame.get();
+            let stops = g.resolved_stops(CoreSize::new(Points(frame.width), Points(frame.height)));
+            let span = stops.last().unwrap().1.0 - stops[0].1.0;
+            if span > 1e-5 && (1.0 / span + 3.0) * stops.len() as f32 > 4096.0 {
+                log::warn!("OHOS repeating conic gradient: limiting repeated stops to 4096");
+            }
         }
+    }
+}
+pub(crate) fn arkui_blend_mode(blend: nsh_core::BlendMode) -> ArkUiBlendMode {
+    use nsh_core::BlendMode as M;
+    match blend {
+        M::Normal => ArkUiBlendMode::None,
+        M::Multiply => ArkUiBlendMode::Multiply,
+        M::Screen => ArkUiBlendMode::Screen,
+        M::Overlay => ArkUiBlendMode::Overlay,
+        M::Darken => ArkUiBlendMode::Darken,
+        M::Lighten => ArkUiBlendMode::Lighten,
+        M::ColorDodge => ArkUiBlendMode::ColorDodge,
+        M::ColorBurn => ArkUiBlendMode::ColorBurn,
+        M::HardLight => ArkUiBlendMode::HardLight,
+        M::SoftLight => ArkUiBlendMode::SoftLight,
+        M::Difference => ArkUiBlendMode::Difference,
+        M::Exclusion => ArkUiBlendMode::Exclusion,
+        M::Hue => ArkUiBlendMode::Hue,
+        M::Saturation => ArkUiBlendMode::Saturation,
+        M::Color => ArkUiBlendMode::Color,
+        M::Luminosity => ArkUiBlendMode::Luminosity,
+        M::PlusLighter => ArkUiBlendMode::Plus,
+        // Scene composition owns this mode. Hidden/detached triggers
+        // can keep the style while their native exports retire.
+        M::PlusDarker => ArkUiBlendMode::None,
     }
 }
 impl Decoration {
-    pub(crate) fn invalidate_native(&self) {
-        self.native.borrow_mut().take();
-    }
     pub(crate) fn clear_paint_cache(&self) {
         self.backgrounds.borrow_mut().take();
         *self.shadows.borrow_mut() = [None, None];
-    }
-    pub(crate) fn native(&self, owner: &Node, style: &ViewStyle) -> Result<()> {
-        use nsh_core::{BlendMode as M, Filter as F};
-        for g in style
-            .effects
-            .as_ref()
-            .into_iter()
-            .flat_map(|e| &e.background_images)
-        {
-            if matches!(g.kind, GradientKind::Conic { .. }) && g.repeating && !g.stops.is_empty() {
-                let frame = owner.frame.get();
-                let stops =
-                    g.resolved_stops(CoreSize::new(Points(frame.width), Points(frame.height)));
-                let span = stops.last().unwrap().1.0 - stops[0].1.0;
-                if span > 1e-5 && (1.0 / span + 3.0) * stops.len() as f32 > 4096.0 {
-                    log::warn!("OHOS repeating conic gradient: limiting repeated stops to 4096");
-                }
-            }
-        }
-        let mut effect = NativeEffects {
-            blend: if owner.scene_active() {
-                nsh_core::BlendMode::Normal
-            } else {
-                style.blend_mode
-            },
-            ..NativeEffects::default()
-        };
-        for filter in style
-            .effects
-            .as_ref()
-            .filter(|_| !owner.scene_active())
-            .into_iter()
-            .flat_map(|e| &e.backdrop_filters)
-        {
-            if let F::Blur(radius) = filter {
-                effect.backdrop_blur += radius.0;
-            }
-        }
-        if !owner.scene_active()
-            && let Some(effects) = style.effects.as_ref()
-            && effects
-                .filters
-                .iter()
-                .all(|filter| matches!(filter, F::Blur(_)))
-        {
-            for filter in &effects.filters {
-                if let F::Blur(radius) = filter {
-                    effect.blur += radius.0;
-                }
-            }
-        }
-        let mut previous = self.native.borrow_mut();
-        let default = NativeEffects::default();
-        let old = previous.as_ref().unwrap_or(&default);
-        let native = owner.native.borrow();
-        if old.blur != effect.blur {
-            owner
-                .visual_node()
-                .borrow()
-                .set_f32_attribute(A::Blur, effect.blur.max(0.0))?;
-        }
-        if old.backdrop_blur != effect.backdrop_blur {
-            native.set_f32_attribute(A::BackdropBlur, effect.backdrop_blur.max(0.0))?;
-        }
-        if old.blend != effect.blend {
-            let mode = match effect.blend {
-                M::Normal => B::None,
-                M::Multiply => B::Multiply,
-                M::Screen => B::Screen,
-                M::Overlay => B::Overlay,
-                M::Darken => B::Darken,
-                M::Lighten => B::Lighten,
-                M::ColorDodge => B::ColorDodge,
-                M::ColorBurn => B::ColorBurn,
-                M::HardLight => B::HardLight,
-                M::SoftLight => B::SoftLight,
-                M::Difference => B::Difference,
-                M::Exclusion => B::Exclusion,
-                M::Hue => B::Hue,
-                M::Saturation => B::Saturation,
-                M::Color => B::Color,
-                M::Luminosity => B::Luminosity,
-                M::PlusLighter => B::Plus,
-                // Scene composition owns this mode. Hidden/detached triggers
-                // can keep the style while their native exports retire.
-                M::PlusDarker => B::None,
-            };
-            owner
-                .visual_node()
-                .borrow()
-                .set_attribute(A::BlendMode, vec![i32::from(mode), 1].into())?;
-        }
-        *previous = Some(effect);
-        Ok(())
     }
     pub(crate) fn background(&self, canvas: &Canvas, style: &ViewStyle, size: Size, scale: f32) {
         let Some(effects) = style.effects.as_ref() else {
@@ -451,6 +374,25 @@ pub(crate) fn outline(style: &ViewStyle, size: Size, spread: f32) -> Path {
     )
     .to_array()
     .map(|r| r.0);
+    if !style.continuous_corners {
+        // Preserve the native rounded-rectangle primitive. Expanding circular
+        // corners into cubics prevents the renderer's rounded-rect blur path.
+        let rect = Rect::new(-spread, -spread, w - spread, h - spread);
+        let mut round_rect = RoundRect::new(&rect, 0.0, 0.0);
+        for (corner, radius) in [
+            CornerPosition::TopLeft,
+            CornerPosition::TopRight,
+            CornerPosition::BottomRight,
+            CornerPosition::BottomLeft,
+        ]
+        .into_iter()
+        .zip(radii)
+        {
+            round_rect.set_corner(corner, radius, radius);
+        }
+        path.add_round_rect(&round_rect, PathDirection::Cw);
+        return path;
+    }
     nsh_core::shape::rounded_rect(
         nsh_core::Bounds::new(
             nsh_core::Point::new(Points(-spread), Points(-spread)),
@@ -504,8 +446,30 @@ pub(crate) fn gradient(g: &Gradient, size: Size) -> Brush {
     let last = stops.last().unwrap().1.0;
     let span = (last - first).max(1e-6);
     brush.set_color(argb(stops.last().unwrap().0));
-    let colors: Vec<_> = stops.iter().map(|(c, _)| argb(*c)).collect();
-    let positions: Vec<_> = stops.iter().map(|(_, p)| (p.0 - first) / span).collect();
+    let stops = if let GradientKind::Conic { from, .. } = g.kind {
+        let mut stops: Vec<_> = stops.into_iter().map(|(c, p)| (p.0, c)).collect();
+        if g.repeating && span > 1e-5 {
+            let original = stops.clone();
+            stops.clear();
+            let start = (-last / span).floor() as i32;
+            let end = ((1.0 - first) / span).ceil() as i32;
+            // A maliciously tiny period must not allocate unbounded stops.
+            if (end - start) as usize * original.len() <= 4096 {
+                for k in start..=end {
+                    stops.extend(original.iter().map(|(p, c)| (*p + k as f32 * span, *c)));
+                }
+            } else {
+                stops = vec![(0.0, original[0].1), (1.0, original.last().unwrap().1)];
+            }
+        }
+        super::gradient::sweep_stops(&stops, from.0 - std::f32::consts::FRAC_PI_2)
+    } else {
+        stops
+            .into_iter()
+            .map(|(c, p)| ((p.0 - first) / span, c))
+            .collect()
+    };
+    let NativeStops { colors, positions } = NativeStops::new(&stops);
     let tile = if g.repeating {
         TileMode::Repeat
     } else {
@@ -528,29 +492,7 @@ pub(crate) fn gradient(g: &Gradient, size: Size) -> Brush {
                 Some(&matrix),
             )
         }
-        GradientKind::Conic { from, x, y } => {
-            let mut stops: Vec<_> = stops.into_iter().map(|(c, p)| (p.0, c)).collect();
-            if g.repeating && span > 1e-5 {
-                let original = stops.clone();
-                stops.clear();
-                let start = (-last / span).floor() as i32;
-                let end = ((1.0 - first) / span).ceil() as i32;
-                // A maliciously tiny period must not allocate unbounded stops.
-                if (end - start) as usize * original.len() <= 4096 {
-                    for k in start..=end {
-                        stops.extend(original.iter().map(|(p, c)| (*p + k as f32 * span, *c)));
-                    }
-                } else {
-                    stops = vec![(0.0, original[0].1), (1.0, original.last().unwrap().1)];
-                }
-            }
-            let begin = crate::render::canvas::sample(&stops, 0.0);
-            let end = crate::render::canvas::sample(&stops, 1.0);
-            stops.retain(|(p, _)| *p > 0.0 && *p < 1.0);
-            stops.insert(0, (0.0, begin));
-            stops.push((1.0, end));
-            let (colors, positions) =
-                crate::render::canvas::sweep_stops(&stops, from.0 - std::f32::consts::FRAC_PI_2);
+        GradientKind::Conic { x, y, .. } => {
             ShaderEffect::conic_gradient((x.0 * w, y.0 * h), &colors, &positions, TileMode::Clamp)
         }
         kind => {

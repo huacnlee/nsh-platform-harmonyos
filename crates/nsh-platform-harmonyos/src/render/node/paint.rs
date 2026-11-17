@@ -4,8 +4,7 @@ use std::rc::{Rc, Weak};
 
 use nsh_core::ViewKind;
 use ohos_arkui_binding::{
-    api::node_custom_event::NodeCustomEvent, component::attribute::ArkUIEvent,
-    types::advanced::NodeDirtyFlag,
+    component::attribute::ArkUICommonAttribute, types::advanced::NodeDirtyFlag,
 };
 use ohos_drawing_binding::Canvas;
 
@@ -16,22 +15,53 @@ use crate::{
 };
 
 impl Node {
-    /// Plain native containers need no recording canvas. Install custom paint
-    /// only when content needs it, as text/canvas views do on UIKit. Keep the
-    /// callback thereafter so removing that content clears the old recording.
-    pub(crate) fn enable_drawing(&self) {
-        if self.drawing.replace(true) {
-            return;
+    /// Custom ink belongs to a retained native modifier, so moving its tree to
+    /// or from a texture target preserves the draw callback and its resources.
+    pub(crate) fn enable_drawing(&self) -> Result<()> {
+        if self.drawing.borrow().is_some() {
+            return Ok(());
         }
         let weak = self.weak.clone();
-        self.native.borrow_mut().on_custom_draw(move |event| {
-            callback(|| {
-                if let Some(node) = weak.upgrade() {
-                    node.draw(event);
-                }
-                Ok(())
-            });
-        });
+        let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
+            if let Some(node) = weak.upgrade() {
+                node.draw(canvas);
+            }
+        })?;
+        paint.native.borrow().set_i32_attribute(
+            ohos_arkui_binding::types::attribute::ArkUINodeAttributeType::ZIndex,
+            -1,
+        )?;
+        let index = self.native.borrow().children().len();
+        self.native
+            .borrow_mut()
+            .insert_child(paint.native.clone(), index)?;
+        *self.drawing.borrow_mut() = Some(paint);
+        self.invalidate_paint()
+    }
+    pub(crate) fn invalidate_paint(&self) -> Result<()> {
+        if let Some(paint) = self.drawing.borrow().as_ref() {
+            let frame = self.frame.get();
+            paint.bounds([
+                0,
+                0,
+                (frame.width * self.scale.get()).round() as i32,
+                (frame.height * self.scale.get()).round() as i32,
+            ])?;
+            paint.invalidate()?;
+        }
+        if let Some(paint) = self.outlined.borrow().as_ref() {
+            let frame = self.frame.get();
+            let pad = (self.applied.get().ink_outset * self.scale.get()).ceil() as i32;
+            paint.bounds([
+                -pad,
+                -pad,
+                (frame.width * self.scale.get()).ceil() as i32 + pad * 2,
+                (frame.height * self.scale.get()).ceil() as i32 + pad * 2,
+            ])?;
+            paint.invalidate()?;
+        }
+        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+        Ok(())
     }
     pub(crate) fn scene_active(&self) -> bool {
         self.scene_prepared.get()
@@ -54,13 +84,9 @@ impl Node {
         }
     }
     pub(crate) fn scene_opacity(&self) -> f32 {
-        self.style.borrow().opacity
-            * self.presentation.get().0
-            * self.extra.get().0
-            * self.navigation_presentation.get().0
+        self.visual_opacity_for(self.style.borrow().opacity)
     }
-    pub(crate) fn has_native_paint(&self) -> bool {
-        let style = self.style.borrow();
+    pub(crate) fn has_native_paint(&self, style: &nsh_core::ViewStyle) -> bool {
         self.id == nsh_core::ROOT_ID
             || self.scene_root.get()
             || self.kind != ViewKind::View
@@ -183,7 +209,7 @@ impl Node {
             *self.text_drawing.borrow_mut() = raster.drawing.lock().expect("text drawing").take();
         }
         if self.text_drawing.borrow().is_some() {
-            self.enable_drawing();
+            self.enable_drawing()?;
         }
         let has_links = !raster.links.is_empty();
         let links_changed = self.has_text_links.replace(has_links) != has_links || has_links;
@@ -194,61 +220,11 @@ impl Node {
             self.ensure_wrapper()?;
         }
         if !same_layout || !same_placement {
-            self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+            self.invalidate_paint()?;
         }
         self.set_events(self.interaction.mask())?;
         Ok(links_changed)
     }
-    /// Re-record custom paint after a native visibility or render-target change.
-    pub(crate) fn invalidate_subtree_paint(&self) -> Result<()> {
-        self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
-        if let Some(wrapper) = self.wrapper.borrow().as_ref() {
-            wrapper
-                .outer
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedRender)?;
-        }
-        if let Some(screen) = self.screen.borrow().as_ref() {
-            screen.invalidate_paint()?;
-        }
-        if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-            layer.invalidate()?;
-        }
-        for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
-            child.invalidate_subtree_paint()?;
-        }
-        for child in self
-            .retained_children
-            .borrow()
-            .iter()
-            .filter_map(Weak::upgrade)
-        {
-            if child.retained.get() {
-                child.invalidate_subtree_paint()?;
-            }
-        }
-        Ok(())
-    }
-    pub(crate) fn schedule_subtree_paint(&self, frames: u8) -> Result<()> {
-        self.invalidate_subtree_paint()?;
-        Self::defer_subtree_paint(self.weak.clone(), frames);
-        Ok(())
-    }
-    fn defer_subtree_paint(weak: Weak<Self>, remaining: u8) {
-        if remaining == 0 {
-            return;
-        }
-        let Some(owner) = weak.upgrade() else {
-            return;
-        };
-        let _ = owner.native.borrow().post_frame_callback(move |_, _| {
-            if let Some(owner) = weak.upgrade() {
-                callback(|| owner.invalidate_subtree_paint());
-                Self::defer_subtree_paint(weak, remaining - 1);
-            }
-        });
-    }
-
     pub(crate) fn draw_outer_shadows(&self, canvas: &Canvas) {
         let frame = self.frame.get();
         self.decoration.shadows(
@@ -259,7 +235,7 @@ impl Node {
             false,
         );
     }
-    pub(super) fn draw(&self, event: &NodeCustomEvent) {
+    pub(super) fn draw(&self, canvas: &Canvas) {
         let frame = self.frame.get();
         let has_area = frame.width > 0.0 && frame.height > 0.0;
         let has_effects = has_area
@@ -279,21 +255,19 @@ impl Node {
                 return;
             }
         }
-        if let Some(raw) = event.draw_context_in_draw().and_then(|ctx| ctx.canvas()) {
-            // SAFETY: ArkUI owns this canvas for the duration of this draw callback.
-            let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
+        {
             if has_effects {
                 self.decoration.background(
-                    &canvas,
+                    canvas,
                     &self.style.borrow(),
                     Size::new(frame.width, frame.height),
                     self.scale.get(),
                 );
             }
             if let Some(drawing) = self.canvas.borrow().as_ref() {
-                callback(|| drawing.draw(&canvas));
+                callback(|| drawing.draw(canvas));
             }
-            self.draw_selection(&canvas, false);
+            self.draw_selection(canvas, false);
             if let Some(drawing) = self.text_drawing.borrow_mut().as_mut() {
                 let content = self.content.get();
                 let brush = self
@@ -343,7 +317,7 @@ impl Node {
                 if let Some(brush) = &brush {
                     canvas.save_layer(None, Some(brush));
                 }
-                if let Err(error) = drawing.draw(&canvas) {
+                if let Err(error) = drawing.draw(canvas) {
                     log::warn!("OHOS text draw: {error}");
                 }
                 if brush.is_some() {
@@ -353,7 +327,7 @@ impl Node {
                     canvas.restore();
                 }
             }
-            self.draw_selection(&canvas, true);
+            self.draw_selection(canvas, true);
         }
     }
 }

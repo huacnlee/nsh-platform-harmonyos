@@ -317,10 +317,14 @@ impl Scroller {
                 // UIKit/Android. Gestures use OnDidScroll once layout settles:
                 // ArkUI OnScroll also exposes intermediate animation steps within
                 // one frame, which must not race a synchronized peer's commands.
-                callback(|| match weak.upgrade() {
-                    Some(scroll) if scroll.applying_offset.get() => scroll.report(),
-                    Some(_) => Ok(()),
-                    None => Ok(()),
+                callback(|| {
+                    if let Some(scroll) = weak.upgrade() {
+                        if scroll.applying_offset.get() {
+                            scroll.report()?;
+                        }
+                        scroll.invalidate_shader_input()?;
+                    }
+                    Ok(())
                 })
             });
         let weak = Rc::downgrade(&scroll);
@@ -331,9 +335,12 @@ impl Scroller {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
                         if scroll.applying_offset.get() {
-                            return scroll.report();
+                            scroll.report()?;
+                            scroll.invalidate_shader_input()?;
+                            return Ok(());
                         }
                         scroll.queue_report()?;
+                        scroll.invalidate_shader_input()?;
                         scroll.phase(event.component_i32(2).unwrap_or(0))?;
                     }
                     Ok(())
@@ -347,9 +354,12 @@ impl Scroller {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
                         if scroll.applying_offset.get() {
-                            return scroll.report();
+                            scroll.report()?;
+                            scroll.invalidate_shader_input()?;
+                            return Ok(());
                         }
                         scroll.queue_report()?;
+                        scroll.invalidate_shader_input()?;
                         scroll.phase(0)?;
                     }
                     Ok(())
@@ -426,6 +436,9 @@ impl Scroller {
             .mark_dirty(NodeDirtyFlag::NeedLayout)?;
         if let Some(owner) = self.owner.upgrade() {
             owner.scroll_watchers.resized(owner.id);
+        }
+        if previous.width != size.width || previous.height != size.height {
+            self.invalidate_shader_input()?;
         }
         Ok(())
     }
@@ -622,6 +635,7 @@ impl Scroller {
         if dx != 0.0 || dy != 0.0 {
             self.pay_owed(dx, dy)?;
         }
+        self.invalidate_shader_input()?;
         Ok(())
     }
     pub(crate) fn to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
@@ -631,7 +645,7 @@ impl Scroller {
                 .upgrade()
                 .is_some_and(|owner| !owner.platform.get().reduce_motion);
         let was_applying = self.applying_offset.replace(true);
-        let result = (|| {
+        let result = (|| -> Result<()> {
             if let Some(cross) = self.cross.borrow().as_ref()
                 && self.behavior.borrow().zooms()
             {
@@ -659,7 +673,8 @@ impl Scroller {
             Ok(())
         })();
         self.applying_offset.set(was_applying);
-        result
+        result?;
+        self.invalidate_shader_input()
     }
     pub(crate) fn by(&self, dx: f32, dy: f32) -> Result<()> {
         self.corrections.set(self.corrections.get().wrapping_add(1));
@@ -706,6 +721,14 @@ impl Scroller {
             ));
         }
         self.report()?;
+        self.invalidate_shader_input()?;
+        Ok(())
+    }
+    fn invalidate_shader_input(&self) -> Result<()> {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.invalidate_composites();
+            owner.flush_arkui()?;
+        }
         Ok(())
     }
     fn read_native_offset(&self) -> Result<Option<(f32, f32)>> {
@@ -1208,9 +1231,12 @@ impl Scroller {
                         callback(|| {
                             if let Some(scroll) = weak.upgrade() {
                                 if scroll.applying_offset.get() {
-                                    return scroll.report();
+                                    scroll.report()?;
+                                    scroll.invalidate_shader_input()?;
+                                    return Ok(());
                                 }
                                 scroll.queue_report()?;
+                                scroll.invalidate_shader_input()?;
                             }
                             Ok(())
                         });

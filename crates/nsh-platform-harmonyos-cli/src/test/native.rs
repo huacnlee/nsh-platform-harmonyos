@@ -338,8 +338,18 @@ impl Native for HdcNative {
         let point: Option<[f32; 2]> = self.query(SceneQuery::DialogPoint {
             button: button.map(str::to_owned),
         })?;
-        let [x, y] = point.ok_or("the dialog button is not on screen")?;
-        self.press_at(Point::new(Points(x), Points(y)))
+        if let Some([x, y]) = point {
+            return self.press_at(Point::new(Points(x), Points(y)));
+        }
+        // System AlertDialog/ActionSheet content belongs to ArkUI, outside the
+        // surface. Resolve its actual accessible button, then inject real input.
+        let bytes = self
+            .device
+            .artifact("json", &["uitest", "dumpLayout"])
+            .map_err(|e| format!("{e:#}"))?;
+        let tree = serde_json::from_slice(&bytes).map_err(|e| format!("invalid UI tree: {e}"))?;
+        let [x, y] = dialog_button_point(&tree, button.unwrap())?;
+        self.shell(&["uitest", "uiInput", "click", &x.to_string(), &y.to_string()])
     }
     fn animating(&self) -> bool {
         self.track(self.query(SceneQuery::Animating))
@@ -434,5 +444,90 @@ mod tests {
         assert_eq!(key_codes("mod+a").unwrap(), [2072, 2017]);
         assert_eq!(key_codes("Enter").unwrap(), [2054]);
         assert!(key_codes("unknown").is_err());
+    }
+}
+
+/// Only match interactive descendants of a system dialog, never same-named page text.
+fn dialog_button_point(tree: &serde_json::Value, label: &str) -> Result<[i32; 2], String> {
+    fn has_label(node: &serde_json::Value, label: &str) -> bool {
+        node["attributes"]["text"].as_str() == Some(label)
+            || node["children"]
+                .as_array()
+                .is_some_and(|children| children.iter().any(|child| has_label(child, label)))
+    }
+    fn visit(node: &serde_json::Value, label: &str, dialog: bool, found: &mut Vec<String>) {
+        let attrs = &node["attributes"];
+        if attrs["visible"] == "false" || attrs["enabled"] == "false" {
+            return;
+        }
+        let dialog_root = matches!(
+            attrs["type"].as_str(),
+            Some("Dialog" | "AlertDialog" | "ActionSheet")
+        );
+        let dialog = dialog || dialog_root;
+        if dialog
+            && !dialog_root
+            && attrs["clickable"] == "true"
+            && has_label(node, label)
+            && let Some(bounds) = attrs["bounds"].as_str()
+        {
+            found.push(bounds.to_owned());
+            return;
+        }
+        if let Some(children) = node["children"].as_array() {
+            for child in children {
+                visit(child, label, dialog, found);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    visit(tree, label, false, &mut found);
+    let [bounds] = found.as_slice() else {
+        return Err(format!(
+            "expected one visible system dialog button {label:?}, found {}",
+            found.len()
+        ));
+    };
+    let coordinates: Vec<i32> = bounds
+        .split(['[', ']', ','])
+        .filter(|part| !part.is_empty())
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .map_err(|_| "invalid system dialog button bounds")?;
+    let [left, top, right, bottom] = coordinates.as_slice() else {
+        return Err("invalid system dialog button bounds".into());
+    };
+    if *left < 0 || *top < 0 || right <= left || bottom <= top {
+        return Err("system dialog button is not on screen".into());
+    }
+    Ok([left + (right - left) / 2, top + (bottom - top) / 2])
+}
+
+#[cfg(test)]
+mod dialog_tests {
+    use super::dialog_button_point;
+    use serde_json::{Value, json};
+
+    fn button(bounds: &str) -> Value {
+        json!({"attributes": {"type": "Button", "clickable": "true", "bounds": bounds},
+            "children": [{"attributes": {"type": "Text", "text": "关闭全部"}}]})
+    }
+    #[test]
+    fn selects_system_button_in_screen_pixels_and_ignores_page_text() {
+        let tree = json!({"children": [button("[0,0][20,20]"),
+            {"attributes": {"type": "Dialog"}, "children": [button("[120,600][520,760]")]}]});
+        assert_eq!(dialog_button_point(&tree, "关闭全部").unwrap(), [320, 680]);
+    }
+    #[test]
+    fn rejects_hidden_ambiguous_or_invalid_targets() {
+        let mut tree = json!({"attributes": {"type": "Dialog", "visible": "false"}, "children": [button("[1,2][3,4]")]});
+        assert!(dialog_button_point(&tree, "关闭全部").is_err());
+        tree["attributes"]["visible"] = json!("true");
+        tree["children"] = json!([button("[1,2][3,4]"), button("[1,2][3,4]")]);
+        assert!(dialog_button_point(&tree, "关闭全部").is_err());
+        tree["children"] = json!([button("[4,2][3,4]")]);
+        assert!(dialog_button_point(&tree, "关闭全部").is_err());
+        tree["children"] = json!([button("bad")]);
+        assert!(dialog_button_point(&tree, "关闭全部").is_err());
     }
 }

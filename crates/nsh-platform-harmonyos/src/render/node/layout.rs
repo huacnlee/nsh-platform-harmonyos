@@ -135,9 +135,9 @@ impl Node {
             if self.text_drawing.borrow().is_some()
                 || self.canvas.borrow().is_some()
                 || self.style.borrow().effects.is_some()
-                || self.outlined.get()
+                || self.outlined.borrow().is_some()
             {
-                self.native.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                self.invalidate_paint()?;
             }
             if self.wrapper.borrow().is_some() {
                 // The outer node owns LayoutRect. Its native child still needs
@@ -169,7 +169,7 @@ impl Node {
             (y * self.scale.get()).round() as i32,
         )
     }
-    pub(super) fn place_bounds(&self, x: i32, y: i32) -> Result<()> {
+    pub(crate) fn place_bounds(&self, x: i32, y: i32) -> Result<()> {
         let frame = self.frame.get();
         let mut width = (frame.width * self.scale.get()).round() as i32;
         let mut height = (frame.height * self.scale.get()).round() as i32;
