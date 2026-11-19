@@ -261,7 +261,6 @@ impl Fills {
         }
     }
     pub(super) fn render(&mut self, route: Option<&Dispatcher>) {
-        let _trace = super::trace::Scope::new(c"NSH fills");
         for (&key, view) in &mut self.views {
             if !view.needs_wake() {
                 continue;

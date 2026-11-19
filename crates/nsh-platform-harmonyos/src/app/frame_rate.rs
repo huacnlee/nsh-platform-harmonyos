@@ -241,19 +241,7 @@ impl RateUpdates {
     }
 
     fn apply_range(sink: &dyn RateSink, range: RateRange) -> i32 {
-        #[cfg(target_env = "ohos")]
-        let _trace = crate::render::composition::trace::Scope::new(c"NSH frame rate IPC");
-        #[cfg(target_env = "ohos")]
-        {
-            use crate::render::composition::trace::count;
-            count(c"NSH rate min", i64::from(range.min));
-            count(c"NSH rate max", i64::from(range.max));
-            count(c"NSH rate expected", i64::from(range.expected));
-        }
-        let status = sink.set_range(range);
-        #[cfg(target_env = "ohos")]
-        crate::render::composition::trace::count(c"NSH rate status", i64::from(status));
-        status
+        sink.set_range(range)
     }
 
     fn wake(&self) -> i32 {

@@ -397,7 +397,6 @@ impl Window {
         Ok(current)
     }
     pub(super) fn present(&self) -> Result<(), Error> {
-        let _trace = super::trace::Scope::new(c"NSH present");
         self.context
             .egl
             .swap_buffers(
@@ -801,7 +800,6 @@ impl TextureReader {
     }
     /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
     pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
-        let _trace = super::trace::Scope::new(c"NSH acquire input");
         let updated = self.drain_oes()?;
         let dirty = self.target_dirty || self.allocated != self.size;
         Ok(self.ensure_texture()?.is_some() && (updated || dirty))

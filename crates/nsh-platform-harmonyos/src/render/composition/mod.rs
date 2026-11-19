@@ -12,5 +12,4 @@ pub(crate) mod readback;
 pub(crate) mod scene;
 pub(crate) mod scene_policy;
 pub(crate) mod surface;
-pub(crate) mod trace;
 pub(crate) mod worker;

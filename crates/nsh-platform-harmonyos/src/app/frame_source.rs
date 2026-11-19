@@ -194,10 +194,7 @@ impl RateDriver {
         let driver = self.clone();
         // The callback retains the dispatcher until the reclamation message has
         // been posted. Do not filter this finite tail by live/active generation.
-        let status = self.vsync.request_frame_once(move |timestamp| {
-            use crate::render::composition::trace::{Scope, count};
-            let _trace = Scope::new(c"NSH native frame");
-            count(c"NSH native timestamp", timestamp);
+        let status = self.vsync.request_frame_once(move |_timestamp| {
             {
                 let mut pending = driver.pending.lock().unwrap();
                 pending.in_flight = false;

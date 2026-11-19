@@ -189,7 +189,6 @@ impl Scene {
         if !self.dirty.replace(false) {
             return;
         }
-        let _trace = super::trace::Scope::new(c"NSH scene prepare");
         let _guard = PreparingGuard::enter(self);
         let max_passes = self.requirements.borrow().len().saturating_add(1);
         for _ in 0..max_passes {

@@ -495,7 +495,6 @@ impl Mounter {
         .cloned()
     }
     pub(crate) fn reconcile_navigation(&mut self) -> Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH navigation reconcile");
         let result = (|| -> Result<()> {
             self.shaders.reconcile_hosts_now()?;
             crate::navigation::stack::reconcile(
@@ -863,7 +862,6 @@ impl Mounter {
         }
     }
     pub(crate) fn apply(&mut self, batch: MountBatch) -> Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH mount batch");
         let batch_guard = BatchGuard::new(self.context.clone());
         let nested = batch_guard.1;
         let mut result = self.apply_batch(batch);
@@ -1838,7 +1836,6 @@ impl Mounter {
         let mut demand = self.animator.tick(timestamp)?;
         let mut settled_leaving = false;
         for id in self.animator.take_removals() {
-            let _trace = super::composition::trace::Scope::new(c"NSH animation removal");
             if let Ok(node) = self.node(id) {
                 settled_leaving = true;
                 if node.pending_delete.get() {
@@ -1877,8 +1874,6 @@ impl Mounter {
         let mut reconcile_capture = settled_leaving;
         let mut result = Ok(());
         if !pending.is_empty() && can_unfreeze {
-            let _trace = super::composition::trace::Scope::new(c"NSH pending deletion");
-            super::composition::trace::count(c"NSH pending delete count", pending.len() as i64);
             let _batch_guard = BatchGuard::new(self.context.clone());
             // Detaching in reverse mount order removes trailing native siblings
             // in O(1) instead of shifting the prefix on each child removal.

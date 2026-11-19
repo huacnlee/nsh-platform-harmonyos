@@ -120,7 +120,6 @@ impl crate::render::mount::UiContext {
         }
     }
     pub(crate) fn flush_arkui(&self) -> crate::render::node::Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH ArkUI flush");
         if self.host.check().is_err() {
             return Ok(());
         }

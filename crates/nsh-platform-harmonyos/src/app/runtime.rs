@@ -654,11 +654,7 @@ impl State {
         if !self.is_active() || !rate_driver.active() {
             return Ok(false);
         }
-        use crate::render::composition::trace::{Scope, count};
-        let _trace = Scope::new(c"NSH UI frame");
-        count(c"NSH UI timestamp", timestamp as i64);
         if std::mem::take(&mut self.engine_wanted) {
-            let _trace = Scope::new(c"NSH engine frame");
             self.engine_in_flight += 1;
             let dispatcher = self.dispatcher.clone();
             let control = self.engine.as_ref().unwrap().control();
@@ -700,11 +696,6 @@ impl State {
         self.frame_rate.set_ui_demand(demand);
         let active =
             self.is_active() && (demand != UiDemand::Idle || self.frame_rate.has_shader_demand());
-        use crate::render::composition::trace::count;
-        count(c"NSH frame wanted", i64::from(self.frame_wanted));
-        count(c"NSH frame active", i64::from(active));
-        count(c"NSH engine requested", i64::from(self.engine_wanted));
-        count(c"NSH engine in flight", self.engine_in_flight as i64);
         let rate_driver = self.rate_driver.as_ref().unwrap();
         rate_driver.set_active(active)?;
         if let Err(error) = self

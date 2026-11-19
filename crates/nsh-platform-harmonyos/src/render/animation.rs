@@ -170,7 +170,6 @@ impl Animator {
         std::mem::take(&mut self.removals.borrow_mut())
     }
     pub(crate) fn set(&self, node: u32, value: f32) -> Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH animation set");
         {
             let mut state = self.state.borrow_mut();
             let State { graph, finished } = &mut *state;
@@ -197,11 +196,9 @@ impl Animator {
         Ok(())
     }
     pub(crate) fn tick(&self, timestamp: Option<u64>) -> Result<UiDemand> {
-        let _trace = super::composition::trace::Scope::new(c"NSH animation tick");
         let now = self.frame_clock.borrow_mut().sample(timestamp, self.now());
         self.frame_time.set(now);
         let (changed, mut demand) = {
-            let _trace = super::composition::trace::Scope::new(c"NSH animation graph");
             let mut state = self.state.borrow_mut();
             let State { graph, finished } = &mut *state;
             let changed = (graph.is_animating() || self.dirty.get())
@@ -221,38 +218,32 @@ impl Animator {
                 *self.selection.borrow_mut() = Weak::new();
             }
         }
-        {
-            let _trace = super::composition::trace::Scope::new(c"NSH animation scroll");
-            self.scrolls
-                .borrow_mut()
-                .try_retain(|weak| -> Result<bool> {
-                    let active = if let Some(owner) = weak.upgrade()
-                        && let Some(scroll) = owner.scroll.borrow().as_ref()
-                    {
-                        scroll.tick(now)?
-                    } else {
-                        false
-                    };
-                    demand = demand.merge(UiDemand::from_animation(active, None));
-                    Ok(active)
-                })?;
-        }
-        {
-            let _trace = super::composition::trace::Scope::new(c"NSH animation motion");
-            self.motion
-                .borrow_mut()
-                .try_retain(|weak| -> Result<bool> {
-                    let Some(owner) = weak.upgrade() else {
-                        return Ok(false);
-                    };
-                    let (motion_demand, removed) = owner.tick_transition(now)?;
-                    demand = demand.merge(motion_demand);
-                    if removed {
-                        self.removals.borrow_mut().push(owner.id);
-                    }
-                    Ok(motion_demand != UiDemand::Idle)
-                })?;
-        }
+        self.scrolls
+            .borrow_mut()
+            .try_retain(|weak| -> Result<bool> {
+                let active = if let Some(owner) = weak.upgrade()
+                    && let Some(scroll) = owner.scroll.borrow().as_ref()
+                {
+                    scroll.tick(now)?
+                } else {
+                    false
+                };
+                demand = demand.merge(UiDemand::from_animation(active, None));
+                Ok(active)
+            })?;
+        self.motion
+            .borrow_mut()
+            .try_retain(|weak| -> Result<bool> {
+                let Some(owner) = weak.upgrade() else {
+                    return Ok(false);
+                };
+                let (motion_demand, removed) = owner.tick_transition(now)?;
+                demand = demand.merge(motion_demand);
+                if removed {
+                    self.removals.borrow_mut().push(owner.id);
+                }
+                Ok(motion_demand != UiDemand::Idle)
+            })?;
         if changed || self.dirty.get() {
             self.write()?;
         } else {
@@ -263,7 +254,6 @@ impl Animator {
         Ok(demand)
     }
     fn write(&self) -> Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH animation write");
         self.dirty.set(false);
         let mut values = Vec::new();
         self.bindings

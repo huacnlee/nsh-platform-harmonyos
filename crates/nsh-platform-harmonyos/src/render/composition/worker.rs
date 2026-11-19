@@ -1364,7 +1364,6 @@ impl Entry {
         revision: u64,
         backdrop: Option<super::gles::Picture>,
     ) -> std::result::Result<bool, String> {
-        let _trace = super::trace::Scope::new(c"NSH composite");
         let installed = self.navigation.as_ref().map(|nav| nav.key);
         if settings.navigation.is_some() && settings.navigation != installed {
             // The settings and captured picture travel separately. Keep the

@@ -45,7 +45,6 @@ napi-ohos = { version = "1.2.0", default-features = false, features = ["napi8", 
 napi-derive-ohos = "1.2.0"
 napi-build-ohos = "1.2.0"
 ohos-arkui-binding = { version = "0.6.2", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
-ohos-hitrace-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
 ohos-accessibility-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-display-binding = { version = "0.1.5", default-features = false, features = ["api-20"] }
 ohos-device-binding = { version = "0.1.0", default-features = false }

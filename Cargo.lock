@@ -2987,7 +2987,6 @@ dependencies = [
  "ohos-display-binding",
  "ohos-drawing-binding",
  "ohos-hilog-binding",
- "ohos-hitrace-binding",
  "ohos-image-native-binding",
  "ohos-native-image-binding",
  "ohos-native-window-binding",
@@ -3304,21 +3303,6 @@ name = "ohos-hilogs-sys"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "186ff2f4c7c551fdc3497d2e814744e723850651ceba1fdcf988bcf9b29cf7cb"
-
-[[package]]
-name = "ohos-hitrace-binding"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ba9d7dacb57b4d51ca9e11f0d42e938b3e0cd96e65c129ca1205a75e260d962"
-dependencies = [
- "ohos-hitrace-sys",
-]
-
-[[package]]
-name = "ohos-hitrace-sys"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31f83a842b81534ef22cea3e12e2fcc461757a86716b6db3bd98a51845a2dfa2"
 
 [[package]]
 name = "ohos-image-binding"
