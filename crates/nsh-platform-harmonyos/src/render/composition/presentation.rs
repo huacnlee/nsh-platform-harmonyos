@@ -142,7 +142,8 @@ impl FrameCapture {
                 Ok(())
             })?;
             let global = env.get_global()?;
-            let schedule: Function<'_, FnArgs<(Function<'_, (), ()>, u32)>, Unknown<'_>> =
+            type TimerArgs<'env> = FnArgs<(Function<'env, (), ()>, u32)>;
+            let schedule: Function<'_, TimerArgs<'_>, Unknown<'_>> =
                 global.get_named_property("setTimeout")?;
             schedule.call((handler, 500).into())?;
             Ok(())
