@@ -12,6 +12,7 @@ use crate::{interop::attachment::NativeAttachment, render::node::Node};
 #[derive(Clone, Debug, PartialEq)]
 #[napi(object)]
 pub(crate) struct EditorSettings {
+    pub below_viewport: bool,
     pub target_id: u32,
     pub multiline: bool,
     pub secure: bool,
@@ -301,8 +302,20 @@ impl Batch {
 
 pub(crate) fn apply(
     context: &crate::render::mount::UiContext,
-    batch: Batch,
+    mut batch: Batch,
 ) -> crate::render::node::Result<()> {
+    if batch.editors.len() > 1 && !context.platform.get().screen_reader {
+        EDITORS.with(|routes| {
+            let routes = routes.borrow();
+            for editor in &mut batch.editors {
+                editor.below_viewport = !editor.auto_focus
+                    && routes
+                        .get(&editor.target_id)
+                        .and_then(Weak::upgrade)
+                        .is_some_and(|input| input.below_viewport());
+            }
+        });
+    }
     context.host.apply_batch(&context.env, batch)?;
     Ok(())
 }

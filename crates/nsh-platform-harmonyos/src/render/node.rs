@@ -19,7 +19,7 @@ use ohos_arkui_binding::common::node::ArkUINode;
 
 use crate::{
     input::{editor::Input, events::Interaction},
-    render::geometry::{Rect, Size},
+    render::geometry::Rect,
     scroll::controller::Scroller,
 };
 
@@ -65,12 +65,15 @@ struct AppliedStyle {
     shadow: Option<(f32, f32, f32, u32)>,
     ink_outset: f32,
     clip: bool,
-    clip_shape: Option<(Size, [f32; 4])>,
     backdrop_blur: f32,
     visibility: i32,
     transform: Option<[f32; 16]>,
     transform_center: [f32; 3],
     blur: f32,
+    grayscale: f32,
+    sepia: f32,
+    invert: f32,
+    contrast: f32,
     blend: nsh_core::BlendMode,
     z_index: i32,
 }
@@ -86,12 +89,15 @@ impl Default for AppliedStyle {
             shadow: None,
             ink_outset: 0.0,
             clip: false,
-            clip_shape: None,
             backdrop_blur: 0.0,
             visibility: 0,
             transform: None,
             transform_center: [f32::NAN; 3],
             blur: 0.0,
+            grayscale: 0.0,
+            sepia: 0.0,
+            invert: 0.0,
+            contrast: 1.0,
             blend: nsh_core::BlendMode::Normal,
             z_index: 0,
         }
@@ -111,8 +117,13 @@ pub(crate) struct Node {
     pub(crate) pending_delete: Cell<bool>,
     pub(crate) scene_prepared: Cell<bool>,
     pub(crate) scene_root: Cell<bool>,
+    pub(crate) scene_ancestor_captured: Cell<bool>,
     /// Effects applied to this node's exported native subtree, in mount order.
     pub(crate) shader_layers: RefCell<Vec<(NodeId, std::sync::Arc<nsh_core::shader::ShaderLayer>)>>,
+    pub(crate) modal_screen_layers:
+        RefCell<Vec<(NodeId, std::sync::Arc<nsh_core::shader::ShaderLayer>)>>,
+    pub(crate) backdrop_layer: Cell<Option<NodeId>>,
+    pub(crate) modal_backdrop: Cell<Option<NodeId>>,
     pub(crate) navigation_capture: Cell<bool>,
     pub(crate) composite_dirty: Cell<bool>,
     capture_cache: Cell<Option<super::composition::geometry::Bounds>>,
@@ -153,9 +164,10 @@ pub(crate) struct Node {
     decoration: crate::render::decor::Decoration,
     layout_callbacks: Cell<bool>,
     drawing: RefCell<Option<super::paint_node::PaintNode>>,
+    drawing_bounds: Cell<[i32; 4]>,
     outlined: RefCell<Option<super::paint_node::PaintNode>>,
-    shadow_layer: RefCell<Option<Rc<super::shadow::ShadowLayer>>>,
-    pub(crate) text_drawing: RefCell<Option<crate::text::typography::TextDrawing>>,
+    pub(crate) text_drawing:
+        RefCell<Option<std::sync::Arc<std::sync::Mutex<crate::text::typography::TextDrawing>>>>,
     pub(crate) selection_area: RefCell<Option<crate::text::selection::area::Area>>,
     pub(crate) raster: RefCell<Option<nsh_core::TextLayout>>,
     pub(crate) selection: crate::text::selection::state::State,
@@ -169,6 +181,13 @@ pub(crate) struct Node {
     applied_layout_size: Cell<(usize, i32, i32)>,
     applied_position: Cell<(usize, i32, i32)>,
     has_text_links: Cell<bool>,
+    pub(crate) batch_created: Cell<bool>,
+    pub(crate) culled_by_scroll: Cell<bool>,
+    pub(crate) in_culled_subtree: Cell<bool>,
+    pub(super) style_deferred: Cell<bool>,
+    pub(super) bounds_deferred: Cell<bool>,
+    pub(super) paint_deferred: Cell<bool>,
+    pub(super) anim_deferred: Cell<bool>,
 }
 
 impl std::ops::Deref for Node {

@@ -53,6 +53,8 @@ void main() {
         if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThan(q, shadow_size))) alpha = texture(shadow, q / shadow_size).a;
         alpha *= color.a;
         result = c + vec4(color.rgb * alpha, alpha) * (1.0 - c.a);
+    } else if (mode == 4) {
+        result = c + texture(shadow, gl_FragCoord.xy / source_size) * (1.0 - c.a);
     } else { result = c; }
 }
 "#;
@@ -186,6 +188,19 @@ impl Filters {
         self.targets.truncate(self.next);
         Ok((picture, x, y, scale))
     }
+    // Both textures cover the same full-screen viewport, in premultiplied RGBA.
+    pub(in crate::render::composition) fn over(
+        &mut self,
+        front: Picture,
+        back: Picture,
+    ) -> Result<Picture> {
+        self.next = 0;
+        let mut pass = Pass::new((front.1, front.2));
+        pass.mode = 4;
+        pass.shadow = Some((back, [0.0; 2], [0.0; 4]));
+        self.draw(front, pass)
+    }
+
     fn blur(&mut self, mut picture: Picture, sigma: f32) -> Result<Picture> {
         if sigma <= 0.0 {
             return Ok(picture);

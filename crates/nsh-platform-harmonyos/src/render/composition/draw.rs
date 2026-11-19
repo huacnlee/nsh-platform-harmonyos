@@ -9,6 +9,14 @@ use crate::render::{
     geometry::Size,
 };
 
+pub(crate) struct DirectText {
+    pub(crate) drawing: Arc<std::sync::Mutex<crate::text::typography::TextDrawing>>,
+    pub(crate) x: f32,
+    pub(crate) y: f32,
+    pub(crate) raster_scale: f32,
+    pub(crate) tint: Option<u32>,
+}
+
 pub(crate) struct PaintNode {
     pub(crate) source: Option<Key>,
     pub(crate) shaders: bool,
@@ -18,6 +26,9 @@ pub(crate) struct PaintNode {
     pub(crate) transform: Transform,
     pub(crate) size: Size,
     pub(crate) style: Arc<ViewStyle>,
+    pub(crate) bg_argb: u32,
+    pub(crate) border_colors: [u32; 4],
+    pub(crate) text: Option<DirectText>,
     pub(crate) opacity: f32,
     pub(crate) clip: bool,
     pub(crate) bounds: Bounds,
@@ -35,12 +46,14 @@ pub(crate) struct Plan {
     pub(crate) roots: Vec<Root>,
 }
 pub(crate) struct Frame {
+    pub(crate) navigation: Option<crate::render::shader::navigation::Key>,
     pub(crate) id: u32,
     pub(crate) scale: f32,
     pub(crate) image: Image,
 }
 
 pub(super) trait Sources {
+    fn navigation(&self, key: Key) -> Option<crate::render::shader::navigation::Key>;
     fn image(&self, key: Key) -> Option<(&Image, f32)>;
     fn shade(
         &mut self,
@@ -88,6 +101,7 @@ impl Plan {
             renderer.node(&root.node, &mut canvas, 0)?;
             total_pixels = renderer.pixels;
             frames.push(Frame {
+                navigation: root.node.source.and_then(|key| source.navigation(key)),
                 id: root.id,
                 scale: root.scale,
                 image: Image::copy(canvas.bitmap().unwrap(), root.origin.0, root.origin.1),
@@ -240,6 +254,60 @@ impl<S: Sources> Renderer<'_, S> {
             canvas.scale(self.scale / scale, self.scale / scale);
             canvas.draw_bitmap(&image.bitmap, image.x, image.y);
             canvas.restore();
+        } else if node.source.is_none() {
+            crate::render::decor::draw_direct_box(
+                canvas,
+                &node.style,
+                node.bg_argb,
+                node.border_colors,
+                node.size,
+                self.scale,
+            );
+            if let Some(text) = &node.text {
+                let tx = (text.x * self.scale).round();
+                let ty = (text.y * self.scale).round();
+                let scale_mismatch = (self.scale - text.raster_scale).abs() > f32::EPSILON;
+                let needs_save = tx != 0.0 || ty != 0.0 || scale_mismatch;
+                if needs_save {
+                    canvas.save();
+                    if tx != 0.0 || ty != 0.0 {
+                        canvas.translate(tx, ty);
+                    }
+                    if scale_mismatch {
+                        canvas.scale(
+                            self.scale / text.raster_scale,
+                            self.scale / text.raster_scale,
+                        );
+                    }
+                }
+                let tint_brush = text
+                    .tint
+                    .and_then(|color| {
+                        ohos_drawing_binding::ColorFilter::blend(
+                            color,
+                            ohos_drawing_binding::BlendMode::SrcIn,
+                        )
+                    })
+                    .map(|cf| {
+                        let mut filter = ohos_drawing_binding::Filter::new();
+                        filter.set_color_filter(Some(&cf));
+                        let mut brush = Brush::new();
+                        brush.set_filter(Some(&filter));
+                        brush
+                    });
+                if let Some(brush) = &tint_brush {
+                    canvas.save_layer(None, Some(brush));
+                }
+                if let Err(error) = text.drawing.lock().expect("text drawing").draw(canvas) {
+                    log::warn!("OHOS scene text draw: {error}");
+                }
+                if tint_brush.is_some() {
+                    canvas.restore();
+                }
+                if needs_save {
+                    canvas.restore();
+                }
+            }
         }
         canvas.save();
         if node.clip {

@@ -255,6 +255,11 @@ impl Fills {
             Command::Remove(key) => self.remove(key),
         }
     }
+    pub(super) fn sample(&mut self, time: std::time::Duration) {
+        for view in self.views.values_mut() {
+            view.effects.sample(time);
+        }
+    }
     pub(super) fn render(&mut self, route: Option<&Dispatcher>) {
         let _trace = super::trace::Scope::new(c"NSH fills");
         for (&key, view) in &mut self.views {

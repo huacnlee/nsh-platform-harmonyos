@@ -115,3 +115,110 @@ test("coordinate restoration failure still drains retirement callbacks", () => {
   assert.ok(retired);
   assert.equal(posting.busy, false);
 });
+
+test("texture wrapper update avoids rebuilding NodeContainer when capture dimensions match", () => {
+  const { instance } = view();
+  let outerUpdates = 0;
+  let textureUpdates = 0;
+  instance.node.update = () => { outerUpdates++; };
+  instance.textureNode.update = () => { textureUpdates++; };
+  instance.state.settings = {
+    targetId: 17,
+    width: 100,
+    height: 80,
+    textureInsets: { left: 4, top: 4, right: 4, bottom: 4 },
+  };
+  instance.update({
+    targetId: 17,
+    width: 100,
+    height: 80,
+    textureInsets: { left: 4, top: 4, right: 4, bottom: 4 },
+    label: "changed-semantics-only",
+  });
+  assert.equal(textureUpdates, 1);
+  assert.equal(outerUpdates, 0);
+
+  instance.update({
+    targetId: 17,
+    width: 120,
+    height: 80,
+    textureInsets: { left: 4, top: 4, right: 4, bottom: 4 },
+  });
+  assert.equal(textureUpdates, 2);
+  assert.equal(outerUpdates, 1);
+});
+
+const webSource = await readFile(new URL("NativeWebViews.ets", source), "utf8");
+const webClasses = webSource.slice(webSource.indexOf("class WebMountFrame"), webSource.indexOf("export class NativeWebViews"));
+const { WebEntry, resetWebMount } = await load(`class FrameCallback {}
+  const webContent = () => {}, wrapBuilder = builder => builder;
+  function ensureWebEngineInitialized() {}
+  let webComponentMounted = false;
+  const quarantinedWebs = new Set();
+  export function resetWebMount() { webComponentMounted = false; }
+  ${webClasses}
+  export { WebEntry };`);
+
+function coldWeb() {
+  resetWebMount();
+  const instance = Object.create(WebEntry.prototype);
+  const calls = [];
+  const frames = [];
+  Object.assign(instance, {
+    context: {
+      getUIContext: () => ({ postFrameCallback: frame => frames.push(frame) }),
+      isActive: () => true,
+      attachNativeNode: () => { calls.push("attach"); return true; },
+      retireNativeNode: () => { calls.push("retire"); return true; },
+    },
+    settings: { targetId: 17, sharedCookies: true },
+    node: { build: () => calls.push("build"), getFrameNode: () => ({}), dispose: () => calls.push("dispose") },
+    controller: { stop() {}, loadUrl() {} }, fileSelectors: new Set(), downloads: new Map(), epoch: 0,
+  });
+  return { instance, frames, calls };
+}
+
+test("a cold WebView attaches after the navigation frame returns", async () => {
+  const { instance, frames, calls } = coldWeb();
+  instance.create();
+  frames[0].onFrame(0);
+  assert.deepEqual(calls, []);
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(calls, ["build", "attach"]);
+});
+
+test("removal between the navigation frame and deferred WebView build cancels attachment", async () => {
+  const { instance, frames, calls } = coldWeb();
+  instance.create();
+  frames[0].onFrame(0);
+  instance.dispose();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.deepEqual(calls, ["retire", "dispose"]);
+});
+
+test("a failed WebView mount retires its builder even if the error handler fails", () => {
+  const { instance, calls } = coldWeb();
+  instance.node.build = () => { throw new Error("build failed"); };
+  instance.context.webEvent = () => { throw new Error("failed to report error"); };
+  assert.throws(() => instance.mount(), /failed to report error/);
+  assert.deepEqual(calls, ["retire", "dispose"]);
+});
+
+test("standalone ArkWeb initialization retries on first mount and runs once after success", async () => {
+  const warmup = webSource.slice(webSource.indexOf("let webEngineInitialized"), webSource.indexOf("// Clear"));
+  const sdk = await load(`
+    export let calls = 0;
+    const webview = { WebviewController: { initializeWebEngine() {
+      if (++calls === 1) throw new Error("unavailable during startup");
+    } } };
+    const hiTraceMeter = { startTrace() {}, finishTrace() {} };
+    const console = { warn() {} };
+    ${warmup}
+    export { ensureWebEngineInitialized };`);
+  sdk.prepareWebEngine();
+  assert.equal(sdk.calls, 1);
+  sdk.ensureWebEngineInitialized();
+  sdk.prepareWebEngine();
+  sdk.ensureWebEngineInitialized();
+  assert.equal(sdk.calls, 2);
+});

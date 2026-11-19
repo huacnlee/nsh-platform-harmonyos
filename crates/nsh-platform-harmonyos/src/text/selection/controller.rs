@@ -52,9 +52,22 @@ impl Node {
         }
         false
     }
+    pub(crate) fn has_selectable_ancestor(&self) -> bool {
+        if self.interaction.selectable_view() {
+            return true;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if node.interaction.selectable_view() {
+                return true;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        false
+    }
     pub(crate) fn selection_configure(self: &Rc<Self>) -> Result<()> {
         if self.raster.borrow().is_some() {
-            if self.selectable() {
+            if self.has_selection() {
                 self.ensure_wrapper()?;
             }
             self.set_events(self.interaction.mask())?;
@@ -150,6 +163,7 @@ impl Node {
         if let Some(route) = self.dispatcher.upgrade() {
             route.keyboard.lock().unwrap().selection = Some(self.id);
         }
+        self.ensure_wrapper()?;
         self.selection_menu_show(true)?;
         self.touches.borrow_mut().selection_started(self, (x, y))?;
         Ok(true)

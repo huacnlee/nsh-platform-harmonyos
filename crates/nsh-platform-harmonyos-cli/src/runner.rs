@@ -589,7 +589,7 @@ mod tests {
         fs::write(
             app.join("Cargo.toml"),
             "[package]\nname = \"counter-rust-app\"\nversion = \"0.0.0\"\n\n\
-             [dependencies]\nnsh-core = \"0.5\"\n",
+             [dependencies]\nnsh-core = \"0.6\"\n",
         )
         .unwrap();
         fs::write(

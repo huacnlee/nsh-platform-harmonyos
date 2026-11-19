@@ -133,8 +133,13 @@ impl Node {
         self.sync_visual_node(&visual);
         let extra = self.extra.get().1;
         let pinned = self.pinned.get();
-        let nav_x = self.navigation_presentation.get().1;
-        let pres_y = self.presentation.get().1;
+        let scale = self.scale.get() as f64;
+        // Snap screen-slide and modal-sheet offsets to physical pixels (matching
+        // Android StackBox.place) so glyph & shadow caches do not miss per frame.
+        let nav_x_px = (self.navigation_presentation.get().1 as f64 * scale).round();
+        let pres_y_px = (self.presentation.get().1 as f64 * scale).round();
+        let nav_x = nav_x_px / scale;
+        let pres_y = pres_y_px / scale;
         let parent_mirrored = self.parent_node.borrow().upgrade().is_some_and(|parent| {
             parent
                 .scroll
@@ -208,24 +213,47 @@ impl Node {
                 .mul(&m)
         };
         let mut matrix = m.0;
-        matrix[12] += (pinned.0 + nav_x) as f64;
-        matrix[13] += (pres_y + pinned.1) as f64;
+        let pure_presentation_shift = style.transform.ops().is_empty()
+            && !parent_mirrored
+            && extra == crate::render::transition::Extra::NONE
+            && pinned == (0.0, 0.0);
+        matrix[12] += pinned.0 as f64 + nav_x;
+        matrix[13] += pres_y + pinned.1 as f64;
         // ArkUI matrices translate in pixels; core matrices use surface vp.
         let mut raw_values = [0.0f32; 16];
         for (i, v) in matrix.into_iter().enumerate() {
             raw_values[i] = (v * if matches!(i, 12..=14) {
-                self.scale.get() as f64
+                scale
             } else if matches!(i, 3 | 7 | 11) {
-                1.0 / self.scale.get() as f64
+                1.0 / scale
             } else {
                 1.0
             }) as f32;
         }
+        let pure_translation = (raw_values[0] - 1.0).abs() <= 1e-5
+            && raw_values[1].abs() <= 1e-5
+            && raw_values[2].abs() <= 1e-5
+            && raw_values[3].abs() <= 1e-5
+            && raw_values[4].abs() <= 1e-5
+            && (raw_values[5] - 1.0).abs() <= 1e-5
+            && raw_values[6].abs() <= 1e-5
+            && raw_values[7].abs() <= 1e-5
+            && raw_values[8].abs() <= 1e-5
+            && raw_values[9].abs() <= 1e-5
+            && (raw_values[10] - 1.0).abs() <= 1e-5
+            && raw_values[11].abs() <= 1e-5
+            && raw_values[14].abs() <= 1e-5
+            && (raw_values[15] - 1.0).abs() <= 1e-5;
+        if pure_presentation_shift {
+            raw_values[12] = nav_x_px as f32;
+            raw_values[13] = pres_y_px as f32;
+        } else if pure_translation {
+            raw_values[12] = raw_values[12].round();
+            raw_values[13] = raw_values[13].round();
+        }
         if applied.transform != Some(raw_values) {
-            native.set_number_attribute(
-                Attribute::Transform,
-                raw_values.into_iter().map(Number::Float).collect(),
-            )?;
+            let values = raw_values.map(Number::Float);
+            native.set_number_slice_attribute(Attribute::Transform, &values)?;
             applied.transform = Some(raw_values);
             self.invalidate_ink(applied.ink_outset)?;
         }

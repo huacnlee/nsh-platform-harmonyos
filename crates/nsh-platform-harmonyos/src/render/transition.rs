@@ -171,6 +171,18 @@ impl Live {
         }
     }
 
+    pub(crate) fn changes_layout_or_transform(&self) -> bool {
+        if self.inner.idle() {
+            return false;
+        }
+        self.frame_target().is_some()
+            || self.inner.extra().is_some()
+            || self
+                .target_style
+                .as_ref()
+                .is_none_or(|style| !style.transform.is_identity())
+    }
+
     pub(crate) fn frame_target(&self) -> Option<Rect> {
         self.inner.frame_target().map(Rect::from)
     }
@@ -296,13 +308,12 @@ mod tests {
 
     #[test]
     fn text_color_interpolates_and_invalidates_the_terminal_frame() {
+        let mut transition = Transition::default();
+        transition.properties = TransitionProps(TransitionProps::COLORS);
+        transition.duration = 100.0;
+        transition.easing = [0.0, 0.0, 1.0, 1.0];
         let mut style = Box::new(ViewStyle {
-            transition: Some(Transition {
-                properties: TransitionProps(TransitionProps::COLORS),
-                duration: 100.0,
-                delay: 0.0,
-                easing: [0.0, 0.0, 1.0, 1.0],
-            }),
+            transition: Some(transition),
             ..Default::default()
         });
         let (red, blue) = (Color(0xff0000ff), Color(0x0000ffff));

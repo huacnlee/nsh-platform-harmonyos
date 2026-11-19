@@ -464,6 +464,7 @@ impl Ui {
                 .position(|child| Rc::ptr_eq(child, &self.native))
                 .ok_or_else(|| napi_ohos::Error::from_reason("Video native parent is missing"))?;
             self.detach(&self.parent)?;
+            root.promote_direct_paint()?;
             if let Err(error) = root.native.borrow_mut().add_child(self.native.clone()) {
                 callback(|| {
                     self.parent

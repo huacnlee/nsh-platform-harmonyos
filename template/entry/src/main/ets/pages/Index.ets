@@ -1,5 +1,5 @@
 import { common } from "@kit.AbilityKit";
-import { NshSurface } from "@nsh/harmonyos";
+import { NshSurface, prepareWebEngine } from "@nsh/harmonyos";
 
 // The app fills the window: written in Rust, it is linked into the native
 // library (`runApp`); written in TSX, its bundle is a raw file of the HAP.
@@ -30,6 +30,9 @@ struct Index {
       this.surface.runApp();
     } else {
       this.surface.loadResource("bundle.js");
+    }
+    if ({{usesWebView}}) {
+      prepareWebEngine();
     }
   }
 

@@ -42,10 +42,47 @@ pub(crate) type TabFactory = FunctionRef<TabBarContext, ObjectRef>;
 #[napi]
 pub(crate) struct TabBarContext {
     context: Context,
+    name: String,
 }
 #[napi]
 #[allow(unreachable_pub)] // Node-API requires public methods on its internal callback object.
 impl TabBarContext {
+    /// The built-in NSH component requested by the engine.
+    #[napi(getter)]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Reports the controlled value selected in a built-in mobile control.
+    #[napi]
+    pub fn value_changed(&self, value: serde_json::Value) {
+        if self.context.active.get() {
+            self.context.control.dispatch_event(
+                self.context.node,
+                nsh_core::EventKind::NativeEvent,
+                nsh_core::EventPayload::Native {
+                    name: "change".into(),
+                    data: value,
+                },
+            );
+        }
+    }
+
+    /// Supplies the intrinsic size in logical points.
+    #[napi]
+    pub fn size(&self, width: f64, height: f64) {
+        if self.context.active.get() && [width, height].iter().all(|v| (0.0..=16384.0).contains(v))
+        {
+            self.context.control.set_component_size(
+                self.context.node,
+                nsh_core::Size::new(
+                    nsh_core::Points(width as f32),
+                    nsh_core::Points(height as f32),
+                ),
+            );
+        }
+    }
+
     /// Reports the native selection while the component remains mounted.
     #[napi]
     pub fn change(&self, index: u32) {
@@ -123,7 +160,14 @@ impl Components {
         let (factory, handle, context) = {
             let mut registry = self.0.borrow_mut();
             let factory = registry.factories.get(name).cloned();
-            if factory.is_none() && name != nsh_core::platform::TAB_BAR_COMPONENT {
+            if factory.is_none()
+                && !matches!(
+                    name,
+                    nsh_core::platform::TAB_BAR_COMPONENT
+                        | nsh_core::platform::SWITCH_COMPONENT
+                        | nsh_core::platform::DATE_TIME_PICKER_COMPONENT
+                )
+            {
                 log::warn!("OHOS native component is not registered: {name}");
                 return Ok(None);
             }
@@ -151,7 +195,10 @@ impl Components {
         } else {
             host.tab_bar_factory()?
                 .borrow_back(&env)?
-                .call(TabBarContext { context })?
+                .call(TabBarContext {
+                    context,
+                    name: name.to_owned(),
+                })?
         };
         let retained = RetainedObject {
             value: Some(value),

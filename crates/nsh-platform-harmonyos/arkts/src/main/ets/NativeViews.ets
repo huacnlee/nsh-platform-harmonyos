@@ -11,8 +11,6 @@ import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import { NshRuntimeContext } from "./NativeEditors";
 
-
-
 interface ViewAction {
   name: string;
   label: string;
@@ -156,7 +154,10 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
     if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
     }
-    if (deviceInfo.sdkApiVersion >= 26 && typeof (node as ActionsAttribute).accessibilityCustomActions === "function") {
+    if (
+      deviceInfo.sdkApiVersion >= 26 &&
+      typeof (node as ActionsAttribute).accessibilityCustomActions === "function"
+    ) {
       const actions: CustomAction[] = s.actions.map((action: ViewAction): CustomAction => {
         return {
           name: action.label,
@@ -167,7 +168,9 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       });
       (node as ActionsAttribute).accessibilityCustomActions(actions);
     } else if (s.api26 && s.actions.length > 0) {
-      console.warn("[NSH] runtime lacks ArkUI accessibilityCustomActions; degrading custom actions");
+      console.warn(
+        "[NSH] runtime lacks ArkUI accessibilityCustomActions; degrading custom actions",
+      );
     }
   }
 }
@@ -180,14 +183,13 @@ struct ViewMenuContent {
       ForEach(
         this.menu.items,
         (item: NativeMenuItem) => {
-          MenuItem({ content: item.label })
-            .onClick((): void => {
-              this.entry.action(item.name, "menu", this.menu.generation);
-            });
+          MenuItem({ content: item.label }).onClick((): void => {
+            this.entry.action(item.name, "menu", this.menu.generation);
+          });
         },
         (item: NativeMenuItem): string => item.name,
       )
-    }.padding(8);
+    }.padding(4);
   }
 }
 @Builder
@@ -342,7 +344,9 @@ class ViewEntry {
     try {
       this.disposeBuilders();
     } catch (error) {
-      console.error(`[NSH] failed to clean up aborted wrapper ${this.settings.targetId}: ${String(error)}`);
+      console.error(
+        `[NSH] failed to clean up aborted wrapper ${this.settings.targetId}: ${String(error)}`,
+      );
     }
   }
   create(): void {
@@ -350,7 +354,9 @@ class ViewEntry {
     let stage: string = "build";
     try {
       const params: ViewParameters = { entry: this, settings: this.settings };
-      this.textureNode?.build(wrapBuilder(sourceContent), params, { nestingBuilderSupported: true });
+      this.textureNode?.build(wrapBuilder(sourceContent), params, {
+        nestingBuilderSupported: true,
+      });
       this.node.build(wrapBuilder(viewContent), params, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("Native wrapper creation was cancelled");
@@ -383,6 +389,13 @@ class ViewEntry {
       }
     }
   }
+  private static sameCaptureSize(a: Settings, b: Settings): boolean {
+    const aw = a.width + (a.textureInsets?.left ?? 0) + (a.textureInsets?.right ?? 0);
+    const ah = a.height + (a.textureInsets?.top ?? 0) + (a.textureInsets?.bottom ?? 0);
+    const bw = b.width + (b.textureInsets?.left ?? 0) + (b.textureInsets?.right ?? 0);
+    const bh = b.height + (b.textureInsets?.top ?? 0) + (b.textureInsets?.bottom ?? 0);
+    return aw === bw && ah === bh;
+  }
   update(settings: Settings): void {
     if (this.closed) {
       throw new Error("Native wrapper is already closed");
@@ -390,11 +403,19 @@ class ViewEntry {
     if (settings.targetId !== this.settings.targetId) {
       throw new Error("Native wrapper target cannot change");
     }
+    const previous = this.state.settings;
     this.state.settings = settings;
     const params: ViewParameters = { entry: this, settings: settings };
     this.sdkBusy = true;
     try {
-      this.node.update(params);
+      if (this.textureNode) {
+        this.textureNode.update(params);
+        if (!ViewEntry.sameCaptureSize(previous, settings)) {
+          this.node.update(params);
+        }
+      } else {
+        this.node.update(params);
+      }
     } finally {
       this.sdkBusy = false;
       if (this.disposePending) {
@@ -636,12 +657,7 @@ export class NativeViews {
         if (entry) {
           entry.update(state);
         } else {
-          const created = new ViewEntry(
-            state,
-            context,
-            this.menus,
-            this.pointerPosting,
-          );
+          const created = new ViewEntry(state, context, this.menus, this.pointerPosting);
           created.create();
           this.entries.set(state.targetId, created);
         }

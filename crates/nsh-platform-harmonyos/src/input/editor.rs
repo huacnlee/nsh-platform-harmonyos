@@ -418,6 +418,35 @@ impl Input {
         }
         Ok(())
     }
+    // Use the committed NSH layout: ArkUI has not measured newly attached children
+    // during their first mount. Keep a half-viewport of editors ahead of a drag.
+    pub(crate) fn below_viewport(&self) -> bool {
+        let Some(mut node) = self.owner.upgrade() else {
+            return false;
+        };
+        let mut top = 0.0;
+        while let Some(parent) = { node.parent_node.borrow().upgrade() } {
+            if !node.style.borrow().transform.is_identity()
+                || node
+                    .live
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|live| live.changes_layout_or_transform())
+            {
+                return false;
+            }
+            top += node.frame.get().y;
+            if let Some(scroll) = parent.scroll.borrow().as_ref() {
+                let height = parent.frame.get().height;
+                return height > 0.0
+                    && scroll.scale() == 1.0
+                    && top - scroll.current_offset().1 > height * 1.5;
+            }
+            node = parent;
+        }
+        false
+    }
+
     pub(crate) fn update(&self) {
         let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
             return;
@@ -460,6 +489,7 @@ impl Input {
             .selection_color
             .unwrap_or(nsh_core::Color(0x3388ff55));
         owner.editor_update(EditorSettings {
+            below_viewport: false,
             accessibility: Some(EditorAccessibility {
                 label: accessibility.label.as_deref().unwrap_or("").to_owned(),
                 hint: accessibility.hint.as_deref().unwrap_or("").to_owned(),

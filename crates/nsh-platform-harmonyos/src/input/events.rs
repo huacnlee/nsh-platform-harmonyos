@@ -26,19 +26,22 @@ use ohos_arkui_binding::{
 
 use crate::render::node::{Node, Result, callback};
 
-#[derive(Default)]
 pub(crate) struct Interaction {
     props: RefCell<ViewProps>,
     events: Cell<EventMask>,
     tracked: Cell<u16>,
     states: Cell<u16>,
     inherited_block: Cell<bool>,
+    applied_hit_test: Cell<i32>,
+    applied_internal_hit_test: Cell<i32>,
     click_registered: Cell<bool>,
     touch_registered: Cell<bool>,
     expanded_hit_region: Cell<bool>,
     hover_registered: Cell<bool>,
+    key_focusable: Cell<bool>,
     mouse_registered: Cell<bool>,
     opacity: Cell<Option<f32>>,
+    applied_opacity: Cell<Option<f32>>,
     label: RefCell<Option<Arc<str>>>,
     applied_label: RefCell<Option<Arc<str>>>,
     long_press: RefCell<Option<(u32, Gesture)>>,
@@ -46,6 +49,36 @@ pub(crate) struct Interaction {
     gestures: RefCell<Vec<Gesture>>,
     gesture_values: Cell<GestureValues>,
     gesture_start: Cell<[f32; 4]>,
+}
+
+impl Default for Interaction {
+    fn default() -> Self {
+        let default_hit: i32 = HitTestMode::Default.into();
+        Self {
+            props: RefCell::default(),
+            events: Cell::default(),
+            tracked: Cell::default(),
+            states: Cell::default(),
+            inherited_block: Cell::new(false),
+            applied_hit_test: Cell::new(default_hit),
+            applied_internal_hit_test: Cell::new(default_hit),
+            click_registered: Cell::new(false),
+            touch_registered: Cell::new(false),
+            expanded_hit_region: Cell::new(false),
+            hover_registered: Cell::new(false),
+            key_focusable: Cell::new(false),
+            mouse_registered: Cell::new(false),
+            opacity: Cell::new(Some(1.0)),
+            applied_opacity: Cell::new(Some(1.0)),
+            label: RefCell::default(),
+            applied_label: RefCell::default(),
+            long_press: RefCell::default(),
+            long_fired: Cell::new(false),
+            gestures: RefCell::default(),
+            gesture_values: Cell::default(),
+            gesture_start: Cell::default(),
+        }
+    }
 }
 
 impl Interaction {
@@ -61,7 +94,7 @@ impl Interaction {
     pub(crate) fn hit_region(&self, owner: &Node) -> Result<()> {
         let frame = owner.frame.get();
         let has_area = frame.width > 0.0 && frame.height > 0.0;
-        let mut slop = if has_area {
+        let slop = if has_area {
             self.props.borrow().hit_slop
         } else {
             nsh_core::EdgeInsets::default()
@@ -76,18 +109,9 @@ impl Interaction {
         } else {
             1.0 / owner.scale.get()
         };
-        if !owner.clips_children()
-            && let Some(extent) = owner.overflow.get()
-        {
-            slop.left = slop.left.max(nsh_core::Points(-extent.x));
-            slop.top = slop.top.max(nsh_core::Points(-extent.y));
-            slop.right = slop
-                .right
-                .max(nsh_core::Points(extent.x + extent.width - eff_w));
-            slop.bottom = slop
-                .bottom
-                .max(nsh_core::Points(extent.y + extent.height - eff_h));
-        }
+        // ArkUI visits the children of an unclipped node even outside its own
+        // response region. Extending the parent to their bounding box lets a
+        // decorative sibling intercept clicks in empty space between children.
         if slop == nsh_core::EdgeInsets::default() {
             if self.expanded_hit_region.replace(false) {
                 owner.native.borrow().reset_attribute(A::ResponseRegion)?;
@@ -116,11 +140,56 @@ impl Interaction {
     pub(crate) fn pan_activation(&self) -> Option<nsh_core::PanActivation> {
         self.props.borrow().pan_activation
     }
+    pub(crate) fn key_interest(
+        &self,
+        kind: EventKind,
+        stroke: Option<&nsh_core::keymap::Keystroke>,
+    ) -> (bool, bool) {
+        let props = self.props.borrow();
+        if props.accessibility.state.disabled {
+            return (false, false);
+        }
+        (
+            self.mask().contains(kind),
+            props.key_capture.captures_key(stroke),
+        )
+    }
+    fn sync_key_focus(&self, owner: &Rc<Node>) -> Result<()> {
+        if owner.kind == nsh_core::ViewKind::Input
+            || owner.kind == nsh_core::ViewKind::Native
+            || owner.id == nsh_core::ROOT_ID
+        {
+            return Ok(());
+        }
+        let focusable = self
+            .props
+            .borrow()
+            .focus_stop(self.mask().contains(EventKind::Press));
+        if self.key_focusable.replace(focusable) == focusable {
+            return Ok(());
+        }
+        let mut native = owner.native.borrow_mut();
+        native.set_focusable(focusable)?;
+        for (native_kind, kind) in [(E::OnFocus, EventKind::Focus), (E::OnBlur, EventKind::Blur)] {
+            if focusable {
+                let weak = Rc::downgrade(owner);
+                native.on_event(native_kind, move |_| {
+                    if let Some(owner) = weak.upgrade() {
+                        owner.emit(kind, EventPayload::None);
+                    }
+                });
+            } else {
+                native.off_event(native_kind)?;
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn mask(&self) -> EventMask {
         self.events.get()
     }
     pub(crate) fn events(&self, owner: &Rc<Node>, events: EventMask) -> Result<()> {
         self.events.set(events);
+        self.sync_key_focus(owner)?;
         if let Some(scroll) = owner.scroll.borrow().as_ref() {
             scroll.refreshable(events.contains(EventKind::Refresh))?;
         }
@@ -356,37 +425,52 @@ impl Interaction {
         Ok(())
     }
     pub(crate) fn props(&self, owner: &Rc<Node>, props: ViewProps) -> Result<()> {
-        let selection_changed = self.props.borrow().selectable_view != props.selectable_view;
+        let old_props = self.props.borrow().clone();
+        let selection_changed = old_props.selectable_view != props.selectable_view;
+        let pointer_changed = old_props.pointer_events != props.pointer_events;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
-            if let Some(id) = &props.test_id {
-                native.id(id.as_ref())?;
-            } else {
-                native.reset_attribute(A::Id)?;
+            if old_props.test_id != props.test_id {
+                if let Some(id) = &props.test_id {
+                    native.id(id.as_ref())?;
+                } else {
+                    native.reset_attribute(A::Id)?;
+                }
             }
-            native.set_bool_attribute(
-                A::AccessibilityGroup,
-                props.accessibility.accessible.unwrap_or(false),
-            )?;
-            let mode = if props.accessibility.hidden {
-                AccessibilityMode::DisabledForDescendants
-            } else {
-                match props.accessibility.accessible {
-                    Some(true) => AccessibilityMode::Enabled,
-                    Some(false) => AccessibilityMode::Disabled,
-                    None => AccessibilityMode::Auto,
+            let next_group = props.accessibility.accessible.unwrap_or(false);
+            if old_props.accessibility.accessible.unwrap_or(false) != next_group {
+                native.set_bool_attribute(A::AccessibilityGroup, next_group)?;
+            }
+            let mode_for = |hidden: bool, accessible: Option<bool>| -> i32 {
+                if hidden {
+                    AccessibilityMode::DisabledForDescendants.into()
+                } else {
+                    match accessible {
+                        Some(true) => AccessibilityMode::Enabled.into(),
+                        Some(false) => AccessibilityMode::Disabled.into(),
+                        None => AccessibilityMode::Auto.into(),
+                    }
                 }
             };
-            native.set_i32_attribute(A::AccessibilityMode, mode.into())?;
-            native.set_string_attribute(
-                A::AccessibilityDescription,
-                props.accessibility.hint.as_deref().unwrap_or_default(),
-            )?;
+            let next_mode = mode_for(props.accessibility.hidden, props.accessibility.accessible);
+            if mode_for(
+                old_props.accessibility.hidden,
+                old_props.accessibility.accessible,
+            ) != next_mode
+            {
+                native.set_i32_attribute(A::AccessibilityMode, next_mode)?;
+            }
+            if old_props.accessibility.hint != props.accessibility.hint {
+                native.set_string_attribute(
+                    A::AccessibilityDescription,
+                    props.accessibility.hint.as_deref().unwrap_or_default(),
+                )?;
+            }
         }
         crate::accessibility::node::configure(
             owner,
-            &self.props.borrow().accessibility,
+            &old_props.accessibility,
             &props.accessibility,
         )?;
         let disabled = props.accessibility.state.disabled;
@@ -402,11 +486,13 @@ impl Interaction {
         self.state(owner, state::DISABLED, disabled)?;
         self.apply_label(owner)?;
         self.apply_opacity(owner)?;
-        self.pointer(owner, self.inherited_block.get())?;
+        if pointer_changed {
+            self.pointer_internal(owner, self.inherited_block.get(), true)?;
+        }
         if selection_changed {
             owner.selection_configure()?;
         }
-        Ok(())
+        self.sync_key_focus(owner)
     }
     pub(crate) fn label(&self, owner: &Node, label: Option<Arc<str>>) -> Result<()> {
         self.props.borrow_mut().accessibility.label = label;
@@ -440,47 +526,60 @@ impl Interaction {
         Ok(())
     }
     pub(crate) fn pointer(&self, owner: &Rc<Node>, inherited: bool) -> Result<()> {
-        self.inherited_block.set(inherited);
+        self.pointer_internal(owner, inherited, false)
+    }
+    fn pointer_internal(&self, owner: &Rc<Node>, inherited: bool, force_self: bool) -> Result<()> {
+        let inherited_changed = self.inherited_block.replace(inherited) != inherited;
         let pointer = self.props.borrow().pointer_events;
-        let mode = if inherited {
-            HitTestMode::None
+        let mode: i32 = if inherited {
+            HitTestMode::None.into()
         } else {
             match pointer {
-                PointerEvents::Auto => HitTestMode::Default,
-                PointerEvents::BoxOnly => HitTestMode::Block,
-                PointerEvents::BoxNone | PointerEvents::None => HitTestMode::None,
+                PointerEvents::Auto => HitTestMode::Default.into(),
+                PointerEvents::BoxOnly => HitTestMode::Block.into(),
+                PointerEvents::BoxNone | PointerEvents::None => HitTestMode::None.into(),
             }
         };
-        owner
-            .native
-            .borrow()
-            .set_i32_attribute(A::HitTestBehavior, mode.into())?;
+        if self.applied_hit_test.replace(mode) != mode {
+            owner
+                .native
+                .borrow()
+                .set_i32_attribute(A::HitTestBehavior, mode)?;
+        }
         let internal =
             if inherited || matches!(pointer, PointerEvents::None | PointerEvents::BoxOnly) {
                 HitTestMode::None
             } else {
                 HitTestMode::Default
             };
-        if let Some(input) = owner.input.borrow().as_ref() {
-            input.hit_test(internal)?;
+        let internal_i32: i32 = internal.into();
+        if self.applied_internal_hit_test.replace(internal_i32) != internal_i32 {
+            if let Some(input) = owner.input.borrow().as_ref() {
+                input.hit_test(internal)?;
+            }
+            if let Some(scroll) = owner.scroll.borrow().as_ref() {
+                scroll
+                    .native
+                    .borrow()
+                    .set_i32_attribute(A::HitTestBehavior, internal_i32)?;
+            }
         }
-        if let Some(scroll) = owner.scroll.borrow().as_ref() {
-            scroll
-                .native
-                .borrow()
-                .set_i32_attribute(A::HitTestBehavior, internal.into())?;
+        if force_self || inherited_changed || owner.raster.borrow().is_some() {
+            self.events(owner, self.events.get())?;
         }
-        self.events(owner, self.events.get())?;
+        let next_child_inherited =
+            inherited || matches!(pointer, PointerEvents::None | PointerEvents::BoxOnly);
         for child in owner
             .children
             .borrow()
             .iter()
             .filter_map(|child| child.upgrade())
         {
-            child.interaction.pointer(
-                &child,
-                inherited || matches!(pointer, PointerEvents::None | PointerEvents::BoxOnly),
-            )?;
+            if child.interaction.inherited_block.get() != next_child_inherited {
+                child
+                    .interaction
+                    .pointer_internal(&child, next_child_inherited, false)?;
+            }
         }
         Ok(())
     }
@@ -693,6 +792,7 @@ impl Interaction {
     }
     pub(crate) fn invalidate_opacity(&self) {
         self.opacity.set(None);
+        self.applied_opacity.set(None);
     }
     fn apply_opacity(&self, owner: &Node) -> Result<()> {
         let opacity = if owner.native_visibility_hidden() {
@@ -700,7 +800,9 @@ impl Interaction {
         } else {
             self.opacity.get().unwrap_or(1.0)
         };
-        owner.visual_node().borrow().opacity(opacity)?;
+        if self.applied_opacity.replace(Some(opacity)) != Some(opacity) {
+            owner.visual_node().borrow().opacity(opacity)?;
+        }
         Ok(())
     }
 }

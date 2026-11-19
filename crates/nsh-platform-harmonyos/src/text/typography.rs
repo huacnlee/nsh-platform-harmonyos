@@ -615,13 +615,18 @@ impl TextEngine for OhosTextEngine {
                     }));
                 }
             };
+            let needs_clip = prepared.no_wrap
+                || paragraph.longest_line() > f64::from(size.width) + 0.5
+                || paragraph.height() > f64::from(bottom) + 0.5;
             let canvas = recording.canvas();
             canvas.save();
-            canvas.clip_rect(
-                &ohos_drawing_binding::Rect::new(0.0, 0.0, width as f32, height as f32),
-                ohos_drawing_binding::ClipOperation::Intersect,
-                false,
-            );
+            if needs_clip {
+                canvas.clip_rect(
+                    &ohos_drawing_binding::Rect::new(0.0, 0.0, width as f32, height as f32),
+                    ohos_drawing_binding::ClipOperation::Intersect,
+                    false,
+                );
+            }
             canvas.scale(scale, scale);
             canvas.translate(0.0, padding_top);
             if !prepared.backgrounds.is_empty() {
@@ -680,39 +685,13 @@ impl TextEngine for OhosTextEngine {
                         let r = b.radius();
                         let top = baseline - b.ascent.0;
                         let h = (b.ascent + b.descent).0;
+                        let rect =
+                            ohos_drawing_binding::Rect::new(b.x.0, top, b.x.0 + b.width.0, top + h);
                         if r.0 > 0.0 {
-                            let mut path = ohos_drawing_binding::Path::new();
-                            nsh_core::shape::rounded_rect(
-                                nsh_core::Bounds::new(
-                                    Point::new(b.x, Points(top)),
-                                    Size::new(b.width, Points(h)),
-                                ),
-                                nsh_core::Corners::all(Size::new(r, r)),
-                                false,
-                                false,
-                                &mut |s| match s {
-                                    nsh_core::shape::Segment::Move(p) => {
-                                        path.move_to(p.x.0, p.y.0);
-                                    }
-                                    nsh_core::shape::Segment::Line(p) => {
-                                        path.line_to(p.x.0, p.y.0);
-                                    }
-                                    nsh_core::shape::Segment::Cubic([a, b, c]) => {
-                                        path.bezier_curve_to(
-                                            a.x.0, a.y.0, b.x.0, b.y.0, c.x.0, c.y.0,
-                                        );
-                                    }
-                                    nsh_core::shape::Segment::Close => path.close(),
-                                },
-                            );
-                            canvas.draw_path(&path);
+                            let round_rect = ohos_drawing_binding::RoundRect::new(&rect, r.0, r.0);
+                            canvas.draw_round_rect(&round_rect);
                         } else {
-                            canvas.draw_rect(&ohos_drawing_binding::Rect::new(
-                                b.x.0,
-                                top,
-                                b.x.0 + b.width.0,
-                                top + h,
-                            ));
+                            canvas.draw_rect(&rect);
                         }
                         canvas.detach_brush();
                     });

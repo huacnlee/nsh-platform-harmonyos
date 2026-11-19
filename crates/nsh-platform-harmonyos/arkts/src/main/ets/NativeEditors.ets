@@ -1,11 +1,11 @@
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
-import { uiAppearance } from "@kit.ArkUI";
 import pasteboard from "@ohos.pasteboard";
 import image from "@ohos.multimedia.image";
 import util from "@ohos.util";
 
 export interface EditorSettings {
+  belowViewport?: boolean;
   targetId: number;
   multiline: boolean;
   secure: boolean;
@@ -105,6 +105,7 @@ export interface WebEventPayload {
 export interface NshRuntimeContext {
   isActive(): boolean;
   getUIContext(): UIContext;
+  colorMode?(): ThemeColorMode;
   attachNativeNode(targetId: number, content: FrameNode | null): boolean;
   attachNativeSubtree(targetId: number, content: FrameNode | null, slot: NodeContent): boolean;
   retireNativeNode(targetId: number): boolean;
@@ -486,40 +487,6 @@ function editActionLabel(action: string): ResourceStr {
   }
 }
 
-// The system keeps a separate resource for each dark color, so the menu picks
-// the pair that matches the appearance the system is showing (API 20).
-function darkMode(): boolean {
-  try {
-    return uiAppearance.getDarkMode() === uiAppearance.DarkMode.ALWAYS_DARK;
-  } catch {
-    return false;
-  }
-}
-
-function menuBackgroundColor(): ResourceColor {
-  return darkMode()
-    ? $r("sys.color.ohos_id_color_card_bg_dark")
-    : $r("sys.color.ohos_id_color_card_bg");
-}
-
-function menuTextColor(): ResourceColor {
-  return darkMode()
-    ? $r("sys.color.ohos_id_color_text_primary_dark")
-    : $r("sys.color.ohos_id_color_text_primary");
-}
-
-function menuDividerColor(): ResourceColor {
-  return darkMode()
-    ? $r("sys.color.ohos_id_color_component_normal_dark")
-    : $r("sys.color.ohos_id_color_component_normal");
-}
-
-function menuShadowColor(): ResourceColor {
-  return darkMode()
-    ? $r("sys.color.ohos_id_color_mask_thin_dark")
-    : $r("sys.color.ohos_id_color_mask_thin");
-}
-
 @Component
 struct EditMenuView {
   entry!: EditorEntry;
@@ -560,82 +527,83 @@ struct EditMenuView {
   }
 
   build() {
-    Row() {
-      ForEach(
-        this.actions,
-        (action: string, index: number) => {
-          if (index > 0) {
-            Divider().vertical(true).height(16).color(menuDividerColor()).strokeWidth(0.5);
-          }
-          if (action === "paste") {
-            PasteButton({
-              text: PasteDescription.PASTE,
-              buttonType: ButtonType.Capsule,
-            })
-              .fontSize(14)
-              .fontColor(menuTextColor())
-              .iconColor(menuTextColor())
-              .fontWeight(FontWeight.Regular)
-              .backgroundColor(menuBackgroundColor())
-              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-              .onClick((_event: ClickEvent, result: PasteButtonOnClickResult): void => {
-                if (result === PasteButtonOnClickResult.SUCCESS) {
-                  this.entry.chooseEditAction("paste");
-                }
-              });
-          } else {
-            Text(editActionLabel(action))
-              .fontSize(14)
-              .fontColor(menuTextColor())
-              .padding({ left: 12, right: 12, top: 8, bottom: 8 })
-              .focusable(false)
-              .onClick((): void => {
-                this.entry.chooseEditAction(action);
-              });
-          }
-        },
-        (action: string): string => action,
-      )
-    }
-    .backgroundColor(menuBackgroundColor())
-    .borderRadius(18)
-    .border({
-      width: 0.5,
-      color: menuDividerColor(),
-    })
-    .shadow({
-      radius: 16,
-      color: menuShadowColor(),
-      offsetX: 0,
-      offsetY: 4,
-    })
-    .focusable(false)
-    .onTouch((event: TouchEvent): void => {
-      if (event.type === TouchType.Down) {
-        this.entry.markMenuInteraction();
+    WithTheme({ colorMode: this.entry.colorMode() }) {
+      Row() {
+        ForEach(
+          this.actions,
+          (action: string, index: number) => {
+            if (index > 0) {
+              Divider()
+                .vertical(true)
+                .height(16)
+                .color($r("sys.color.comp_divider"))
+                .strokeWidth(0.5);
+            }
+            if (action === "paste") {
+              PasteButton({
+                text: PasteDescription.PASTE,
+                buttonType: ButtonType.Capsule,
+              })
+                .fontSize(14)
+                .fontColor($r("sys.color.font_primary"))
+                .iconColor($r("sys.color.font_primary"))
+                .fontWeight(FontWeight.Regular)
+                .backgroundColor($r("sys.color.comp_background_primary"))
+                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                .onClick((_event: ClickEvent, result: PasteButtonOnClickResult): void => {
+                  if (result === PasteButtonOnClickResult.SUCCESS) {
+                    this.entry.chooseEditAction("paste");
+                  }
+                });
+            } else {
+              Text(editActionLabel(action))
+                .fontSize(14)
+                .fontColor($r("sys.color.font_primary"))
+                .padding({ left: 12, right: 12, top: 8, bottom: 8 })
+                .focusable(false)
+                .onClick((): void => {
+                  this.entry.chooseEditAction(action);
+                });
+            }
+          },
+          (action: string): string => action,
+        )
       }
-    })
-    .onAreaChange((_old: Area, area: Area): void => {
-      const w = Number(area.width);
-      const h = Number(area.height);
-      const gx = Number(area.globalPosition.x);
-      const gy = Number(area.globalPosition.y);
-      const lx = Number(area.position.x);
-      const ly = Number(area.position.y);
-      if (w > 0) {
-        this.menuW = w;
-      }
-      if (h > 0) {
-        this.menuH = h;
-      }
-      if (Number.isFinite(gx) && Number.isFinite(lx)) {
-        this.overlayOriginX = gx - lx;
-      }
-      if (Number.isFinite(gy) && Number.isFinite(ly)) {
-        this.overlayOriginY = gy - ly;
-      }
-    })
-    .position({ x: this.posX(), y: this.posY() });
+      .backgroundColor($r("sys.color.comp_background_primary"))
+      .borderRadius(18)
+      .border({
+        width: 0.5,
+        color: $r("sys.color.comp_divider"),
+      })
+      .shadow(ShadowStyle.OUTER_DEFAULT_MD)
+      .focusable(false)
+      .onTouch((event: TouchEvent): void => {
+        if (event.type === TouchType.Down) {
+          this.entry.markMenuInteraction();
+        }
+      })
+      .onAreaChange((_old: Area, area: Area): void => {
+        const w = Number(area.width);
+        const h = Number(area.height);
+        const gx = Number(area.globalPosition.x);
+        const gy = Number(area.globalPosition.y);
+        const lx = Number(area.position.x);
+        const ly = Number(area.position.y);
+        if (w > 0) {
+          this.menuW = w;
+        }
+        if (h > 0) {
+          this.menuH = h;
+        }
+        if (Number.isFinite(gx) && Number.isFinite(lx)) {
+          this.overlayOriginX = gx - lx;
+        }
+        if (Number.isFinite(gy) && Number.isFinite(ly)) {
+          this.overlayOriginY = gy - ly;
+        }
+      })
+      .position({ x: this.posX(), y: this.posY() })
+    };
   }
 }
 
@@ -821,6 +789,9 @@ class EditorEntry {
     return (
       this.updating || (this.settings.editable && this.settings.accessibility?.disabled !== true)
     );
+  }
+  colorMode(): ThemeColorMode {
+    return this.context.colorMode ? this.context.colorMode() : ThemeColorMode.SYSTEM;
   }
   editorHeight(): number {
     return this.settings.multiline && !this.settings.secure
@@ -1327,7 +1298,8 @@ class EditorEntry {
         } else {
           this.line.setTextSelection(0, end);
         }
-      } catch {} finally {
+      } catch {
+      } finally {
         this.updating = false;
       }
       this.selection(0, end);
@@ -1414,7 +1386,8 @@ class EditorEntry {
       } else {
         this.line.setTextSelection(caret, caret);
       }
-    } catch {} finally {
+    } catch {
+    } finally {
       this.updating = false;
     }
     if (this.text !== next) {
@@ -1461,7 +1434,8 @@ class EditorEntry {
       } else {
         this.line.setTextSelection(delStart, delStart);
       }
-    } catch {} finally {
+    } catch {
+    } finally {
       this.updating = false;
     }
     if (this.text !== next) {
@@ -1622,10 +1596,62 @@ class EditorEntry {
   }
 }
 
+class EditorBuildCallback extends FrameCallback {
+  private build: (timeLeft: number) => void;
+  constructor(build: (timeLeft: number) => void) {
+    super();
+    this.build = build;
+  }
+  onIdle(timeLeft: number): void {
+    this.build(timeLeft);
+  }
+}
+
 export class NativeEditors {
+  private pending: Map<number, EditorSettings> = new Map();
+  private scheduled: boolean = false;
+  private create(state: EditorSettings, context: NshRuntimeContext): EditorEntry {
+    this.pending.delete(state.targetId);
+    const entry = new EditorEntry(state, context);
+    // Publish before build because SDK callbacks can synchronously retire the target.
+    this.entries.set(state.targetId, entry);
+    try {
+      entry.create();
+    } catch (error) {
+      if (this.entries.get(state.targetId) === entry) this.entries.delete(state.targetId);
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    return entry;
+  }
+  private schedule(context: NshRuntimeContext): void {
+    if (this.scheduled || this.pending.size === 0 || !context.isActive()) return;
+    this.scheduled = true;
+    const callback = new EditorBuildCallback((timeLeft: number): void => {
+      this.scheduled = false;
+      if (!context.isActive()) return;
+      // Allow at least one editor to progress on a busy frame. Leave the rest of
+      // the interval to ArkUI to present and process the next input.
+      const until = Date.now() + Math.min(3, timeLeft / 1000000);
+      try {
+        for (const state of this.pending.values()) {
+          this.create(state, context);
+          if (Date.now() >= until || !context.isActive()) break;
+        }
+      } finally {
+        this.schedule(context);
+      }
+    });
+    try {
+      context.getUIContext().postFrameCallback(callback);
+    } catch (error) {
+      this.scheduled = false;
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+  }
   private entries: Map<number, EditorEntry> = new Map();
   remove(ids: number[], context: NshRuntimeContext): void {
     for (const id of ids) {
+      this.pending.delete(id);
       this.entries.get(id)?.dispose(context);
       this.entries.delete(id);
     }
@@ -1635,21 +1661,24 @@ export class NativeEditors {
       if (!context.isActive()) {
         throw new Error("NSH SDK session is inactive");
       }
-      let entry = this.entries.get(state.targetId);
+      const entry = this.entries.get(state.targetId);
       if (entry) {
         entry.update(state);
+      } else if (state.belowViewport && !state.autoFocus) {
+        this.pending.set(state.targetId, state);
       } else {
-        entry = new EditorEntry(state, context);
-        // Publish before SDK build: onAppear/onClosing may reenter synchronously.
-        this.entries.set(state.targetId, entry);
-        entry.create();
+        this.create(state, context);
       }
     }
     for (const command of commands) {
-      this.entries.get(command.targetId)?.command(command);
+      const pending = this.pending.get(command.targetId);
+      const entry = pending ? this.create(pending, context) : this.entries.get(command.targetId);
+      entry?.command(command);
     }
+    this.schedule(context);
   }
   dispose(context: NshRuntimeContext): void {
+    this.pending.clear();
     let failure: Error | undefined;
     for (const id of Array.from(this.entries.keys())) {
       const entry = this.entries.get(id)!;

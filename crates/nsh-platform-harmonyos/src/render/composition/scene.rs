@@ -29,6 +29,7 @@ use crate::{
 };
 
 struct RootBitmap {
+    navigation: Option<crate::render::shader::navigation::Key>,
     bitmap: Bitmap,
     x: f32,
     y: f32,
@@ -77,6 +78,7 @@ pub(crate) struct Scene {
     dirty: Cell<bool>,
     preparing: Cell<bool>,
     requeued: Cell<bool>,
+    inactive_requirements: Cell<bool>,
     shared: Arc<SceneShared>,
     bitmaps: RefCell<FxHashMap<u32, RootBitmap>>,
     roots: RefCell<Vec<Weak<Node>>>,
@@ -92,6 +94,7 @@ impl Scene {
             dirty: Cell::new(false),
             preparing: Cell::new(false),
             requeued: Cell::new(false),
+            inactive_requirements: Cell::new(false),
             shared: Arc::default(),
             bitmaps: RefCell::default(),
             roots: RefCell::default(),
@@ -100,8 +103,40 @@ impl Scene {
             eligibility: RefCell::default(),
         }
     }
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.get()
+    }
+    pub(crate) fn has_inactive_requirements(&self) -> bool {
+        self.inactive_requirements.get()
+    }
+    pub(crate) fn is_ancestor_of_active_root(&self, node: &Node) -> bool {
+        if !self.active.get() {
+            return false;
+        }
+        let target = node as *const Node;
+        for root in self.roots.borrow().iter().filter_map(Weak::upgrade) {
+            let mut cur = Some(root);
+            while let Some(current) = cur {
+                if std::ptr::eq(Rc::as_ptr(&current), target) {
+                    return true;
+                }
+                cur = current.parent_node.borrow().upgrade();
+            }
+        }
+        false
+    }
     pub(crate) fn has_output(&self) -> bool {
         !self.bitmaps.borrow().is_empty()
+    }
+    pub(crate) fn has_navigation_frame(
+        &self,
+        id: u32,
+        key: crate::render::shader::navigation::Key,
+    ) -> bool {
+        self.bitmaps
+            .borrow()
+            .get(&id)
+            .is_some_and(|output| output.navigation == Some(key))
     }
     pub(crate) fn has_output_for(&self, id: u32) -> bool {
         self.bitmaps.borrow().contains_key(&id)
@@ -109,11 +144,26 @@ impl Scene {
     pub(crate) fn require(&self, node: &Rc<Node>) {
         let required = node.effects_plan().requires_scene;
         let mut nodes = self.requirements.borrow_mut();
-        nodes.retain(|weak| weak.upgrade().is_some_and(|owner| owner.id != node.id));
+        let mut existed = false;
+        nodes.retain(|weak| {
+            if let Some(owner) = weak.upgrade() {
+                if owner.id == node.id {
+                    existed = true;
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            }
+        });
         if required {
             nodes.push(Rc::downgrade(node));
         }
         drop(nodes);
+        if !existed && !required {
+            return;
+        }
         self.eligibility
             .borrow_mut()
             .on_requirement_updated(node.id, required);
@@ -139,6 +189,7 @@ impl Scene {
         if !self.dirty.replace(false) {
             return;
         }
+        let _trace = super::trace::Scope::new(c"NSH scene prepare");
         let _guard = PreparingGuard::enter(self);
         let max_passes = self.requirements.borrow().len().saturating_add(1);
         for _ in 0..max_passes {
@@ -186,6 +237,7 @@ impl Scene {
         };
         let mut live_ids = FxHashSet::default();
         let mut candidates: Vec<CandidateRoot> = Vec::new();
+        let mut has_inactive = false;
         {
             let mut requirements = self.requirements.borrow_mut();
             requirements.retain(|node| node.strong_count() > 0);
@@ -194,7 +246,11 @@ impl Scene {
             // ordinary mount/animation turns do not scan the whole native tree.
             for node in requirements.iter().filter_map(Weak::upgrade) {
                 live_ids.insert(node.id);
-                if !eligibility.is_eligible(node.id) || !node.paint_visible() {
+                if !eligibility.is_eligible(node.id) {
+                    continue;
+                }
+                if !node.paint_visible() {
+                    has_inactive = true;
                     continue;
                 }
                 let mut connected = false;
@@ -221,9 +277,12 @@ impl Scene {
                             req_ids: vec![node.id],
                         });
                     }
+                } else {
+                    has_inactive = true;
                 }
             }
         }
+        self.inactive_requirements.set(has_inactive);
         self.eligibility
             .borrow_mut()
             .retain_live(|id| live_ids.contains(&id));
@@ -328,6 +387,7 @@ impl Scene {
             roots: &mut Vec<(Rc<Node>, Vec<NodeId>)>,
             touched: &mut Vec<Rc<Node>>,
             req_ids: &[NodeId],
+            ancestor_captures_texture: bool,
             depth: usize,
         ) -> Result<()> {
             if depth > 256 {
@@ -337,22 +397,38 @@ impl Scene {
                 return Ok(());
             }
             touched.push(node.clone());
+            node.scene_ancestor_captured.set(ancestor_captures_texture);
             let was_prepared = node.scene_prepared.replace(true);
-            node.ensure_wrapper()?;
-            if let Some(scroll) = node.scroll.borrow().as_ref() {
-                scroll.prepare_scene(node)?;
-            }
-            if !was_prepared {
-                node.restore_style()?;
-            }
             if node.kind == ViewKind::Modal
                 && !roots.iter().any(|(existing, _)| Rc::ptr_eq(existing, node))
             {
                 node.scene_root.set(true);
                 roots.push((node.clone(), req_ids.to_vec()));
             }
+            let captures_texture = node.effects_plan().requires_texture;
+            if node.scene_root.get() || node.wrapper.borrow().is_some() || captures_texture {
+                node.ensure_wrapper()?;
+            }
+            if let Some(scroll) = node.scroll.borrow().as_ref() {
+                scroll.prepare_scene(node)?;
+            }
+            if !was_prepared {
+                node.restore_style()?;
+            }
+            let next_ancestor_captures = if node.kind == ViewKind::Modal {
+                captures_texture
+            } else {
+                ancestor_captures_texture || captures_texture
+            };
             for child in node.children.borrow().iter().filter_map(Weak::upgrade) {
-                prepare_subtree(&child, roots, touched, req_ids, depth + 1)?;
+                prepare_subtree(
+                    &child,
+                    roots,
+                    touched,
+                    req_ids,
+                    next_ancestor_captures,
+                    depth + 1,
+                )?;
             }
             Ok(())
         }
@@ -371,6 +447,7 @@ impl Scene {
                     &mut roots,
                     &mut touched,
                     &candidate.req_ids,
+                    false,
                     0,
                 ) {
                     return Err(ReconcileFailure {
@@ -389,10 +466,19 @@ impl Scene {
                 return Err(failure);
             }
         };
+        let worker = match crate::render::composition::worker::Worker::for_owner(root) {
+            Ok(worker) => worker,
+            Err(error) => {
+                let root_nodes: Vec<Rc<Node>> = roots.into_iter().map(|(n, _)| n).collect();
+                self.rollback(root, &root_nodes, &touched);
+                return Err(ReconcileFailure {
+                    error,
+                    culprit_ids: Vec::new(),
+                });
+            }
+        };
         *self.roots.borrow_mut() = roots.iter().map(|(n, _)| Rc::downgrade(n)).collect();
-        if let Some(worker) = root.compositor.borrow().as_ref() {
-            worker.plan(Arc::new(plan), self.shared.clone());
-        }
+        worker.plan(Arc::new(plan), self.shared.clone());
         Ok(())
     }
     fn rollback(&self, root: &Rc<Node>, candidate_roots: &[Rc<Node>], touched: &[Rc<Node>]) {
@@ -430,6 +516,7 @@ impl Scene {
             let was_empty = !self.has_output();
             let mut bitmaps = self.bitmaps.borrow_mut();
             let mut next_ids = FxHashSet::default();
+            let mut presence_changed = FxHashSet::default();
             for frame in frames {
                 next_ids.insert(frame.id);
                 if let Some(existing) = bitmaps.get_mut(&frame.id)
@@ -437,6 +524,7 @@ impl Scene {
                     && existing.bitmap.height() == frame.height
                 {
                     existing.bitmap.pixels_mut().copy_from_slice(&frame.pixels);
+                    existing.navigation = frame.navigation;
                     existing.x = frame.x;
                     existing.y = frame.y;
                     existing.scale = frame.scale;
@@ -444,24 +532,46 @@ impl Scene {
                     let mut bitmap =
                         Bitmap::new(frame.width, frame.height, BitmapFormat::default());
                     bitmap.pixels_mut().copy_from_slice(&frame.pixels);
-                    bitmaps.insert(
-                        frame.id,
-                        RootBitmap {
-                            bitmap,
-                            x: frame.x,
-                            y: frame.y,
-                            scale: frame.scale,
-                        },
-                    );
+                    if bitmaps
+                        .insert(
+                            frame.id,
+                            RootBitmap {
+                                navigation: frame.navigation,
+                                bitmap,
+                                x: frame.x,
+                                y: frame.y,
+                                scale: frame.scale,
+                            },
+                        )
+                        .is_none()
+                    {
+                        presence_changed.insert(frame.id);
+                    }
                 }
             }
-            bitmaps.retain(|id, _| next_ids.contains(id));
+            bitmaps.retain(|id, _| {
+                if next_ids.contains(id) {
+                    true
+                } else {
+                    presence_changed.insert(*id);
+                    false
+                }
+            });
             let has_output = !bitmaps.is_empty();
             drop(bitmaps);
-            for root in self.roots.borrow().iter().filter_map(Weak::upgrade) {
+            let roots: Vec<Rc<Node>> = self
+                .roots
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for root in &roots {
                 root.mounted()
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                if presence_changed.contains(&root.id) {
+                    root.update_wrapper()?;
+                }
             }
             if was_empty
                 && has_output
@@ -469,7 +579,9 @@ impl Scene {
             {
                 let composites = root.composite_nodes.borrow().clone();
                 for node in composites.into_iter().filter_map(|w| w.upgrade()) {
-                    node.update_wrapper()?;
+                    if !roots.iter().any(|r| Rc::ptr_eq(r, &node)) {
+                        node.update_wrapper()?;
+                    }
                 }
             }
         }
@@ -550,6 +662,7 @@ fn restore_node_only(
     first_error: &mut Option<Error>,
     failed_nodes: &mut Vec<Weak<Node>>,
 ) {
+    node.scene_ancestor_captured.set(false);
     let was_prepared = node.scene_prepared.replace(false);
     let was_root = node.scene_root.replace(false);
     if was_prepared || was_root {
@@ -818,6 +931,12 @@ fn build_paint_tree(owner: &Rc<Node>, parent: Option<&Node>, depth: usize) -> Re
         bounds.union(Bounds::new(size.width, size.height).filters(&effects.backdrop_filters));
     }
     let transform = parent.map_or(Ok(Matrix::IDENTITY), |parent| owner.input_to_parent(parent))?;
+    let (bg_argb, border_colors) = owner.applied_box_colors();
+    let text = if source.is_none() {
+        owner.direct_scene_text()
+    } else {
+        None
+    };
     Ok(PaintNode {
         source,
         shaders: !owner.shader_layers.borrow().is_empty(),
@@ -838,6 +957,9 @@ fn build_paint_tree(owner: &Rc<Node>, parent: Option<&Node>, depth: usize) -> Re
         }),
         transform,
         size,
+        bg_argb,
+        border_colors,
+        text,
         opacity: owner.scene_opacity(),
         clip: owner.clips_children(),
         bounds,

@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 
 impl Mounter {
     fn focused_input(&self) -> Option<(std::rc::Rc<crate::input::editor::Input>, u32)> {
-        self.slots.iter().flatten().find_map(|node| {
+        self.nodes.values().find_map(|node| {
             let input = node.input.borrow().as_ref()?.clone();
             input.is_focused().then_some((input, node.id))
         })
@@ -103,7 +103,7 @@ impl Mounter {
                     || self.dialogs.animating()
                     || self.shaders.animating()
                     || self.leaving_nodes.get() > 0
-                    || self.slots.iter().flatten().any(|node| node
+                    || self.nodes.values().any(|node| node
                         .scroll
                         .borrow()
                         .as_ref()

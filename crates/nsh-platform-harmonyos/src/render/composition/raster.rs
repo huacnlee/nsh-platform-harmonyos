@@ -9,6 +9,7 @@ use super::draw::{Plan, Sources};
 use crate::app::runtime::{Dispatcher, Message};
 
 pub(crate) struct Pixels {
+    pub(crate) navigation: Option<crate::render::shader::navigation::Key>,
     pub(crate) id: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
@@ -34,6 +35,7 @@ impl Scene {
                     frames
                         .into_iter()
                         .map(|frame| Pixels {
+                            navigation: frame.navigation,
                             id: frame.id,
                             width: frame.image.bitmap.width(),
                             height: frame.image.bitmap.height(),

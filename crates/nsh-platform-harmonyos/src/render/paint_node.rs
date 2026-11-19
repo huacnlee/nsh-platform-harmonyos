@@ -1,139 +1,186 @@
 //! Retained custom ink. Unlike C node draw events, a ContentModifier keeps its
 //! draw callback when Rosen moves the node between the window and texture trees.
-use std::{cell::Cell, ffi::c_void, ptr::NonNull, rc::Rc};
-
+//! Leaf hosts attach the RenderNode directly; container hosts use a lightweight
+//! child Custom carrier so FrameNode and RenderNode siblings never mix.
 use ohos_arkui_binding::{
+    common::node::ArkUINode,
     component::{attribute::ArkUICommonAttribute, built_in_component::Custom},
+    render_node::{FloatProperty, RenderContentModifier, RenderNode},
     types::{
         advanced::LengthMetricUnit, attribute::ArkUINodeAttributeType as A, view::HitTestMode,
     },
 };
-use ohos_drawing_binding::Canvas;
+pub(crate) use ohos_drawing_binding::Canvas as PaintCanvas;
+use ohos_drawing_binding::{CornerPosition, Rect, RoundRect};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Deref,
+    rc::{Rc, Weak},
+};
 
-use super::node::{Error, NativeNode, Result, callback};
+use super::node::{NativeNode, Result, callback};
 
-type Handle = *mut c_void;
-type Draw = unsafe extern "C" fn(Handle, Handle);
-
-// Public API 20 native_render.h APIs, not yet exposed by ohos-arkui-binding.
-#[link(name = "ace_ndk.z")]
-unsafe extern "C" {
-    fn OH_ArkUI_RenderNodeUtils_CreateNode() -> Handle;
-    fn OH_ArkUI_RenderNodeUtils_DisposeNode(node: Handle) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_AddRenderNode(node: Handle, child: Handle) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_RemoveRenderNode(node: Handle, child: Handle) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_SetSize(node: Handle, width: i32, height: i32) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_CreateContentModifier() -> Handle;
-    fn OH_ArkUI_RenderNodeUtils_DisposeContentModifier(modifier: Handle);
-    fn OH_ArkUI_RenderNodeUtils_AttachContentModifier(node: Handle, modifier: Handle) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_SetContentModifierOnDraw(
-        modifier: Handle,
-        data: Handle,
-        draw: Draw,
-    ) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_CreateFloatProperty(value: f32) -> Handle;
-    fn OH_ArkUI_RenderNodeUtils_DisposeFloatProperty(property: Handle);
-    fn OH_ArkUI_RenderNodeUtils_AttachFloatProperty(modifier: Handle, property: Handle) -> i32;
-    fn OH_ArkUI_RenderNodeUtils_SetFloatPropertyValue(property: Handle, value: f32) -> i32;
-    fn OH_ArkUI_DrawContext_GetCanvas(context: Handle) -> Handle;
+pub(crate) struct NativeRoundRect {
+    rect: RoundRect,
+    bounds: [f32; 4],
 }
-
-fn check(status: i32) -> Result<()> {
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(ohos_arkui_binding::common::error::ArkUIError::new(
-            (status as u32).into(),
-            "retained paint",
+impl Deref for NativeRoundRect {
+    type Target = RoundRect;
+    fn deref(&self) -> &RoundRect {
+        &self.rect
+    }
+}
+impl NativeRoundRect {
+    pub(crate) fn new(
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+        corners: [(f32, f32); 4],
+    ) -> Self {
+        use CornerPosition::{BottomLeft, BottomRight, TopLeft, TopRight};
+        let mut rect = RoundRect::new(&Rect::new(left, top, right, bottom), 0., 0.);
+        for (corner, (x, y)) in [TopLeft, TopRight, BottomRight, BottomLeft]
+            .into_iter()
+            .zip(corners)
+        {
+            rect.set_corner(corner, x, y);
+        }
+        Self {
+            rect,
+            bounds: [left, top, right, bottom],
+        }
+    }
+    /// Zero-radius enclosing box guaranteed to satisfy `SkRRect::contains(inner)`
+    /// across `self` and `other`, allowing `(enclosing \ inner) ∩ clip` to draw
+    /// shifted shadow crescents via `drawDRRect` + `Intersect` without `Difference`.
+    pub(crate) fn enclosing(&self, other: &Self, margin: f32) -> Self {
+        let m = margin.max(1.0);
+        Self::new(
+            self.bounds[0].min(other.bounds[0]) - m,
+            self.bounds[1].min(other.bounds[1]) - m,
+            self.bounds[2].max(other.bounds[2]) + m,
+            self.bounds[3].max(other.bounds[3]) + m,
+            [(0.0, 0.0); 4],
         )
-        .into())
     }
 }
 
-struct Drawing(Box<dyn Fn(&Canvas)>);
-
-unsafe extern "C" fn draw(context: Handle, data: Handle) {
-    callback(|| {
-        // SAFETY: the modifier runs on the UI thread; PaintNode keeps Drawing
-        // alive until its callback has been replaced during teardown.
-        let drawing = unsafe { &*data.cast::<Drawing>() };
-        let raw = unsafe { OH_ArkUI_DrawContext_GetCanvas(context) };
-        if let Some(raw) = NonNull::new(raw) {
-            let canvas = unsafe { Canvas::from_raw_borrowed(raw) };
-            (drawing.0)(&canvas);
-        }
-        Ok(())
-    });
+enum Attachment {
+    Direct(Weak<RefCell<ArkUINode>>),
+    Carrier(NativeNode),
 }
-unsafe extern "C" fn detached(_: Handle, _: Handle) {}
+
+fn make_carrier(z_index: i32) -> Result<NativeNode> {
+    let carrier = Custom::new()?.into_node();
+    carrier
+        .borrow()
+        .set_length_metric_unit(LengthMetricUnit::Px)?;
+    carrier
+        .borrow()
+        .set_attribute(A::HitTestBehavior, i32::from(HitTestMode::None).into())?;
+    carrier.borrow().set_bool_attribute(A::Clip, false)?;
+    carrier.borrow().set_i32_attribute(A::ZIndex, z_index)?;
+    Ok(carrier)
+}
 
 pub(crate) struct PaintNode {
-    pub(crate) native: NativeNode,
-    render: NonNull<c_void>,
-    modifier: NonNull<c_void>,
-    property: NonNull<c_void>,
-    _drawing: Box<Drawing>,
-    changed: Cell<bool>,
+    attachment: RefCell<Attachment>,
+    // Drop order matters: dispose node before modifier, and modifier before property.
+    node: RenderNode,
+    modifier: RenderContentModifier,
+    property: FloatProperty,
     bounds: Cell<[i32; 4]>,
+    revision: Cell<bool>,
 }
-
 impl PaintNode {
-    pub(crate) fn new(paint: impl Fn(&Canvas) + 'static) -> Result<Self> {
-        let native = Custom::new()?.into_node();
-        native
-            .borrow()
-            .set_length_metric_unit(LengthMetricUnit::Px)?;
-        native
-            .borrow()
-            .set_attribute(A::HitTestBehavior, i32::from(HitTestMode::None).into())?;
-        native.borrow().set_bool_attribute(A::Clip, false)?;
-        let drawing = Box::new(Drawing(Box::new(paint)));
-        // SAFETY: these UI-thread constructors return separately owned handles.
-        unsafe {
-            let render = NonNull::new(OH_ArkUI_RenderNodeUtils_CreateNode())
-                .ok_or(Error::Unsupported("creating a paint render node"))?;
-            let Some(modifier) = NonNull::new(OH_ArkUI_RenderNodeUtils_CreateContentModifier())
-            else {
-                OH_ArkUI_RenderNodeUtils_DisposeNode(render.as_ptr());
-                return Err(Error::Unsupported("creating a paint modifier"));
-            };
-            let Some(property) = NonNull::new(OH_ArkUI_RenderNodeUtils_CreateFloatProperty(0.0))
-            else {
-                OH_ArkUI_RenderNodeUtils_DisposeContentModifier(modifier.as_ptr());
-                OH_ArkUI_RenderNodeUtils_DisposeNode(render.as_ptr());
-                return Err(Error::Unsupported("creating a paint property"));
-            };
-            let node = Self {
-                native,
-                render,
-                modifier,
-                property,
-                changed: Cell::new(false),
-                bounds: Cell::new([i32::MIN; 4]),
-                _drawing: drawing,
-            };
-            check(OH_ArkUI_RenderNodeUtils_SetContentModifierOnDraw(
-                modifier.as_ptr(),
-                (&*node._drawing as *const Drawing).cast_mut().cast(),
-                draw,
-            ))?;
-            check(OH_ArkUI_RenderNodeUtils_AttachContentModifier(
-                render.as_ptr(),
-                modifier.as_ptr(),
-            ))?;
-            // Custom properties acquire their target from the modifier's node
-            // when attached. Attaching before the modifier has a node leaves
-            // property updates unable to invalidate its recorded drawing.
-            check(OH_ArkUI_RenderNodeUtils_AttachFloatProperty(
-                modifier.as_ptr(),
-                property.as_ptr(),
-            ))?;
-            check(OH_ArkUI_RenderNodeUtils_AddRenderNode(
-                node.native.borrow().raw_handle().cast(),
-                render.as_ptr(),
-            ))?;
-            Ok(node)
+    pub(crate) fn new_attached(
+        host: &NativeNode,
+        z_index: i32,
+        allow_direct: bool,
+        paint: impl Fn(&PaintCanvas) + 'static,
+    ) -> Result<Self> {
+        // Declare in reverse drop order so early errors dispose node -> modifier -> property.
+        let property = FloatProperty::new(0.0)?;
+        let mut modifier = RenderContentModifier::new()?;
+        let node = RenderNode::new()?;
+        node.set_clip_to_frame(false)?;
+        node.set_clip_to_bounds(false)?;
+        modifier.set_on_draw_canvas(paint)?;
+        node.attach_content_modifier(&modifier)?;
+        // Properties acquire their target from the modifier's attached node.
+        modifier.attach_float_property(&property)?;
+        let attachment = if allow_direct
+            && host.borrow().children().is_empty()
+            && node.attach_to(&host.borrow()).is_ok()
+        {
+            Attachment::Direct(Rc::downgrade(host))
+        } else {
+            let carrier = make_carrier(z_index)?;
+            let index = host.borrow().children().len();
+            let attached = node.attach_to(&carrier.borrow());
+            if let Err(error) = attached {
+                let _ = carrier.borrow_mut().dispose();
+                return Err(error.into());
+            }
+            if let Err(error) = host.borrow_mut().insert_child(carrier.clone(), index) {
+                let _ = node.detach_from(&carrier.borrow());
+                let _ = carrier.borrow_mut().dispose();
+                return Err(error.into());
+            }
+            Attachment::Carrier(carrier)
+        };
+        Ok(Self {
+            attachment: RefCell::new(attachment),
+            node,
+            modifier,
+            property,
+            bounds: Cell::new([i32::MIN; 4]),
+            revision: Cell::new(false),
+        })
+    }
+    pub(crate) fn promote_to_carrier(&self, z_index: i32) -> Result<()> {
+        let host = match &*self.attachment.borrow() {
+            Attachment::Direct(host) => host.upgrade(),
+            Attachment::Carrier(_) => return Ok(()),
+        };
+        let Some(host) = host else {
+            return Ok(());
+        };
+        let carrier = make_carrier(z_index)?;
+        let bounds = self.bounds.get();
+        if bounds != [i32::MIN; 4] {
+            let [x, y, w, h] = bounds;
+            carrier
+                .borrow()
+                .set_layout_rect([0, 0, w.max(0), h.max(0)])?;
+            carrier.borrow().set_position([x as f32, y as f32])?;
         }
+        self.node.detach_from(&host.borrow())?;
+        let attach = self
+            .node
+            .set_position(0, 0)
+            .and_then(|()| self.node.attach_to(&carrier.borrow()));
+        if let Err(error) = attach {
+            let _ = self.node.attach_to(&host.borrow());
+            if bounds != [i32::MIN; 4] {
+                let _ = self.node.set_position(bounds[0], bounds[1]);
+            }
+            let _ = carrier.borrow_mut().dispose();
+            return Err(error.into());
+        }
+        let index = host.borrow().children().len();
+        if let Err(error) = host.borrow_mut().insert_child(carrier.clone(), index) {
+            let _ = self.node.detach_from(&carrier.borrow());
+            let _ = self.node.attach_to(&host.borrow());
+            if bounds != [i32::MIN; 4] {
+                let _ = self.node.set_position(bounds[0], bounds[1]);
+            }
+            let _ = carrier.borrow_mut().dispose();
+            return Err(error.into());
+        }
+        *self.attachment.borrow_mut() = Attachment::Carrier(carrier);
+        Ok(())
     }
 
     pub(crate) fn bounds(&self, bounds: [i32; 4]) -> Result<()> {
@@ -141,58 +188,51 @@ impl PaintNode {
             return Ok(());
         }
         let [x, y, w, h] = bounds;
-        self.native
-            .borrow()
-            .set_layout_rect([0, 0, w.max(0), h.max(0)])?;
-        self.native.borrow().set_position([x as f32, y as f32])?;
-        // SAFETY: the render node belongs to this UI-thread owner.
-        check(unsafe {
-            OH_ArkUI_RenderNodeUtils_SetSize(self.render.as_ptr(), w.max(0), h.max(0))
-        })?;
+        let (w, h) = (w.max(0), h.max(0));
+        let pos = match &*self.attachment.borrow() {
+            Attachment::Direct(_) => (x, y),
+            Attachment::Carrier(carrier) => {
+                carrier.borrow().set_layout_rect([0, 0, w, h])?;
+                carrier.borrow().set_position([x as f32, y as f32])?;
+                (0, 0)
+            }
+        };
+        self.node.set_size(w, h)?;
+        self.node.set_position(pos.0, pos.1)?;
+        self.invalidate()?;
         self.bounds.set(bounds);
-        self.invalidate()
+        Ok(())
     }
-
     pub(crate) fn invalidate(&self) -> Result<()> {
-        let changed = !self.changed.get();
-        // A modifier property is ArkUI's native invalidation mechanism. Only
-        // content changes flip it; scrolling and VSync do not re-record ink.
-        check(unsafe {
-            OH_ArkUI_RenderNodeUtils_SetFloatPropertyValue(
-                self.property.as_ptr(),
-                u8::from(changed) as f32,
-            )
-        })?;
-        self.changed.set(changed);
+        let next = !self.revision.get();
+        self.property.set(if next { 1.0 } else { 0.0 })?;
+        self.revision.set(next);
         Ok(())
     }
 }
 
 impl Drop for PaintNode {
     fn drop(&mut self) {
-        // SAFETY: replace the callback before releasing its captured Rust state.
-        // The native parent may retain the modifier until its next transaction.
-        unsafe {
-            let _ = OH_ArkUI_RenderNodeUtils_SetContentModifierOnDraw(
-                self.modifier.as_ptr(),
-                std::ptr::null_mut(),
-                detached,
-            );
-            if self.native.borrow().is_owned() {
-                let _ = OH_ArkUI_RenderNodeUtils_RemoveRenderNode(
-                    self.native.borrow().raw_handle().cast(),
-                    self.render.as_ptr(),
-                );
+        match self.attachment.get_mut() {
+            Attachment::Direct(host) => {
+                if let Some(host) = host.upgrade()
+                    && host.borrow().is_owned()
+                {
+                    let _ = self.node.detach_from(&host.borrow());
+                }
             }
-            OH_ArkUI_RenderNodeUtils_DisposeNode(self.render.as_ptr());
-            OH_ArkUI_RenderNodeUtils_DisposeContentModifier(self.modifier.as_ptr());
-            OH_ArkUI_RenderNodeUtils_DisposeFloatProperty(self.property.as_ptr());
+            Attachment::Carrier(carrier) => {
+                if carrier.borrow().is_owned() {
+                    let _ = self.node.detach_from(&carrier.borrow());
+                }
+                if Rc::strong_count(carrier) == 1 {
+                    callback(|| {
+                        carrier.borrow_mut().dispose()?;
+                        Ok(())
+                    });
+                }
+            }
         }
-        if Rc::strong_count(&self.native) == 1 {
-            callback(|| {
-                self.native.borrow_mut().dispose()?;
-                Ok(())
-            });
-        }
+        let _ = self.modifier.clear_on_draw();
     }
 }

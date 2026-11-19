@@ -34,6 +34,9 @@ impl Default for State {
     }
 }
 impl State {
+    pub(crate) fn has_live(&self) -> bool {
+        self.has_live_region.get()
+    }
     pub(crate) fn deactivate(&self, owner: &Node) {
         if self.has_live_region.replace(false) {
             owner
@@ -89,12 +92,18 @@ impl State {
         }
     }
     pub(crate) fn changed(&self, owner: &Rc<Node>) {
-        self.spec_dirty.set(true);
-        if !self.dirty.replace(true) {
-            owner
-                .accessibility_dirty
-                .borrow_mut()
-                .push(Rc::downgrade(owner));
+        let needs_self_flush = owner.wrapper.borrow().is_some()
+            || owner.input.borrow().is_some()
+            || self.has_live_region.get()
+            || cfg!(feature = "api-23");
+        if needs_self_flush {
+            self.spec_dirty.set(true);
+            if !self.dirty.replace(true) {
+                owner
+                    .accessibility_dirty
+                    .borrow_mut()
+                    .push(Rc::downgrade(owner));
+            }
         }
         if owner.accessibility_live_regions.get() > 0 || owner.accessibility_wrappers.get() > 0 {
             self.mark_ancestors(owner);
@@ -104,8 +113,7 @@ impl State {
         let mut parent = owner.parent_node.borrow().upgrade();
         while let Some(node) = parent {
             let state = &node.accessibility_state;
-            if (state.spec.borrow().live_region != LiveRegion::None
-                || node.wrapper.borrow().is_some())
+            if (state.has_live_region.get() || node.wrapper_owns_semantics())
                 && !state.dirty.replace(true)
             {
                 owner

@@ -1,6 +1,8 @@
+import { FrameCallback } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
 import { fileIo as fs } from "@kit.CoreFileKit";
 import picker from "@ohos.file.picker";
+import hiTraceMeter from "@ohos.hiTraceMeter";
 import webview from "@ohos.web.webview";
 import { NshRuntimeContext } from "./NativeEditors";
 
@@ -36,19 +38,39 @@ export interface WebCommand {
 }
 
 let webEngineInitialized = false;
+let webComponentMounted = false;
 let nextWebNativeTagId = 1;
 
-function ensureWebEngineInitialized(): void {
+function ensureWebEngineInitialized(startup: boolean = false): void {
   if (!webEngineInitialized) {
-    webview.WebviewController.initializeWebEngine();
-    webEngineInitialized = true;
+    const trace = startup
+      ? "NSH ArkWeb startup initialization"
+      : "NSH ArkWeb first mount initialization";
+    hiTraceMeter.startTrace(trace, 0);
+    try {
+      webview.WebviewController.initializeWebEngine();
+      webEngineInitialized = true;
+    } finally {
+      hiTraceMeter.finishTrace(trace, 0);
+    }
+  }
+}
+
+/** Prepare ArkWeb on the UI thread during standalone launch. A failed attempt is retried at first mount. */
+export function prepareWebEngine(): void {
+  try {
+    ensureWebEngineInitialized(true);
+  } catch (error) {
+    console.warn(`[NSH] ArkWeb startup initialization: ${String(error)}`);
   }
 }
 
 // Clear the selected store before the controller's first navigation, including
 // settings queued while its native node was still attaching.
 function clearCookiesIfNeeded(entry: WebEntry): void {
-  if (!entry.settings.clearCookies) { return; }
+  if (!entry.settings.clearCookies) {
+    return;
+  }
   try {
     webview.WebCookieManager.clearAllCookiesSync(!entry.settings.sharedCookies);
     entry.settings.clearCookies = false;
@@ -83,7 +105,9 @@ function webContent(entry: WebEntry) {
       },
     ])
     .onShowFileSelector((event): boolean => {
-      if (!event) { return false; }
+      if (!event) {
+        return false;
+      }
       entry.selectFiles(event.fileSelector, event.result);
       return true;
     })
@@ -120,6 +144,18 @@ function webContent(entry: WebEntry) {
 
 const quarantinedWebs: Set<WebEntry> = new Set();
 
+class WebMountFrame extends FrameCallback {
+  private entry: WebEntry;
+  constructor(entry: WebEntry) {
+    super();
+    this.entry = entry;
+  }
+  onFrame(_frameTime: number): void {
+    // The navigation frame must return to ArkUI before ArkWeb starts.
+    setTimeout((): void => this.entry.mountAfterFrame(), 0);
+  }
+}
+
 class WebEntry {
   readonly nativeTag: string = `nsh.web.${nextWebNativeTagId++}`;
   readonly controller: webview.WebviewController = new webview.WebviewController(this.nativeTag);
@@ -148,13 +184,32 @@ class WebEntry {
   constructor(settings: WebSettings, context: NshRuntimeContext) {
     this.settings = settings;
     this.context = context;
-    ensureWebEngineInitialized();
     this.node = new BuilderNode<[WebEntry]>(context.getUIContext());
   }
 
   create(): void {
+    if (!webComponentMounted) {
+      this.context.getUIContext().postFrameCallback(new WebMountFrame(this));
+      return;
+    }
+    this.mount();
+  }
+
+  mountAfterFrame(): void {
+    if (this.closed || !this.context.isActive()) {
+      return;
+    }
+    try {
+      this.mount();
+    } catch (error) {
+      console.error(`[NSH] deferred WebView mount: ${String(error)}`);
+    }
+  }
+
+  private mount(): void {
     this.sdkBusy = true;
     try {
+      ensureWebEngineInitialized();
       this.node.build(wrapBuilder(webContent), this);
       if (this.closed || !this.context.isActive()) {
         throw new Error("WebView creation was cancelled");
@@ -167,11 +222,27 @@ class WebEntry {
         throw new Error("Native WebView target is no longer live");
       }
       this.attached = true;
+      webComponentMounted = true;
       if (this.controllerObserved && !this.controllerReady) {
         this.finishControllerAttach();
       }
     } catch (error) {
-      this.dispose();
+      try {
+        if (!this.closed && this.context.isActive()) {
+          this.context.webEvent({
+            targetId: this.settings.targetId,
+            phase: "error",
+            url: this.settings.url ?? "",
+            title: "",
+            loading: false,
+            canGoBack: false,
+            canGoForward: false,
+            message: String(error),
+          });
+        }
+      } finally {
+        this.dispose();
+      }
       throw new Error(String(error));
     } finally {
       this.sdkBusy = false;
@@ -305,24 +376,36 @@ class WebEntry {
     const epoch = this.epoch;
     const finish = (uris: string[]): void => {
       if (this.fileSelectors.delete(result)) {
-        result.handleFileList(this.closed || !this.context.isActive() || epoch !== this.epoch ? [] : uris);
+        result.handleFileList(
+          this.closed || !this.context.isActive() || epoch !== this.epoch ? [] : uris,
+        );
       }
     };
-    this.pickFiles(selector).then(finish).catch((error: Error) => {
-      console.warn(`NSH WebView file picker: ${String(error)}`);
-      finish([]);
-    });
+    this.pickFiles(selector)
+      .then(finish)
+      .catch((error: Error) => {
+        console.warn(`NSH WebView file picker: ${String(error)}`);
+        finish([]);
+      });
   }
 
   private async pickFiles(selector: FileSelectorParam): Promise<string[]> {
-    if (this.closed || !this.context.isActive()) { return []; }
+    if (this.closed || !this.context.isActive()) {
+      return [];
+    }
     const mode = selector.getMode();
-    if (mode === FileSelectorMode.FileSaveMode) { return []; }
+    if (mode === FileSelectorMode.FileSaveMode) {
+      return [];
+    }
     const limit = mode === FileSelectorMode.FileOpenMultipleMode ? 100 : 1;
     const accept = selector.getAcceptType().map((type: string) => type.toLowerCase());
     const host = this.context.getUIContext().getHostContext();
-    if (!host) { return []; }
-    const media = accept.length > 0 && accept.every((type: string) => type.startsWith("image/") || type.startsWith("video/"));
+    if (!host) {
+      return [];
+    }
+    const media =
+      accept.length > 0 &&
+      accept.every((type: string) => type.startsWith("image/") || type.startsWith("video/"));
     if (media && mode !== FileSelectorMode.FileOpenFolderMode) {
       const photos = new picker.PhotoViewPicker(host);
       const options = new picker.PhotoSelectOptions();
@@ -330,15 +413,20 @@ class WebEntry {
       options.MIMEType = accept.every((type: string) => type.startsWith("image/"))
         ? picker.PhotoViewMIMETypes.IMAGE_TYPE
         : accept.every((type: string) => type.startsWith("video/"))
-          ? picker.PhotoViewMIMETypes.VIDEO_TYPE : picker.PhotoViewMIMETypes.IMAGE_VIDEO_TYPE;
+          ? picker.PhotoViewMIMETypes.VIDEO_TYPE
+          : picker.PhotoViewMIMETypes.IMAGE_VIDEO_TYPE;
       return (await photos.select(options)).photoUris;
     }
     const documents = new picker.DocumentViewPicker(host);
     const options = new picker.DocumentSelectOptions();
     options.maxSelectNumber = limit;
-    if (mode === FileSelectorMode.FileOpenFolderMode) { options.selectMode = picker.DocumentSelectMode.FOLDER; }
+    if (mode === FileSelectorMode.FileOpenFolderMode) {
+      options.selectMode = picker.DocumentSelectMode.FOLDER;
+    }
     const suffixes = accept.filter((type: string) => /^\.[a-z0-9]+$/.test(type));
-    if (suffixes.length > 0) { options.fileSuffixFilters = suffixes; }
+    if (suffixes.length > 0) {
+      options.fileSuffixFilters = suffixes;
+    }
     return documents.select(options);
   }
 
@@ -586,7 +674,9 @@ class WebEntry {
 
   dispose(cleanup: NshRuntimeContext = this.context): void {
     for (const result of this.fileSelectors) {
-      try { result.handleFileList([]); } catch {}
+      try {
+        result.handleFileList([]);
+      } catch {}
     }
     this.fileSelectors.clear();
     if (this.disposed) {

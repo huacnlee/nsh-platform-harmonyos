@@ -66,6 +66,7 @@ pub(crate) struct Progress {
 pub(crate) struct Decoded {
     bytes: Arc<[u8]>,
     svg: Option<nsh_core::svg::Raster>,
+    frames: Option<Mutex<PixelFrames>>,
     width: u32,
     height: u32,
 }
@@ -92,8 +93,8 @@ impl std::ops::Deref for Loading {
 pub(crate) struct Loader {
     context: Mutex<Context>,
     dispatcher: Weak<Dispatcher>,
-    cache: MemoryCache<String, Arc<Decoded>>,
-    pending: Mutex<FxHashMap<String, Arc<Loading>>>,
+    cache: MemoryCache<(String, bool), Arc<Decoded>>,
+    pending: Mutex<FxHashMap<(String, bool), Arc<Loading>>>,
 }
 impl Data {
     pub(crate) fn decoded_bytes(&self) -> usize {
@@ -171,9 +172,10 @@ impl Loader {
         inline: Option<ImageData>,
     ) -> Arc<AtomicBool> {
         let cancelled = Arc::new(AtomicBool::new(false));
+        let key = (uri.clone(), matches!(target, Target::View { .. }));
         let request = {
             let mut pending = self.pending.lock().expect("pending images");
-            if let Some(request) = pending.get(&uri) {
+            if let Some(request) = pending.get(&key) {
                 match request.join(target, &cancelled) {
                     Ok(true) => return cancelled,
                     Ok(false) => {}
@@ -192,21 +194,21 @@ impl Loader {
                 request: crate::media::request::Request::new(target, cancelled.clone()),
                 ticket: Mutex::default(),
             });
-            pending.insert(uri.clone(), request.clone());
+            pending.insert(key.clone(), request.clone());
             request
         };
         let context = self.context.lock().expect("image context").clone();
         if inline.is_none() && !context.access.allows_media(&uri) {
             self.finish(
-                &uri,
+                &key,
                 &request,
                 Err("image URL is not granted by capabilities.network".into()),
             );
             return cancelled;
         }
-        if let Some((decoded, lease)) = self.cache.get(&uri) {
+        if let Some((decoded, lease)) = self.cache.get(&key) {
             self.finish(
-                &uri,
+                &key,
                 &request,
                 Ok(Arc::new(Data {
                     decoded,
@@ -219,17 +221,17 @@ impl Loader {
             .map(|bytes| Location::Memory(uri.clone().into(), bytes))
             .or_else(|| context.resolve(&uri));
         let Some(location) = location else {
-            self.finish(&uri, &request, Err("unsupported image URI".into()));
+            self.finish(&key, &request, Err("unsupported image URI".into()));
             return cancelled;
         };
-        let decode_uri = uri.clone();
+        let decode_key = key.clone();
         let progress_loader = self.clone();
         let progress_request = request.clone();
         let progress = Arc::new(move |loaded, total| {
             if progress_request.cancelled() {
                 progress_request.ticket.lock().expect("image ticket").take();
                 // Also retire the platform's waiters: a cancelled shared read has no completion.
-                progress_loader.finish(&uri, &progress_request, Err("cancelled".into()));
+                progress_loader.finish(&key, &progress_request, Err("cancelled".into()));
                 return;
             }
             if let Some(dispatcher) = progress_loader.dispatcher.upgrade() {
@@ -251,7 +253,7 @@ impl Loader {
         });
         let decode_loader = self.clone();
         let decode_request = request.clone();
-        let uri = decode_uri;
+
         let ticket = loader::loader().read(
             location,
             &context,
@@ -260,9 +262,10 @@ impl Loader {
             Box::new(move |bytes| {
                 loader::loader()
                     .decode(Priority::Normal, move || {
-                        let result = bytes
-                            .and_then(|bytes| decode_loader.decode(&uri, bytes, &decode_request));
-                        decode_loader.finish(&uri, &decode_request, result);
+                        let result = bytes.and_then(|bytes| {
+                            decode_loader.decode(&decode_key, bytes, &decode_request)
+                        });
+                        decode_loader.finish(&decode_key, &decode_request, result);
                     })
                     .detach();
             }),
@@ -272,16 +275,16 @@ impl Loader {
     }
     fn finish(
         &self,
-        uri: &str,
+        key: &(String, bool),
         request: &Arc<Loading>,
         data: std::result::Result<Arc<Data>, String>,
     ) {
         let mut pending = self.pending.lock().expect("pending images");
         if pending
-            .get(uri)
+            .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, request))
         {
-            pending.remove(uri);
+            pending.remove(key);
         }
         let waiters = std::mem::take(&mut *request.waiters.lock().expect("image waiters"));
         drop(pending);
@@ -298,7 +301,7 @@ impl Loader {
     }
     fn decode(
         &self,
-        uri: &str,
+        key: &(String, bool),
         bytes: ImageData,
         request: &Loading,
     ) -> std::result::Result<Arc<Data>, String> {
@@ -308,11 +311,12 @@ impl Loader {
         if bytes.len() > MAX_DATA {
             return Err("image exceeds 16 MiB".into());
         }
-        let (svg, width, height) = if nsh_core::svg::sniff(&bytes) {
+        let (svg, frames, width, height) = if nsh_core::svg::sniff(&bytes) {
             let raster = nsh_core::svg::rasterize_oversampled(&bytes).map_err(|e| e.to_string())?;
             let reported = nsh_core::svg::reported_size(raster.size);
             (
                 Some(raster),
+                None,
                 reported.width.0 as u32,
                 reported.height.0 as u32,
             )
@@ -333,11 +337,24 @@ impl Loader {
             {
                 return Err("image dimensions exceed 16 megapixels".into());
             }
-            (None, width, height)
+            let pixels = if key.1 {
+                Some(Mutex::new(PixelFrames::decode(&source, frames)?))
+            } else {
+                None
+            };
+            (None, pixels, width, height)
         };
+        if request.cancelled() {
+            return Err("cancelled".into());
+        }
+        let frame_bytes = frames.as_ref().map_or(0, |frames| {
+            let count = frames.lock().expect("decoded frames").pixels.len();
+            (width as usize * height as usize * 4).saturating_mul(count)
+        });
         let decoded = Arc::new(Decoded {
             bytes: bytes.to_vec().into(),
             svg,
+            frames,
             width,
             height,
         });
@@ -345,9 +362,9 @@ impl Loader {
             decoded
                 .svg
                 .as_ref()
-                .map_or(width as usize * height as usize * 4, |svg| svg.pixels.len()),
+                .map_or(frame_bytes, |svg| svg.pixels.len()),
         );
-        let lease = self.cache.insert(uri.to_owned(), decoded.clone(), cost);
+        let lease = self.cache.insert(key.clone(), decoded.clone(), cost);
         Ok(Arc::new(Data {
             decoded,
             _lease: lease,
@@ -355,15 +372,58 @@ impl Loader {
     }
 }
 
+struct PixelFrames {
+    pixels: Vec<ohos_image_native_binding::PixelMap>,
+    durations: Vec<u32>,
+}
+
+// SAFETY: these are owned C ImageKit pixel maps, independent of any napi_env
+// or graphics context. After decode only the UI borrows their read-only
+// handles under the mutex. Each ArkUI descriptor stays on its UI thread.
+unsafe impl Send for PixelFrames {}
+
+impl PixelFrames {
+    fn decode(
+        source: &ohos_image_native_binding::ImageSource,
+        count: u64,
+    ) -> std::result::Result<Self, String> {
+        let mut options =
+            ohos_image_native_binding::DecodingOptions::new().map_err(|e| e.to_string())?;
+        if count > 1 {
+            let pixels = source
+                .create_pixelmap_list(&mut options)
+                .map_err(|e| e.to_string())?;
+            if !pixels.is_empty() {
+                let delays = source.delay_time_list().unwrap_or_default();
+                let durations = (0..pixels.len())
+                    .map(|idx| {
+                        let delay = delays.get(idx).copied().unwrap_or(100);
+                        if delay <= 10 { 100 } else { delay as u32 }
+                    })
+                    .collect();
+                return Ok(Self { pixels, durations });
+            }
+        }
+        let pixel = source
+            .create_pixelmap(&mut options)
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            pixels: vec![pixel],
+            durations: Vec::new(),
+        })
+    }
+}
+
 struct NativeImage {
     descriptor: ohos_arkui_binding::api::attribute_option::DrawableDescriptor,
-    _pixels: Vec<ohos_image_native_binding::PixelMap>,
-    _bytes: Arc<[u8]>,
+    // Descriptors borrow their pixel handles. Each view owns playback state.
+    _svg_pixels: Option<ohos_image_native_binding::PixelMap>,
+    _data: Arc<Data>,
 }
 impl NativeImage {
-    fn new(data: &Data) -> std::result::Result<Self, String> {
+    fn new(data: &Arc<Data>) -> std::result::Result<Self, String> {
         use ohos_image_native_binding::{
-            DecodingOptions, ImageSource, PixelMap, PixelMapInitializationOptions,
+            PixelMap, PixelMapInitializationOptions,
             types::{PixelFormat, PixelMapAlphaType},
         };
         if let Some(svg) = &data.svg {
@@ -389,64 +449,42 @@ impl NativeImage {
                 .map_err(|e| e.to_string())?;
             return Ok(Self {
                 descriptor,
-                _pixels: vec![pixels],
-                _bytes: data.bytes.clone(),
+                _svg_pixels: Some(pixels),
+                _data: data.clone(),
             });
         }
-        let source = ImageSource::create_from_data(&data.bytes).map_err(|e| e.to_string())?;
-        let mut options = DecodingOptions::new().map_err(|e| e.to_string())?;
-        let frame_count = source.frame_count().unwrap_or(1);
-        if frame_count > 1 {
-            let frames = source
-                .create_pixelmap_list(&mut options)
-                .map_err(|e| e.to_string())?;
-            if !frames.is_empty() {
-                let handles: Vec<_> = frames.iter().map(PixelMap::handle).collect();
-                let mut descriptor =
-                    ohos_arkui_binding::api::attribute_option::DrawableDescriptor::from_animated_pixel_map(
-                        &handles,
-                    )
-                    .map_err(|e| e.to_string())?;
-                let delays = source.delay_time_list().unwrap_or_default();
-                let mut frame_durations: Vec<u32> = (0..frames.len())
-                    .map(|idx| {
-                        let d = delays.get(idx).copied().unwrap_or(100);
-                        if d <= 10 { 100 } else { d as u32 }
-                    })
-                    .collect();
-                let total_ms: i32 = frame_durations
-                    .iter()
-                    .map(|&d| d as i32)
-                    .sum::<i32>()
-                    .max(100);
-                descriptor.set_animation_duration(total_ms);
-                descriptor.set_animation_iteration(-1);
-                #[cfg(feature = "api-23")]
-                {
-                    let _ = descriptor.set_animation_frame_durations(&mut frame_durations);
-                    let _ = descriptor.set_animation_auto_play(1);
-                }
-                #[cfg(not(feature = "api-23"))]
-                let _ = &mut frame_durations;
-                return Ok(Self {
-                    descriptor,
-                    _pixels: frames,
-                    _bytes: data.bytes.clone(),
-                });
+        use ohos_arkui_binding::api::attribute_option::DrawableDescriptor;
+        let frames = data
+            .frames
+            .as_ref()
+            .ok_or("missing decoded view pixels")?
+            .lock()
+            .expect("decoded frames");
+        let descriptor = if frames.durations.is_empty() {
+            DrawableDescriptor::from_pixel_map(frames.pixels[0].handle())
+                .map_err(|e| e.to_string())?
+        } else {
+            let handles: Vec<_> = frames.pixels.iter().map(PixelMap::handle).collect();
+            let mut descriptor =
+                DrawableDescriptor::from_animated_pixel_map(&handles).map_err(|e| e.to_string())?;
+            let total = frames
+                .durations
+                .iter()
+                .copied()
+                .fold(0u32, u32::saturating_add);
+            descriptor.set_animation_duration(total.clamp(100, i32::MAX as u32) as i32);
+            descriptor.set_animation_iteration(-1);
+            #[cfg(feature = "api-23")]
+            {
+                let _ = descriptor.set_animation_frame_durations(&mut frames.durations.clone());
+                let _ = descriptor.set_animation_auto_play(1);
             }
-        }
-        let pixels = source
-            .create_pixelmap(&mut options)
-            .map_err(|e| e.to_string())?;
-        let descriptor =
-            ohos_arkui_binding::api::attribute_option::DrawableDescriptor::from_pixel_map(
-                pixels.handle(),
-            )
-            .map_err(|e| e.to_string())?;
+            descriptor
+        };
         Ok(Self {
             descriptor,
-            _pixels: vec![pixels],
-            _bytes: data.bytes.clone(),
+            _svg_pixels: None,
+            _data: data.clone(),
         })
     }
 }
@@ -460,7 +498,7 @@ pub(crate) struct ImageView {
     primary: Cell<bool>,
     loaded: Cell<bool>,
     data: RefCell<Option<Arc<Data>>>,
-    tint: Cell<Option<nsh_core::Color>>,
+    color_filter: Cell<Option<[f32; 20]>>,
     radii: Cell<[f32; 4]>,
     blur_radius: Cell<f32>,
     applied_blur: Cell<f32>,
@@ -487,7 +525,7 @@ impl ImageView {
             primary: Cell::new(false),
             loaded: Cell::new(false),
             data: RefCell::default(),
-            tint: Cell::new(None),
+            color_filter: Cell::new(None),
             radii: Cell::new([0.0; 4]),
             blur_radius: Cell::new(0.0),
             applied_blur: Cell::new(0.0),
@@ -551,19 +589,24 @@ impl ImageView {
         self.native.borrow().height(size.height)?;
         Ok(())
     }
-    pub(crate) fn style(&self, style: &nsh_core::ViewStyle) -> Result<()> {
-        if self.tint.replace(style.tint_color) != style.tint_color {
+    pub(crate) fn style(
+        &self,
+        style: &nsh_core::ViewStyle,
+        filter_matrix: Option<[f32; 20]>,
+    ) -> Result<()> {
+        let desired_filter = if let Some(color) = style.tint_color {
+            let (r, g, b, a) = color.to_f64();
+            Some([
+                0.0_f32, 0.0, 0.0, 0.0, r as f32, 0.0, 0.0, 0.0, 0.0, g as f32, 0.0, 0.0, 0.0, 0.0,
+                b as f32, 0.0, 0.0, 0.0, a as f32, 0.0,
+            ])
+        } else {
+            filter_matrix
+        };
+        if self.color_filter.replace(desired_filter) != desired_filter {
             let native = self.native.borrow();
-            if let Some(color) = style.tint_color {
-                let (r, g, b, a) = color.to_f64();
-                native.set_attribute(
-                    A::ImageColorFilter,
-                    vec![
-                        0.0_f32, 0.0, 0.0, 0.0, r as f32, 0.0, 0.0, 0.0, 0.0, g as f32, 0.0, 0.0,
-                        0.0, 0.0, b as f32, 0.0, 0.0, 0.0, a as f32, 0.0,
-                    ]
-                    .into(),
-                )?;
+            if let Some(matrix) = desired_filter {
+                native.set_attribute(A::ImageColorFilter, matrix.to_vec().into())?;
             } else {
                 native.reset_attribute(A::ImageColorFilter)?;
             }

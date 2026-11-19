@@ -13,12 +13,12 @@ missing_docs = "warn"
 unreachable_pub = "deny"
 
 [workspace.dependencies]
-nsh-core = "0.5"
-nsh-engine = { version = "0.5", default-features = false }
-nsh-base = { version = "0.5", default-features = false }
-nsh-package = "0.5"
-nsh-dev = "0.5"
-nsh-testing = { version = "0.5", default-features = false }
+nsh-core = "=0.6.0"
+nsh-engine = { version = "=0.6.0", default-features = false }
+nsh-base = { version = "=0.6.0", default-features = false }
+nsh-package = "=0.6.0"
+nsh-dev = "=0.6.0"
+nsh-testing = { version = "=0.6.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
@@ -44,11 +44,12 @@ khronos-egl = { version = "6", default-features = false, features = ["static", "
 napi-ohos = { version = "1.2.0", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
 napi-derive-ohos = "1.2.0"
 napi-build-ohos = "1.2.0"
-ohos-arkui-binding = { version = "0.6.0", default-features = false, features = ["napi", "xcomponent", "api-20"] }
+ohos-arkui-binding = { version = "0.6.2", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
+ohos-hitrace-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
 ohos-accessibility-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-display-binding = { version = "0.1.5", default-features = false, features = ["api-20"] }
 ohos-device-binding = { version = "0.1.0", default-features = false }
-ohos-drawing-binding = { version = "0.2.8", default-features = false, features = ["api-20"] }
+ohos-drawing-binding = { version = "0.2.9", default-features = false, features = ["api-20"] }
 ohos-native-image-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
 ohos-resource-manager-binding = { version = "0.3.6", default-features = false, features = ["napi", "api-20"] }
 ohos-vsync-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
@@ -58,7 +59,7 @@ ohos-image-native-binding = { version = "0.0.8", default-features = false }
 ohos-pasteboard-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-udmf-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-avplayer-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-xcomponent-binding = { version = "0.6.0", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
+ohos-xcomponent-binding = { version = "0.6.1", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
 ohos-native-window-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
@@ -74,16 +75,15 @@ opt-level = 3
 [profile.dev.package.taffy]
 opt-level = 3
 
-# NSH 0.5 scroll configuration must also reach views first mounted after culling.
+# Keep the host and generated runners on the same upstream NSH revision.
 [patch.crates-io]
-nsh-base = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-bundler = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-core = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-dev = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-engine = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-i18n = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-js = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-macros = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-package = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-testing = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
-nsh-updater = { git = "https://github.com/richerfu/nsh", rev = "0b38d1f036d0a0a9e317e2bc17b0ea1fed82e0c2" }
+nsh-base = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-core = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-engine = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-dev = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-i18n = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-js = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-macros = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-package = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-testing = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+nsh-updater = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }

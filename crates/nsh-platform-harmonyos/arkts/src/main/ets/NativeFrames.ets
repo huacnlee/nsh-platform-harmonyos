@@ -1,11 +1,6 @@
 import displaySync from "@ohos.graphics.displaySync";
 import { UIContext } from "@ohos.arkui.UIContext";
 
-// API 20's ArkUI FrameRateRange validates max <= 144, including on panels
-// whose native frame-rate demand is higher. Bound only this UI consumer;
-// changing FrameRate's shared demand here would also throttle GPU consumers.
-const DISPLAY_SYNC_MAX_HZ = 144;
-
 export interface FrameCallbacks {
   frame(timestamp: number): boolean;
 }
@@ -18,7 +13,9 @@ export interface FrameRequest {
   expected: number;
 }
 
-// The runtime owns this consumer, independently of its optional shader outputs.
+// The only animation clock. Rust owns demand and supplies the rate; ArkUI
+// applies its system divider and invokes us before layout and RS submission.
+// NativeVSync maintains the RS vote but never advances these consumers.
 export function createFrameSource(
   ui: UIContext,
   callbacks: FrameCallbacks,
@@ -54,9 +51,9 @@ export function createFrameSource(
     ui.runScopedTask((): void => {
       if (request.enabled) {
         current.setExpectedFrameRateRange({
-          min: Math.min(request.min, DISPLAY_SYNC_MAX_HZ),
-          max: Math.min(request.max, DISPLAY_SYNC_MAX_HZ),
-          expected: Math.min(request.expected, DISPLAY_SYNC_MAX_HZ),
+          min: request.min,
+          max: request.max,
+          expected: request.expected,
         });
         current.start();
       } else {

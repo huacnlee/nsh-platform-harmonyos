@@ -770,6 +770,35 @@ impl TextureReader {
         self.target_dirty = false;
         Ok(Some((self.target, width, height)))
     }
+    /// Draw an unfiltered producer directly into the display queue. Captures
+    /// can still resolve this same OES frame with ensure_texture().
+    pub(super) fn present_input(&self, window: &Window) -> Result<bool, Error> {
+        let (width, height) = self.size;
+        let draw = || -> Result<(), Error> {
+            let _current = window.enter(width, height)?;
+            // SAFETY: this worker owns both the window and OES texture on the
+            // same EGL context. The default framebuffer belongs to this window.
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.draw_oes(width, height, 0.5)?;
+            }
+            window.present()
+        };
+        match draw() {
+            Ok(()) => Ok(true),
+            Err(error) if error.output_unavailable() => {
+                window.on_present_unavailable();
+                let _current = self.context.enter()?;
+                // SAFETY: clear pending errors from the failed window submit.
+                unsafe { while self.gl.get_error() != glow::NO_ERROR {} }
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    pub(super) fn has_frame(&self) -> bool {
+        self.has_oes_frame
+    }
     /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
     pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
         let _trace = super::trace::Scope::new(c"NSH acquire input");

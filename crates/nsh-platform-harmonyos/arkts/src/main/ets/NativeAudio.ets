@@ -55,13 +55,17 @@ function fitsSoundPool(metadata: media.AVMetadata, duration: number, sampleRate:
   }
   // SoundPool silently truncates decoded data at 1 MB. Unknown channel counts
   // or sample rates stay on AVPlayer; the reported stereo budget is no proof.
-  if (!Number.isFinite(sampleRate) || sampleRate <= 0 ||
-    Math.ceil((duration * sampleRate) / 1000) * 4 >= MAX_POOL_BYTES) {
+  if (
+    !Number.isFinite(sampleRate) ||
+    sampleRate <= 0 ||
+    Math.ceil((duration * sampleRate) / 1000) * 4 >= MAX_POOL_BYTES
+  ) {
     return false;
   }
   const tracks = metadata.tracks ?? [];
-  const audioTracks = tracks.filter((track) =>
-    track[media.MediaDescriptionKey.MD_KEY_TRACK_TYPE] === 1);
+  const audioTracks = tracks.filter(
+    (track) => track[media.MediaDescriptionKey.MD_KEY_TRACK_TYPE] === 1,
+  );
   if (audioTracks.length !== 1) {
     return false;
   }
@@ -94,10 +98,7 @@ class SoundVoice {
   private closed: boolean = false;
   private readonly onDone: (voice: SoundVoice) => void;
 
-  constructor(
-    soundId: number,
-    onDone: (voice: SoundVoice) => void,
-  ) {
+  constructor(soundId: number, onDone: (voice: SoundVoice) => void) {
     this.soundId = soundId;
     this.onDone = onDone;
   }
@@ -714,8 +715,14 @@ export class NativeAudio {
       const rate = Number(metadata.sampleRate);
       const sampleRate = Number.isFinite(rate) && rate > 0 ? rate : 44100;
       if (Number.isFinite(durationMs) && durationMs > 0) {
-        this.soundLoaded(entry, durationMs, sampleRate, maxDurationMs,
-          fitsSoundPool(metadata, durationMs, rate), reply);
+        this.soundLoaded(
+          entry,
+          durationMs,
+          sampleRate,
+          maxDurationMs,
+          fitsSoundPool(metadata, durationMs, rate),
+          reply,
+        );
         return;
       }
     } catch {
@@ -809,7 +816,11 @@ export class NativeAudio {
       let stream = 0;
       try {
         stream = await pool.play(entry.poolId!, {
-          loop: 0, rate: poolRate, leftVolume: volume, rightVolume: volume, priority: 0,
+          loop: 0,
+          rate: poolRate,
+          leftVolume: volume,
+          rightVolume: volume,
+          priority: 0,
         });
       } catch {}
       const index = this.voices.indexOf(voice);
@@ -869,12 +880,17 @@ export class NativeAudio {
     this.sounds.delete(id);
     const path = entry.path;
     entry.path = undefined;
-    this.releaseProbe(entry).finally(() => unlinkQuietly(path)).catch(() => {});
+    this.releaseProbe(entry)
+      .finally(() => unlinkQuietly(path))
+      .catch(() => {});
     const fd = entry.poolFd;
     entry.poolFd = undefined;
     if (this.pool && entry.poolId !== undefined) {
       this.poolLoaded.delete(entry.poolId);
-      this.pool.unload(entry.poolId).catch(() => {}).finally(() => closeQuietly(fd));
+      this.pool
+        .unload(entry.poolId)
+        .catch(() => {})
+        .finally(() => closeQuietly(fd));
     } else {
       closeQuietly(fd);
     }

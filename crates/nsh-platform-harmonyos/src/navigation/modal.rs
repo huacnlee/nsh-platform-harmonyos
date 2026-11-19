@@ -26,7 +26,7 @@ struct Transition {
 pub(crate) struct Modal {
     owner: Weak<Node>,
     dialog: RefCell<Dialog>,
-    config: Cell<ModalConfig>,
+    config: RefCell<ModalConfig>,
     pending_present: Cell<bool>,
     shown: Cell<bool>,
     show_emitted: Cell<bool>,
@@ -55,7 +55,7 @@ impl Modal {
         let modal = Rc::new(Self {
             owner,
             dialog: RefCell::new(dialog),
-            config: Cell::new(ModalConfig::default()),
+            config: RefCell::new(ModalConfig::default()),
             pending_present: Cell::new(false),
             shown: Cell::new(false),
             show_emitted: Cell::new(false),
@@ -93,20 +93,19 @@ impl Modal {
         self.owner.upgrade().map(|node| node.id)
     }
     pub(crate) fn presentation(&self) -> ModalPresentation {
-        self.config.get().presentation
+        self.config.borrow().presentation
     }
     pub(crate) fn configure(&self, config: ModalConfig) -> Result<()> {
         if self.closing.get() {
             return Ok(());
         }
-        self.config.set(config);
-        self.dialog
-            .borrow()
-            .content_alignment(match config.presentation {
-                ModalPresentation::FullScreen | ModalPresentation::FormSheet => Alignment::Center,
-                ModalPresentation::PageSheet => Alignment::Bottom,
-            })?;
-        match config.presentation {
+        let presentation = config.presentation;
+        let previous = self.config.replace(config);
+        self.dialog.borrow().content_alignment(match presentation {
+            ModalPresentation::FullScreen | ModalPresentation::FormSheet => Alignment::Center,
+            ModalPresentation::PageSheet => Alignment::Bottom,
+        })?;
+        match presentation {
             ModalPresentation::FullScreen => {
                 self.dialog.borrow().corner_radius(0.0, 0.0, 0.0, 0.0)?;
             }
@@ -120,6 +119,9 @@ impl Modal {
         self.theme()?;
         self.refresh_metrics();
         if let Some(owner) = self.owner.upgrade() {
+            if self.shown.get() && previous.presentation != presentation {
+                owner.shaders.modal_presentation_changed(&owner)?;
+            }
             owner.set_frame(owner.raw_frame.get())?;
             owner.restore_style()?;
             owner.update_wrapper()?;
@@ -143,12 +145,18 @@ impl Modal {
         Ok(())
     }
     fn theme(&self) -> Result<()> {
-        let config = self.config.get();
+        let config = self.config.borrow();
         let full = config.presentation == ModalPresentation::FullScreen;
         // A full-screen modal owns its backdrop and hit-test surface.
         // ArkUI's default modal mask would dim that backdrop a second time.
         // Sheets still need the native mask outside their smaller content bounds.
         self.dialog.borrow().modal_mode(!full)?;
+        // A full-screen surface paints to the keyboard edge. Restore ArkUI's
+        // default 16vp spacing when this controller changes back to a sheet.
+        self.dialog.borrow().keyboard_avoid_distance(
+            if full { 0.0 } else { 16.0 },
+            ohos_arkui_binding::types::advanced::LengthMetricUnit::Vp,
+        )?;
         // `owner.native` paints the sheet's background, rounded corners and slide/fade
         // transition; keep the outer dialog container transparent so no stationary box
         // shows behind an animating sheet.
@@ -178,6 +186,7 @@ impl Modal {
             self.theme()?;
             self.dialog.borrow().content_node(&owner.mounted())?;
             self.dialog.borrow().show()?;
+            owner.shaders.modal_shown(&owner, true)?;
             *self.overlay.borrow_mut() = Some(owner.host.overlay(owner.dispatcher.clone())?);
         }
         owner
@@ -208,7 +217,7 @@ impl Modal {
         if self.closing.get() {
             return Ok(());
         }
-        let config = self.config.get();
+        let config = self.config.borrow();
         let (reason_str, should_close) = match reason {
             1 => ("backdropPress", config.close_on_backdrop_press),
             3 => ("swipe", config.close_on_swipe),
@@ -271,7 +280,7 @@ impl Modal {
             .owner
             .upgrade()
             .is_some_and(|owner| owner.platform.get().reduce_motion);
-        let duration = nsh_core::navigation::modal_motion(self.config.get().animation, reduced)
+        let duration = nsh_core::navigation::modal_motion(self.config.borrow().animation, reduced)
             .map_or(0.0, |motion| {
                 motion.0.as_secs_f64() * 1000.0 * (self.progress.get() - to).abs() as f64
             });
@@ -306,6 +315,7 @@ impl Modal {
         let had_shader = self.shader.borrow_mut().take().is_some();
         if let Some(owner) = self.owner.upgrade() {
             if to == 0.0 {
+                owner.shaders.modal_shown(&owner, false)?;
                 owner.shaders.finish_modal_close(&owner, had_shader)?;
             } else if had_shader {
                 owner.shaders.end_navigation(owner.id)?;
@@ -369,7 +379,7 @@ impl Modal {
                         .composite
                         .borrow()
                         .as_ref()
-                        .is_some_and(|composite| composite.has_presented(&owner))
+                        .is_some_and(|composite| composite.has_presented(&owner, nav.key))
                 });
                 let waiting_open =
                     crate::render::shader::navigation::modal_open_waiting(nav, has_presented);
@@ -377,12 +387,12 @@ impl Modal {
             }
             let progress = self.progress.get();
             let crossfade = nsh_core::navigation::modal_motion(
-                self.config.get().animation,
+                self.config.borrow().animation,
                 owner.platform.get().reduce_motion,
             )
             .is_some_and(|motion| motion.1);
             let fade = if crossfade { progress } else { 1.0 };
-            let dy = if self.config.get().animation == ModalAnimation::Slide && !crossfade {
+            let dy = if self.config.borrow().animation == ModalAnimation::Slide && !crossfade {
                 nsh_core::navigation::modal_in_offset(Points(owner.frame.get().height), progress).0
             } else {
                 0.0
@@ -406,6 +416,7 @@ impl Modal {
                 self.available.set(None);
             }
             if let Some(owner) = self.owner.upgrade() {
+                owner.shaders.modal_shown(&owner, false)?;
                 owner.shaders.finish_modal_close(&owner, had_shader)?;
                 owner.presentation(1.0, 0.0)?;
                 if was_shown {
@@ -432,7 +443,7 @@ impl Modal {
         self.closing.get() && self.shown.get()
     }
     fn size_for_bounds(&self, owner: &Node, width: f32, height: f32) -> Size {
-        match self.config.get().presentation {
+        match self.config.borrow().presentation {
             ModalPresentation::FullScreen => Size::new(width, height),
             ModalPresentation::PageSheet => {
                 let scale = owner.scale.get() as f64;
@@ -510,7 +521,7 @@ impl Modal {
                 )
             })
             .unwrap_or(owner.platform.get().safe_area);
-        let presentation = self.config.get().presentation;
+        let presentation = self.config.borrow().presentation;
         let full = presentation == ModalPresentation::FullScreen;
         let insets = EdgeInsets {
             top: if full { safe.top } else { Points::ZERO },

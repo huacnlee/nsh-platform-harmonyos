@@ -2,11 +2,7 @@
 //! Coordinates in pictures start at the top left; only presentation flips rows.
 
 mod filters;
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{rc::Rc, sync::Arc, time::Duration};
 
 pub(super) use filters::Filters;
 use glow::HasContext;
@@ -529,10 +525,10 @@ struct Effect {
     program: Program,
     words: Vec<u32>,
     progress: f32,
-    clock: Instant,
+    clock: Option<Duration>,
     elapsed: Duration,
     dirty: bool,
-    transition: Option<(Instant, Duration, bool)>,
+    transition: Option<(Option<Duration>, Duration, bool)>,
     pending: Option<(Duration, bool)>,
     navigation: bool,
     reverse_inputs: bool,
@@ -551,6 +547,9 @@ pub(super) struct Effects {
     output: Option<Target>,
     shown: Option<usize>,
     direct_output: bool,
+    pub(super) before_screen: Option<Target>,
+    pub(super) capture_before: Option<NodeId>,
+    time: Duration,
 }
 impl Effects {
     pub(super) fn new(gpu: &TextureContext) -> Self {
@@ -560,6 +559,20 @@ impl Effects {
             output: None,
             shown: None,
             direct_output: false,
+            before_screen: None,
+            capture_before: None,
+            time: Duration::ZERO,
+        }
+    }
+    /// Only the surface's display pump advances shader time. Input textures
+    /// arriving between frames are drawn at this last sampled timestamp.
+    pub(super) fn sample(&mut self, time: Duration) {
+        self.time = self.time.max(time);
+        for view in &mut self.views {
+            view.clock.get_or_insert(self.time);
+            if let Some((start, _, _)) = &mut view.transition {
+                start.get_or_insert(self.time);
+            }
         }
     }
     pub(super) fn layers(&mut self, layers: &[(NodeId, Arc<ShaderLayer>)]) -> Result<()> {
@@ -594,10 +607,18 @@ impl Effects {
                             }
                         }
                     }
-                    if !view.layer.paused {
-                        view.elapsed += view.clock.elapsed();
+                    if !view.layer.paused
+                        && let Some(clock) = view.clock
+                    {
+                        view.elapsed += self.time.saturating_sub(clock);
                     }
-                    view.clock = Instant::now();
+                    // A newly resumed layer waits for its first display frame,
+                    // so an idle interval is never counted as animation time.
+                    view.clock = if view.layer.paused != layer.paused {
+                        None
+                    } else {
+                        view.clock.map(|_| self.time)
+                    };
                     view.layer = layer.clone();
                     view.words = words;
                     if !same || layer.progress_slot().is_none() {
@@ -614,7 +635,7 @@ impl Effects {
                         program: Program::new(&self.gpu, layer)?,
                         words: layer.uniforms.to_vec(),
                         progress: layer.progress.0,
-                        clock: Instant::now(),
+                        clock: None,
                         elapsed: Duration::ZERO,
                         dirty: true,
                         transition: None,
@@ -746,6 +767,18 @@ impl Effects {
         let mut changed = changed;
         let mut shown = None;
         for (index, view) in self.views.iter_mut().enumerate() {
+            if self.capture_before == Some(view.id) {
+                let resize = self
+                    .before_screen
+                    .as_ref()
+                    .is_none_or(|target| (target.width, target.height) != (picture.1, picture.2));
+                if resize {
+                    self.before_screen = Some(Target::new(&self.gpu, picture.1, picture.2)?);
+                }
+                if resize || changed {
+                    self.before_screen.as_ref().unwrap().blit(picture)?;
+                }
+            }
             let layer_coverage = Coverage::shader(coverage.box_size, view.layer.overflow.0);
             let (width, height, effective_scale) = layer_coverage.pixels(scale);
             let layer_size = (width.max(1), height.max(1));
@@ -777,16 +810,25 @@ impl Effects {
                 view.from = Some(target);
                 view.from_coverage = Some(layer_coverage);
             }
-            let now = Instant::now();
+            let now = self.time;
             if let Some((duration, backwards)) = view.pending.take() {
-                view.transition = Some((now, duration, backwards));
+                // The first usable input may arrive on a texture notification.
+                // Draw its initial state now and anchor it on the next display
+                // frame instead of starting from a stale pre-idle timestamp.
+                view.transition = Some((None, duration, backwards));
             }
             let progress = view
                 .transition
                 .map_or(view.progress, |(start, duration, backwards)| {
-                    let p = (now.saturating_duration_since(start).as_secs_f32()
-                        / duration.as_secs_f32().max(f32::MIN_POSITIVE))
-                    .clamp(0.0, 1.0);
+                    let p = if duration.is_zero() {
+                        1.0
+                    } else {
+                        (start
+                            .map_or(Duration::ZERO, |start| now.saturating_sub(start))
+                            .as_secs_f32()
+                            / duration.as_secs_f32())
+                        .clamp(0.0, 1.0)
+                    };
                     if backwards { 1.0 - p } else { p }
                 });
             let transitioning = view.transition.is_some();
@@ -828,7 +870,8 @@ impl Effects {
                     + if view.layer.paused {
                         Duration::ZERO
                     } else {
-                        view.clock.elapsed()
+                        view.clock
+                            .map_or(Duration::ZERO, |clock| now.saturating_sub(clock))
                     };
                 let output = view.output.as_ref().unwrap();
                 if let Some(backdrop) = backdrop {
@@ -875,7 +918,8 @@ impl Effects {
                 shown = Some(index);
             }
             if view.transition.is_some_and(|(start, duration, _)| {
-                now.saturating_duration_since(start) >= duration
+                duration.is_zero()
+                    || start.is_some_and(|start| now.saturating_sub(start) >= duration)
             }) {
                 view.progress = progress;
                 view.transition = None;

@@ -292,6 +292,7 @@ impl Wrapper {
         }
         let target_id = self.target.borrow().as_ref().unwrap().id();
         let spec = owner.accessibility_state.spec.borrow();
+        let semantic = owns_semantics(&spec);
         let frame = owner.frame.get();
         let value = crate::accessibility::value::spoken_value(&spec).unwrap_or_default();
         let actions: Vec<MenuItem> = if cfg!(feature = "api-26") {
@@ -315,7 +316,7 @@ impl Wrapper {
             width: frame.width as f64,
             height: frame.height as f64,
             hue: 0.0,
-            semantic: owns_semantics(&spec),
+            semantic,
             clickable: owner.interaction.mask().contains(EventKind::Press)
                 || spec
                     .actions
@@ -324,7 +325,13 @@ impl Wrapper {
             disabled: spec.state.disabled,
             accessible: spec.accessible,
             hidden: spec.hidden,
-            label: owner.accessibility_state.label(owner),
+            // Display-only wrappers have accessibilityLevel "no". The native
+            // node owns its group and label; do not aggregate its subtree here.
+            label: if semantic {
+                owner.accessibility_state.label(owner)
+            } else {
+                String::new()
+            },
             hint: spec.hint.as_deref().unwrap_or("").to_owned(),
             api23: cfg!(feature = "api-23") && !value.is_empty(),
             api26: !actions.is_empty(),
@@ -425,6 +432,16 @@ impl Node {
             .as_ref()
             .map_or_else(|| self.native.clone(), |wrapper| wrapper.outer.clone())
     }
+    pub(crate) fn keeps_modal_shader_input(&self) -> bool {
+        self.kind == nsh_core::ViewKind::Modal
+            && self.navigation_shader.borrow().is_some()
+            && !self.platform.get().reduce_motion
+            && self
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| modal.is_visible())
+    }
     pub(crate) fn ensure_wrapper(self: &Rc<Self>) -> Result<()> {
         if self
             .wrapper
@@ -440,11 +457,18 @@ impl Node {
         }
         let has_semantics = owns_semantics(&spec);
         drop(spec);
-        // The root keeps one display queue across effect changes. ArkUI writes
-        // directly to it without effects; a shader changes only its producer.
-        // Moving an already visible root out of the display tree would otherwise
-        // need an asynchronous picture, rewinding any animation in that picture.
-        let requires_texture = self.id == nsh_core::ROOT_ID || self.effects_plan().requires_texture;
+        // Keep both texture queues through reversals on the presenting screen.
+        // Other screens can then render through ArkUI's ordinary window again.
+        // A shader dialog keeps its foreground buffer until dismissal. Recreating
+        // the output at close exposes the page for a frame before the iris draws.
+        let keep_input = (self.id == nsh_core::ROOT_ID && self.shaders.holds_root_input()
+            || self.keeps_modal_shader_input())
+            && self
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_some_and(|wrapper| wrapper.composite.borrow().is_some());
+        let requires_texture = keep_input || self.effects_plan().requires_texture;
         // Establish the root's layout host before it has scroll descendants.
         // Adding it around an already laid-out tree resets native scroll offsets.
         let needed = self.id == nsh_core::ROOT_ID
@@ -453,7 +477,8 @@ impl Node {
             // any old children retained by the texture-export renderer.
             || self.kind == nsh_core::ViewKind::Screen
             || self.kind == nsh_core::ViewKind::Modal
-            || self.selectable()
+            || self.scene_root.get()
+            || self.has_selection()
             || has_semantics
             || requires_texture;
         let mut created_wrapper = false;
@@ -597,7 +622,10 @@ impl Node {
                 .as_ref()
                 .filter(|c| c.generation == generation)
         {
-            composite.ready();
+            composite.ready(self);
+            if let Some(modal) = self.modal.borrow().as_ref() {
+                modal.refresh_presentation()?;
+            }
             wrapper
                 .outer
                 .borrow()
@@ -608,7 +636,9 @@ impl Node {
         if let Some(parent) = self.parent_node.borrow().upgrade() {
             parent.invalidate_composites();
         }
-        self.invalidate_scene();
+        if self.scene_active() {
+            self.invalidate_scene();
+        }
         Ok(())
     }
 }
