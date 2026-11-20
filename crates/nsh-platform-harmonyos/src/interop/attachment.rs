@@ -94,6 +94,7 @@ pub(crate) struct ContentRoot {
 struct ContentOwner {
     root: RootNode,
     events: NodeContent,
+    has_callback: bool,
     value: Option<ObjectRef>,
     env: Env,
 }
@@ -113,6 +114,23 @@ impl ContentRoot {
             owner: Some(ContentOwner {
                 root: RootNode::new(handle),
                 events: NodeContent::from_handle(handle),
+                has_callback: false,
+                value: Some(value),
+                env,
+            }),
+        })
+    }
+
+    pub(crate) fn from_object(env: Env, object: Object<'_>) -> Result<Self> {
+        // SAFETY: the live ArkTS NodeContent belongs to this UI-thread callback and is
+        // retained by `value` before any native root or event callback can use its handle.
+        let handle = unsafe { ArkUIHandle::from_napi_value(env.raw(), object.raw()) }?;
+        let value = object.create_ref()?;
+        Ok(Self {
+            owner: Some(ContentOwner {
+                root: RootNode::new(handle),
+                events: NodeContent::from_handle(handle),
+                has_callback: false,
                 value: Some(value),
                 env,
             }),
@@ -153,24 +171,25 @@ impl ContentRoot {
         &mut self,
         callback: impl Fn(bool) + 'static,
     ) -> ArkUIResult<()> {
-        self.owner
-            .as_mut()
-            .expect("live ContentRoot")
-            .events
-            .register_callback(move |event| {
-                callback(
-                    event.event_type()
-                        == ohos_arkui_binding::types::advanced::NodeContentEventType::OnAttachToWindow,
-                );
-            })
+        let owner = self.owner.as_mut().expect("live ContentRoot");
+        owner.events.register_callback(move |event| {
+            callback(
+                event.event_type()
+                    == ohos_arkui_binding::types::advanced::NodeContentEventType::OnAttachToWindow,
+            );
+        })?;
+        owner.has_callback = true;
+        Ok(())
     }
 
     pub(crate) fn clear_window_callback(&mut self) -> ArkUIResult<()> {
-        self.owner
-            .as_mut()
-            .expect("live ContentRoot")
-            .events
-            .clear_callback()
+        let owner = self.owner.as_mut().expect("live ContentRoot");
+        if !owner.has_callback {
+            return Ok(());
+        }
+        owner.events.clear_callback()?;
+        owner.has_callback = false;
+        Ok(())
     }
 }
 
@@ -179,11 +198,12 @@ impl Drop for ContentRoot {
         let Some(mut owner) = self.owner.take() else {
             return;
         };
-        if let Err(error) = owner
-            .events
-            .clear_callback()
-            .and_then(|()| owner.root.unmount())
-        {
+        let clear = if owner.has_callback {
+            owner.events.clear_callback()
+        } else {
+            Ok(())
+        };
+        if let Err(error) = clear.and_then(|()| owner.root.unmount()) {
             log::error!("Failed to retire ContentRoot; retaining its native owners: {error}");
             std::mem::forget(owner);
             return;

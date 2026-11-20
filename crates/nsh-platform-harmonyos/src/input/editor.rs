@@ -65,7 +65,7 @@ impl Input {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(route) = owner.dispatcher.upgrade()
         {
-            use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+            use nsh_core::keymap::{Key, Keystroke, Modifiers};
             let stroke = match kind {
                 "return" => Some(Keystroke {
                     key: Key::Enter,
@@ -85,8 +85,13 @@ impl Input {
                 _ => None,
             };
             if let Some(stroke) = stroke {
-                let matched = route.keyboard.lock().unwrap().map.find(stroke, true, false);
-                if let KeyMatch::Fire(id) = matched {
+                let matched = route.keyboard.lock().unwrap().map.find_in(
+                    owner.key_window_id(),
+                    stroke,
+                    true,
+                    false,
+                );
+                if let Some(id) = matched.fired() {
                     route.send(crate::app::runtime::Message::HostEvent(
                         EventKind::KeyCommand,
                         EventPayload::Value(PayloadValue::Number(id as f64)),
@@ -325,11 +330,13 @@ impl Input {
             }
             "delete-to-doc-start" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
-                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+                    use nsh_core::keymap::{Key, Keystroke, Modifiers};
+                    let window = owner.key_window_id();
                     let (select_id, delete_id) = {
                         let snapshot = route.keyboard.lock().unwrap();
                         (
-                            snapshot.map.find(
+                            snapshot.map.find_in(
+                                window,
                                 Keystroke {
                                     key: Key::Home,
                                     modifiers: Modifiers {
@@ -341,7 +348,8 @@ impl Input {
                                 true,
                                 false,
                             ),
-                            snapshot.map.find(
+                            snapshot.map.find_in(
+                                window,
                                 Keystroke {
                                     key: Key::Backspace,
                                     modifiers: Modifiers::default(),
@@ -351,12 +359,12 @@ impl Input {
                             ),
                         )
                     };
-                    if let KeyMatch::Fire(id) = select_id {
+                    if let Some(id) = select_id.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,
                             EventPayload::Value(PayloadValue::Number(id as f64)),
                         ));
-                        if let KeyMatch::Fire(del) = delete_id {
+                        if let Some(del) = delete_id.fired() {
                             route.send(crate::app::runtime::Message::HostEvent(
                                 EventKind::KeyCommand,
                                 EventPayload::Value(PayloadValue::Number(del as f64)),
@@ -369,8 +377,9 @@ impl Input {
             }
             "undo" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
-                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
-                    let matched = route.keyboard.lock().unwrap().map.find(
+                    use nsh_core::keymap::{Key, Keystroke, Modifiers};
+                    let matched = route.keyboard.lock().unwrap().map.find_in(
+                        owner.key_window_id(),
                         Keystroke {
                             key: Key::Char('z'),
                             modifiers: Modifiers {
@@ -381,7 +390,7 @@ impl Input {
                         true,
                         false,
                     );
-                    if let KeyMatch::Fire(id) = matched {
+                    if let Some(id) = matched.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,
                             EventPayload::Value(PayloadValue::Number(id as f64)),

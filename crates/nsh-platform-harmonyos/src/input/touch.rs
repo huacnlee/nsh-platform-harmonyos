@@ -45,9 +45,18 @@ struct SelectionDrag {
     finger: u32,
     start: (f32, f32),
     moved: bool,
+    desktop: bool,
     pointer: Option<(f32, f32)>,
     frame_time: f64,
     blocked: Vec<Weak<crate::scroll::controller::Scroller>>,
+}
+struct WindowResize {
+    modal: Weak<crate::navigation::modal::Modal>,
+    edge: nsh_core::desktop::ResizeEdge,
+    start_display: (f32, f32),
+    start_origin: (f32, f32),
+    start_size: (f32, f32),
+    last: (f32, f32),
 }
 impl SelectionDrag {
     fn unblock(&self) -> Result<()> {
@@ -71,9 +80,20 @@ pub(crate) struct Touches {
     back: Option<BackSwipe>,
     primary: Option<u32>,
     selection: Option<SelectionDrag>,
+    window_resize: Option<WindowResize>,
+    mouse_up_targets: Vec<Weak<Node>>,
+    last_pointer: Option<(f32, f32)>,
     last_tap: Option<LastTap>,
 }
 impl Touches {
+    pub(crate) fn record_pointer(&mut self, point: (f32, f32)) {
+        if point.0.is_finite() && point.1.is_finite() {
+            self.last_pointer = Some(point);
+        }
+    }
+    pub(crate) fn last_pointer(&self) -> Option<(f32, f32)> {
+        self.last_pointer
+    }
     pub(crate) fn record_down(&mut self, scale: f32, input: &ArkUIInputEvent) {
         if input.action != UIInputAction::Down || input.pointer_count() != 1 {
             return;
@@ -91,6 +111,7 @@ impl Touches {
             input.pointer_window_x_by_index(0),
             input.pointer_window_y_by_index(0),
         );
+        self.record_pointer(window);
         let max_dist = 24.0 * scale.max(1.0);
         let clicks = match &self.last_tap {
             Some(last)
@@ -115,6 +136,8 @@ impl Touches {
     pub(crate) fn cancel(&mut self, root: &Node) -> Result<()> {
         self.primary = None;
         self.last_tap = None;
+        self.window_resize = None;
+        self.mouse_up_targets.clear();
         if let Some(drag) = self.selection.take() {
             drag.unblock()?;
             if let Some(owner) = drag.owner.upgrade() {
@@ -198,6 +221,12 @@ impl Touches {
         let origin = surface.native.borrow().layout_position_in_window()?;
         if phase == TouchPhase::Start && count == 1 {
             self.primary = changed;
+        }
+        if self.window_resize.is_some() {
+            if matches!(phase, TouchPhase::End | TouchPhase::Cancel) {
+                self.primary = None;
+            }
+            return Ok(());
         }
         if self.selection_input(root, input, phase, changed, count)? {
             return Ok(());
@@ -377,6 +406,60 @@ impl Touches {
     pub(crate) fn press_allowed(&self, id: nsh_core::NodeId) -> bool {
         !self.suppressed_presses.contains(&id)
     }
+    pub(crate) fn start_window_resize(
+        &mut self,
+        modal: &Rc<crate::navigation::modal::Modal>,
+        edge: nsh_core::desktop::ResizeEdge,
+        display_point: (f32, f32),
+    ) {
+        let Some((start_origin, start_size)) = modal.desktop_resize_anchor() else {
+            return;
+        };
+        self.window_resize = Some(WindowResize {
+            modal: Rc::downgrade(modal),
+            edge,
+            start_display: display_point,
+            start_origin,
+            start_size,
+            last: display_point,
+        });
+    }
+    pub(crate) fn window_resizing(&self) -> bool {
+        self.window_resize.is_some()
+    }
+    pub(crate) fn move_window_resize(&mut self, display_point: (f32, f32)) -> Result<bool> {
+        let Some(mut resize) = self.window_resize.take() else {
+            return Ok(false);
+        };
+        let Some(modal) = resize.modal.upgrade() else {
+            return Ok(false);
+        };
+        let step_dx = display_point.0 - resize.last.0;
+        let step_dy = display_point.1 - resize.last.1;
+        resize.last = display_point;
+        if step_dx.abs() > 0.01 || step_dy.abs() > 0.01 {
+            let total_dx = display_point.0 - resize.start_display.0;
+            let total_dy = display_point.1 - resize.start_display.1;
+            modal.desktop_resize_from(
+                resize.edge,
+                resize.start_origin,
+                resize.start_size,
+                total_dx,
+                total_dy,
+            )?;
+        }
+        self.window_resize = Some(resize);
+        Ok(true)
+    }
+    pub(crate) fn end_window_resize(&mut self) {
+        self.window_resize = None;
+    }
+    pub(crate) fn capture_mouse_up(&mut self, targets: Vec<Weak<Node>>) {
+        self.mouse_up_targets = targets;
+    }
+    pub(crate) fn take_mouse_up_targets(&mut self) -> Vec<Weak<Node>> {
+        std::mem::take(&mut self.mouse_up_targets)
+    }
     pub(crate) fn selection_started(&mut self, owner: &Rc<Node>, point: (f32, f32)) -> Result<()> {
         let Some(finger) = self.primary else {
             return Ok(());
@@ -387,6 +470,7 @@ impl Touches {
             finger,
             start: point,
             moved: false,
+            desktop: false,
             pointer: None,
             frame_time: owner.animator.now(),
             blocked,
@@ -456,14 +540,62 @@ impl Touches {
         changed: Option<u32>,
         count: u32,
     ) -> Result<bool> {
+        let is_mouse = matches!(
+            input.tool_type,
+            UIInputToolType::Mouse | UIInputToolType::Touchpad
+        );
         if phase == TouchPhase::Start && count == 1 {
             // A popup can consume the preceding contact's release.
             if let Some(old) = self.selection.take() {
                 old.unblock()?;
             }
+            let local = (input.pointer_x_by_index(0), input.pointer_y_by_index(0));
+            if is_mouse {
+                if let Some(target) = hit(root, local, &nsh_core::Matrix::IDENTITY)?
+                    && target.selectable()
+                    && let Some(point) = target
+                        .input_in_root(root)?
+                        .and_then(|m| crate::render::geometry::local_point(&m.0, local))
+                {
+                    let clicks = self.clicks();
+                    let extend = self.modifiers.shift;
+                    if target.selection_press(point.0, point.1, clicks, extend)? {
+                        let owner = target
+                            .selected_text
+                            .borrow()
+                            .as_ref()
+                            .and_then(Weak::upgrade);
+                        let owner = owner.unwrap_or(target);
+                        let immediate = clicks >= 2 || extend;
+                        let blocked = if immediate {
+                            self.claim_selection(&owner)?
+                        } else {
+                            Vec::new()
+                        };
+                        self.selection = Some(SelectionDrag {
+                            owner: Rc::downgrade(&owner),
+                            finger: changed.unwrap_or(0),
+                            start: point,
+                            moved: immediate,
+                            desktop: true,
+                            pointer: Some(local),
+                            frame_time: owner.animator.now(),
+                            blocked,
+                        });
+                        if immediate {
+                            owner.animator.track_selection(root);
+                            return Ok(true);
+                        }
+                        // Plain single click passes through so links/buttons still fire onPress;
+                        // moving past the drag threshold claims the gesture below.
+                        return Ok(false);
+                    }
+                }
+                root.clear_text_selection()?;
+                return Ok(false);
+            }
             let selected = root.selected_text.borrow().as_ref().and_then(Weak::upgrade);
             if let Some(owner) = selected {
-                let local = (input.pointer_x_by_index(0), input.pointer_y_by_index(0));
                 let point = owner
                     .input_in_root(root)?
                     .and_then(|m| crate::render::geometry::local_point(&m.0, local));
@@ -478,6 +610,7 @@ impl Touches {
                             finger: changed.unwrap_or(0),
                             start: point,
                             moved: true,
+                            desktop: false,
                             pointer: Some(local),
                             frame_time: owner.animator.now(),
                             blocked,
@@ -515,11 +648,15 @@ impl Touches {
                 .input_in_root(root)?
                 .and_then(|m| crate::render::geometry::local_point(&m.0, local))
             {
+                let threshold = if drag.desktop { 4.0 } else { 8.0 };
                 if !drag.moved
                     && phase == TouchPhase::Move
-                    && (point.0 - drag.start.0).hypot(point.1 - drag.start.1) > 8.0
+                    && (point.0 - drag.start.0).hypot(point.1 - drag.start.1) > threshold
                 {
                     drag.moved = true;
+                    if drag.desktop && drag.blocked.is_empty() {
+                        drag.blocked = self.claim_selection(&owner)?;
+                    }
                     owner.selection_menu_show(false)?;
                 }
                 if drag.moved && phase == TouchPhase::Move {
@@ -528,18 +665,23 @@ impl Touches {
                 }
             }
         }
+        let consumed = !drag.desktop || drag.moved;
         if cancelled || phase == TouchPhase::End || index.is_none() {
             self.primary = None;
             drag.unblock()?;
             if cancelled {
                 owner.selection_clear()?;
+            } else if drag.desktop {
+                if !owner.has_selection() {
+                    owner.selection_clear()?;
+                }
             } else {
                 owner.selection_menu_show(true)?;
             }
         } else {
             self.selection = Some(drag);
         }
-        Ok(true)
+        Ok(consumed)
     }
     pub(crate) fn selection_tick(&mut self, root: &Rc<Node>, now: f64) -> Result<bool> {
         let Some(drag) = self.selection.as_mut().filter(|drag| drag.moved) else {
@@ -593,6 +735,14 @@ impl Touches {
         changed: Option<u32>,
         count: u32,
     ) -> Result<bool> {
+        if root.platform.get().os.is_desktop()
+            || matches!(
+                input.tool_type,
+                UIInputToolType::Mouse | UIInputToolType::Touchpad
+            )
+        {
+            return Ok(false);
+        }
         if phase == TouchPhase::Start
             && count == 1
             && !root.interaction.mask().contains(EventKind::BackPress)
@@ -791,7 +941,11 @@ fn block(node: &Rc<Node>, blocked: bool) -> Result<()> {
     }
     Ok(())
 }
-fn hit(root: &Rc<Node>, point: (f32, f32), world: &nsh_core::Matrix) -> Result<Option<Rc<Node>>> {
+pub(crate) fn hit(
+    root: &Rc<Node>,
+    point: (f32, f32),
+    world: &nsh_core::Matrix,
+) -> Result<Option<Rc<Node>>> {
     if !root.input_visible() {
         return Ok(None);
     }

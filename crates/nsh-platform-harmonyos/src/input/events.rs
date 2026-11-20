@@ -12,11 +12,15 @@ use nsh_core::{
     tailwind::state,
 };
 use ohos_arkui_binding::{
-    arkui_input_binding::{UIInputAction, UIMouseEventAction, UIMouseEventButton},
+    arkui_input_binding::{
+        ArkUIInputEvent, UIAxisEventAction, UIInputAction, UIInputToolType, UIMouseEventAction,
+        UIMouseEventButton,
+    },
     component::attribute::{ArkUICommonAttribute, ArkUIEvent, ArkUIGesture},
     gesture::{gesture_data::GestureData, inner_gesture::Gesture},
     types::{
         attribute::ArkUINodeAttributeType as A,
+        drag::{DragResult, DropOperation},
         event::NodeEventType as E,
         gesture_direction::GestureDirection,
         gesture_event::GestureEventAction,
@@ -40,6 +44,9 @@ pub(crate) struct Interaction {
     hover_registered: Cell<bool>,
     key_focusable: Cell<bool>,
     mouse_registered: Cell<bool>,
+    axis_registered: Cell<bool>,
+    drag_registered: Cell<bool>,
+    pinch_scale: Cell<f32>,
     opacity: Cell<Option<f32>>,
     applied_opacity: Cell<Option<f32>>,
     label: RefCell<Option<Arc<str>>>,
@@ -68,6 +75,9 @@ impl Default for Interaction {
             hover_registered: Cell::new(false),
             key_focusable: Cell::new(false),
             mouse_registered: Cell::new(false),
+            axis_registered: Cell::new(false),
+            drag_registered: Cell::new(false),
+            pinch_scale: Cell::new(1.0),
             opacity: Cell::new(Some(1.0)),
             applied_opacity: Cell::new(Some(1.0)),
             label: RefCell::default(),
@@ -84,6 +94,18 @@ impl Default for Interaction {
 impl Interaction {
     pub(crate) fn selectable_view(&self) -> bool {
         self.props.borrow().selectable_view
+    }
+    pub(crate) fn selection_menu(&self) -> Arc<[nsh_core::desktop::MenuItem]> {
+        self.props.borrow().selection_menu.clone()
+    }
+    pub(crate) fn window_drag(&self) -> Option<bool> {
+        self.props.borrow().window_drag
+    }
+    pub(crate) fn window_control(&self) -> Option<nsh_core::desktop::WindowControl> {
+        self.props.borrow().window_control
+    }
+    pub(crate) fn window_resize(&self) -> Option<nsh_core::desktop::ResizeEdge> {
+        self.props.borrow().window_resize
     }
     pub(crate) fn continues_text(&self) -> bool {
         self.props.borrow().continues_text
@@ -198,8 +220,10 @@ impl Interaction {
                 self.props.borrow().pointer_events,
                 PointerEvents::None | PointerEvents::BoxNone
             );
-        let click =
-            !blocked && (events.contains(EventKind::Press) || owner.text_listens(EventKind::Press));
+        let click = !blocked
+            && (events.contains(EventKind::Press)
+                || owner.text_listens(EventKind::Press)
+                || self.props.borrow().window_control.is_some());
         if self.click_registered.replace(click) != click {
             if click {
                 let weak = Rc::downgrade(owner);
@@ -210,6 +234,13 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade()
                             && !owner.interaction.long_fired.replace(false)
                         {
+                            owner
+                                .control
+                                .set_input_modality(nsh_core::platform::InputModality::Pointer);
+                            if let Some(control) = owner.interaction.window_control() {
+                                callback(|| dispatch_window_control(&owner, control));
+                                return;
+                            }
                             // OnClick's component payload is physical pixels on
                             // device; touch input below already uses the node's vp.
                             owner.press(
@@ -239,6 +270,11 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade()
                             && let Some(input) = event.input_event()
                         {
+                            if input.action == UIInputAction::Down {
+                                owner
+                                    .control
+                                    .set_input_modality(nsh_core::platform::InputModality::Pointer);
+                            }
                             if owner.id == nsh_core::ROOT_ID
                                 || owner.kind == nsh_core::ViewKind::Modal
                             {
@@ -274,11 +310,14 @@ impl Interaction {
                 owner.native.borrow_mut().off_event(E::TouchEvent)?;
             }
         }
+        let is_surface_root =
+            owner.id == nsh_core::ROOT_ID || owner.kind == nsh_core::ViewKind::Modal;
         let hover = !blocked
             && (events.contains(EventKind::MouseEnter)
                 || events.contains(EventKind::MouseLeave)
                 || self.tracked.get() & state::HOVERED != 0
-                || owner.style.borrow().cursor != nsh_core::Cursor::Auto);
+                || owner.style.borrow().cursor != nsh_core::Cursor::Auto
+                || (is_surface_root && owner.platform.get().os.is_desktop()));
         if self.hover_registered.replace(hover) != hover {
             if hover {
                 let weak = Rc::downgrade(owner);
@@ -291,16 +330,29 @@ impl Interaction {
                                 && let Some(input) = event.input_event()
                             {
                                 let hovered = input.is_hovered();
+                                if !hovered
+                                    && (owner.id == nsh_core::ROOT_ID
+                                        || owner.kind == nsh_core::ViewKind::Modal)
+                                {
+                                    owner.cursor.clear_dynamic(&owner)?;
+                                }
                                 owner.cursor.update(&owner, hovered)?;
                                 owner.interaction.state(&owner, state::HOVERED, hovered)?;
-                                owner.emit(
-                                    if hovered {
-                                        EventKind::MouseEnter
-                                    } else {
-                                        EventKind::MouseLeave
-                                    },
-                                    owner.mouse_payload(input.pointer_x(), input.pointer_y(), None),
-                                );
+                                let kind = if hovered {
+                                    EventKind::MouseEnter
+                                } else {
+                                    EventKind::MouseLeave
+                                };
+                                if owner.interaction.mask().contains(kind) {
+                                    owner.emit(
+                                        kind,
+                                        owner.mouse_payload(
+                                            input.pointer_x(),
+                                            input.pointer_y(),
+                                            None,
+                                        ),
+                                    );
+                                }
                             }
                             Ok(())
                         })
@@ -310,8 +362,8 @@ impl Interaction {
             }
         }
         let mouse = !blocked
-            && (owner.id == nsh_core::ROOT_ID
-                || owner.kind == nsh_core::ViewKind::Modal
+            && (is_surface_root
+                || owner.selectable()
                 || events.contains(EventKind::MouseMove)
                 || events.contains(EventKind::ContextMenu));
         if self.mouse_registered.replace(mouse) != mouse {
@@ -324,52 +376,98 @@ impl Interaction {
                         {
                             let x = input.pointer_x();
                             let y = input.pointer_y();
+                            let wx = input.pointer_window_x();
+                            let wy = input.pointer_window_y();
+                            let dx = input.pointer_display_x();
+                            let dy = input.pointer_display_y();
+                            owner.touches.borrow_mut().record_pointer((wx, wy));
                             let mask = owner.interaction.mask();
+                            let is_root = owner.id == nsh_core::ROOT_ID
+                                || owner.kind == nsh_core::ViewKind::Modal;
+                            let desktop = owner.platform.get().os.is_desktop();
                             match input.mouse_action() {
                                 UIMouseEventAction::Move => {
+                                    if is_root {
+                                        if owner.touches.borrow_mut().move_window_resize((dx, dy))?
+                                        {
+                                            return Ok(());
+                                        }
+                                        if desktop {
+                                            update_desktop_pointer_cursor(&owner, x, y)?;
+                                        }
+                                    }
                                     if mask.contains(EventKind::MouseMove) {
+                                        let pressed = pressed_mouse_button(&input);
                                         owner.emit(
                                             EventKind::MouseMove,
-                                            owner.mouse_payload(
-                                                x,
-                                                y,
-                                                match input.mouse_button() {
-                                                    UIMouseEventButton::Left => {
-                                                        Some(nsh_core::MouseButton::Left)
-                                                    }
-                                                    UIMouseEventButton::Right => {
-                                                        Some(nsh_core::MouseButton::Right)
-                                                    }
-                                                    UIMouseEventButton::Middle => {
-                                                        Some(nsh_core::MouseButton::Middle)
-                                                    }
-                                                    UIMouseEventButton::Back => {
-                                                        Some(nsh_core::MouseButton::Back)
-                                                    }
-                                                    UIMouseEventButton::Forward => {
-                                                        Some(nsh_core::MouseButton::Forward)
-                                                    }
-                                                    _ => None,
-                                                },
-                                            ),
+                                            owner.mouse_payload(x, y, pressed),
                                         );
                                     }
                                 }
-                                UIMouseEventAction::Press
-                                    if input.mouse_button() == UIMouseEventButton::Right
-                                        && mask.contains(EventKind::ContextMenu) =>
-                                {
-                                    owner.emit(
-                                        EventKind::ContextMenu,
-                                        owner.context_menu_payload(x, y),
-                                    );
+                                UIMouseEventAction::Release => {
+                                    if is_root {
+                                        let was_resizing =
+                                            owner.touches.borrow().window_resizing();
+                                        owner.touches.borrow_mut().end_window_resize();
+                                        if was_resizing && desktop {
+                                            update_desktop_pointer_cursor(&owner, x, y)?;
+                                        }
+                                        if let Some(button) = mouse_button(input.mouse_button()) {
+                                            dispatch_mouse_up(&owner, x, y, button)?;
+                                        }
+                                    }
                                 }
-                                UIMouseEventAction::Press
-                                    if input.mouse_button() == UIMouseEventButton::Back
-                                        && (owner.id == nsh_core::ROOT_ID
-                                            || owner.kind == nsh_core::ViewKind::Modal) =>
-                                {
-                                    let _ = owner.host.handle_back();
+                                UIMouseEventAction::Press => {
+                                    owner.control.set_input_modality(
+                                        nsh_core::platform::InputModality::Pointer,
+                                    );
+                                    if is_root {
+                                        capture_mouse_up_targets(&owner, x, y)?;
+                                    }
+                                    match input.mouse_button() {
+                                        UIMouseEventButton::Left if is_root && desktop => {
+                                            if !handle_window_resize_press(
+                                                &owner,
+                                                x,
+                                                y,
+                                                (dx, dy),
+                                            )? {
+                                                handle_window_drag_press(&owner, x, y)?;
+                                            }
+                                        }
+                                        UIMouseEventButton::Right => {
+                                            if mask.contains(EventKind::ContextMenu) {
+                                                owner.emit(
+                                                    EventKind::ContextMenu,
+                                                    owner.context_menu_payload(x, y),
+                                                );
+                                            } else if is_root && desktop {
+                                                if let Some(target) =
+                                                    desktop_right_click_selection_target(
+                                                        &owner, x, y,
+                                                    )?
+                                                    && let Some(route) = owner.dispatcher.upgrade()
+                                                {
+                                                    route.send(
+                                                        crate::app::runtime::Message::DesktopSelectionMenu {
+                                                            target,
+                                                            x: wx,
+                                                            y: wy,
+                                                        },
+                                                    );
+                                                }
+                                            } else if !desktop
+                                                && owner.selectable()
+                                                && owner.has_selection()
+                                            {
+                                                owner.selection_menu_show(true)?;
+                                            }
+                                        }
+                                        UIMouseEventButton::Back if is_root => {
+                                            let _ = owner.host.handle_back();
+                                        }
+                                        _ => {}
+                                    }
                                 }
                                 _ => {}
                             }
@@ -379,6 +477,183 @@ impl Interaction {
                 });
             } else {
                 owner.native.borrow_mut().off_event(E::OnMouse)?;
+            }
+        }
+        let axis =
+            !blocked && (events.contains(EventKind::Wheel) || events.contains(EventKind::Pinch));
+        if self.axis_registered.replace(axis) != axis {
+            if axis {
+                let weak = Rc::downgrade(owner);
+                owner.native.borrow_mut().on_axis(move |event| {
+                    callback(|| {
+                        if let Some(owner) = weak.upgrade()
+                            && let Some(input) = event.input_event()
+                        {
+                            let mask = owner.interaction.mask();
+                            let x = input.pointer_x();
+                            let y = input.pointer_y();
+                            let action = input.axis_action();
+                            let pinch_scale = input.axis_pinch_scale_value() as f32;
+                            if mask.contains(EventKind::Pinch)
+                                && pinch_scale.is_finite()
+                                && pinch_scale > 0.0
+                                && (pinch_scale != 1.0
+                                    || matches!(
+                                        action,
+                                        UIAxisEventAction::Begin
+                                            | UIAxisEventAction::End
+                                            | UIAxisEventAction::Cancel
+                                    ))
+                            {
+                                let (phase, delta) = match action {
+                                    UIAxisEventAction::Begin => {
+                                        owner.interaction.pinch_scale.set(pinch_scale);
+                                        (nsh_core::PinchPhase::Start, 0.0)
+                                    }
+                                    UIAxisEventAction::End | UIAxisEventAction::Cancel => {
+                                        let prev = owner.interaction.pinch_scale.replace(1.0);
+                                        let delta = if prev > 0.0 {
+                                            pinch_scale / prev - 1.0
+                                        } else {
+                                            0.0
+                                        };
+                                        (nsh_core::PinchPhase::End, delta)
+                                    }
+                                    _ => {
+                                        let prev =
+                                            owner.interaction.pinch_scale.replace(pinch_scale);
+                                        let delta = if prev > 0.0 {
+                                            pinch_scale / prev - 1.0
+                                        } else {
+                                            0.0
+                                        };
+                                        (nsh_core::PinchPhase::Move, delta)
+                                    }
+                                };
+                                owner.emit(
+                                    EventKind::Pinch,
+                                    owner.pinch_payload(x, y, delta, phase),
+                                );
+                                if takes_axis(&owner, x, y, EventKind::Pinch) {
+                                    let _ = input.axis_set_propagation(false);
+                                }
+                                return Ok(());
+                            }
+                            let is_mouse = input.tool_type == UIInputToolType::Mouse;
+                            let modifiers = owner.host.modifiers();
+                            let vx = input.axis_horizontal_value();
+                            let vy = input.axis_vertical_value();
+                            if mask.contains(EventKind::Wheel) {
+                                if let Some(delta) =
+                                    crate::services::desktop::wheel_delta_from_axis(
+                                        vx,
+                                        vy,
+                                        is_mouse,
+                                        owner.scale.get(),
+                                        modifiers.shift && !modifiers.ctrl,
+                                    )
+                                {
+                                    owner.emit(EventKind::Wheel, owner.wheel_payload(x, y, delta));
+                                    if takes_axis(&owner, x, y, EventKind::Wheel) {
+                                        let _ = input.axis_set_propagation(false);
+                                    }
+                                }
+                            } else if mask.contains(EventKind::Pinch)
+                                && is_mouse
+                                && modifiers.ctrl
+                                && vy.is_finite()
+                                && vy != 0.0
+                            {
+                                let delta = crate::services::desktop::ctrl_wheel_pinch_delta(
+                                    (vy as f32) / 15.0,
+                                );
+                                if delta != 0.0 {
+                                    owner.emit(
+                                        EventKind::Pinch,
+                                        owner.pinch_payload(
+                                            x,
+                                            y,
+                                            delta,
+                                            nsh_core::PinchPhase::Move,
+                                        ),
+                                    );
+                                    if takes_axis(&owner, x, y, EventKind::Pinch) {
+                                        let _ = input.axis_set_propagation(false);
+                                    }
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+            } else {
+                owner.native.borrow_mut().off_event(E::OnAxis)?;
+            }
+        }
+        let file_drop = !blocked
+            && (events.contains(EventKind::FileDragEnter)
+                || events.contains(EventKind::FileDragLeave)
+                || events.contains(EventKind::FileDrop));
+        if self.drag_registered.replace(file_drop) != file_drop {
+            if file_drop {
+                let weak_enter = Rc::downgrade(owner);
+                owner.native.borrow_mut().on_drag_enter(move |event| {
+                    callback(|| {
+                        if let Some(owner) = weak_enter.upgrade()
+                            && let Some(drag) = event.drag_event()
+                        {
+                            let _ = drag.set_suggested_drop_operation(DropOperation::Copy);
+                            if owner.interaction.mask().contains(EventKind::FileDragEnter) {
+                                let uris = extract_drag_file_uris(&drag);
+                                owner.emit(EventKind::FileDragEnter, EventPayload::FileDrop(uris));
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+                let weak_leave = Rc::downgrade(owner);
+                owner.native.borrow_mut().on_drag_leave(move |_| {
+                    callback(|| {
+                        if let Some(owner) = weak_leave.upgrade()
+                            && owner.interaction.mask().contains(EventKind::FileDragLeave)
+                        {
+                            owner.emit(EventKind::FileDragLeave, EventPayload::None);
+                        }
+                        Ok(())
+                    })
+                });
+                let weak_drop = Rc::downgrade(owner);
+                owner.native.borrow_mut().on_drop(move |event| {
+                    callback(|| {
+                        if let Some(owner) = weak_drop.upgrade()
+                            && let Some(drag) = event.drag_event()
+                        {
+                            let uris = extract_drag_file_uris(&drag);
+                            if !uris.is_empty() {
+                                let _ = drag.set_drag_result(DragResult::Successful);
+                                if owner.interaction.mask().contains(EventKind::FileDrop) {
+                                    let page_position = nsh_core::Point::new(
+                                        nsh_core::Points(drag.touch_point_x_to_window()),
+                                        nsh_core::Points(drag.touch_point_y_to_window()),
+                                    );
+                                    owner.emit(
+                                        EventKind::FileDrop,
+                                        EventPayload::FileDropAt {
+                                            uris,
+                                            page_position,
+                                        },
+                                    );
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                });
+            } else {
+                let mut native = owner.native.borrow_mut();
+                native.off_event(E::OnDragEnter)?;
+                native.off_event(E::OnDragLeave)?;
+                native.off_event(E::OnDrop)?;
             }
         }
         let delay = self
@@ -428,6 +703,7 @@ impl Interaction {
         let old_props = self.props.borrow().clone();
         let selection_changed = old_props.selectable_view != props.selectable_view;
         let pointer_changed = old_props.pointer_events != props.pointer_events;
+        let window_control_changed = old_props.window_control != props.window_control;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -488,6 +764,8 @@ impl Interaction {
         self.apply_opacity(owner)?;
         if pointer_changed {
             self.pointer_internal(owner, self.inherited_block.get(), true)?;
+        } else if window_control_changed {
+            self.events(owner, self.events.get())?;
         }
         if selection_changed {
             owner.selection_configure()?;
@@ -805,4 +1083,399 @@ impl Interaction {
         }
         Ok(())
     }
+}
+
+fn mouse_button(button: UIMouseEventButton) -> Option<nsh_core::MouseButton> {
+    match button {
+        UIMouseEventButton::Left => Some(nsh_core::MouseButton::Left),
+        UIMouseEventButton::Right => Some(nsh_core::MouseButton::Right),
+        UIMouseEventButton::Middle => Some(nsh_core::MouseButton::Middle),
+        UIMouseEventButton::Back => Some(nsh_core::MouseButton::Back),
+        UIMouseEventButton::Forward => Some(nsh_core::MouseButton::Forward),
+        _ => None,
+    }
+}
+
+fn pressed_mouse_button(input: &ArkUIInputEvent) -> Option<nsh_core::MouseButton> {
+    let mut raw = [0_i32; 8];
+    match input.mouse_pressed_buttons(&mut raw) {
+        Ok(count) => raw[..count.min(raw.len())]
+            .iter()
+            .find_map(|&code| UIMouseEventButton::try_from_raw(code as u32).and_then(mouse_button)),
+        Err(_) => mouse_button(input.mouse_button()),
+    }
+}
+
+fn capture_mouse_up_targets(root: &Rc<Node>, x: f32, y: f32) -> Result<()> {
+    let mut targets = Vec::new();
+    if let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? {
+        loop {
+            if cur.interaction.mask().contains(EventKind::MouseUp) {
+                targets.push(Rc::downgrade(&cur));
+            }
+            if cur.id == root.id {
+                break;
+            }
+            let Some(parent) = cur.parent_node.borrow().upgrade() else {
+                break;
+            };
+            cur = parent;
+        }
+    }
+    root.touches.borrow_mut().capture_mouse_up(targets);
+    Ok(())
+}
+
+fn dispatch_mouse_up(root: &Rc<Node>, x: f32, y: f32, button: nsh_core::MouseButton) -> Result<()> {
+    let mut targets: Vec<Rc<Node>> = root
+        .touches
+        .borrow_mut()
+        .take_mouse_up_targets()
+        .into_iter()
+        .filter_map(|weak| weak.upgrade())
+        .filter(|node| {
+            node.visible_in_tree() && node.interaction.mask().contains(EventKind::MouseUp)
+        })
+        .collect();
+    if let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? {
+        loop {
+            if cur.interaction.mask().contains(EventKind::MouseUp)
+                && !targets.iter().any(|existing| existing.id == cur.id)
+            {
+                targets.push(cur.clone());
+            }
+            if cur.id == root.id {
+                break;
+            }
+            let Some(parent) = cur.parent_node.borrow().upgrade() else {
+                break;
+            };
+            cur = parent;
+        }
+    }
+    for target in targets {
+        let (lx, ly) = if target.id == root.id {
+            (x, y)
+        } else {
+            target
+                .input_in_root(root)?
+                .and_then(|matrix| crate::render::geometry::local_point(&matrix.0, (x, y)))
+                .unwrap_or((x, y))
+        };
+        target.emit(EventKind::MouseUp, target.mouse_up_payload(lx, ly, button));
+    }
+    Ok(())
+}
+
+fn dispatch_window_control(
+    owner: &Rc<Node>,
+    control: nsh_core::desktop::WindowControl,
+) -> Result<()> {
+    let mut cur = Some(owner.clone());
+    while let Some(node) = cur {
+        if let Some(modal) = node.modal.borrow().as_ref()
+            && modal.is_desktop_window()
+        {
+            return modal.desktop_window_control(control);
+        }
+        cur = node.parent_node.borrow().upgrade();
+    }
+    use crate::services::desktop::{DesktopEvent, WireCommand, wire_request};
+    match control {
+        nsh_core::desktop::WindowControl::Minimize => {
+            owner
+                .host
+                .desktop_command(&wire_request(&nsh_core::desktop::WindowRequest::Minimize))?;
+        }
+        nsh_core::desktop::WindowControl::Maximize => {
+            owner
+                .host
+                .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+        }
+        nsh_core::desktop::WindowControl::Close => {
+            if let Some(route) = owner.dispatcher.upgrade() {
+                route.send(crate::app::runtime::Message::HostDesktop(
+                    DesktopEvent::ClosePress(nsh_core::desktop::CloseReason::CloseButton),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_window_drag_target(root: &Rc<Node>, x: f32, y: f32) -> Result<bool> {
+    let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
+        return Ok(false);
+    };
+    loop {
+        if cur.interaction.window_control().is_some()
+            || cur.kind == nsh_core::ViewKind::Input
+            || cur.interaction.window_drag() == Some(false)
+        {
+            return Ok(false);
+        }
+        let mask = cur.interaction.mask();
+        if mask.contains(EventKind::Press)
+            || mask.contains(EventKind::PressDown)
+            || mask.contains(EventKind::Touch)
+            || cur.text_listens(EventKind::Press)
+        {
+            return Ok(false);
+        }
+        if cur.interaction.window_drag() == Some(true) {
+            return Ok(true);
+        }
+        if cur.id == root.id {
+            return Ok(false);
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            return Ok(false);
+        };
+        cur = parent;
+    }
+}
+
+fn hit_is_window_control(root: &Rc<Node>, x: f32, y: f32) -> Result<bool> {
+    let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
+        return Ok(false);
+    };
+    loop {
+        if cur.interaction.window_control().is_some() {
+            return Ok(true);
+        }
+        if cur.id == root.id {
+            return Ok(false);
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            return Ok(false);
+        };
+        cur = parent;
+    }
+}
+
+fn desktop_right_click_selection_target(
+    root: &Rc<Node>,
+    x: f32,
+    y: f32,
+) -> Result<Option<nsh_core::NodeId>> {
+    let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
+        return Ok(None);
+    };
+    loop {
+        if cur.interaction.mask().contains(EventKind::ContextMenu)
+            || cur.kind == nsh_core::ViewKind::Input
+        {
+            return Ok(None);
+        }
+        if cur.selectable() || cur.interaction.selectable_view() {
+            return Ok(Some(cur.id));
+        }
+        if cur.id == root.id {
+            return Ok(None);
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            return Ok(None);
+        };
+        cur = parent;
+    }
+}
+
+fn hit_window_resize_edge(
+    root: &Rc<Node>,
+    x: f32,
+    y: f32,
+) -> Result<Option<nsh_core::desktop::ResizeEdge>> {
+    let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
+        return Ok(None);
+    };
+    loop {
+        if cur.interaction.window_control().is_some() {
+            return Ok(None);
+        }
+        if let Some(edge) = cur.interaction.window_resize() {
+            return Ok(Some(edge));
+        }
+        if cur.id == root.id {
+            return Ok(None);
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            return Ok(None);
+        };
+        cur = parent;
+    }
+}
+
+fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> {
+    let modal = root
+        .modal
+        .borrow()
+        .as_ref()
+        .filter(|modal| modal.is_desktop_window())
+        .cloned();
+    let resizable = modal.as_ref().map_or_else(
+        || {
+            root.platform
+                .get()
+                .window_state
+                .is_none_or(|state| state.mode == nsh_core::desktop::WindowMode::Normal)
+        },
+        |modal| modal.desktop_resizable(),
+    );
+    let explicit_edge = if resizable {
+        hit_window_resize_edge(root, x, y)?
+    } else {
+        None
+    };
+    let resize_edge = explicit_edge.or_else(|| {
+        modal
+            .as_ref()
+            .and_then(|modal| modal.desktop_resize_edge((x, y)))
+    });
+    if let Some(edge) = resize_edge
+        && (explicit_edge.is_some() || !hit_is_window_control(root, x, y)?)
+    {
+        root.cursor.set_resize(
+            root,
+            Some(crate::services::desktop::resize_edge_cursor(edge)),
+        )?;
+        return Ok(());
+    }
+    root.cursor.set_resize(root, None)?;
+
+    let auto_cursor =
+        if let Some(node) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? {
+            if node.style.borrow().cursor != nsh_core::Cursor::Auto {
+                None
+            } else {
+                let local = if node.id == root.id {
+                    Some((x, y))
+                } else {
+                    node.input_in_root(root)?
+                        .and_then(|matrix| crate::render::geometry::local_point(&matrix.0, (x, y)))
+                };
+                if let Some((lx, ly)) = local
+                    && node.text_link_at(EventKind::Press, lx, ly).is_some()
+                {
+                    Some(nsh_core::Cursor::Pointer)
+                } else if node.selectable() {
+                    Some(nsh_core::Cursor::Text)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    root.cursor.set_pointer_auto(root, auto_cursor)
+}
+
+fn handle_window_resize_press(
+    owner: &Rc<Node>,
+    x: f32,
+    y: f32,
+    window_point: (f32, f32),
+) -> Result<bool> {
+    let modal = owner.modal.borrow().clone();
+    let Some(modal) = modal.filter(|modal| modal.is_desktop_window() && modal.desktop_resizable())
+    else {
+        return Ok(false);
+    };
+    let explicit = hit_window_resize_edge(owner, x, y)?;
+    let Some(edge) = explicit.or_else(|| modal.desktop_resize_edge((x, y))) else {
+        return Ok(false);
+    };
+    if explicit.is_none() && hit_is_window_control(owner, x, y)? {
+        return Ok(false);
+    }
+    owner
+        .touches
+        .borrow_mut()
+        .start_window_resize(&modal, edge, window_point);
+    owner.cursor.set_resize(
+        owner,
+        Some(crate::services::desktop::resize_edge_cursor(edge)),
+    )?;
+    Ok(true)
+}
+
+fn takes_axis(owner: &Rc<Node>, x: f32, y: f32, event: EventKind) -> bool {
+    if owner.scroll.borrow().is_some() {
+        return false;
+    }
+    let Ok(Some(mut cur)) = crate::input::touch::hit(owner, (x, y), &nsh_core::Matrix::IDENTITY)
+    else {
+        return true;
+    };
+    let mut chain = Vec::new();
+    loop {
+        let stop = cur.id == owner.id;
+        chain.push(cur.clone());
+        if stop {
+            break;
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            break;
+        };
+        cur = parent;
+    }
+    nsh_core::input::wheel_listener(
+        chain,
+        |node| node.interaction.mask().contains(event),
+        |node| {
+            node.scroll.borrow().is_some()
+                || matches!(
+                    node.kind,
+                    nsh_core::ViewKind::WebView | nsh_core::ViewKind::Input
+                )
+        },
+    )
+    .is_some_and(|(target, takes)| target.id == owner.id && takes)
+}
+
+fn handle_window_drag_press(owner: &Rc<Node>, x: f32, y: f32) -> Result<()> {
+    if !is_window_drag_target(owner, x, y)? {
+        return Ok(());
+    }
+    let double_click = owner.touches.borrow().clicks() == 2;
+    if let Some(modal) = owner.modal.borrow().as_ref()
+        && modal.is_desktop_window()
+    {
+        if double_click {
+            modal.desktop_toggle_maximize()?;
+        } else {
+            modal.desktop_start_moving()?;
+        }
+        return Ok(());
+    }
+    if owner.id == nsh_core::ROOT_ID {
+        let cmd = if double_click {
+            crate::services::desktop::WireCommand::ToggleMaximize { window_id: None }
+        } else {
+            crate::services::desktop::WireCommand::StartMoving { window_id: None }
+        };
+        owner.host.desktop_command(&cmd)?;
+    }
+    Ok(())
+}
+
+fn extract_drag_file_uris(drag: &ohos_arkui_binding::api::drag::DragEvent<'_>) -> Vec<String> {
+    let Ok(mut data) = ohos_udmf_binding::UdmfData::try_new() else {
+        return Vec::new();
+    };
+    if drag.get_udmf_data(&mut data).is_err() {
+        return Vec::new();
+    }
+    let Ok(records) = data.records() else {
+        return Vec::new();
+    };
+    let mut uris = Vec::new();
+    for record in records {
+        if let Ok(uds) = record.file_uri()
+            && let Ok(uri) = uds.file_uri()
+            && !uri.is_empty()
+        {
+            uris.push(uri);
+        }
+    }
+    uris
 }

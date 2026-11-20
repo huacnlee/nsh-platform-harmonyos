@@ -501,6 +501,65 @@ impl Scroller {
         let (x, y) = self.offset.get();
         self.command_to(x + dx, y + dy, animated)
     }
+    pub(crate) fn can_key_scroll(&self, horizontal: bool) -> bool {
+        if !self.behavior.borrow().enabled
+            || self.blocked.get()
+            || self.horizontal.get() != horizontal
+        {
+            return false;
+        }
+        let (vw, vh) = self.current_viewport();
+        let (cw, ch) = self.current_content_size();
+        if horizontal {
+            cw > vw + 1.0
+        } else {
+            ch > vh + 1.0
+        }
+    }
+    pub(crate) fn key_scroll(
+        &self,
+        key_move: nsh_core::scroll::KeyMove,
+        horizontal: bool,
+    ) -> Result<()> {
+        use nsh_core::scroll::KeyMove;
+        let (x, y) = self.offset.get();
+        let viewport = self.viewport_size.get();
+        let size = self.size.get();
+        let inset = self.behavior.borrow().content_inset;
+        let zoom = self.zoom.get();
+        let (cur, vp, min, max) = if horizontal {
+            (
+                x,
+                viewport.width,
+                -inset.left.0,
+                (size.width * zoom + inset.right.0 - viewport.width).max(-inset.left.0),
+            )
+        } else {
+            (
+                y,
+                viewport.height,
+                -inset.top.0,
+                (size.height * zoom + inset.bottom.0 - viewport.height).max(-inset.top.0),
+            )
+        };
+        let target = match key_move {
+            KeyMove::Points(d) => (cur + d.0).clamp(min, max),
+            KeyMove::Pages(n) => (cur + n * (vp - 40.0).max(40.0)).clamp(min, max),
+            KeyMove::Start => min,
+            KeyMove::End => max,
+        };
+        if (target - cur).abs() > 0.5 {
+            if horizontal {
+                self.command_to(target, y, true)?;
+            } else {
+                self.command_to(x, target, true)?;
+            }
+        }
+        if let Some(owner) = self.owner.upgrade() {
+            owner.control.key_scrolled(owner.id, key_move);
+        }
+        Ok(())
+    }
     pub(crate) fn host_stop_scrolling(&self) -> Result<()> {
         let stopped = (|| {
             let (x, y) = self
