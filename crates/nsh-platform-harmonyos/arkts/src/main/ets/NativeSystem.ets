@@ -3,8 +3,8 @@ import { common, wantConstant } from "@kit.AbilityKit";
 import { fileUri } from "@kit.CoreFileKit";
 import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAudio } from "./NativeAudio";
-import { NativeClipboard, ClipboardReply } from "./NativeClipboard";
-import { NativeNotifications, NotificationReply } from "./NativeNotifications";
+import { NativeClipboard } from "./NativeClipboard";
+import { NativeNotifications } from "./NativeNotifications";
 import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 
 // The system bridge uses the same typed completion for every service.

@@ -2,7 +2,6 @@ import { FrameCallback } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
 import { fileIo as fs } from "@kit.CoreFileKit";
 import picker from "@ohos.file.picker";
-import hiTraceMeter from "@ohos.hiTraceMeter";
 import webview from "@ohos.web.webview";
 import { NshRuntimeContext } from "./NativeEditors";
 
@@ -41,25 +40,17 @@ let webEngineInitialized = false;
 let webComponentMounted = false;
 let nextWebNativeTagId = 1;
 
-function ensureWebEngineInitialized(startup: boolean = false): void {
+function ensureWebEngineInitialized(): void {
   if (!webEngineInitialized) {
-    const trace = startup
-      ? "NSH ArkWeb startup initialization"
-      : "NSH ArkWeb first mount initialization";
-    hiTraceMeter.startTrace(trace, 0);
-    try {
-      webview.WebviewController.initializeWebEngine();
-      webEngineInitialized = true;
-    } finally {
-      hiTraceMeter.finishTrace(trace, 0);
-    }
+    webview.WebviewController.initializeWebEngine();
+    webEngineInitialized = true;
   }
 }
 
 /** Prepare ArkWeb on the UI thread during standalone launch. A failed attempt is retried at first mount. */
 export function prepareWebEngine(): void {
   try {
-    ensureWebEngineInitialized(true);
+    ensureWebEngineInitialized();
   } catch (error) {
     console.warn(`[NSH] ArkWeb startup initialization: ${String(error)}`);
   }
