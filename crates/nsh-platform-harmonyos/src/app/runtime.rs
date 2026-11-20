@@ -570,7 +570,18 @@ impl State {
             }
             Message::RequestFrame => self.request_frame()?,
             Message::EngineFrameRequested => {
-                self.engine_wanted = true;
+                if self.laid_out
+                    && self.is_active()
+                    && self.engine_in_flight == 0
+                    && !self
+                        .phase
+                        .as_ref()
+                        .is_some_and(super::frame_source::Phase::is_running)
+                {
+                    self.dispatch_engine_frame();
+                } else {
+                    self.engine_wanted = true;
+                }
                 self.schedule_frame()?;
             }
             Message::EngineFrameCompleted => {
@@ -655,21 +666,24 @@ impl State {
     fn report(&self, error: String) {
         self.errors.report(error);
     }
+    fn dispatch_engine_frame(&mut self) {
+        self.engine_in_flight += 1;
+        let dispatcher = self.dispatcher.clone();
+        let control = self.engine.as_ref().unwrap().control();
+        control.frame();
+        control.flush(move |_| {
+            if let Some(dispatcher) = dispatcher.upgrade() {
+                dispatcher.send(Message::EngineFrameCompleted);
+            }
+        });
+    }
     fn step_frame(&mut self, timestamp: u64) -> Result<bool> {
         let rate_driver = self.rate_driver.as_ref().unwrap().clone();
         if !self.is_active() || !rate_driver.active() {
             return Ok(false);
         }
         if std::mem::take(&mut self.engine_wanted) {
-            self.engine_in_flight += 1;
-            let dispatcher = self.dispatcher.clone();
-            let control = self.engine.as_ref().unwrap().control();
-            control.frame();
-            control.flush(move |_| {
-                if let Some(dispatcher) = dispatcher.upgrade() {
-                    dispatcher.send(Message::EngineFrameCompleted);
-                }
-            });
+            self.dispatch_engine_frame();
         }
         self.frame_wanted = false;
         let mounter = self.mounter.as_mut().unwrap();
@@ -1084,6 +1098,7 @@ impl Runtime {
             unreclaimed_delete_count: std::cell::Cell::new(0),
             arkui: crate::render::arkui::empty_batch(),
             arkui_views: Default::default(),
+            deferred_webs: RefCell::default(),
             host: config.host.clone(),
             dispatcher: Arc::downgrade(&dispatcher),
             env,

@@ -87,6 +87,10 @@ impl Phase {
         })
     }
 
+    pub(crate) fn is_running(&self) -> bool {
+        self.running.get()
+    }
+
     pub(crate) fn set_running(&self, running: bool, range: RateRange) -> napi_ohos::Result<()> {
         let range = range.for_display_sync();
         if self.running.get() != running || (running && self.range.get() != Some(range)) {
