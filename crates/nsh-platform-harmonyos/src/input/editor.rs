@@ -400,9 +400,15 @@ impl Input {
         );
     }
     pub(crate) fn configure(self: &Rc<Self>, config: InputConfig) -> Result<()> {
-        if config.multiline != self.config.borrow().multiline
-            || config.secure != self.config.borrow().secure
-        {
+        let replace = {
+            let previous = self.config.borrow();
+            let cleared_custom_font = editor_font_family(previous.style.font_family).is_some()
+                && editor_font_family(config.style.font_family).is_none();
+            config.multiline != previous.multiline
+                || config.secure != previous.secure
+                || cleared_custom_font
+        };
+        if replace {
             self.retire()?;
             let Some(owner) = self.owner.upgrade() else {
                 return Ok(());
@@ -507,10 +513,7 @@ impl Input {
             placeholder: config.placeholder.clone(),
             font_size: config.style.font_size.0 as f64,
             font_weight: config.style.font_weight as u32,
-            font_family: config
-                .style
-                .font_family
-                .map(|family| crate::text::fonts::families(&family.name()).join(",")),
+            font_family: editor_font_family(config.style.font_family),
             italic: config.style.italic,
             color: argb(config.style.color),
             placeholder_color: argb(config.placeholder_color.unwrap_or(config.style.color)),
@@ -811,4 +814,10 @@ fn content_type(fill: nsh_core::AutoFill) -> Option<&'static str> {
         F::CreditCardNumber => Some("credit-card"),
         _ => None,
     }
+}
+
+fn editor_font_family(family: Option<nsh_core::FontFamily>) -> Option<String> {
+    let family = family?.name();
+    let list = crate::text::fonts::families(&family);
+    (!list.is_empty()).then(|| list.join(","))
 }

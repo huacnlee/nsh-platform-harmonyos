@@ -121,6 +121,7 @@ interface NshNativeModule {
     timeZone?: string,
     regionalLocale?: string,
     is24HourClock?: boolean,
+    fontChanged?: boolean,
   ): void;
   nshUpdateAccessibility(sessionId: number, screenReader?: boolean, reduceMotion?: boolean): void;
   nshUpdateWindow(
@@ -412,6 +413,7 @@ class HostSession {
   private readonly tabBars: Set<NativeTabBar> = new Set();
   private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private systemColorMode: number = -1;
+  private fontId: string = "";
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
@@ -519,6 +521,7 @@ class HostSession {
         : "inactive"
       : "background";
     this.systemColorMode = config?.colorMode ?? -1;
+    this.fontId = config?.fontId ?? "";
     this.sessionId = mod.nshCreateSession(
       {
         shareAvailable:
@@ -651,6 +654,11 @@ class HostSession {
       if (this.colorMode === ThemeColorMode.SYSTEM && newConfig.colorMode !== undefined) {
         this.systemColorMode = newConfig.colorMode;
       }
+      let fontChanged = false;
+      if (newConfig.fontId !== undefined && newConfig.fontId !== this.fontId) {
+        this.fontId = newConfig.fontId;
+        fontChanged = true;
+      }
       const localeDetails = readSystemLocaleDetails();
       this.mod.nshUpdateConfig(
         this.sessionId,
@@ -664,6 +672,7 @@ class HostSession {
         localeDetails.timeZone,
         localeDetails.regionalLocale,
         localeDetails.is24HourClock,
+        fontChanged,
       );
       this.refreshMobileControls();
       this.tabBars.forEach((bar: NativeTabBar): void => bar.refresh());

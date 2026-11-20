@@ -198,6 +198,7 @@ pub(crate) fn nsh_update_config(
     time_zone: Option<String>,
     regional_locale: Option<String>,
     is_24_hour_clock: Option<bool>,
+    font_changed: Option<bool>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
         let mut environment = crate::app::session::environment_from_config(
@@ -213,6 +214,9 @@ pub(crate) fn nsh_update_config(
         );
         environment.pixel_ratio = pixel_ratio;
         host.update(environment)?;
+        if font_changed == Some(true) {
+            host.notify_fonts_changed()?;
+        }
     }
     Ok(())
 }

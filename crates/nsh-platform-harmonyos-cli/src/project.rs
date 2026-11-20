@@ -526,6 +526,25 @@ mod tests {
             app.contains("\"bundleName\": \"com.example.counter\""),
             "{app}"
         );
+        assert!(
+            app.contains("\"configuration\": \"$profile:configuration\""),
+            "{app}"
+        );
+        let configuration = fs::read_to_string(join_all(
+            &out,
+            [
+                "AppScope",
+                "resources",
+                "base",
+                "profile",
+                "configuration.json",
+            ],
+        ))
+        .unwrap();
+        assert!(
+            configuration.contains("\"fontSizeScale\": \"followSystem\""),
+            "{configuration}"
+        );
         let strings = fs::read_to_string(join_all(
             &out,
             ["AppScope", "resources", "base", "element", "string.json"],

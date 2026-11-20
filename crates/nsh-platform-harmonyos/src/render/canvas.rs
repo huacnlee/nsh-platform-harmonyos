@@ -1342,7 +1342,10 @@ impl ShapedText {
             },
         ));
         if let Some(family) = &font.family {
-            text_style.set_font_families(&crate::text::fonts::families(family));
+            let families = crate::text::fonts::families(family);
+            if !families.is_empty() {
+                text_style.set_font_families(&families);
+            }
         }
         for tag in font.variant.tags() {
             text_style.add_font_feature(tag, 1);

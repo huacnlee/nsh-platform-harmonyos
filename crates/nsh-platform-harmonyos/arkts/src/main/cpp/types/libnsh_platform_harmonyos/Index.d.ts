@@ -540,6 +540,7 @@ export declare function nshUpdateConfig(
   timeZone?: string | undefined | null,
   regionalLocale?: string | undefined | null,
   is24HourClock?: boolean | undefined | null,
+  fontChanged?: boolean | undefined | null,
 ): void;
 
 export declare function nshUpdateKeyboard(

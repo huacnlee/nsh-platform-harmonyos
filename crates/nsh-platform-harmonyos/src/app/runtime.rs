@@ -122,6 +122,7 @@ pub(crate) enum Message {
         index: i32,
     },
     HostEnvironment(NshEnvironment),
+    HostFontsChanged,
     HostWindow(
         [crate::app::session::AvoidArea; 3],
         crate::app::session::AvoidArea,
@@ -493,6 +494,11 @@ impl State {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
+            Message::HostFontsChanged => {
+                self.engine.as_ref().unwrap().control().fonts_changed();
+                self.mounter.as_ref().unwrap().invalidate_canvases()?;
+                self.request_frame()?;
+            }
             Message::HostWindow(visual, keyboard) if self.laid_out => {
                 let changes = self
                     .mounter
@@ -1028,7 +1034,7 @@ impl Runtime {
         }
         let host_tokens = config.host_tokens.clone();
         let host_fonts = config.fonts.clone();
-        let fonts = crate::text::fonts::Fonts::new();
+        let fonts = crate::text::fonts::Fonts::shared();
         let engine_fonts = fonts.clone();
         let scale = environment.pixel_ratio;
         let text_scale = Arc::new(std::sync::atomic::AtomicU32::new(scale.to_bits()));

@@ -185,6 +185,17 @@ impl Mounter {
         }
         self.flush_arkui()
     }
+    pub(crate) fn invalidate_canvases(&self) -> Result<()> {
+        for node in self.nodes.values() {
+            if let Some(canvas) = node.canvas.borrow().as_ref() {
+                canvas.invalidate()?;
+                if node.scene_active() {
+                    node.invalidate_scene();
+                }
+            }
+        }
+        Ok(())
+    }
     pub(crate) fn composite_ready(&self, id: NodeId, generation: u32) -> Result<()> {
         if let Some(worker) = self.compositor.borrow().as_ref() {
             worker.collect();

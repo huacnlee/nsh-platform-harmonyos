@@ -268,6 +268,19 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
   }
   applyNormalAttribute(node: TextInputAttribute | TextAreaAttribute): void {
     const s = this.entry.settings;
+    // `nsh-core` already scales `fontSize` by `font_scale` (honoring `allowFontScaling`
+    // and `maxFontSizeMultiplier`), so pass `vp` rather than ArkUI's default `fp` to
+    // avoid double-scaling when `fontSizeScale: "followSystem"` is active.
+    const fontSize = `${s.fontSize}vp`;
+    const fontStyle = s.italic ? FontStyle.Italic : FontStyle.Normal;
+    const placeholderFont: Font = {
+      size: fontSize,
+      weight: s.fontWeight,
+      style: fontStyle,
+    };
+    if (s.fontFamily) {
+      placeholderFont.family = s.fontFamily;
+    }
     node
       .width(s.width)
       .height(this.entry.editorHeight())
@@ -276,11 +289,11 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       // The outer NSH node owns corners; theme rounding would clip this content box.
       .borderRadius(0)
       .backgroundColor(Color.Transparent)
-      .fontSize(s.fontSize)
+      .fontSize(fontSize)
       .fontWeight(s.fontWeight)
-      .fontFamily(s.fontFamily ?? "HarmonyOS Sans")
-      .fontStyle(s.italic ? FontStyle.Italic : FontStyle.Normal)
+      .fontStyle(fontStyle)
       .fontColor(argbColor(s.color))
+      .placeholderFont(placeholderFont)
       .placeholderColor(argbColor(s.placeholderColor))
       .caretColor(argbColor(s.caretColor))
       .selectedBackgroundColor(argbColor(s.selectionColor))
@@ -305,6 +318,9 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       .enableAutoFill(s.autoFill)
       .contentType(contentType(s.contentType))
       .hitTestBehavior(s.hitTest as HitTestMode);
+    if (s.fontFamily) {
+      node.fontFamily(s.fontFamily);
+    }
     if (s.multiline && !s.secure) {
       (node as TextAreaAttribute).type(areaType(s.keyboard));
     } else {

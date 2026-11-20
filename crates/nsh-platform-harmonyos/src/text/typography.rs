@@ -274,16 +274,23 @@ impl TextEngine for OhosTextEngine {
         if family.is_empty() || family.contains('\0') {
             return Err("font has no valid family name".into());
         }
-        let mut bytes: Arc<[u8]> = Arc::from(data.as_ref());
         let mut fonts = self.fonts.lock().expect("font collection");
+        if fonts
+            .data
+            .iter()
+            .any(|existing| existing.as_ref() == data.as_ref())
+        {
+            return Ok(());
+        }
+        let mut bytes: Arc<[u8]> = Arc::from(data.as_ref());
         fonts
             .collection
             .register_font_buffer(&family, Arc::get_mut(&mut bytes).expect("new font buffer"))
             .map_err(|e| e.to_string())?;
-        // Retain the buffer for the font collection's lifetime, even on SDKs
-        // where registration copies it internally.
+        // Retain the buffer for the global font collection's lifetime, even on
+        // SDKs where registration copies it internally.
         fonts.data.push(bytes);
-        fonts.generation += 1;
+        fonts.generation = fonts.generation.wrapping_add(1);
         Ok(())
     }
 
@@ -407,7 +414,10 @@ impl TextEngine for OhosTextEngine {
             }
             if let Some(family) = span.style.font_family {
                 let family = family.name();
-                style.set_font_families(&super::fonts::families(&family));
+                let families = super::fonts::families(&family);
+                if !families.is_empty() {
+                    style.set_font_families(&families);
+                }
             }
             if span.style.line_height.0 > 0.0 && span.style.font_size.0 > 0.0 {
                 // Match the other text engines: split extra line height above and below the font.

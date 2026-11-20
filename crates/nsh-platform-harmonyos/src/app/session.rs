@@ -906,6 +906,13 @@ impl Services {
         Ok(())
     }
 
+    pub(crate) fn notify_fonts_changed(&self) -> Result<()> {
+        self.check()?;
+        crate::text::fonts::Fonts::on_system_font_changed();
+        self.broadcast(|| Message::HostFontsChanged);
+        Ok(())
+    }
+
     fn close(&self) {
         if self.active.swap(false, Ordering::AcqRel) {
             self.keyboard.lock().unwrap().take();
