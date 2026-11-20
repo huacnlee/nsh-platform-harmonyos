@@ -86,3 +86,5 @@ nsh-macros = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189
 nsh-package = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
 nsh-testing = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
 nsh-updater = { git = "https://github.com/longbridge/nsh", rev = "e2cd5f49ea63189acecdcf5a4c6df5a0aa612fa0" }
+# Avoid Linux openat2 fast path (SIGSYS in OHOS app sandbox) until upstream cap-std ships it.
+cap-primitives = { git = "https://github.com/richerfu/cap-std", rev = "80a6b95e731c57f8ca3466e4c600de032bc0df95" }
