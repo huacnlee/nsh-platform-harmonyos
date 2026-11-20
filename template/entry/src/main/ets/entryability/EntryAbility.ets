@@ -24,6 +24,18 @@ export default class EntryAbility extends UIAbility {
     if (typeof want.uri === "string" && want.uri.length > 0) {
       this.context.eventHub.emit("nsh.openUrl", want.uri);
     }
+    const rawArgs = want.parameters?.["nsh.args"];
+    const args: string[] = [];
+    if (Array.isArray(rawArgs)) {
+      for (let i = 0; i < rawArgs.length; i++) {
+        if (typeof rawArgs[i] === "string") {
+          args.push(rawArgs[i] as string);
+        }
+      }
+    } else if (typeof want.uri === "string" && want.uri.length > 0) {
+      args.push(want.uri);
+    }
+    this.context.eventHub.emit("nsh.secondInstance", args);
   }
 
   onWindowStageCreate(windowStage: window.WindowStage): void {

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use nsh_core::{
     NodeId,
-    keymap::{Key, KeyMatch, Keymap, Keystroke, Modifiers},
+    keymap::{Key, Keymap, Keystroke, Modifiers},
 };
 use ohos_arkui_binding::{
     component::attribute::{ArkUICommonAttribute, ArkUIEvent},
@@ -32,6 +32,29 @@ impl crate::render::node::Node {
         }
         Ok(())
     }
+    pub(crate) fn key_window_id(&self) -> NodeId {
+        if self
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| modal.is_desktop_window())
+        {
+            return self.id;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if node
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| modal.is_desktop_window())
+            {
+                return node.id;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        nsh_core::ROOT_ID
+    }
     fn find_input(&self, id: NodeId) -> Option<std::rc::Rc<crate::input::editor::Input>> {
         if self.id == id {
             return self.input.borrow().clone();
@@ -43,13 +66,29 @@ impl crate::render::node::Node {
             .find_map(|node| node.find_input(id))
     }
 }
-#[derive(Default)]
 pub(crate) struct Snapshot {
     pub(crate) map: Arc<Keymap>,
+    pub(crate) menu: Option<Arc<[nsh_core::desktop::MenuItem]>>,
+    pub(crate) quit_on_request: bool,
+    pub(crate) desktop: bool,
     pub(crate) focused: Option<NodeId>,
     pub(crate) input: Option<NodeId>,
     pub(crate) selection: Option<NodeId>,
     pub(crate) composing: bool,
+}
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            menu: None,
+            quit_on_request: true,
+            desktop: false,
+            focused: None,
+            input: None,
+            selection: None,
+            composing: false,
+        }
+    }
 }
 #[derive(Default)]
 struct Held {
@@ -89,6 +128,23 @@ impl KeyboardWindow {
             _ => return false,
         };
         let code = event.key_code();
+        if action == 1
+            && !matches!(
+                code,
+                N::ShiftLeft
+                    | N::ShiftRight
+                    | N::CtrlLeft
+                    | N::CtrlRight
+                    | N::AltLeft
+                    | N::AltRight
+                    | N::MetaLeft
+                    | N::MetaRight
+            )
+        {
+            owner
+                .control
+                .set_input_modality(nsh_core::platform::InputModality::Keyboard);
+        }
         let mut held = self.held.lock().unwrap();
         // Focus may have entered while modifiers were held in the host. Read the
         // event's pressed set instead of depending on keydowns outside our tree.
@@ -249,10 +305,11 @@ impl KeyboardWindow {
                     return true;
                 }
             }
+            let window = owner.key_window_id();
             let matched = snapshot
                 .map
-                .find(stroke, snapshot.focused.is_some(), repeat);
-            if let KeyMatch::Fire(id) = matched {
+                .find_in(window, stroke, snapshot.focused.is_some(), repeat);
+            if let Some(id) = matched.fired() {
                 route.send(crate::app::runtime::Message::HostEvent(
                     nsh_core::EventKind::KeyCommand,
                     nsh_core::EventPayload::Value(nsh_core::PayloadValue::Number(id as f64)),
@@ -261,11 +318,42 @@ impl KeyboardWindow {
             if matched.consumed() {
                 return true;
             }
+            if !repeat
+                && snapshot.desktop
+                && let Some(menu) = snapshot.menu.as_deref()
+                && let Some(shortcut) = crate::services::desktop::shortcut_from_keystroke(stroke)
+                && let Some(action) = nsh_core::desktop::MenuItem::find_shortcut(menu, &shortcut)
+                && (snapshot.focused.is_none() || action.fires_while_editing())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuAction {
+                    id: action.id,
+                    role: action.role,
+                });
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && stroke.key == Key::Char('q')
+                && stroke.modifiers
+                    == (Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    })
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuAction {
+                    id: 0,
+                    role: Some(nsh_core::desktop::MenuRole::Quit),
+                });
+                return true;
+            }
             if !repeat {
                 if stroke.key == Key::Escape && stroke.modifiers == Modifiers::default() {
                     if snapshot.input.is_some() {
-                        route.send(crate::app::runtime::Message::DismissKeyboard);
-                        return true;
+                        if !snapshot.desktop {
+                            route.send(crate::app::runtime::Message::DismissKeyboard);
+                            return true;
+                        }
+                        return false;
                     }
                     drop(snapshot);
                     return back(route);
@@ -286,6 +374,38 @@ impl KeyboardWindow {
                 {
                     drop(snapshot);
                     return back(route);
+                }
+            }
+            if snapshot.desktop && snapshot.focused.is_none() && snapshot.selection.is_none() {
+                use nsh_core::scroll::KeyMove;
+                let scroll_move = if stroke.modifiers == Modifiers::default() {
+                    match stroke.key {
+                        Key::PageUp => Some((KeyMove::Pages(-1.0), false)),
+                        Key::PageDown => Some((KeyMove::Pages(1.0), false)),
+                        Key::Home => Some((KeyMove::Start, false)),
+                        Key::End => Some((KeyMove::End, false)),
+                        Key::Up => Some((KeyMove::Points(nsh_core::Points(-40.0)), false)),
+                        Key::Down => Some((KeyMove::Points(nsh_core::Points(40.0)), false)),
+                        Key::Char(' ') => Some((KeyMove::Pages(1.0), false)),
+                        _ => None,
+                    }
+                } else if stroke.modifiers
+                    == (Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    })
+                    && stroke.key == Key::Char(' ')
+                {
+                    Some((KeyMove::Pages(-1.0), false))
+                } else {
+                    None
+                };
+                if let Some((key_move, horizontal)) = scroll_move {
+                    route.send(crate::app::runtime::Message::KeyScroll {
+                        key_move,
+                        horizontal,
+                    });
+                    return true;
                 }
             }
             false
@@ -309,6 +429,10 @@ pub(crate) fn install(
     owner: &std::rc::Rc<crate::render::node::Node>,
 ) -> crate::render::node::Result<()> {
     owner.native.borrow().set_focusable(true)?;
+    if owner.platform.get().os.is_desktop() {
+        let _ = owner.native.borrow().set_default_focus(true);
+        let _ = owner.native.borrow().set_focus_on_touch(true);
+    }
     let weak = std::rc::Rc::downgrade(owner);
     owner.native.borrow_mut().on_key_pre_ime(move |event| {
         if let Some(owner) = weak.upgrade()

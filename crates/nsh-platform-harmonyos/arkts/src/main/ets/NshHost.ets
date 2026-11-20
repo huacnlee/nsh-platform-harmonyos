@@ -30,6 +30,7 @@ import { NativeTabBar, TabBarContext } from "./NativeTabBar";
 import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames";
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
+import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -107,6 +108,13 @@ interface NshNativeModule {
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
+  nshDesktopEvent(sessionId: number, kind: string, payload: string): void;
+  nshAttachSubWindow(
+    sessionId: number,
+    windowId: number,
+    content: NodeContent,
+    platformWindowId: number,
+  ): boolean;
   nshSetLifecycle(sessionId: number, lifecycle: string): void;
   nshUpdateKeyboard(sessionId: number, duration: number): void;
   nshUpdateConfig(
@@ -242,6 +250,7 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private readonly mod: NshNativeModule;
   private active: boolean = true;
   private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  private focusHandler?: (componentId: string) => boolean;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
@@ -254,6 +263,22 @@ class ComponentRuntimeContext implements NshRuntimeContext {
 
   setColorMode(colorMode: ThemeColorMode): void {
     this.themeColorMode = colorMode;
+  }
+
+  setFocusHandler(handler?: (componentId: string) => boolean): void {
+    this.focusHandler = handler;
+  }
+
+  requestFocus(componentId: string): boolean {
+    if (this.focusHandler?.(componentId)) {
+      return true;
+    }
+    try {
+      this.ui.getFocusController().requestFocus(componentId);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   deactivate(): void {
@@ -417,6 +442,8 @@ class HostSession {
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
+  private readonly desktop?: NativeDesktop;
+  private readonly isDesktop: boolean;
   private readonly plugin: NshPlugin = new NshPlugin();
   private closed: boolean = false;
   private savedPointerVisible?: boolean;
@@ -469,6 +496,30 @@ class HostSession {
 
   private readonly onKeyboardHeightChange = (_height: number): void => {
     this.syncWindowMetrics();
+  };
+
+  private readonly onSecondInstance = (rawArgs?: string[]): void => {
+    if (this.closed || !this.isDesktop) {
+      return;
+    }
+    try {
+      this.mainWindow.showWindow().catch((): void => {});
+    } catch {}
+    const args: string[] = [];
+    if (Array.isArray(rawArgs)) {
+      for (let i = 0; i < rawArgs.length; i++) {
+        if (typeof rawArgs[i] === "string") {
+          args.push(rawArgs[i]);
+        }
+      }
+    }
+    try {
+      this.mod.nshDesktopEvent(
+        this.sessionId,
+        "second-instance",
+        JSON.stringify({ args, cwd: "" }),
+      );
+    } catch {}
   };
 
   private constructor(
@@ -572,6 +623,36 @@ class HostSession {
     this.system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
       this.mod.nshServiceEvent(this.sessionId, key, event),
     );
+    this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
+    if (this.isDesktop) {
+      this.desktop = new NativeDesktop(
+        uiContext,
+        abilityContext,
+        mainWindow,
+        (kind: string, payload: string): void => {
+          if (!this.closed) {
+            this.mod.nshDesktopEvent(this.sessionId, kind, payload);
+          }
+        },
+        (windowId: number, content: NodeContent, platformWindowId: number): boolean => {
+          if (this.closed) {
+            return false;
+          }
+          try {
+            return this.mod.nshAttachSubWindow(this.sessionId, windowId, content, platformWindowId);
+          } catch (error) {
+            console.error(`[NSH] attachSubWindow(${windowId}) failed: ${String(error)}`);
+            return false;
+          }
+        },
+      );
+      this.runtimeContext.setFocusHandler((componentId: string): boolean =>
+        this.desktop?.requestComponentFocus(componentId) ?? false,
+      );
+      try {
+        abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
+      } catch {}
+    }
     this.bindWindowListeners();
     this.subscribeLifecycleListeners();
     this.subscribeAccessibility();
@@ -692,6 +773,12 @@ class HostSession {
     }
     this.mobileControls.clear();
     this.tabBars.clear();
+    if (this.isDesktop) {
+      try {
+        this.abilityContext.eventHub.off("nsh.secondInstance", this.onSecondInstance);
+      } catch {}
+    }
+    this.desktop?.close();
     this.system.close();
     this.updateCursor("auto");
     this.updateSystemBars();
@@ -841,6 +928,9 @@ class HostSession {
   }
 
   private updateSystemBars(command?: HostCommandPayload): void {
+    if (this.isDesktop) {
+      return;
+    }
     // Keep restoration ordered after outstanding writes, including when a
     // surface stops while a window API promise is still pending.
     this.barsWork = this.barsWork
@@ -965,9 +1055,11 @@ class HostSession {
         break;
       default:
         controller.restoreDefault();
+        this.desktop?.updateCursor(undefined);
         return;
     }
     controller.setCursor(style);
+    this.desktop?.updateCursor(style);
   }
 
   private handleHostCommand(command: HostCommandPayload): void {
@@ -989,6 +1081,10 @@ class HostSession {
     }
     if (command.kind === "system-cancel") {
       this.system.cancel(command.openId ?? 0);
+      return;
+    }
+    if (command.kind === "desktop") {
+      this.desktop?.execute(command.text ?? "{}");
       return;
     }
     if (command.kind === "cursor") {
@@ -1035,6 +1131,7 @@ class HostSession {
           control.setColorMode(mode),
         );
         this.tabBars.forEach((bar: NativeTabBar): void => bar.setColorMode(mode));
+        this.desktop?.setColorMode(mode);
         this.runtimeContext.setColorMode(mode);
       }
       return;
