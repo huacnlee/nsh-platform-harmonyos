@@ -4,33 +4,27 @@
 //! follows a `<Scroll>` by its `nativeID` on the UI thread without a round trip
 //! through JS.
 
-#[cfg(target_env = "ohos")]
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
     sync::Arc,
 };
 
-#[cfg(target_env = "ohos")]
+use napi_derive_ohos::napi;
 use napi_ohos::{
     Env, Error, Result,
     bindgen_prelude::{FnArgs, Function, FunctionRef},
 };
-#[cfg(target_env = "ohos")]
 use nsh_core::NodeId;
-#[cfg(target_env = "ohos")]
 use rustc_hash::FxHashMap;
 
-#[cfg(target_env = "ohos")]
 use crate::scroll::controller::Scroller;
 
-#[cfg(target_env = "ohos")]
 enum Listener {
     Scroll(FunctionRef<FnArgs<(f64, f64, f64, f64)>, ()>),
     ContentSize(FunctionRef<FnArgs<(f64, f64)>, ()>),
 }
 
-#[cfg(target_env = "ohos")]
 struct HandleEntry {
     env: Env,
     scroll: Weak<Scroller>,
@@ -41,147 +35,87 @@ struct HandleEntry {
     next_listener: Cell<u32>,
 }
 
-#[cfg(target_env = "ohos")]
 static NEXT_HANDLE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-#[cfg(target_env = "ohos")]
 thread_local! {
     static HANDLES: RefCell<FxHashMap<u64, Rc<HandleEntry>>> = RefCell::default();
 }
 
 /// A `<Scroll>` of the app watched by the host on the UI thread.
-#[cfg_attr(target_env = "ohos", napi_derive_ohos::napi)]
+#[napi]
 #[derive(Clone, Debug)]
 pub struct NshScrollHandle {
     id: u64,
 }
 
-#[cfg_attr(target_env = "ohos", napi_derive_ohos::napi)]
+#[napi]
 impl NshScrollHandle {
     /// Whether the scroll view is still mounted with the watched `nativeID`.
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn is_alive(&self) -> bool {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|_| true).unwrap_or(false)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            false
-        }
+        self.with_scroller(|_| true).unwrap_or(false)
     }
 
     /// The horizontal scroll offset in vp.
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn scroll_x(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_offset().0))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_offset().0))
+            .unwrap_or(0.0)
     }
 
     /// The vertical scroll offset in vp.
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn scroll_y(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_offset().1))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_offset().1))
+            .unwrap_or(0.0)
     }
 
     /// The content's width in vp (at least the viewport's).
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn content_width(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_content_size().0))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_content_size().0))
+            .unwrap_or(0.0)
     }
 
     /// The content's height in vp (at least the viewport's).
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn content_height(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_content_size().1))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_content_size().1))
+            .unwrap_or(0.0)
     }
 
     /// The visible width in vp.
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn viewport_width(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_viewport().0))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_viewport().0))
+            .unwrap_or(0.0)
     }
 
     /// The visible height in vp.
-    #[cfg_attr(target_env = "ohos", napi(getter))]
+    #[napi(getter)]
     pub fn viewport_height(&self) -> f64 {
-        #[cfg(target_env = "ohos")]
-        {
-            self.with_scroller(|s| f64::from(s.current_viewport().1))
-                .unwrap_or(0.0)
-        }
-        #[cfg(not(target_env = "ohos"))]
-        {
-            0.0
-        }
+        self.with_scroller(|s| f64::from(s.current_viewport().1))
+            .unwrap_or(0.0)
     }
 
     /// Scrolls by `dx`, `dy`, clamped to the content.
-    #[cfg_attr(target_env = "ohos", napi)]
+    #[napi]
     pub fn scroll_by(&self, dx: f64, dy: f64, animated: Option<bool>) {
-        #[cfg(target_env = "ohos")]
-        {
-            let _ = self.with_scroller(|s| {
-                let _ = s.host_scroll_by(dx as f32, dy as f32, animated.unwrap_or(false));
-            });
-        }
-        #[cfg(not(target_env = "ohos"))]
-        let _ = (dx, dy, animated);
+        let _ = self.with_scroller(|s| {
+            let _ = s.host_scroll_by(dx as f32, dy as f32, animated.unwrap_or(false));
+        });
     }
 
     /// Ends a fling or an animated scroll where it is.
-    #[cfg_attr(target_env = "ohos", napi)]
+    #[napi]
     pub fn stop_scrolling(&self) {
-        #[cfg(target_env = "ohos")]
-        {
-            let _ = self.with_scroller(|s| {
-                let _ = s.host_stop_scrolling();
-            });
-        }
+        let _ = self.with_scroller(|s| {
+            let _ = s.host_stop_scrolling();
+        });
     }
 
     /// Calls `listener(scrollX, scrollY, dx, dy)` on every offset change.
     /// Returns a listener id for `removeListener`.
-    #[cfg(target_env = "ohos")]
     #[napi]
     pub fn on_scroll(&self, listener: Function<FnArgs<(f64, f64, f64, f64)>, ()>) -> Result<u32> {
         let reference = listener.create_ref()?;
@@ -190,7 +124,6 @@ impl NshScrollHandle {
 
     /// Calls `listener(contentWidth, contentHeight)` when the content size changes.
     /// Returns a listener id for `removeListener`.
-    #[cfg(target_env = "ohos")]
     #[napi]
     pub fn on_content_size_change(
         &self,
@@ -201,20 +134,16 @@ impl NshScrollHandle {
     }
 
     /// Stops calling listener `id`.
-    #[cfg_attr(target_env = "ohos", napi)]
+    #[napi]
     pub fn remove_listener(&self, id: u32) {
-        #[cfg(target_env = "ohos")]
         HANDLES.with(|handles| {
             if let Some(entry) = handles.borrow().get(&self.id) {
                 entry.listeners.borrow_mut().retain(|(i, _)| *i != id);
             }
         });
-        #[cfg(not(target_env = "ohos"))]
-        let _ = id;
     }
 }
 
-#[cfg(target_env = "ohos")]
 impl NshScrollHandle {
     fn new(env: Env, scroll: &Rc<Scroller>) -> Self {
         let id = NEXT_HANDLE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -343,13 +272,11 @@ impl NshScrollHandle {
     }
 }
 
-#[cfg(target_env = "ohos")]
 struct WatcherCallback {
     env: Env,
     callback: FunctionRef<Option<NshScrollHandle>, ()>,
 }
 
-#[cfg(target_env = "ohos")]
 impl WatcherCallback {
     fn notify(&self, handle: Option<NshScrollHandle>) {
         if let Ok(func) = self.callback.borrow_back(&self.env) {
@@ -358,7 +285,6 @@ impl WatcherCallback {
     }
 }
 
-#[cfg(target_env = "ohos")]
 #[derive(Default)]
 struct Registry {
     watchers: FxHashMap<Arc<str>, Rc<WatcherCallback>>,
@@ -367,11 +293,9 @@ struct Registry {
 }
 
 /// Per-surface scroll watcher registry shared between `NshSurface` and `UiContext`.
-#[cfg(target_env = "ohos")]
 #[derive(Clone, Default)]
 pub(crate) struct ScrollWatchers(Rc<RefCell<Registry>>);
 
-#[cfg(target_env = "ohos")]
 impl ScrollWatchers {
     pub(crate) fn watch(
         &self,
