@@ -1319,13 +1319,8 @@ impl Mounter {
                     MountItem::NavShader { id, shader } => {
                         if !self.frozen(id) {
                             let configured = shader.is_some();
+                            let precompile_layer = shader.as_ref().map(|spec| spec.layer.clone());
                             let node = self.node(id)?;
-                            if let Some(spec) = &shader
-                                && let Ok(worker) =
-                                    crate::render::composition::worker::Worker::for_owner(node)
-                            {
-                                worker.precompile(spec.layer.clone());
-                            }
                             *node.navigation_shader.borrow_mut() = shader;
                             if !configured {
                                 self.shaders.end_navigation(id)?;
@@ -1334,6 +1329,12 @@ impl Mounter {
                             }
                             node.ensure_wrapper()?;
                             node.restore_style()?;
+                            if let Some(layer) = precompile_layer
+                                && let Ok(worker) =
+                                    crate::render::composition::worker::Worker::for_owner(node)
+                            {
+                                worker.precompile(layer);
+                            }
                         }
                     }
                     // These projections are opt-in for the terminal backend.

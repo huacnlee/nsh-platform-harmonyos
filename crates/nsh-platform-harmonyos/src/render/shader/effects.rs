@@ -480,11 +480,9 @@ impl Effects {
         navigation: Option<Rc<Navigation>>,
     ) -> Result<()> {
         let is_non_nav = navigation.is_none();
+        let precompile_layer = is_non_nav.then(|| layer.clone());
         if is_non_nav {
             self.held.borrow_mut().remove_view(owner.id);
-            if let Ok(worker) = crate::render::composition::worker::Worker::for_owner(target) {
-                worker.precompile(layer.clone());
-            }
         }
         let moved = self.views.borrow().get(&owner.id).is_some_and(|state| {
             state
@@ -543,6 +541,13 @@ impl Effects {
         }
         target.ensure_wrapper()?;
         target.restore_style()?;
+        // Enqueue precompile after wrapper/Composite creation so Task::Create
+        // reaches the compositor before any shader compilation work.
+        if let Some(layer) = precompile_layer
+            && let Ok(worker) = crate::render::composition::worker::Worker::for_owner(target)
+        {
+            worker.precompile(layer);
+        }
         target.animator.request_frame();
         Ok(())
     }

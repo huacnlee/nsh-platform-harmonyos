@@ -295,6 +295,12 @@ impl Node {
             && self.modal.borrow().is_none()
             && self.component.borrow().is_none()
             && !self.shaders.contains(self.id)
+            && self.shader_layers.borrow().is_empty()
+            && self
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_none_or(|wrapper| wrapper.composite.borrow().is_none())
             && !self.navigation_capture.get()
             && !self.scene_root.get()
             && !self.scene_active()

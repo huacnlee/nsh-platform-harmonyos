@@ -117,6 +117,7 @@ enum Task {
         shared: Arc<Shared>,
     },
     Precompile(Vec<Arc<ShaderLayer>>),
+    ShaderWarmed,
     Fill(super::fill::Command),
     Frame(u64),
     Resume,
@@ -145,9 +146,12 @@ impl Coalesce for Task {
     fn is_barrier(&self) -> bool {
         use super::fill::Command as FillCmd;
         match self {
-            Self::Frame(_) | Self::Resume | Self::Plan | Self::Precompile(_) | Self::Slot(..) => {
-                false
-            }
+            Self::Frame(_)
+            | Self::Resume
+            | Self::Plan
+            | Self::Precompile(_)
+            | Self::ShaderWarmed
+            | Self::Slot(..) => false,
             Self::Fill(FillCmd::Slot(..) | FillCmd::Size(..) | FillCmd::Shown(..)) => false,
             Self::Create { .. }
             | Self::Fill(
@@ -178,7 +182,9 @@ impl Coalesce for Task {
                 }
                 true
             }
-            (Self::Resume, Some(Self::Resume)) | (Self::Plan, Some(Self::Plan)) => {
+            (Self::Resume, Some(Self::Resume))
+            | (Self::Plan, Some(Self::Plan))
+            | (Self::ShaderWarmed, Some(Self::ShaderWarmed)) => {
                 incoming.take();
                 true
             }
@@ -332,6 +338,10 @@ impl Worker {
                 let mut fills = super::fill::Fills::default();
                 let mut clock = crate::render::frame_clock::FrameClock::default();
                 let mut scene_dirty = false;
+                let mut readback_warmed = false;
+                let mut filters_warmed = false;
+                let mut precompiler: Option<super::precompile::Precompiler> = None;
+                let mut precompiler_failed = false;
                 let mut pending_precompiles: std::collections::VecDeque<Arc<ShaderLayer>> =
                     std::collections::VecDeque::new();
                 let mut pending_captures: Vec<PendingCapture> = Vec::new();
@@ -339,6 +349,26 @@ impl Worker {
                     crate::render::shader::navigation::Key,
                     Snapshot,
                 )> = Vec::new();
+                const WINDOW_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+                let ensure_precompiler = |precompiler: &mut Option<super::precompile::Precompiler>,
+                                          failed: &mut bool,
+                                          gpu: &Option<TextureContext>,
+                                          callback: &CommandSender<Task>| {
+                    if precompiler.is_none() && !*failed {
+                        let notify = callback.clone();
+                        match super::precompile::Precompiler::spawn(move || {
+                            let _ = notify.send(Task::ShaderWarmed);
+                        }) {
+                            Some(p) => {
+                                if let Some(gpu) = gpu.as_ref() {
+                                    gpu.attach_binary_store(p.binary_store());
+                                }
+                                *precompiler = Some(p);
+                            }
+                            None => *failed = true,
+                        }
+                    }
+                };
                 loop {
                     // Publish demand after every command, including failure and
                     // retirement paths that continue the loop. The UI owns the
@@ -360,9 +390,43 @@ impl Worker {
                     {
                         route.send(Message::CompositeDemand);
                     }
-                    let task = if pending_precompiles.is_empty() {
+                    let nav_active = entries
+                        .values()
+                        .any(|entry| entry.navigation.as_ref().is_some_and(|n| !n.complete));
+                    let has_idle_work = !pending_precompiles.is_empty()
+                        || (!nav_active
+                            && gpu.is_some()
+                            && (!readback_warmed
+                                || !filters_warmed
+                                || fills.has_pending_warmup(precompiler.as_ref())));
+                    let window_grace = if has_idle_work {
+                        entries
+                            .values()
+                            .filter(|entry| {
+                                entry.settings.gpu
+                                    && entry.window.is_none()
+                                    && entry.shared.active.load(Ordering::Acquire)
+                                    && !entry.shared.state.lock().unwrap().closed
+                            })
+                            .filter_map(|entry| {
+                                entry
+                                    .window_wait_since
+                                    .and_then(|since| WINDOW_GRACE.checked_sub(since.elapsed()))
+                                    .filter(|remaining| !remaining.is_zero())
+                            })
+                            .min()
+                    } else {
+                        None
+                    };
+                    let task = if !has_idle_work {
                         match receive.recv() {
                             Ok(task) => task,
+                            Err(()) => break,
+                        }
+                    } else if let Some(wait) = window_grace {
+                        match receive.recv_timeout(wait) {
+                            Ok(Some(task)) => task,
+                            Ok(None) => continue,
                             Err(()) => break,
                         }
                     } else if let Some(task) = receive.try_recv() {
@@ -371,6 +435,9 @@ impl Worker {
                         if gpu.is_none() {
                             match TextureContext::new() {
                                 Ok(ctx) => {
+                                    if let Some(p) = precompiler.as_ref() {
+                                        ctx.attach_binary_store(p.binary_store());
+                                    }
                                     gpu = Some(ctx);
                                     gpu_error_reported = false;
                                 }
@@ -382,14 +449,35 @@ impl Worker {
                             }
                         }
                         if let Some(gpu) = gpu.as_ref() {
+                            let mut did_work = false;
                             while let Some(layer) = pending_precompiles.pop_front() {
-                                if super::gles::is_compiled(gpu, &layer) {
+                                if super::gles::is_warmed(gpu, &layer) {
                                     continue;
                                 }
                                 if let Err(error) = super::gles::precompile(gpu, &layer) {
                                     log::warn!("shader precompile: {error}");
                                 }
+                                did_work = true;
                                 break;
+                            }
+                            if !did_work && !nav_active {
+                                if !readback_warmed {
+                                    readback_warmed = true;
+                                    if let Err(error) = gpu.precompile_readback() {
+                                        log::warn!("readback precompile: {error}");
+                                    }
+                                } else if !filters_warmed {
+                                    filters_warmed = true;
+                                    if let Err(error) = super::gles::precompile_filters(gpu) {
+                                        log::warn!("filter precompile: {error}");
+                                    }
+                                } else if fills.has_pending_warmup(precompiler.as_ref()) {
+                                    fills.warmup_one(
+                                        gpu,
+                                        precompiler.as_ref(),
+                                        route.upgrade().as_deref(),
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -429,7 +517,27 @@ impl Worker {
                             }
                         }
                         Task::Precompile(layers) => {
-                            pending_precompiles.extend(layers);
+                            ensure_precompiler(&mut precompiler, &mut precompiler_failed, &gpu, &callback);
+                            if let Some(p) = precompiler.as_ref() {
+                                for layer in layers {
+                                    if gpu
+                                        .as_ref()
+                                        .is_none_or(|g| !super::gles::has_program(g, &layer))
+                                    {
+                                        p.submit_or_compiling(&layer);
+                                    }
+                                }
+                            } else {
+                                pending_precompiles.extend(layers);
+                            }
+                        }
+                        Task::ShaderWarmed => {
+                            fill_frame = true;
+                            for entry in entries.values() {
+                                if entry.waiting_for_shader {
+                                    wake(&callback, entry.key, &entry.shared);
+                                }
+                            }
                         }
                         Task::Fill(super::fill::Command::Remove(key)) => {
                             fills.remove(key);
@@ -440,9 +548,27 @@ impl Worker {
                         }
                         Task::Fill(command) => {
                             let upgraded = route.upgrade();
+                            if let super::fill::Command::Layer(_, ref layer) = command {
+                                ensure_precompiler(
+                                    &mut precompiler,
+                                    &mut precompiler_failed,
+                                    &gpu,
+                                    &callback,
+                                );
+                                if let Some(p) = precompiler.as_ref()
+                                    && gpu
+                                        .as_ref()
+                                        .is_none_or(|g| !super::gles::has_program(g, layer))
+                                {
+                                    p.submit_or_compiling(layer);
+                                }
+                            }
                             if gpu.is_none() {
                                 match TextureContext::new() {
                                     Ok(ctx) => {
+                                        if let Some(p) = precompiler.as_ref() {
+                                            ctx.attach_binary_store(p.binary_store());
+                                        }
                                         gpu = Some(ctx);
                                         gpu_error_reported = false;
                                     }
@@ -540,15 +666,37 @@ impl Worker {
                                 let settings = shared.state.lock().unwrap().settings.clone();
                                 check_pixels(&entries, key, settings.pixels())?;
                                 if gpu.is_none() {
-                                    gpu = Some(TextureContext::new().map_err(|error| error.to_string())?);
+                                    let ctx = TextureContext::new().map_err(|error| error.to_string())?;
+                                    if let Some(p) = precompiler.as_ref() {
+                                        ctx.attach_binary_store(p.binary_store());
+                                    }
+                                    gpu = Some(ctx);
                                 }
                                 let mut reader = create_input(gpu.as_ref().unwrap(), &settings, key, &shared, &callback)?;
                                 let id = reader.as_mut().map(TextureReader::id).transpose().map_err(|e| e.to_string())?;
-                                pending_precompiles.extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
+                                if !settings.shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
+                                    if let Some(p) = precompiler.as_ref() {
+                                        for (_, layer) in &settings.shaders {
+                                            if !super::gles::has_program(gpu.as_ref().unwrap(), layer) {
+                                                p.submit_or_compiling(layer);
+                                            }
+                                        }
+                                    } else {
+                                        pending_precompiles
+                                            .extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
+                                    }
+                                }
 
                                 if let Some(old) = entries.remove(&key.slot()) {
                                     retire_entry(old, &route);
                                 }
+                                let window_wait_since = settings.gpu.then(std::time::Instant::now);
                                 entries.insert(key.slot(), Entry {
                                     key,
                                     shared: shared.clone(),
@@ -563,7 +711,11 @@ impl Worker {
                                     backdrop_dirty: false,
                                     filtered: None,
                                     window: None,
+                                    window_wait_since,
                                     window_dirty: false,
+                                    waiting_for_shader: false,
+                                    pending_slots: Vec::new(),
+                                    pending_transitions: Vec::new(),
                                     pending_readback_bytes: 0,
                                     navigation: None,
                                     completed: None,
@@ -621,9 +773,22 @@ impl Worker {
                                 .and_then(|source| source.shaders.before_screen.as_ref()).map(super::gles::Target::picture));
                             let result =
                                 check_pixels(&entries, key, settings.pixels()).and_then(|()| {
+                                    if !settings.shaders.is_empty() && !settings.scene {
+                                        ensure_precompiler(
+                                            &mut precompiler,
+                                            &mut precompiler_failed,
+                                            &gpu,
+                                            &callback,
+                                        );
+                                    }
                                     let entry = entries.get_mut(&key.slot()).unwrap();
                                     entry.update_input(&settings, &callback)?;
-                                    entry.render(settings, revision, backdrop)
+                                    entry.render(
+                                        settings,
+                                        revision,
+                                        backdrop,
+                                        precompiler.as_ref(),
+                                    )
                                 });
                             let upgraded = route.upgrade();
                             match result {
@@ -705,14 +870,36 @@ impl Worker {
                                 .filter(|entry| entry.key == key)
                             {
                                 repaint = scene.is_some() && entry.settings.scene;
-                                if let Err(error) = entry
-                                    .shaders
-                                    .layers(&entry.shared.state.lock().unwrap().settings.shaders)
-                                {
-                                    log::warn!("shader layers: {error}");
+                                let shaders = entry.shared.state.lock().unwrap().settings.shaders.clone();
+                                if !entry.settings.scene && !shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
                                 }
-                                entry.shaders.slot(id, slot, value);
-                                wake(&callback, key, &entry.shared);
+                                if entry.waiting_for_shader
+                                    || (!entry.settings.scene
+                                        && entry.needs_shader_warmup(&shaders, precompiler.as_ref()))
+                                {
+                                    entry.waiting_for_shader = true;
+                                    if let Some((_, _, existing)) = entry
+                                        .pending_slots
+                                        .iter_mut()
+                                        .find(|(eid, eslot, _)| *eid == id && *eslot == slot)
+                                    {
+                                        *existing = value;
+                                    } else {
+                                        entry.pending_slots.push((id, slot, value));
+                                    }
+                                } else {
+                                    if let Err(error) = entry.shaders.layers(&shaders) {
+                                        log::warn!("shader layers: {error}");
+                                    }
+                                    entry.shaders.slot(id, slot, value);
+                                    wake(&callback, key, &entry.shared);
+                                }
                             }
                         }
                         Task::Transition(key, id, duration) => {
@@ -721,14 +908,31 @@ impl Worker {
                                 .filter(|entry| entry.key == key)
                             {
                                 repaint = scene.is_some() && entry.settings.scene;
-                                if let Err(error) = entry
-                                    .shaders
-                                    .layers(&entry.shared.state.lock().unwrap().settings.shaders)
-                                    .and_then(|()| entry.shaders.transition(id, duration))
-                                {
-                                    log::warn!("shader transition: {error}");
+                                let shaders = entry.shared.state.lock().unwrap().settings.shaders.clone();
+                                if !entry.settings.scene && !shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
                                 }
-                                wake(&callback, key, &entry.shared);
+                                if entry.waiting_for_shader
+                                    || (!entry.settings.scene
+                                        && entry.needs_shader_warmup(&shaders, precompiler.as_ref()))
+                                {
+                                    entry.waiting_for_shader = true;
+                                    entry.pending_transitions.push((id, duration));
+                                } else {
+                                    if let Err(error) = entry
+                                        .shaders
+                                        .layers(&shaders)
+                                        .and_then(|()| entry.shaders.transition(id, duration))
+                                    {
+                                        log::warn!("shader transition: {error}");
+                                    }
+                                    wake(&callback, key, &entry.shared);
+                                }
                             }
                         }
                         Task::Capture {
@@ -865,6 +1069,7 @@ impl Worker {
                                     available
                                 };
                                 let raw = window.raw() as usize;
+                                entry.window_wait_since = None;
                                 if let Some(existing) = entry.window.as_ref()
                                     && existing.raw() == raw
                                 {
@@ -934,11 +1139,12 @@ impl Worker {
                     }
                     let upgraded_for_frame = route.upgrade();
                     if fill_frame
+                        && let Some(gpu) = gpu.as_ref()
                         && upgraded_for_frame
                             .as_ref()
                             .is_some_and(|r| r.active.load(Ordering::Acquire))
                     {
-                        fills.render( upgraded_for_frame.as_deref());
+                        fills.render(gpu, precompiler.as_ref(), upgraded_for_frame.as_deref());
                     }
                     // Many exports wake together during navigation. Compose their latest
                     // pictures once on VSync, so command delivery never waits for a full
@@ -1103,6 +1309,7 @@ impl Worker {
                     retire_entry(entry, &route);
                     }
                 completed_fills.lock().unwrap().extend(fills.clear());
+                drop(precompiler);
                 drop(gpu);
                 worker_drained.store(true, Ordering::Release);
                 if let Some(route) = route.upgrade() {
@@ -1288,7 +1495,11 @@ struct Entry {
     backdrop_dirty: bool,
     filtered: Option<super::gles::Target>,
     window: Option<super::readback::Window>,
+    window_wait_since: Option<std::time::Instant>,
     window_dirty: bool,
+    waiting_for_shader: bool,
+    pending_slots: Vec<(NodeId, u16, AnimationValue)>,
+    pending_transitions: Vec<(NodeId, std::time::Duration)>,
     pending_readback_bytes: u64,
     navigation: Option<Navigation<Option<Snapshot>>>,
     completed: Option<crate::render::shader::navigation::Key>,
@@ -1358,11 +1569,23 @@ impl Entry {
         self.publish_input(settings.native_output(), Ok(id));
         Ok(())
     }
+    fn needs_shader_warmup(
+        &self,
+        shaders: &[(NodeId, Arc<ShaderLayer>)],
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> bool {
+        !shaders.is_empty()
+            && shaders.iter().any(|(_, layer)| {
+                !super::gles::has_program(&self.gpu, layer)
+                    && precompiler.is_some_and(|p| p.submit_or_compiling(layer))
+            })
+    }
     fn render(
         &mut self,
         settings: Settings,
         revision: u64,
         backdrop: Option<super::gles::Picture>,
+        precompiler: Option<&super::precompile::Precompiler>,
     ) -> std::result::Result<bool, String> {
         let installed = self.navigation.as_ref().map(|nav| nav.key);
         if settings.navigation.is_some() && settings.navigation != installed {
@@ -1380,7 +1603,25 @@ impl Entry {
             // Keep the terminal picture until its generation is retired by the UI.
             return Ok(false);
         }
-        let mut changed = self.settings != settings || std::mem::take(&mut self.window_dirty);
+        let was_waiting = std::mem::take(&mut self.waiting_for_shader);
+        if !settings.scene
+            && !settings.native_output()
+            && self.needs_shader_warmup(&settings.shaders, precompiler)
+        {
+            // Keep draining producer buffers so RSRenderThread never stalls
+            // while the shader compiles on the background precompile thread.
+            if let Some(reader) = self.reader.as_mut() {
+                reader
+                    .resize(settings.width, settings.height)
+                    .map_err(|e| e.to_string())?;
+                reader.drain_oes().map_err(|e| e.to_string())?;
+            }
+            self.waiting_for_shader = true;
+            self.shared.animating.store(true, Ordering::Release);
+            return Ok(false);
+        }
+        let mut changed =
+            self.settings != settings || std::mem::take(&mut self.window_dirty) || was_waiting;
         changed |= std::mem::take(&mut self.backdrop_dirty);
         self.shaders.capture_before = settings.first_screen_layer;
         if settings.first_screen_layer.is_none() {
@@ -1390,6 +1631,21 @@ impl Entry {
             self.modal_composition = None;
         }
         self.shaders.layers(&settings.shaders)?;
+        for (id, slot, value) in self.pending_slots.drain(..) {
+            self.shaders.slot(id, slot, value);
+            changed = true;
+        }
+        for (id, duration) in self.pending_transitions.drain(..) {
+            if let Err(error) = self.shaders.transition(id, duration) {
+                log::warn!("shader transition: {error}");
+            }
+            changed = true;
+        }
+        if !self.settings.gpu && settings.gpu && self.window.is_none() {
+            self.window_wait_since = Some(std::time::Instant::now());
+        } else if !settings.gpu {
+            self.window_wait_since = None;
+        }
         self.settings = settings;
         let direct = !self.settings.scene;
         let x = -(self.settings.insets[0] as f32);
@@ -1398,6 +1654,7 @@ impl Entry {
             self.scene_source = None;
             self.scene_output = None;
             self.shaders.clear_output();
+            self.shaders.release_recycled();
             self.filtered = None;
             self.shared.awaiting_origin.store(false, Ordering::Release);
             self.shared.animating.store(false, Ordering::Release);

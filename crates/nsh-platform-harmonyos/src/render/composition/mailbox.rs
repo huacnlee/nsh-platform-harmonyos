@@ -213,6 +213,39 @@ impl<T> CommandReceiver<T> {
         }
     }
 
+    pub(crate) fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Option<T>, ()> {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(item) = state.items.pop_front() {
+            state.barrier_watermark = state.barrier_watermark.saturating_sub(1);
+            return Ok(Some(item));
+        }
+        if state.closed {
+            return Err(());
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next, result) = self.inner.ready.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if let Some(item) = state.items.pop_front() {
+                state.barrier_watermark = state.barrier_watermark.saturating_sub(1);
+                return Ok(Some(item));
+            }
+            if state.closed {
+                return Err(());
+            }
+            if result.timed_out() {
+                return Ok(None);
+            }
+        }
+    }
+
     pub(crate) fn try_recv(&self) -> Option<T> {
         let mut state = self.inner.state.lock().unwrap();
         let item = state.items.pop_front()?;
@@ -365,5 +398,33 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn recv_timeout_returns_promptly_on_item_timeout_and_close() {
+        use std::time::Duration;
+
+        let (tx, rx) = command_channel::<MockTask>();
+        assert_eq!(rx.recv_timeout(Duration::from_millis(5)), Ok(None));
+
+        tx.send(MockTask::Frame(42)).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Ok(Some(MockTask::Frame(42)))
+        );
+
+        let sender = tx.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            sender.send(MockTask::Drain).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Some(MockTask::Drain))
+        );
+        handle.join().unwrap();
+
+        drop(tx);
+        assert_eq!(rx.recv_timeout(Duration::from_millis(50)), Err(()));
     }
 }
