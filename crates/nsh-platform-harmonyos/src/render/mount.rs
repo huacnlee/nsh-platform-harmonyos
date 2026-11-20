@@ -117,6 +117,7 @@ pub(crate) struct UiContext {
     pub(crate) unreclaimed_delete_count: std::cell::Cell<usize>,
     pub(crate) arkui: std::cell::RefCell<crate::interop::sdk::Batch>,
     pub(crate) arkui_views: std::cell::RefCell<Vec<crate::interop::attachment::NativeAttachment>>,
+    pub(crate) deferred_webs: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) host: Arc<crate::app::session::Services>,
     pub(crate) dispatcher: std::sync::Weak<crate::app::runtime::Dispatcher>,
     pub(crate) env: napi_ohos::Env,
@@ -317,6 +318,7 @@ impl Mounter {
         let mut result = Ok(());
         if !ready {
             result = result.and(self.shaders.cancel_navigation("context-lost"));
+            self.deferred_webs.borrow_mut().clear();
             let mut pending = self.arkui.borrow_mut();
             pending.editors.clear();
             pending.commands.clear();
@@ -1762,6 +1764,14 @@ impl Mounter {
             }
         }
         Self::attribute(self.reconcile_navigation());
+        for node in std::mem::take(&mut *self.deferred_webs.borrow_mut())
+            .into_iter()
+            .filter_map(|weak| weak.upgrade())
+        {
+            if let Some(web) = node.web.borrow().as_ref() {
+                Self::attribute(web.flush_mount_gate(&node));
+            }
+        }
         if nav_shader_configured {
             self.shaders.log_idle_configured();
         }

@@ -26,6 +26,8 @@ use crate::{
     text::typography::argb,
 };
 
+type SettledCallback = Box<dyn FnOnce(bool)>;
+
 pub(crate) struct Screen {
     owner: Weak<Node>,
     pub(crate) config: RefCell<ScreenConfig>,
@@ -45,6 +47,7 @@ pub(crate) struct Screen {
     immediate_removal: Cell<bool>,
     detached_for_pop: Cell<Option<usize>>,
     insets: Cell<Option<EdgeInsets>>,
+    on_settled: RefCell<Vec<SettledCallback>>,
 }
 impl Screen {
     #[cfg(feature = "dev")]
@@ -104,6 +107,7 @@ impl Screen {
             immediate_removal: Cell::new(false),
             detached_for_pop: Cell::new(None),
             insets: Cell::new(None),
+            on_settled: RefCell::default(),
         });
         let weak = Rc::downgrade(&screen);
         let paint = crate::render::paint_node::PaintNode::new_attached(
@@ -426,6 +430,32 @@ impl Screen {
     pub(crate) fn is_unanimated(&self) -> bool {
         self.motion.borrow().is_none() && self.shader.borrow().is_none()
     }
+    pub(crate) fn is_entering(&self) -> bool {
+        !self.popped.get()
+            && (self
+                .motion
+                .borrow()
+                .as_ref()
+                .is_some_and(|motion| motion.to == 0.0)
+                || self
+                    .shader
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|nav| !nav.backwards && nav.running()))
+    }
+    pub(crate) fn when_settled(&self, callback: impl FnOnce(bool) + 'static) {
+        if self.is_entering() {
+            self.on_settled.borrow_mut().push(Box::new(callback));
+        } else {
+            callback(!self.popped.get());
+        }
+    }
+    fn notify_settled(&self, entered: bool) {
+        let callbacks = std::mem::take(&mut *self.on_settled.borrow_mut());
+        for callback in callbacks {
+            callback(entered);
+        }
+    }
     fn show(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             owner.restore_style()?;
@@ -536,6 +566,7 @@ impl Screen {
         Ok(())
     }
     fn pop(&self) -> Result<bool> {
+        self.notify_settled(false);
         let Some(owner) = self.owner.upgrade() else {
             return Ok(false);
         };
@@ -640,6 +671,7 @@ impl Screen {
         {
             owner.shaders.end_navigation(owner.id)?;
         }
+        self.notify_settled(!popped);
         Ok(())
     }
     pub(crate) fn frame(&self, now: f64) -> Result<(bool, bool)> {

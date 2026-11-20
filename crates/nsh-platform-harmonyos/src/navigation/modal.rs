@@ -23,6 +23,8 @@ struct Transition {
     to: f32,
     duration: f64,
 }
+type SettledCallback = Box<dyn FnOnce(bool)>;
+
 pub(crate) struct Modal {
     owner: Weak<Node>,
     dialog: RefCell<Dialog>,
@@ -39,6 +41,7 @@ pub(crate) struct Modal {
     available: Cell<Option<Size>>,
     reported: Cell<nsh_core::navigation::Reported>,
     overlay: RefCell<Option<crate::app::session::Overlay>>,
+    on_settled: RefCell<Vec<SettledCallback>>,
 }
 impl Modal {
     #[cfg(feature = "dev")]
@@ -67,6 +70,7 @@ impl Modal {
             available: Cell::new(None),
             reported: Cell::new(nsh_core::navigation::Reported::default()),
             overlay: RefCell::default(),
+            on_settled: RefCell::default(),
         });
         let weak = Rc::downgrade(&modal);
         modal.dialog.borrow().dismiss_handler(move |reason| {
@@ -240,8 +244,35 @@ impl Modal {
     pub(crate) fn is_visible(&self) -> bool {
         self.shown.get()
     }
+    pub(crate) fn is_entering(&self) -> bool {
+        !self.closing.get()
+            && (self
+                .transition
+                .borrow()
+                .as_ref()
+                .is_some_and(|transition| transition.to == 1.0)
+                || self
+                    .shader
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|nav| !nav.backwards && nav.running()))
+    }
+    pub(crate) fn when_settled(&self, callback: impl FnOnce(bool) + 'static) {
+        if self.is_entering() {
+            self.on_settled.borrow_mut().push(Box::new(callback));
+        } else {
+            callback(self.shown.get() && !self.closing.get());
+        }
+    }
+    fn notify_settled(&self, entered: bool) {
+        let callbacks = std::mem::take(&mut *self.on_settled.borrow_mut());
+        for callback in callbacks {
+            callback(entered);
+        }
+    }
     pub(crate) fn close(&self, animated: bool) -> Result<()> {
         self.pending_present.set(false);
+        self.notify_settled(false);
         if !self.shown.get() {
             return Ok(());
         }
@@ -423,6 +454,7 @@ impl Modal {
                     owner.emit(EventKind::Dismiss, EventPayload::None);
                 }
             }
+            self.notify_settled(false);
         } else {
             if had_shader && let Some(owner) = self.owner.upgrade() {
                 owner.shaders.end_navigation(owner.id)?;
@@ -433,6 +465,7 @@ impl Modal {
             {
                 owner.emit(EventKind::Show, EventPayload::None);
             }
+            self.notify_settled(self.shown.get() && !self.closing.get());
         }
         Ok(())
     }

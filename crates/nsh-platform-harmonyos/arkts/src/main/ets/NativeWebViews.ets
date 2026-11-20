@@ -71,66 +71,92 @@ function clearCookiesIfNeeded(entry: WebEntry): void {
   }
 }
 
+@Observed
+class WebViewState {
+  revealed: boolean = false;
+}
+
+@Component
+struct WebViewHost {
+  entry!: WebEntry;
+  @ObjectLink state!: WebViewState;
+
+  build() {
+    Web({
+      src: "",
+      controller: this.entry.controller,
+      renderMode: RenderMode.SYNC_RENDER,
+      incognitoMode: !this.entry.settings.sharedCookies,
+    })
+      .id(`nsh-web-${this.entry.settings.targetId}`)
+      .width("100%")
+      .height("100%")
+      .opacity(this.state.revealed ? 1 : 0)
+      .backgroundColor(Color.Transparent)
+      .hitTestBehavior(HitTestMode.Block)
+      .javaScriptAccess(this.entry.settings.javaScriptEnabled)
+      .domStorageAccess(true)
+      .fileAccess(false)
+      .onlineImageAccess(true)
+      .imageAccess(true)
+      .runJavaScriptOnDocumentStart([
+        {
+          script: this.entry.settings.documentStartScript,
+          scriptRules: ["*", "nsh-asset://"],
+        },
+      ])
+      .onShowFileSelector((event): boolean => {
+        if (!event) {
+          return false;
+        }
+        this.entry.selectFiles(event.fileSelector, event.result);
+        return true;
+      })
+      .onControllerAttached(() => {
+        this.entry.onControllerAttached();
+      })
+      .onLoadIntercept((event): boolean => {
+        return this.entry.onLoadIntercept(event.data.getRequestUrl());
+      })
+      .onPageBegin(() => {
+        this.entry.onPageBegin();
+      })
+      .onPageVisible((event) => {
+        this.entry.onPageVisible(event.url);
+      })
+      .onFirstContentfulPaint(() => {
+        this.entry.onFirstPaint();
+      })
+      .onFirstMeaningfulPaint(() => {
+        this.entry.onFirstPaint();
+      })
+      .onPageEnd(() => {
+        this.entry.onPageEnd();
+      })
+      .onTitleReceive(() => {
+        this.entry.emit("title");
+      })
+      .onFocus(() => {
+        this.entry.emit("focus");
+      })
+      .onBlur(() => {
+        this.entry.emit("blur");
+      })
+      .onErrorReceive((event) => {
+        if (event.request.isMainFrame()) {
+          this.entry.onFirstBufferReady();
+          this.entry.emit("error", event.error.getErrorInfo(), event.error.getErrorCode());
+        }
+      })
+      .onRenderExited(() => {
+        this.entry.emit("render-exited");
+      });
+  }
+}
+
 @Builder
 function webContent(entry: WebEntry) {
-  Web({
-    src: "",
-    controller: entry.controller,
-    renderMode: RenderMode.SYNC_RENDER,
-    incognitoMode: !entry.settings.sharedCookies,
-  })
-    .id(`nsh-web-${entry.settings.targetId}`)
-    .width("100%")
-    .height("100%")
-    .backgroundColor(Color.Transparent)
-    .hitTestBehavior(HitTestMode.Block)
-    .javaScriptAccess(entry.settings.javaScriptEnabled)
-    .domStorageAccess(true)
-    .fileAccess(false)
-    .onlineImageAccess(true)
-    .imageAccess(true)
-    .runJavaScriptOnDocumentStart([
-      {
-        script: entry.settings.documentStartScript,
-        scriptRules: ["*", "nsh-asset://"],
-      },
-    ])
-    .onShowFileSelector((event): boolean => {
-      if (!event) {
-        return false;
-      }
-      entry.selectFiles(event.fileSelector, event.result);
-      return true;
-    })
-    .onControllerAttached(() => {
-      entry.onControllerAttached();
-    })
-    .onLoadIntercept((event): boolean => {
-      return entry.onLoadIntercept(event.data.getRequestUrl());
-    })
-    .onPageBegin(() => {
-      entry.onPageBegin();
-    })
-    .onPageEnd(() => {
-      entry.onPageEnd();
-    })
-    .onTitleReceive(() => {
-      entry.emit("title");
-    })
-    .onFocus(() => {
-      entry.emit("focus");
-    })
-    .onBlur(() => {
-      entry.emit("blur");
-    })
-    .onErrorReceive((event) => {
-      if (event.request.isMainFrame()) {
-        entry.emit("error", event.error.getErrorInfo(), event.error.getErrorCode());
-      }
-    })
-    .onRenderExited(() => {
-      entry.emit("render-exited");
-    });
+  WebViewHost({ entry: entry, state: entry.viewState });
 }
 
 const quarantinedWebs: Set<WebEntry> = new Set();
@@ -151,11 +177,16 @@ class WebEntry {
   readonly nativeTag: string = `nsh.web.${nextWebNativeTagId++}`;
   readonly controller: webview.WebviewController = new webview.WebviewController(this.nativeTag);
   readonly node: BuilderNode<[WebEntry]>;
+  readonly viewState: WebViewState = new WebViewState();
   settings: WebSettings;
   private context: NshRuntimeContext;
   private attached: boolean = false;
+  private wasWarmMount: boolean = false;
   private controllerObserved: boolean = false;
   private controllerReady: boolean = false;
+  private attachFinalized: boolean = false;
+  private sourceApplied: boolean = false;
+  private sourceEpoch: number = 0;
   private appliedLoadGeneration: number = 0;
   private pendingCommands: WebCommand[] = [];
   private inputCommands: Promise<void> = Promise.resolve();
@@ -179,11 +210,8 @@ class WebEntry {
   }
 
   create(): void {
-    if (!webComponentMounted) {
-      this.context.getUIContext().postFrameCallback(new WebMountFrame(this));
-      return;
-    }
-    this.mount();
+    // Let the settled navigation or commit frame present before creating NWeb.
+    this.context.getUIContext().postFrameCallback(new WebMountFrame(this));
   }
 
   mountAfterFrame(): void {
@@ -200,8 +228,9 @@ class WebEntry {
   private mount(): void {
     this.sdkBusy = true;
     try {
+      this.wasWarmMount = webComponentMounted;
       ensureWebEngineInitialized();
-      this.node.build(wrapBuilder(webContent), this);
+      this.node.build(wrapBuilder(webContent), this, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("WebView creation was cancelled");
       }
@@ -214,7 +243,7 @@ class WebEntry {
       }
       this.attached = true;
       webComponentMounted = true;
-      if (this.controllerObserved && !this.controllerReady) {
+      if (this.controllerObserved && !this.attachFinalized) {
         this.finishControllerAttach();
       }
     } catch (error) {
@@ -251,16 +280,17 @@ class WebEntry {
       return;
     }
     this.controllerObserved = true;
-    if (!this.attached || this.controllerReady || this.closed || !this.context.isActive()) {
+    if (!this.attached || this.attachFinalized || this.closed || !this.context.isActive()) {
       return;
     }
     this.finishControllerAttach();
   }
 
   private finishControllerAttach(): void {
-    if (this.controllerReady || this.closed || !this.context.isActive()) {
+    if (this.attachFinalized || this.closed || !this.context.isActive()) {
       return;
     }
+    this.attachFinalized = true;
     try {
       this.controller.setScrollable(this.settings.scrollEnabled);
       this.controller.setCustomUserAgent(this.settings.userAgent ?? "");
@@ -306,18 +336,33 @@ class WebEntry {
         } catch {}
       });
       this.controller.setDownloadDelegate(this.downloadDelegate);
-      this.controllerReady = true;
-      const queued = this.pendingCommands.splice(0);
-      if (this.settings.url === "about:blank" && queued.some((cmd) => cmd.kind === "load")) {
-        clearCookiesIfNeeded(this);
-        this.appliedLoadGeneration = this.settings.loadGeneration;
+      const startInitialLoad = (): void => {
+        if (this.closed || !this.context.isActive()) {
+          return;
+        }
+        try {
+          this.controllerReady = true;
+          const queued = this.pendingCommands.splice(0);
+          if (this.settings.url === "about:blank" && queued.some((cmd) => cmd.kind === "load")) {
+            clearCookiesIfNeeded(this);
+            this.appliedLoadGeneration = this.settings.loadGeneration;
+          } else {
+            this.applySource();
+          }
+          for (const cmd of queued) {
+            this.command(cmd);
+          }
+          this.emit("ready");
+        } catch (error) {
+          this.emit("error", String(error));
+        }
+      };
+      if (!this.wasWarmMount) {
+        // Yield after cold CreateNWeb so initial navigation doesn't stack in the same turn.
+        setTimeout(startInitialLoad, 0);
       } else {
-        this.applySource();
+        startInitialLoad();
       }
-      for (const cmd of queued) {
-        this.command(cmd);
-      }
-      this.emit("ready");
     } catch (error) {
       this.emit("error", String(error));
     }
@@ -349,6 +394,8 @@ class WebEntry {
   private applySource(): void {
     clearCookiesIfNeeded(this);
     this.appliedLoadGeneration = this.settings.loadGeneration;
+    this.sourceApplied = true;
+    this.sourceEpoch = this.epoch;
     if (this.settings.url != null) {
       this.controller.loadUrl(this.settings.url);
     } else {
@@ -434,10 +481,33 @@ class WebEntry {
     this.emit("start");
   }
 
+  onPageVisible(url: string): void {
+    if (!this.sourceApplied) {
+      return;
+    }
+    if (url.length === 0 || (url === "about:blank" && this.settings.url !== "about:blank")) {
+      return;
+    }
+    this.onFirstBufferReady();
+  }
+
+  onFirstPaint(): void {
+    if (this.sourceApplied && this.epoch > this.sourceEpoch) {
+      this.onFirstBufferReady();
+    }
+  }
+
+  onFirstBufferReady(): void {
+    if (!this.closed && this.sourceApplied && !this.viewState.revealed) {
+      this.viewState.revealed = true;
+    }
+  }
+
   onPageEnd(): void {
     if (this.closed || !this.context.isActive()) {
       return;
     }
+    this.onFirstBufferReady();
     const epoch = this.epoch;
     const script = this.settings.injectedJavascript;
     if (script && this.settings.javaScriptEnabled) {
@@ -631,6 +701,8 @@ class WebEntry {
       } else if (command.kind === "load") {
         if (command.url != null) {
           clearCookiesIfNeeded(this);
+          this.sourceApplied = true;
+          this.sourceEpoch = this.epoch;
           this.controller.loadUrl(command.url, command.headers ?? []);
         }
       } else if (command.kind === "evaluate") {
