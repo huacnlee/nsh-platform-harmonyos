@@ -467,6 +467,13 @@ export declare function nshAttachNativeSubtree(
   slot: NodeContent,
 ): void;
 
+export declare function nshAttachSubWindow(
+  sessionId: number,
+  windowId: number,
+  content: NodeContent,
+  platformWindowId: number,
+): boolean;
+
 export declare function nshCloseSession(sessionId: number): void;
 
 export declare function nshCreateSession(
@@ -480,6 +487,12 @@ export declare function nshCreateSession(
     frame(timestamp: number): boolean;
   }) => (request: object) => void,
 ): number;
+
+export declare function nshDesktopEvent(
+  sessionId: number,
+  kind: string,
+  payload: string,
+): void;
 
 export declare function nshEditorEvent(
   targetId: number,

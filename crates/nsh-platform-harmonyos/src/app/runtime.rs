@@ -127,6 +127,20 @@ pub(crate) enum Message {
         [crate::app::session::AvoidArea; 3],
         crate::app::session::AvoidArea,
     ),
+    HostDesktop(crate::services::desktop::DesktopEvent),
+    DesktopMenuAction {
+        id: u32,
+        role: Option<nsh_core::desktop::MenuRole>,
+    },
+    DesktopSelectionMenu {
+        target: nsh_core::NodeId,
+        x: f32,
+        y: f32,
+    },
+    KeyScroll {
+        key_move: nsh_core::scroll::KeyMove,
+        horizontal: bool,
+    },
     HostEvent(nsh_core::EventKind, nsh_core::EventPayload),
     TextSelection(
         nsh_core::NodeId,
@@ -508,6 +522,74 @@ impl State {
                 self.update_environment(changes)?;
             }
             Message::HostWindow(..) => {}
+            Message::HostDesktop(event) => {
+                use crate::services::desktop::DesktopEvent;
+                match event {
+                    DesktopEvent::WindowState(state) => {
+                        if self.environment.os.is_desktop()
+                            && self.environment.window_state != Some(state)
+                        {
+                            self.environment.window_state = Some(state);
+                            self.engine
+                                .as_ref()
+                                .unwrap()
+                                .control()
+                                .set_environment(self.environment);
+                            self.mounter
+                                .as_ref()
+                                .unwrap()
+                                .environment(self.environment)?;
+                        }
+                    }
+                    DesktopEvent::TitleBar(edges) => {
+                        if self.environment.os.is_desktop() && self.environment.title_bar != edges {
+                            self.environment.title_bar = edges;
+                            self.engine
+                                .as_ref()
+                                .unwrap()
+                                .control()
+                                .set_environment(self.environment);
+                            self.mounter
+                                .as_ref()
+                                .unwrap()
+                                .environment(self.environment)?;
+                        }
+                    }
+                    DesktopEvent::Displays(displays) => {
+                        if self.environment.os.is_desktop() {
+                            self.engine
+                                .as_ref()
+                                .unwrap()
+                                .control()
+                                .set_displays(displays);
+                        }
+                    }
+                    other => {
+                        self.mounter.as_mut().unwrap().desktop_event(other)?;
+                    }
+                }
+            }
+            Message::DesktopMenuAction { id, role } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_menu_action(id, role)?;
+            }
+            Message::DesktopSelectionMenu { target, x, y } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_selection_menu(target, x, y)?;
+            }
+            Message::KeyScroll {
+                key_move,
+                horizontal,
+            } => {
+                self.mounter
+                    .as_ref()
+                    .unwrap()
+                    .key_scroll(key_move, horizontal)?;
+            }
             Message::HostEvent(kind, payload) => self
                 .engine
                 .as_ref()
@@ -991,7 +1073,18 @@ impl Runtime {
             ..Environment::default()
         };
         let environment = config.host.environment().apply(environment)?;
-        let environment = config.environment.clone().apply(environment)?;
+        let mut environment = config.environment.clone().apply(environment)?;
+        let os = crate::services::desktop::os_for_idiom(environment.idiom);
+        environment.os = os;
+        let initial_displays = if os.is_desktop() {
+            let (window_state, title_bar, displays) = config.host.desktop_snapshot();
+            environment.window_state = window_state;
+            environment.title_bar = title_bar;
+            displays
+        } else {
+            Vec::new()
+        };
+        dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
         state.borrow_mut().environment = environment;
         let access = match &app.app {
             nsh_engine::App::Js(bundle) => bundle.policy.access(),
@@ -1017,7 +1110,7 @@ impl Runtime {
             filesystem: None,
             assets: Some(engine_assets),
             environment,
-            header_heights: (nsh_core::Points(52.0), nsh_core::Points(52.0)),
+            header_heights: crate::services::desktop::header_heights_for_os(os),
             limits: config.limits,
             ui_sets: crate::ui_sets(),
             runtime: None,
@@ -1061,6 +1154,9 @@ impl Runtime {
             move || OhosTextEngine::new(engine_scale, engine_fonts),
             Sink(dispatcher.clone(), app.chunks),
             move |control| {
+                if !initial_displays.is_empty() {
+                    control.set_displays(initial_displays);
+                }
                 if let Some(tokens) = host_tokens {
                     control.set_tokens(Some(tokens));
                 }
@@ -1240,7 +1336,14 @@ impl Runtime {
     }
     pub(crate) fn layout_changed(&self) -> napi_ohos::Result<()> {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        let first_layout = !state.laid_out;
         state.laid_out = true;
+        if first_layout
+            && state.environment.os.is_desktop()
+            && let Some(mounter) = &state.mounter
+        {
+            mounter.request_desktop_focus();
+        }
         let changes = if let Some(mounter) = &state.mounter {
             mounter
                 .host

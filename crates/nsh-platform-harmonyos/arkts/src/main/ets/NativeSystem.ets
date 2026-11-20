@@ -1,6 +1,7 @@
 import { NativeShare } from "./NativeShare";
 import { common, wantConstant } from "@kit.AbilityKit";
-import { fileUri } from "@kit.CoreFileKit";
+import { fileUri, picker } from "@kit.CoreFileKit";
+import { fileManagerService } from "@kit.FileManagerServiceKit";
 import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAudio } from "./NativeAudio";
 import { NativeClipboard } from "./NativeClipboard";
@@ -159,6 +160,86 @@ export class NativeSystem {
           flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION,
         });
         reply({} as SystemReply);
+      } else if (request.op === "file-reveal-path") {
+        const path = request.uri ?? "";
+        const uri = path.includes("://") ? path : fileUri.getUriFromPath(path);
+        try {
+          await this.context.startAbility({
+            action: "ohos.want.action.viewData",
+            uri,
+            flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION,
+          });
+        } catch {
+          await this.context.openLink(uri);
+        }
+        reply({} as SystemReply);
+      } else if (request.op === "file-move-to-trash") {
+        if (!canIUse("SystemCapability.FileManagement.FileManagerService.Core")) {
+          throw new Error("moving files to trash is not supported on this device");
+        }
+        const path = request.uri ?? "";
+        const uri = path.includes("://") ? path : fileUri.getUriFromPath(path);
+        const trashedUri = await fileManagerService.deleteToTrash(uri);
+        let trashedPath = trashedUri ?? "";
+        if (trashedPath.startsWith("file://")) {
+          try {
+            trashedPath = new fileUri.FileUri(trashedPath).path;
+          } catch {}
+        }
+        reply({
+          files: trashedPath.length > 0 ? JSON.stringify([trashedPath]) : undefined,
+        } as SystemReply);
+      } else if (request.op === "file-open-dialog") {
+        const documentPicker = new picker.DocumentViewPicker(this.context);
+        const options = new picker.DocumentSelectOptions();
+        options.maxSelectNumber = Math.max(1, Math.min(500, request.count ?? 1));
+        if (request.name === "folders") {
+          options.selectMode = picker.DocumentSelectMode.FOLDER;
+        } else if (request.name === "both") {
+          options.selectMode = picker.DocumentSelectMode.MIXED;
+        } else {
+          options.selectMode = picker.DocumentSelectMode.FILE;
+        }
+        if (request.paths && request.paths.length > 0 && request.name !== "folders") {
+          options.fileSuffixFilters = request.paths;
+        }
+        if (request.uri && request.uri.length > 0) {
+          options.defaultFilePathUri = request.uri.includes("://")
+            ? request.uri
+            : fileUri.getUriFromPath(request.uri);
+        }
+        const uris = (await documentPicker.select(options)) ?? [];
+        const paths = uris.map((uri: string): string => {
+          try {
+            return uri.startsWith("file://") ? new fileUri.FileUri(uri).path : uri;
+          } catch {
+            return uri;
+          }
+        });
+        reply({ files: JSON.stringify(paths) } as SystemReply);
+      } else if (request.op === "file-save-dialog") {
+        const documentPicker = new picker.DocumentViewPicker(this.context);
+        const options = new picker.DocumentSaveOptions();
+        if (request.name && request.name.length > 0) {
+          options.newFileNames = [request.name];
+        }
+        if (request.paths && request.paths.length > 0) {
+          options.fileSuffixChoices = request.paths;
+        }
+        if (request.uri && request.uri.length > 0) {
+          options.defaultFilePathUri = request.uri.includes("://")
+            ? request.uri
+            : fileUri.getUriFromPath(request.uri);
+        }
+        const uris = (await documentPicker.save(options)) ?? [];
+        const paths = uris.map((uri: string): string => {
+          try {
+            return uri.startsWith("file://") ? new fileUri.FileUri(uri).path : uri;
+          } catch {
+            return uri;
+          }
+        });
+        reply({ files: JSON.stringify(paths) } as SystemReply);
       } else if (request.op === "audio-load") {
         await this.audio.loadSound(
           request.count ?? 0,

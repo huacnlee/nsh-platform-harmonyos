@@ -105,6 +105,7 @@ export interface WebEventPayload {
 export interface NshRuntimeContext {
   isActive(): boolean;
   getUIContext(): UIContext;
+  requestFocus?(componentId: string): boolean;
   colorMode?(): ThemeColorMode;
   attachNativeNode(targetId: number, content: FrameNode | null): boolean;
   attachNativeSubtree(targetId: number, content: FrameNode | null, slot: NodeContent): boolean;
@@ -1251,23 +1252,23 @@ class EditorEntry {
     ) {
       this.focusedOnce = true;
       this.focusRequested = false;
-      try {
-        this.context
-          .getUIContext()
-          .getFocusController()
-          .requestFocus(`nsh-editor-${this.settings.targetId}`);
-      } catch {}
+      this.requestEditorFocus();
     }
+  }
+  private requestEditorFocus(): void {
+    const id = `nsh-editor-${this.settings.targetId}`;
+    try {
+      if (this.context.requestFocus) {
+        this.context.requestFocus(id);
+        return;
+      }
+      this.context.getUIContext().getFocusController().requestFocus(id);
+    } catch {}
   }
   command(command: EditorCommand): void {
     if (command.kind === "focus") {
       this.focusRequested = true;
-      try {
-        this.context
-          .getUIContext()
-          .getFocusController()
-          .requestFocus(`nsh-editor-${this.settings.targetId}`);
-      } catch {}
+      this.requestEditorFocus();
       if (!this.focused) {
         this.emit("focus");
       }

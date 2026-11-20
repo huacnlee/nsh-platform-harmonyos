@@ -219,6 +219,9 @@ pub(crate) struct Services {
     keyboard: Mutex<Option<crate::input::keyboard::KeyboardWindow>>,
     window_id: AtomicU32,
     window_avoid: Mutex<Option<([AvoidArea; 3], AvoidArea)>>,
+    desktop_window: Mutex<Option<nsh_core::desktop::WindowState>>,
+    desktop_title_bar: Mutex<nsh_core::Edges<nsh_core::Points>>,
+    desktop_displays: Mutex<Vec<nsh_core::desktop::Display>>,
     pub(crate) system: crate::services::system::System,
     command_tsfn: HostCommandCallback,
     next_open_id: AtomicU32,
@@ -366,6 +369,60 @@ impl Services {
 
     pub(crate) fn window_areas(&self) -> Option<([AvoidArea; 3], AvoidArea)> {
         *self.window_avoid.lock().unwrap()
+    }
+
+    #[cfg(feature = "dev")]
+    pub(crate) fn is_desktop(&self) -> bool {
+        self.environment.lock().unwrap().idiom.as_deref() == Some("desktop")
+    }
+
+    pub(crate) fn desktop_snapshot(
+        &self,
+    ) -> (
+        Option<nsh_core::desktop::WindowState>,
+        nsh_core::Edges<nsh_core::Points>,
+        Vec<nsh_core::desktop::Display>,
+    ) {
+        (
+            *self.desktop_window.lock().unwrap(),
+            *self.desktop_title_bar.lock().unwrap(),
+            self.desktop_displays.lock().unwrap().clone(),
+        )
+    }
+
+    pub(crate) fn desktop_command(
+        &self,
+        command: &crate::services::desktop::WireCommand,
+    ) -> Result<()> {
+        let json = serde_json::to_string(command)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        self.send_host_command(HostCommand {
+            kind: "desktop".into(),
+            text: Some(json),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn handle_desktop_event(&self, kind: &str, payload: &str) {
+        if self.check().is_err() {
+            return;
+        }
+        let Some(event) = crate::services::desktop::parse_desktop_event(kind, payload) else {
+            return;
+        };
+        match &event {
+            crate::services::desktop::DesktopEvent::WindowState(state) => {
+                *self.desktop_window.lock().unwrap() = Some(*state);
+            }
+            crate::services::desktop::DesktopEvent::TitleBar(edges) => {
+                *self.desktop_title_bar.lock().unwrap() = *edges;
+            }
+            crate::services::desktop::DesktopEvent::Displays(displays) => {
+                *self.desktop_displays.lock().unwrap() = displays.clone();
+            }
+            _ => {}
+        }
+        self.broadcast(|| Message::HostDesktop(event.clone()));
     }
 
     pub(crate) fn is_foreground(&self) -> bool {
@@ -766,6 +823,9 @@ impl Services {
             keyboard: Mutex::default(),
             window_id: AtomicU32::new(platform_window_id as u32),
             window_avoid: Mutex::default(),
+            desktop_window: Mutex::default(),
+            desktop_title_bar: Mutex::default(),
+            desktop_displays: Mutex::default(),
             command_tsfn,
             system: Default::default(),
             next_open_id: AtomicU32::new(1),

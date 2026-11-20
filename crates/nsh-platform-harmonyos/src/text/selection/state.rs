@@ -6,6 +6,7 @@ pub(crate) struct State {
     pub(crate) handles: Cell<[bool; 2]>,
     pub(crate) range: Cell<Option<(usize, usize)>>,
     pub(crate) menu: Cell<bool>,
+    pub(crate) desktop: Cell<bool>,
     pub(crate) generation: Cell<u32>,
     pub(crate) geometry: RefCell<super::layout::Geometry>,
 }
