@@ -37,12 +37,36 @@ class ControlSettings {
   }
 }
 
+let cachedSystemLocale: string | undefined;
+let cached24HourClock: boolean | undefined;
+
+function invalidateLocaleCache(): void {
+  cachedSystemLocale = undefined;
+  cached24HourClock = undefined;
+}
+
 function systemLocale(): string {
-  try {
-    return i18n.System.getSystemLocaleInstance().toString();
-  } catch {
-    return "en-US";
+  if (cachedSystemLocale !== undefined) {
+    return cachedSystemLocale;
   }
+  try {
+    cachedSystemLocale = i18n.System.getSystemLocaleInstance().toString();
+  } catch {
+    cachedSystemLocale = "en-US";
+  }
+  return cachedSystemLocale;
+}
+
+function is24HourClock(): boolean {
+  if (cached24HourClock !== undefined) {
+    return cached24HourClock;
+  }
+  try {
+    cached24HourClock = i18n.System.is24HourClock();
+  } catch {
+    cached24HourClock = false;
+  }
+  return cached24HourClock;
 }
 
 function date(fields?: Fields): Date {
@@ -68,13 +92,23 @@ function clampDate(value: Date, start?: Date, end?: Date): Date {
 
 function display(mode: string, value: Date): string {
   const locale = systemLocale();
+  if (mode === "time") {
+    return value.toLocaleTimeString(locale, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: !is24HourClock(),
+    });
+  }
   const day = value.toLocaleDateString(locale);
-  const time = value.toLocaleTimeString(locale, {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: !i18n.System.is24HourClock(),
-  });
-  return mode === "time" ? time : mode === "dateTime" ? day + " " + time : day;
+  if (mode === "dateTime") {
+    const time = value.toLocaleTimeString(locale, {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: !is24HourClock(),
+    });
+    return day + " " + time;
+  }
+  return day;
 }
 
 @Builder
@@ -198,6 +232,7 @@ export class NativeMobileControl {
     if (this.closed) {
       return;
     }
+    invalidateLocaleCache();
     this.builder.updateConfiguration();
     if (!this.settings.isSwitch) {
       const next = this.cloneSettings();
@@ -335,7 +370,7 @@ export class NativeMobileControl {
           end,
           alignment: DialogAlignment.Bottom,
           offset,
-          useMilitaryTime: i18n.System.is24HourClock(),
+          useMilitaryTime: is24HourClock(),
           enableCascade: true,
           enableHapticFeedback: true,
           dateTimeOptions: { hour: "2-digit", minute: "2-digit" },
@@ -361,7 +396,7 @@ export class NativeMobileControl {
           showTime: mode === "dateTime",
           alignment: DialogAlignment.Bottom,
           offset,
-          useMilitaryTime: i18n.System.is24HourClock(),
+          useMilitaryTime: is24HourClock(),
           enableHapticFeedback: true,
           dateTimeOptions: { hour: "2-digit", minute: "2-digit" },
           backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
