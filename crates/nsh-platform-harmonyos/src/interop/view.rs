@@ -308,6 +308,7 @@ impl Wrapper {
         } else {
             Vec::new()
         };
+        let (focus_command_gen, focus_command_focus) = owner.interaction.focus_command();
         let settings = ViewOptions {
             texture_surface,
             texture_insets: Some(self.insets()),
@@ -322,6 +323,9 @@ impl Wrapper {
                     .actions
                     .iter()
                     .any(|action| action.name.as_ref() == "activate"),
+            key_focusable: owner.interaction.wrapper_key_focusable(owner),
+            focus_command_gen,
+            focus_command_focus,
             disabled: spec.state.disabled,
             accessible: spec.accessible,
             hidden: spec.hidden,
@@ -479,6 +483,7 @@ impl Node {
             || self.kind == nsh_core::ViewKind::Modal
             || self.scene_root.get()
             || self.has_selection()
+            || self.interaction.needs_focus_wrapper(self)
             || has_semantics
             || requires_texture;
         let mut created_wrapper = false;

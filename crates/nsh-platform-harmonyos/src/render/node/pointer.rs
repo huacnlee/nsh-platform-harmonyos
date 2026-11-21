@@ -211,13 +211,14 @@ impl Node {
         x: f32,
         y: f32,
         delta: nsh_core::WheelDelta,
+        modifiers: nsh_core::keymap::Modifiers,
     ) -> EventPayload {
         let (position, page_position) = self.pointer_positions(x, y);
         EventPayload::Wheel(nsh_core::WheelEvent::new(
             position,
             page_position,
             delta,
-            self.host.modifiers(),
+            modifiers,
         ))
     }
     pub(crate) fn pinch_payload(
@@ -226,6 +227,7 @@ impl Node {
         y: f32,
         delta: f32,
         phase: nsh_core::PinchPhase,
+        modifiers: nsh_core::keymap::Modifiers,
     ) -> EventPayload {
         let (position, page_position) = self.pointer_positions(x, y);
         EventPayload::Pinch(nsh_core::PinchEvent::new(
@@ -233,7 +235,7 @@ impl Node {
             page_position,
             nsh_core::geometry::Percentage(delta),
             phase,
-            self.host.modifiers(),
+            modifiers,
         ))
     }
     pub(crate) fn context_menu_payload(&self, x: f32, y: f32) -> EventPayload {

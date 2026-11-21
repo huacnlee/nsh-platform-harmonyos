@@ -171,11 +171,12 @@ impl KeyboardWindow {
         } else {
             nsh_core::EventKind::KeyUp
         };
+        let window = owner.key_window_id();
         let focus = owner
             .key_focus
             .borrow()
             .upgrade()
-            .filter(|node| node.visible_in_tree());
+            .filter(|node| node.visible_in_tree() && node.key_window_id() == window);
         let target = focus.as_ref().unwrap_or(owner);
         let mut ancestor = Some(target.clone());
         let (mut observes, mut captures) = (false, false);
@@ -190,41 +191,8 @@ impl KeyboardWindow {
         }
         if (observes || captures) && !route.keyboard.lock().unwrap().composing {
             let mut details = nsh_core::KeyEvent::default();
-            let text = char::from_u32(event.unicode()).filter(|ch| !ch.is_control());
-            let named = match code {
-                N::ShiftLeft | N::ShiftRight => "Shift",
-                N::AltLeft | N::AltRight => "Alt",
-                N::CtrlLeft | N::CtrlRight => "Control",
-                N::MetaLeft | N::MetaRight => "Meta",
-                N::DpadLeft => "ArrowLeft",
-                N::DpadRight => "ArrowRight",
-                N::DpadDown => "ArrowDown",
-                N::DpadUp => "ArrowUp",
-                N::MoveHome => "Home",
-                N::MoveEnd => "End",
-                N::Del => "Backspace",
-                N::ForwardDel => "Delete",
-                N::Enter => "Enter",
-                N::Escape => "Escape",
-                N::Tab => "Tab",
-                N::PageUp => "PageUp",
-                N::PageDown => "PageDown",
-                N::Insert => "Insert",
-                _ => "",
-            };
-            let logical = if !named.is_empty() {
-                named.to_owned()
-            } else if let Some(text) = text {
-                text.to_string()
-            } else {
-                let text = event.key_text();
-                if text.is_empty() {
-                    "Unidentified".into()
-                } else {
-                    text
-                }
-            };
-            details.key = logical.into();
+            let key_text = event.key_text();
+            details.key = logical_key(code, event.unicode(), modifiers.shift, &key_text).into();
             // ArkUI exposes a logical key identifier but no hardware scan code.
             details.modifiers = modifiers;
             match code {
@@ -266,6 +234,10 @@ impl KeyboardWindow {
         } else {
             captures = false;
         }
+        let allow_key_scroll = !observes
+            && focus
+                .as_ref()
+                .is_none_or(|node| node.scroll.borrow().is_some());
         let shortcut = held.event(action, code, |stroke, repeat| {
             // Capture is recomputed for each transition. Only shortcut
             // consumption is retained for the matching hardware release.
@@ -305,7 +277,6 @@ impl KeyboardWindow {
                     return true;
                 }
             }
-            let window = owner.key_window_id();
             let matched = snapshot
                 .map
                 .find_in(window, stroke, snapshot.focused.is_some(), repeat);
@@ -376,7 +347,11 @@ impl KeyboardWindow {
                     return back(route);
                 }
             }
-            if snapshot.desktop && snapshot.focused.is_none() && snapshot.selection.is_none() {
+            if snapshot.desktop
+                && snapshot.focused.is_none()
+                && snapshot.selection.is_none()
+                && allow_key_scroll
+            {
                 use nsh_core::scroll::KeyMove;
                 let scroll_move = if stroke.modifiers == Modifiers::default() {
                     match stroke.key {
@@ -402,6 +377,7 @@ impl KeyboardWindow {
                 };
                 if let Some((key_move, horizontal)) = scroll_move {
                     route.send(crate::app::runtime::Message::KeyScroll {
+                        window,
                         key_move,
                         horizontal,
                     });
@@ -431,7 +407,6 @@ pub(crate) fn install(
     owner.native.borrow().set_focusable(true)?;
     if owner.platform.get().os.is_desktop() {
         let _ = owner.native.borrow().set_default_focus(true);
-        let _ = owner.native.borrow().set_focus_on_touch(true);
     }
     let weak = std::rc::Rc::downgrade(owner);
     owner.native.borrow_mut().on_key_pre_ime(move |event| {
@@ -496,6 +471,56 @@ impl Held {
             .any(|(code, _)| *code == left || *code == right)
     }
 }
+fn logical_key(code: N, unicode: u32, shift: bool, key_text: &str) -> String {
+    let named = match code {
+        N::ShiftLeft | N::ShiftRight => "Shift",
+        N::AltLeft | N::AltRight => "Alt",
+        N::CtrlLeft | N::CtrlRight => "Control",
+        N::MetaLeft | N::MetaRight => "Meta",
+        N::DpadLeft => "ArrowLeft",
+        N::DpadRight => "ArrowRight",
+        N::DpadDown => "ArrowDown",
+        N::DpadUp => "ArrowUp",
+        N::MoveHome => "Home",
+        N::MoveEnd => "End",
+        N::Del => "Backspace",
+        N::ForwardDel => "Delete",
+        N::Enter => "Enter",
+        N::Escape => "Escape",
+        N::Tab => "Tab",
+        N::Space => " ",
+        N::PageUp => "PageUp",
+        N::PageDown => "PageDown",
+        N::Insert => "Insert",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named.to_owned();
+    }
+    if let Some(ch) = char::from_u32(unicode).filter(|ch| !ch.is_control()) {
+        return ch.to_string();
+    }
+    if let Some(mapped) = key(code) {
+        match mapped {
+            Key::Char(ch) => {
+                let ch = if shift && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
+                return ch.to_string();
+            }
+            Key::F(n) => return format!("F{n}"),
+            _ => {}
+        }
+    }
+    if key_text.is_empty() || key_text.starts_with("KEYCODE_") {
+        "Unidentified".into()
+    } else {
+        key_text.to_owned()
+    }
+}
+
 fn key(code: N) -> Option<Key> {
     use Key as K;
     Some(match code {
@@ -614,5 +639,13 @@ mod tests {
             assert!(!stroke.modifiers.ctrl);
             false
         });
+    }
+    #[test]
+    fn logical_key_maps_space_and_letters_when_unicode_is_zero() {
+        assert_eq!(logical_key(N::Space, 0, true, "KEYCODE_SPACE"), " ");
+        assert_eq!(logical_key(N::A, 0, false, "KEYCODE_A"), "a");
+        assert_eq!(logical_key(N::A, 0, true, "KEYCODE_A"), "A");
+        assert_eq!(logical_key(N::F5, 0, false, "KEYCODE_F5"), "F5");
+        assert_eq!(logical_key(N::A, 'ä' as u32, false, "KEYCODE_A"), "ä");
     }
 }

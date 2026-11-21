@@ -4,10 +4,11 @@
 use nsh_core::{
     Bounds, Edges, EventKind, EventPayload, PayloadValue, Point, Points, Size,
     desktop::{
-        Backdrop, CloseReason, DesktopCommand, Display, DisplayId, Key as DesktopKey, MenuItem,
-        MenuLabels, MenuRole, OpenWindow, ResizeEdge, Shortcut, TitleBarStyle, WindowAttributes,
-        WindowFrameStyle, WindowKind, WindowLevel, WindowMode, WindowPlacement,
-        WindowPointerEvents, WindowPosition, WindowRequest, WindowState,
+        Backdrop, CloseReason, DesktopCommand, Display, DisplayId, Key as DesktopKey,
+        MainWindowOptions, MenuItem, MenuLabels, MenuRole, OpenWindow, ResizeEdge, Shortcut,
+        SizeToContent, TitleBarStyle, WindowAttributes, WindowFrameStyle, WindowKind, WindowLevel,
+        WindowMode, WindowPlacement, WindowPointerEvents, WindowPosition, WindowRequest,
+        WindowState,
     },
     keymap::{Key as KeymapKey, Keystroke},
     platform::{Idiom, Os},
@@ -259,6 +260,8 @@ pub(crate) enum WireCommand {
         modal: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         parent_window_id: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
         width: f32,
         height: f32,
         position: &'static str,
@@ -421,6 +424,30 @@ pub(crate) enum WireCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         window_id: Option<u32>,
     },
+    #[serde(rename_all = "camelCase")]
+    ApplyMainWindowLaunch {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        x: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        y: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        width: Option<f32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        height: Option<f32>,
+        content_sized: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        clamp_to_display: bool,
+        #[serde(skip_serializing_if = "is_false")]
+        title_bar_hidden: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        position: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        display: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        mode: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        visible: Option<bool>,
+    },
     Quit,
     Restart,
 }
@@ -544,11 +571,13 @@ pub(crate) fn wire_open_sub_window(
         }
     };
     let parent_window_id = open.parent.filter(|id| *id != nsh_core::ROOT_ID);
+    let display = open.options.display.map(|id| format!("{:016x}", id.0));
     WireCommand::OpenSubWindow {
         window_id,
         kind: kind_name(open.options.kind),
         modal: open.options.modal,
         parent_window_id,
+        display,
         width: size.0,
         height: size.1,
         position,
@@ -599,6 +628,87 @@ pub(crate) fn wire_open_sub_window(
         transparent: attrs.transparent,
         backdrop: attrs.backdrop.map(backdrop_name),
         shadow: attrs.shadow,
+    }
+}
+
+/// Fallback desktop main window content size (vp) when an app omits `defaultSize`
+/// and has no restored placement. HarmonyOS PC's system default (~1100x734 vp) is
+/// shorter than the 1200x800 desktop baseline expected by multi-pane layouts.
+pub(crate) const DEFAULT_DESKTOP_MAIN_WINDOW_SIZE: (f32, f32) = (1200.0, 800.0);
+
+fn clamp_size_to_attributes(size: (f32, f32), attrs: &WindowAttributes) -> (f32, f32) {
+    let (mut w, mut h) = size;
+    if let Some(Some(min)) = attrs.min_size {
+        if min.width.0.is_finite() && min.width.0 > 0.0 {
+            w = w.max(min.width.0);
+        }
+        if min.height.0.is_finite() && min.height.0 > 0.0 {
+            h = h.max(min.height.0);
+        }
+    }
+    if let Some(Some(max)) = attrs.max_size {
+        if max.width.0.is_finite() && max.width.0 > 0.0 {
+            w = w.min(max.width.0);
+        }
+        if max.height.0.is_finite() && max.height.0 > 0.0 {
+            h = h.min(max.height.0);
+        }
+    }
+    (w.max(1.0), h.max(1.0))
+}
+
+#[allow(dead_code)]
+pub(crate) fn wire_main_window_launch(
+    options: &MainWindowOptions,
+    kept: Option<WindowPlacement>,
+) -> WireCommand {
+    let visible = (!options.visible_at_launch()).then_some(false);
+    let title_bar_hidden = options.attributes.frame == Some(WindowFrameStyle::None)
+        || options
+            .attributes
+            .title_bar
+            .is_some_and(|tb| tb.style == TitleBarStyle::Hidden);
+    if let Some(placement) = kept {
+        return WireCommand::ApplyMainWindowLaunch {
+            x: Some(placement.bounds.origin.x.0),
+            y: Some(placement.bounds.origin.y.0),
+            width: Some(placement.bounds.size.width.0),
+            height: Some(placement.bounds.size.height.0),
+            content_sized: false,
+            clamp_to_display: false,
+            title_bar_hidden,
+            position: Some("at"),
+            display: None,
+            mode: Some(mode_name(placement.mode)),
+            visible,
+        };
+    }
+    let fallback_size = options.default_size.is_none();
+    let (width, height) = match options.default_size {
+        Some(size) => clamp_size_to_attributes((size.width.0, size.height.0), &options.attributes),
+        None => clamp_size_to_attributes(DEFAULT_DESKTOP_MAIN_WINDOW_SIZE, &options.attributes),
+    };
+    let (position, x, y) = match options.default_position {
+        Some(WindowPosition::At(point)) => (Some("at"), Some(point.x.0), Some(point.y.0)),
+        Some(WindowPosition::Center) => (Some("center"), None, None),
+        Some(WindowPosition::ParentCenter) => (Some("parentCenter"), None, None),
+        None if fallback_size => (Some("center"), None, None),
+        None => (None, None, None),
+    };
+    let display = options.display.map(|id| format!("{:016x}", id.0));
+    let mode = options.default_mode.map(mode_name);
+    WireCommand::ApplyMainWindowLaunch {
+        x,
+        y,
+        width: Some(width),
+        height: Some(height),
+        content_sized: true,
+        clamp_to_display: fallback_size,
+        title_bar_hidden,
+        position,
+        display,
+        mode,
+        visible,
     }
 }
 
@@ -1416,6 +1526,65 @@ pub(crate) fn ctrl_wheel_pinch_delta(dy_lines: f32) -> f32 {
     nsh_core::input::zoom_factor(dy_lines) - 1.0
 }
 
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub(crate) struct MainWindowState {
+    pub(crate) movable: bool,
+    pub(crate) maximizable: bool,
+    pub(crate) resizable: bool,
+    pub(crate) frame_none: bool,
+    pub(crate) min_size: Option<Size<Points>>,
+    pub(crate) max_size: Option<Size<Points>>,
+    pub(crate) size_to_content: SizeToContent,
+}
+
+impl Default for MainWindowState {
+    fn default() -> Self {
+        Self {
+            movable: true,
+            maximizable: true,
+            resizable: true,
+            frame_none: false,
+            min_size: None,
+            max_size: None,
+            size_to_content: SizeToContent::Off,
+        }
+    }
+}
+
+#[allow(dead_code)]
+impl MainWindowState {
+    pub(crate) fn apply_attributes(&mut self, attrs: &WindowAttributes) {
+        if let Some(movable) = attrs.movable {
+            self.movable = movable;
+        }
+        if let Some(maximizable) = attrs.maximizable {
+            self.maximizable = maximizable;
+        }
+        if let Some(resizable) = attrs.resizable {
+            self.resizable = resizable;
+        }
+        if let Some(frame) = attrs.frame {
+            self.frame_none = frame == WindowFrameStyle::None;
+        }
+        if let Some(min_size) = attrs.min_size {
+            self.min_size = min_size;
+        }
+        if let Some(max_size) = attrs.max_size {
+            self.max_size = max_size;
+        }
+        if let Some(size_to_content) = attrs.size_to_content {
+            self.size_to_content = size_to_content;
+        }
+    }
+
+    pub(crate) fn can_resize(&self, mode: WindowMode) -> bool {
+        mode == WindowMode::Normal
+            && self.resizable
+            && matches!(self.size_to_content, SizeToContent::Off)
+    }
+}
+
 #[cfg(target_env = "ohos")]
 pub(crate) struct DesktopState {
     pub(crate) labels: MenuLabels,
@@ -1868,6 +2037,13 @@ mod tests {
         assert_eq!(req_json["height"], 280.0);
 
         let display_id = DisplayId::from_name(b"display-1");
+        let mut open_with_display = open.clone();
+        open_with_display.options.display = Some(display_id);
+        let open_disp_json =
+            serde_json::to_value(wire_open_sub_window(43, &open_with_display, (320.0, 440.0)))
+                .unwrap();
+        assert_eq!(open_disp_json["display"], format!("{:016x}", display_id.0));
+
         let center_json = serde_json::to_value(wire_request_for(
             Some(42),
             &WindowRequest::Center {
@@ -1879,6 +2055,72 @@ mod tests {
         assert_eq!(center_json["windowId"], 42);
         assert_eq!(center_json["action"], "center");
         assert_eq!(center_json["display"], format!("{:016x}", display_id.0));
+    }
+
+    #[test]
+    fn main_window_launch_and_state_respect_options_and_kept_placement() {
+        let mut options = MainWindowOptions::default();
+        let default_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
+        assert_eq!(default_json["op"], "applyMainWindowLaunch");
+        assert_eq!(default_json["width"], DEFAULT_DESKTOP_MAIN_WINDOW_SIZE.0);
+        assert_eq!(default_json["height"], DEFAULT_DESKTOP_MAIN_WINDOW_SIZE.1);
+        assert_eq!(default_json["contentSized"], true);
+        assert_eq!(default_json["clampToDisplay"], true);
+        assert_eq!(default_json["position"], "center");
+
+        options.attributes.max_size = Some(Some(Size::new(Points(900.0), Points(650.0))));
+        let clamped_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
+        assert_eq!(clamped_json["width"], 900.0);
+        assert_eq!(clamped_json["height"], 650.0);
+        assert_eq!(clamped_json["clampToDisplay"], true);
+        options.attributes.max_size = None;
+        options.attributes.min_size = Some(Some(Size::new(Points(1280.0), Points(900.0))));
+        let min_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
+        assert_eq!(min_json["width"], 1280.0);
+        assert_eq!(min_json["height"], 900.0);
+        options.attributes.min_size = None;
+
+        options.default_size = Some(Size::new(Points(720.0), Points(500.0)));
+        options.default_position = Some(WindowPosition::Center);
+        options.default_visible = Some(false);
+        let cmd = wire_main_window_launch(&options, None);
+        let json = serde_json::to_value(cmd).unwrap();
+        assert_eq!(json["op"], "applyMainWindowLaunch");
+        assert_eq!(json["width"], 720.0);
+        assert_eq!(json["height"], 500.0);
+        assert_eq!(json["contentSized"], true);
+        assert!(json.get("clampToDisplay").is_none());
+        assert_eq!(json["position"], "center");
+        assert_eq!(json["visible"], false);
+
+        let mut kept = WindowPlacement::default();
+        kept.bounds = Bounds::new(
+            Point::new(Points(100.0), Points(120.0)),
+            Size::new(Points(900.0), Points(640.0)),
+        );
+        kept.mode = WindowMode::Maximized;
+        let kept_json =
+            serde_json::to_value(wire_main_window_launch(&options, Some(kept))).unwrap();
+        assert_eq!(kept_json["x"], 100.0);
+        assert_eq!(kept_json["y"], 120.0);
+        assert_eq!(kept_json["width"], 900.0);
+        assert_eq!(kept_json["height"], 640.0);
+        assert_eq!(kept_json["contentSized"], false);
+        assert!(kept_json.get("clampToDisplay").is_none());
+        assert_eq!(kept_json["mode"], "maximized");
+
+        let mut main_state = MainWindowState::default();
+        assert!(main_state.can_resize(WindowMode::Normal));
+        let mut attrs = WindowAttributes::default();
+        attrs.resizable = Some(false);
+        attrs.movable = Some(false);
+        attrs.maximizable = Some(false);
+        attrs.frame = Some(WindowFrameStyle::None);
+        main_state.apply_attributes(&attrs);
+        assert!(!main_state.can_resize(WindowMode::Normal));
+        assert!(!main_state.movable);
+        assert!(!main_state.maximizable);
+        assert!(main_state.frame_none);
     }
 
     #[test]

@@ -33,16 +33,21 @@ use crate::render::{
 };
 
 thread_local! {
-    static SUB_WINDOWS: RefCell<BTreeMap<u32, Weak<Modal>>> = RefCell::default();
+    static SUB_WINDOWS: RefCell<BTreeMap<(u32, u32), Weak<Modal>>> = RefCell::default();
 }
 
 pub(crate) fn attach_sub_window(
     env: napi_ohos::Env,
+    session_id: u32,
     window_id: u32,
     content: napi_ohos::bindgen_prelude::Object<'_>,
     platform_window_id: i32,
 ) -> napi_ohos::Result<bool> {
-    let modal = SUB_WINDOWS.with(|map| map.borrow().get(&window_id).and_then(Weak::upgrade));
+    let modal = SUB_WINDOWS.with(|map| {
+        map.borrow()
+            .get(&(session_id, window_id))
+            .and_then(Weak::upgrade)
+    });
     let Some(modal) = modal else {
         return Ok(false);
     };
@@ -58,7 +63,10 @@ struct Transition {
 type SettledCallback = Box<dyn FnOnce(bool)>;
 
 struct DesktopWindow {
+    session_id: u32,
     window_id: u32,
+    modal: bool,
+    parent_window_id: Option<u32>,
     attrs: WindowAttributes,
     mode: WindowMode,
     minimized: bool,
@@ -72,6 +80,7 @@ struct DesktopWindow {
     /// Outer window origin in screen vp, refreshed from native window events.
     origin: Option<(f32, f32)>,
     normal_origin: Option<(f32, f32)>,
+    scale_factor: f32,
     platform_window_id: Option<i32>,
     sub_window_opened: bool,
     closed_emitted: bool,
@@ -184,6 +193,37 @@ impl Modal {
                 .as_ref()
                 .is_some_and(|w| w.focused && !w.hidden && !w.minimized)
     }
+    pub(crate) fn is_desktop_modal(&self) -> bool {
+        self.is_visible()
+            && self
+                .desktop
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| w.modal && !w.hidden && !w.minimized)
+    }
+    pub(crate) fn desktop_movable(&self) -> bool {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.attrs.movable != Some(false) && w.mode == WindowMode::Normal)
+    }
+    pub(crate) fn desktop_parent_window_id(&self) -> Option<u32> {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.parent_window_id.or(Some(nsh_core::ROOT_ID)))
+    }
+    pub(crate) fn close_for_parent(&self) -> Result<()> {
+        if !self.is_desktop_window() || !self.shown.get() {
+            return Ok(());
+        }
+        let owner = self.owner.upgrade();
+        self.close_sub_window(false)?;
+        if let Some(owner) = owner {
+            self.emit_desktop_closed(&owner, WindowCloseCause::ParentClose);
+        }
+        Ok(())
+    }
     pub(crate) fn desktop_transparent(&self) -> bool {
         self.desktop
             .borrow()
@@ -256,9 +296,14 @@ impl Modal {
             &open,
             (size.width, size.height),
         );
+        let session_id = owner.host.session_id();
+        let parent_window_id = open.parent.filter(|id| *id != nsh_core::ROOT_ID);
         self.config.borrow_mut().animation = ModalAnimation::None;
         *self.desktop.borrow_mut() = Some(DesktopWindow {
+            session_id,
             window_id: owner.id,
+            modal: open.options.modal,
+            parent_window_id,
             attrs: open.options.attributes,
             mode,
             minimized: false,
@@ -269,6 +314,7 @@ impl Modal {
             normal_size: size,
             origin,
             normal_origin: origin,
+            scale_factor: owner.scale.get().max(1.0),
             platform_window_id: None,
             sub_window_opened: true,
             closed_emitted: false,
@@ -276,7 +322,7 @@ impl Modal {
         if let Some(modal_rc) = owner.modal.borrow().as_ref() {
             let weak = Rc::downgrade(modal_rc);
             SUB_WINDOWS.with(|map| {
-                map.borrow_mut().insert(owner.id, weak);
+                map.borrow_mut().insert((session_id, owner.id), weak);
             });
         }
         self.pending_present.set(false);
@@ -661,6 +707,9 @@ impl Modal {
             win.minimized = state.minimized;
             win.focused = state.focused;
             win.hidden = !state.visible && !state.minimized;
+            if state.scale_factor.is_finite() && state.scale_factor > 0.0 {
+                win.scale_factor = state.scale_factor;
+            }
             if state.bounds.size.width.0 > 0.0 && state.bounds.size.height.0 > 0.0 {
                 win.size = Size::new(state.bounds.size.width.0, state.bounds.size.height.0);
                 win.origin = Some((state.bounds.origin.x.0, state.bounds.origin.y.0));
@@ -755,8 +804,14 @@ impl Modal {
         self.available.set(None);
         self.notify_settled(false);
         if let Some(owner) = self.owner.upgrade() {
+            let key = self
+                .desktop
+                .borrow()
+                .as_ref()
+                .map(|w| (w.session_id, w.window_id))
+                .unwrap_or((owner.host.session_id(), owner.id));
             SUB_WINDOWS.with(|map| {
-                map.borrow_mut().remove(&owner.id);
+                map.borrow_mut().remove(&key);
             });
             // Unmount the native subtree from the SubWindow's NodeContent before
             // ArkTS calls destroyWindow(), preventing dangling native handles.
@@ -1249,16 +1304,21 @@ impl Modal {
             }
         }
     }
+    fn sub_window_scale(&self, owner: &Node) -> f32 {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .map(|w| w.scale_factor)
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or_else(|| owner.scale.get().max(1.0))
+    }
     fn sub_window_drawable_size(&self, owner: &Node) -> Option<Size> {
         let id = self.desktop.borrow().as_ref()?.platform_window_id?;
         let window = ohos_window_manager_binding::Window::from_id(id);
         let bounds = window.properties().ok()?.drawable_rect;
-        (bounds.width > 0 && bounds.height > 0).then(|| {
-            Size::new(
-                bounds.width as f32 / owner.scale.get(),
-                bounds.height as f32 / owner.scale.get(),
-            )
-        })
+        let scale = self.sub_window_scale(owner);
+        (bounds.width > 0 && bounds.height > 0)
+            .then(|| Size::new(bounds.width as f32 / scale, bounds.height as f32 / scale))
     }
     fn window_size(owner: &Node) -> Option<Size> {
         let window = ohos_window_manager_binding::Window::from_id(owner.host.window_id()? as i32);
@@ -1408,9 +1468,10 @@ impl Modal {
                 .borrow()
                 .as_ref()
                 .map_or_else(|| Size::new(640.0, 480.0), |w| w.content_size);
+            let scale = self.sub_window_scale(&owner);
             let available = if let Some(constraint) = event.layout_constraint_in_measure() {
                 let bound = |value: i32, fallback: f32| {
-                    let value = value as f32 / owner.scale.get();
+                    let value = value as f32 / scale;
                     if value > 0.0 && value <= 16384.0 {
                         value
                     } else {
@@ -1465,7 +1526,7 @@ impl Drop for Modal {
         let is_desktop = self.desktop.get_mut().is_some();
         if let Some(win) = self.desktop.get_mut().as_mut() {
             SUB_WINDOWS.with(|map| {
-                map.borrow_mut().remove(&win.window_id);
+                map.borrow_mut().remove(&(win.session_id, win.window_id));
             });
             self.sub_window.get_mut().take();
             if std::mem::replace(&mut win.sub_window_opened, false)

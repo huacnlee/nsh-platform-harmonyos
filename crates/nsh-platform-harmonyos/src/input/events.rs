@@ -13,8 +13,8 @@ use nsh_core::{
 };
 use ohos_arkui_binding::{
     arkui_input_binding::{
-        ArkUIInputEvent, UIAxisEventAction, UIInputAction, UIInputToolType, UIMouseEventAction,
-        UIMouseEventButton,
+        ArkUIInputEvent, ModifierKey, UIAxisEventAction, UIInputAction, UIInputSourceType,
+        UIInputToolType, UIMouseEventAction, UIMouseEventButton,
     },
     component::attribute::{ArkUICommonAttribute, ArkUIEvent, ArkUIGesture},
     gesture::{gesture_data::GestureData, inner_gesture::Gesture},
@@ -43,6 +43,9 @@ pub(crate) struct Interaction {
     expanded_hit_region: Cell<bool>,
     hover_registered: Cell<bool>,
     key_focusable: Cell<bool>,
+    focus_wrapped: Cell<bool>,
+    focus_command_gen: Cell<u32>,
+    focus_command_focus: Cell<bool>,
     mouse_registered: Cell<bool>,
     axis_registered: Cell<bool>,
     drag_registered: Cell<bool>,
@@ -74,6 +77,9 @@ impl Default for Interaction {
             expanded_hit_region: Cell::new(false),
             hover_registered: Cell::new(false),
             key_focusable: Cell::new(false),
+            focus_wrapped: Cell::new(false),
+            focus_command_gen: Cell::new(0),
+            focus_command_focus: Cell::new(false),
             mouse_registered: Cell::new(false),
             axis_registered: Cell::new(false),
             drag_registered: Cell::new(false),
@@ -176,10 +182,63 @@ impl Interaction {
             props.key_capture.captures_key(stroke),
         )
     }
+    pub(crate) fn needs_focus_wrapper(&self, owner: &Node) -> bool {
+        if matches!(
+            owner.kind,
+            nsh_core::ViewKind::Input
+                | nsh_core::ViewKind::Native
+                | nsh_core::ViewKind::WebView
+                | nsh_core::ViewKind::Modal
+        ) || owner.id == nsh_core::ROOT_ID
+        {
+            return false;
+        }
+        let props = self.props.borrow();
+        !props.accessibility.state.disabled
+            && (props.focusable == Some(true) || self.focus_wrapped.get())
+    }
+    pub(crate) fn wrapper_key_focusable(&self, owner: &Node) -> bool {
+        self.needs_focus_wrapper(owner)
+    }
+    pub(crate) fn focus_command(&self) -> (u32, bool) {
+        (self.focus_command_gen.get(), self.focus_command_focus.get())
+    }
+    pub(crate) fn command_focus(&self, owner: &Rc<Node>, focused: bool) -> Result<()> {
+        if matches!(
+            owner.kind,
+            nsh_core::ViewKind::Input
+                | nsh_core::ViewKind::Native
+                | nsh_core::ViewKind::WebView
+                | nsh_core::ViewKind::Modal
+        ) || owner.id == nsh_core::ROOT_ID
+        {
+            return Ok(());
+        }
+        if focused {
+            let props = self.props.borrow();
+            if props.focusable == Some(false) || props.accessibility.state.disabled {
+                return Ok(());
+            }
+            drop(props);
+            self.focus_wrapped.set(true);
+        }
+        if !focused && !self.needs_focus_wrapper(owner) && owner.wrapper.borrow().is_none() {
+            return Ok(());
+        }
+        let next = self.focus_command_gen.get().wrapping_add(1).max(1);
+        self.focus_command_gen.set(next);
+        self.focus_command_focus.set(focused);
+        owner.ensure_wrapper()?;
+        owner.update_wrapper()
+    }
     fn sync_key_focus(&self, owner: &Rc<Node>) -> Result<()> {
-        if owner.kind == nsh_core::ViewKind::Input
-            || owner.kind == nsh_core::ViewKind::Native
-            || owner.id == nsh_core::ROOT_ID
+        if matches!(
+            owner.kind,
+            nsh_core::ViewKind::Input
+                | nsh_core::ViewKind::Native
+                | nsh_core::ViewKind::WebView
+                | nsh_core::ViewKind::Modal
+        ) || owner.id == nsh_core::ROOT_ID
         {
             return Ok(());
         }
@@ -187,22 +246,11 @@ impl Interaction {
             .props
             .borrow()
             .focus_stop(self.mask().contains(EventKind::Press));
-        if self.key_focusable.replace(focusable) == focusable {
-            return Ok(());
-        }
-        let mut native = owner.native.borrow_mut();
-        native.set_focusable(focusable)?;
-        for (native_kind, kind) in [(E::OnFocus, EventKind::Focus), (E::OnBlur, EventKind::Blur)] {
-            if focusable {
-                let weak = Rc::downgrade(owner);
-                native.on_event(native_kind, move |_| {
-                    if let Some(owner) = weak.upgrade() {
-                        owner.emit(kind, EventPayload::None);
-                    }
-                });
-            } else {
-                native.off_event(native_kind)?;
-            }
+        let changed = self.key_focusable.replace(focusable) != focusable;
+        if self.needs_focus_wrapper(owner) {
+            owner.ensure_wrapper()?;
+        } else if changed {
+            owner.update_wrapper()?;
         }
         Ok(())
     }
@@ -388,7 +436,17 @@ impl Interaction {
                             match input.mouse_action() {
                                 UIMouseEventAction::Move => {
                                     if is_root {
-                                        if owner.touches.borrow_mut().move_window_resize((dx, dy))?
+                                        if owner
+                                            .touches
+                                            .borrow_mut()
+                                            .move_window_resize(&owner, (dx, dy))?
+                                        {
+                                            return Ok(());
+                                        }
+                                        if owner
+                                            .touches
+                                            .borrow_mut()
+                                            .move_pending_window_drag(&owner, (wx, wy))?
                                         {
                                             return Ok(());
                                         }
@@ -409,6 +467,7 @@ impl Interaction {
                                         let was_resizing =
                                             owner.touches.borrow().window_resizing();
                                         owner.touches.borrow_mut().end_window_resize();
+                                        owner.touches.borrow_mut().clear_pending_window_drag();
                                         if was_resizing && desktop {
                                             update_desktop_pointer_cursor(&owner, x, y)?;
                                         }
@@ -426,13 +485,23 @@ impl Interaction {
                                     }
                                     match input.mouse_button() {
                                         UIMouseEventButton::Left if is_root && desktop => {
+                                            let clicks = owner
+                                                .touches
+                                                .borrow_mut()
+                                                .record_mouse_press(input.event_time(), (wx, wy));
                                             if !handle_window_resize_press(
                                                 &owner,
                                                 x,
                                                 y,
                                                 (dx, dy),
                                             )? {
-                                                handle_window_drag_press(&owner, x, y)?;
+                                                handle_window_drag_press(
+                                                    &owner,
+                                                    x,
+                                                    y,
+                                                    (wx, wy),
+                                                    clicks,
+                                                )?;
                                             }
                                         }
                                         UIMouseEventButton::Right => {
@@ -530,35 +599,23 @@ impl Interaction {
                                         (nsh_core::PinchPhase::Move, delta)
                                     }
                                 };
+                                let modifiers = axis_modifiers(&owner, &input);
                                 owner.emit(
                                     EventKind::Pinch,
-                                    owner.pinch_payload(x, y, delta, phase),
+                                    owner.pinch_payload(x, y, delta, phase, modifiers),
                                 );
                                 if takes_axis(&owner, x, y, EventKind::Pinch) {
                                     let _ = input.axis_set_propagation(false);
                                 }
                                 return Ok(());
                             }
-                            let is_mouse = input.tool_type == UIInputToolType::Mouse;
-                            let modifiers = owner.host.modifiers();
+                            let is_mouse = input.tool_type == UIInputToolType::Mouse
+                                || (input.source_type == UIInputSourceType::Mouse
+                                    && input.tool_type != UIInputToolType::Touchpad);
+                            let modifiers = axis_modifiers(&owner, &input);
                             let vx = input.axis_horizontal_value();
                             let vy = input.axis_vertical_value();
-                            if mask.contains(EventKind::Wheel) {
-                                if let Some(delta) =
-                                    crate::services::desktop::wheel_delta_from_axis(
-                                        vx,
-                                        vy,
-                                        is_mouse,
-                                        owner.scale.get(),
-                                        modifiers.shift && !modifiers.ctrl,
-                                    )
-                                {
-                                    owner.emit(EventKind::Wheel, owner.wheel_payload(x, y, delta));
-                                    if takes_axis(&owner, x, y, EventKind::Wheel) {
-                                        let _ = input.axis_set_propagation(false);
-                                    }
-                                }
-                            } else if mask.contains(EventKind::Pinch)
+                            if mask.contains(EventKind::Pinch)
                                 && is_mouse
                                 && modifiers.ctrl
                                 && vy.is_finite()
@@ -575,11 +632,29 @@ impl Interaction {
                                             y,
                                             delta,
                                             nsh_core::PinchPhase::Move,
+                                            modifiers,
                                         ),
                                     );
                                     if takes_axis(&owner, x, y, EventKind::Pinch) {
                                         let _ = input.axis_set_propagation(false);
                                     }
+                                }
+                            } else if mask.contains(EventKind::Wheel)
+                                && let Some(delta) =
+                                    crate::services::desktop::wheel_delta_from_axis(
+                                        vx,
+                                        vy,
+                                        is_mouse,
+                                        owner.scale.get(),
+                                        modifiers.shift && !modifiers.ctrl,
+                                    )
+                            {
+                                owner.emit(
+                                    EventKind::Wheel,
+                                    owner.wheel_payload(x, y, delta, modifiers),
+                                );
+                                if takes_axis(&owner, x, y, EventKind::Wheel) {
+                                    let _ = input.axis_set_propagation(false);
                                 }
                             }
                         }
@@ -632,9 +707,10 @@ impl Interaction {
                             if !uris.is_empty() {
                                 let _ = drag.set_drag_result(DragResult::Successful);
                                 if owner.interaction.mask().contains(EventKind::FileDrop) {
+                                    let scale = owner.scale.get().max(1.0);
                                     let page_position = nsh_core::Point::new(
-                                        nsh_core::Points(drag.touch_point_x_to_window()),
-                                        nsh_core::Points(drag.touch_point_y_to_window()),
+                                        nsh_core::Points(drag.touch_point_x_to_window() / scale),
+                                        nsh_core::Points(drag.touch_point_y_to_window() / scale),
                                     );
                                     owner.emit(
                                         EventKind::FileDrop,
@@ -704,6 +780,8 @@ impl Interaction {
         let selection_changed = old_props.selectable_view != props.selectable_view;
         let pointer_changed = old_props.pointer_events != props.pointer_events;
         let window_control_changed = old_props.window_control != props.window_control;
+        let focusable_changed = old_props.focusable != props.focusable
+            || old_props.accessibility.state.disabled != props.accessibility.state.disabled;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -764,7 +842,7 @@ impl Interaction {
         self.apply_opacity(owner)?;
         if pointer_changed {
             self.pointer_internal(owner, self.inherited_block.get(), true)?;
-        } else if window_control_changed {
+        } else if window_control_changed || focusable_changed {
             self.events(owner, self.events.get())?;
         }
         if selection_changed {
@@ -1261,20 +1339,21 @@ fn desktop_right_click_selection_target(
     let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
         return Ok(None);
     };
+    let mut found = None;
     loop {
         if cur.interaction.mask().contains(EventKind::ContextMenu)
             || cur.kind == nsh_core::ViewKind::Input
         {
             return Ok(None);
         }
-        if cur.selectable() || cur.interaction.selectable_view() {
-            return Ok(Some(cur.id));
+        if found.is_none() && (cur.selectable() || cur.interaction.selectable_view()) {
+            found = Some(cur.id);
         }
         if cur.id == root.id {
-            return Ok(None);
+            return Ok(found);
         }
         let Some(parent) = cur.parent_node.borrow().upgrade() else {
-            return Ok(None);
+            return Ok(found);
         };
         cur = parent;
     }
@@ -1314,10 +1393,12 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
         .cloned();
     let resizable = modal.as_ref().map_or_else(
         || {
-            root.platform
+            let mode = root
+                .platform
                 .get()
                 .window_state
-                .is_none_or(|state| state.mode == nsh_core::desktop::WindowMode::Normal)
+                .map_or(nsh_core::desktop::WindowMode::Normal, |state| state.mode);
+            root.main_window.borrow().can_resize(mode)
         },
         |modal| modal.desktop_resizable(),
     );
@@ -1327,9 +1408,14 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
         None
     };
     let resize_edge = explicit_edge.or_else(|| {
-        modal
-            .as_ref()
-            .and_then(|modal| modal.desktop_resize_edge((x, y)))
+        if let Some(modal) = modal.as_ref() {
+            modal.desktop_resize_edge((x, y))
+        } else if resizable && root.main_window.borrow().frame_none {
+            let frame = root.frame.get();
+            crate::services::desktop::resize_edge(x, y, frame.width, frame.height, 6.0)
+        } else {
+            None
+        }
     });
     if let Some(edge) = resize_edge
         && (explicit_edge.is_some() || !hit_is_window_control(root, x, y)?)
@@ -1375,27 +1461,83 @@ fn handle_window_resize_press(
     y: f32,
     window_point: (f32, f32),
 ) -> Result<bool> {
-    let modal = owner.modal.borrow().clone();
-    let Some(modal) = modal.filter(|modal| modal.is_desktop_window() && modal.desktop_resizable())
-    else {
+    let modal = owner
+        .modal
+        .borrow()
+        .clone()
+        .filter(|modal| modal.is_desktop_window());
+    if let Some(modal) = modal {
+        if !modal.desktop_resizable() {
+            return Ok(false);
+        }
+        let explicit = hit_window_resize_edge(owner, x, y)?;
+        let Some(edge) = explicit.or_else(|| modal.desktop_resize_edge((x, y))) else {
+            return Ok(false);
+        };
+        if explicit.is_none() && hit_is_window_control(owner, x, y)? {
+            return Ok(false);
+        }
+        owner
+            .touches
+            .borrow_mut()
+            .start_window_resize(&modal, edge, window_point);
+        owner.cursor.set_resize(
+            owner,
+            Some(crate::services::desktop::resize_edge_cursor(edge)),
+        )?;
+        return Ok(true);
+    }
+    if owner.id != nsh_core::ROOT_ID {
+        return Ok(false);
+    }
+    let Some(state) = owner.platform.get().window_state else {
         return Ok(false);
     };
+    let (can_resize, frame_none) = {
+        let main = owner.main_window.borrow();
+        (main.can_resize(state.mode), main.frame_none)
+    };
+    if !can_resize {
+        return Ok(false);
+    }
     let explicit = hit_window_resize_edge(owner, x, y)?;
-    let Some(edge) = explicit.or_else(|| modal.desktop_resize_edge((x, y))) else {
+    let frame = owner.frame.get();
+    let Some(edge) = explicit.or_else(|| {
+        frame_none
+            .then(|| crate::services::desktop::resize_edge(x, y, frame.width, frame.height, 6.0))
+            .flatten()
+    }) else {
         return Ok(false);
     };
     if explicit.is_none() && hit_is_window_control(owner, x, y)? {
         return Ok(false);
     }
-    owner
-        .touches
-        .borrow_mut()
-        .start_window_resize(&modal, edge, window_point);
+    let start_origin = (state.bounds.origin.x.0, state.bounds.origin.y.0);
+    let start_size = (state.bounds.size.width.0, state.bounds.size.height.0);
+    if start_size.0 <= 0.0 || start_size.1 <= 0.0 {
+        return Ok(false);
+    }
+    owner.touches.borrow_mut().start_main_window_resize(
+        edge,
+        window_point,
+        start_origin,
+        start_size,
+    );
     owner.cursor.set_resize(
         owner,
         Some(crate::services::desktop::resize_edge_cursor(edge)),
     )?;
     Ok(true)
+}
+
+fn axis_modifiers(owner: &Node, input: &ArkUIInputEvent) -> nsh_core::keymap::Modifiers {
+    let mut modifiers = owner.host.modifiers();
+    if let Ok(states) = input.modifier_key_states() {
+        modifiers.ctrl |= states.contains(ModifierKey::Ctrl);
+        modifiers.shift |= states.contains(ModifierKey::Shift);
+        modifiers.alt |= states.contains(ModifierKey::Alt);
+    }
+    modifiers
 }
 
 fn takes_axis(owner: &Rc<Node>, x: f32, y: f32, event: EventKind) -> bool {
@@ -1432,28 +1574,55 @@ fn takes_axis(owner: &Rc<Node>, x: f32, y: f32, event: EventKind) -> bool {
     .is_some_and(|(target, takes)| target.id == owner.id && takes)
 }
 
-fn handle_window_drag_press(owner: &Rc<Node>, x: f32, y: f32) -> Result<()> {
+fn handle_window_drag_press(
+    owner: &Rc<Node>,
+    x: f32,
+    y: f32,
+    window_point: (f32, f32),
+    clicks: u32,
+) -> Result<()> {
     if !is_window_drag_target(owner, x, y)? {
         return Ok(());
     }
-    let double_click = owner.touches.borrow().clicks() == 2;
+    let double_click = clicks == 2;
     if let Some(modal) = owner.modal.borrow().as_ref()
         && modal.is_desktop_window()
     {
         if double_click {
+            owner.touches.borrow_mut().clear_pending_window_drag();
             modal.desktop_toggle_maximize()?;
-        } else {
-            modal.desktop_start_moving()?;
+        } else if modal.desktop_movable() {
+            owner
+                .touches
+                .borrow_mut()
+                .start_pending_window_drag(window_point, Some(modal), false);
         }
         return Ok(());
     }
     if owner.id == nsh_core::ROOT_ID {
-        let cmd = if double_click {
-            crate::services::desktop::WireCommand::ToggleMaximize { window_id: None }
-        } else {
-            crate::services::desktop::WireCommand::StartMoving { window_id: None }
+        let (movable, maximizable) = {
+            let main = owner.main_window.borrow();
+            (main.movable, main.maximizable)
         };
-        owner.host.desktop_command(&cmd)?;
+        if double_click {
+            owner.touches.borrow_mut().clear_pending_window_drag();
+            if maximizable {
+                owner.host.desktop_command(
+                    &crate::services::desktop::WireCommand::ToggleMaximize { window_id: None },
+                )?;
+            }
+        } else if movable
+            && owner
+                .platform
+                .get()
+                .window_state
+                .is_none_or(|state| state.mode == nsh_core::desktop::WindowMode::Normal)
+        {
+            owner
+                .touches
+                .borrow_mut()
+                .start_pending_window_drag(window_point, None, true);
+        }
     }
     Ok(())
 }

@@ -50,13 +50,22 @@ struct SelectionDrag {
     frame_time: f64,
     blocked: Vec<Weak<crate::scroll::controller::Scroller>>,
 }
+enum WindowResizeTarget {
+    SubWindow(Weak<crate::navigation::modal::Modal>),
+    MainWindow,
+}
 struct WindowResize {
-    modal: Weak<crate::navigation::modal::Modal>,
+    target: WindowResizeTarget,
     edge: nsh_core::desktop::ResizeEdge,
     start_display: (f32, f32),
     start_origin: (f32, f32),
     start_size: (f32, f32),
     last: (f32, f32),
+}
+struct PendingWindowDrag {
+    start_window: (f32, f32),
+    modal: Option<Weak<crate::navigation::modal::Modal>>,
+    is_main: bool,
 }
 impl SelectionDrag {
     fn unblock(&self) -> Result<()> {
@@ -81,9 +90,11 @@ pub(crate) struct Touches {
     primary: Option<u32>,
     selection: Option<SelectionDrag>,
     window_resize: Option<WindowResize>,
+    pending_window_drag: Option<PendingWindowDrag>,
     mouse_up_targets: Vec<Weak<Node>>,
     last_pointer: Option<(f32, f32)>,
     last_tap: Option<LastTap>,
+    last_mouse_press: Option<LastTap>,
 }
 impl Touches {
     pub(crate) fn record_pointer(&mut self, point: (f32, f32)) {
@@ -93,6 +104,33 @@ impl Touches {
     }
     pub(crate) fn last_pointer(&self) -> Option<(f32, f32)> {
         self.last_pointer
+    }
+    pub(crate) fn record_mouse_press(&mut self, event_time_ns: i64, window: (f32, f32)) -> u32 {
+        if let Some(last) = &self.last_mouse_press
+            && last.event_time_ns == event_time_ns
+            && event_time_ns != 0
+        {
+            return last.clicks;
+        }
+        let time_ms = event_time_ns as f64 / 1_000_000.0;
+        let max_dist = 12.0;
+        let clicks = match &self.last_mouse_press {
+            Some(last)
+                if time_ms >= last.time_ms
+                    && time_ms - last.time_ms <= 400.0
+                    && (window.0 - last.window.0).hypot(window.1 - last.window.1) <= max_dist =>
+            {
+                (last.clicks % 3) + 1
+            }
+            _ => 1,
+        };
+        self.last_mouse_press = Some(LastTap {
+            time_ms,
+            window,
+            clicks,
+            event_time_ns,
+        });
+        clicks
     }
     pub(crate) fn record_down(&mut self, scale: f32, input: &ArkUIInputEvent) {
         if input.action != UIInputAction::Down || input.pointer_count() != 1 {
@@ -136,7 +174,9 @@ impl Touches {
     pub(crate) fn cancel(&mut self, root: &Node) -> Result<()> {
         self.primary = None;
         self.last_tap = None;
+        self.last_mouse_press = None;
         self.window_resize = None;
+        self.pending_window_drag = None;
         self.mouse_up_targets.clear();
         if let Some(drag) = self.selection.take() {
             drag.unblock()?;
@@ -415,8 +455,26 @@ impl Touches {
         let Some((start_origin, start_size)) = modal.desktop_resize_anchor() else {
             return;
         };
+        self.pending_window_drag = None;
         self.window_resize = Some(WindowResize {
-            modal: Rc::downgrade(modal),
+            target: WindowResizeTarget::SubWindow(Rc::downgrade(modal)),
+            edge,
+            start_display: display_point,
+            start_origin,
+            start_size,
+            last: display_point,
+        });
+    }
+    pub(crate) fn start_main_window_resize(
+        &mut self,
+        edge: nsh_core::desktop::ResizeEdge,
+        display_point: (f32, f32),
+        start_origin: (f32, f32),
+        start_size: (f32, f32),
+    ) {
+        self.pending_window_drag = None;
+        self.window_resize = Some(WindowResize {
+            target: WindowResizeTarget::MainWindow,
             edge,
             start_display: display_point,
             start_origin,
@@ -427,32 +485,117 @@ impl Touches {
     pub(crate) fn window_resizing(&self) -> bool {
         self.window_resize.is_some()
     }
-    pub(crate) fn move_window_resize(&mut self, display_point: (f32, f32)) -> Result<bool> {
+    pub(crate) fn move_window_resize(
+        &mut self,
+        owner: &Rc<Node>,
+        display_point: (f32, f32),
+    ) -> Result<bool> {
         let Some(mut resize) = self.window_resize.take() else {
-            return Ok(false);
-        };
-        let Some(modal) = resize.modal.upgrade() else {
             return Ok(false);
         };
         let step_dx = display_point.0 - resize.last.0;
         let step_dy = display_point.1 - resize.last.1;
         resize.last = display_point;
-        if step_dx.abs() > 0.01 || step_dy.abs() > 0.01 {
-            let total_dx = display_point.0 - resize.start_display.0;
-            let total_dy = display_point.1 - resize.start_display.1;
-            modal.desktop_resize_from(
-                resize.edge,
-                resize.start_origin,
-                resize.start_size,
-                total_dx,
-                total_dy,
-            )?;
+        match &resize.target {
+            WindowResizeTarget::SubWindow(weak) => {
+                let Some(modal) = weak.upgrade() else {
+                    return Ok(false);
+                };
+                if step_dx.abs() > 0.01 || step_dy.abs() > 0.01 {
+                    let total_dx = display_point.0 - resize.start_display.0;
+                    let total_dy = display_point.1 - resize.start_display.1;
+                    modal.desktop_resize_from(
+                        resize.edge,
+                        resize.start_origin,
+                        resize.start_size,
+                        total_dx,
+                        total_dy,
+                    )?;
+                }
+            }
+            WindowResizeTarget::MainWindow => {
+                if step_dx.abs() > 0.01 || step_dy.abs() > 0.01 {
+                    let total_dx = display_point.0 - resize.start_display.0;
+                    let total_dy = display_point.1 - resize.start_display.1;
+                    let main = owner.main_window.borrow();
+                    let min_w = main.min_size.map_or(120.0, |s| s.width.0.max(120.0));
+                    let min_h = main.min_size.map_or(80.0, |s| s.height.0.max(80.0));
+                    let max_w = main.max_size.map_or(16384.0, |s| s.width.0.max(min_w));
+                    let max_h = main.max_size.map_or(16384.0, |s| s.height.0.max(min_h));
+                    drop(main);
+                    let (next_origin, next_size) = crate::services::desktop::apply_resize_delta(
+                        resize.edge,
+                        resize.start_origin,
+                        resize.start_size,
+                        total_dx,
+                        total_dy,
+                        (min_w, min_h),
+                        (max_w, max_h),
+                    );
+                    let frame = nsh_core::desktop::WindowFrame {
+                        x: Some(nsh_core::Points(next_origin.0)),
+                        y: Some(nsh_core::Points(next_origin.1)),
+                        width: Some(nsh_core::Points(next_size.0)),
+                        height: Some(nsh_core::Points(next_size.1)),
+                        ..Default::default()
+                    };
+                    owner
+                        .host
+                        .desktop_command(&crate::services::desktop::wire_request_for(
+                            None,
+                            &nsh_core::desktop::WindowRequest::SetBounds(frame),
+                        ))?;
+                }
+            }
         }
         self.window_resize = Some(resize);
         Ok(true)
     }
     pub(crate) fn end_window_resize(&mut self) {
         self.window_resize = None;
+    }
+    pub(crate) fn start_pending_window_drag(
+        &mut self,
+        start_window: (f32, f32),
+        modal: Option<&Rc<crate::navigation::modal::Modal>>,
+        is_main: bool,
+    ) {
+        self.pending_window_drag = Some(PendingWindowDrag {
+            start_window,
+            modal: modal.map(Rc::downgrade),
+            is_main,
+        });
+    }
+    pub(crate) fn move_pending_window_drag(
+        &mut self,
+        owner: &Rc<Node>,
+        window_point: (f32, f32),
+    ) -> Result<bool> {
+        let Some(pending) = self.pending_window_drag.as_ref() else {
+            return Ok(false);
+        };
+        if (window_point.0 - pending.start_window.0).hypot(window_point.1 - pending.start_window.1)
+            < 3.0
+        {
+            return Ok(false);
+        }
+        let pending = self.pending_window_drag.take().unwrap();
+        if let Some(modal) = pending.modal.and_then(|m| m.upgrade()) {
+            modal.desktop_start_moving()?;
+            return Ok(true);
+        }
+        if pending.is_main {
+            owner
+                .host
+                .desktop_command(&crate::services::desktop::WireCommand::StartMoving {
+                    window_id: None,
+                })?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    pub(crate) fn clear_pending_window_drag(&mut self) {
+        self.pending_window_drag = None;
     }
     pub(crate) fn capture_mouse_up(&mut self, targets: Vec<Weak<Node>>) {
         self.mouse_up_targets = targets;

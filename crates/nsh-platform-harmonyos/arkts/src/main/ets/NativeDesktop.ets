@@ -2,7 +2,7 @@ import { common } from "@kit.AbilityKit";
 import { util } from "@kit.ArkTS";
 import { LengthMetrics, window } from "@kit.ArkUI";
 import { deviceInfo, emitter } from "@kit.BasicServicesKit";
-import { statusBarManager } from "@kit.DeskTopExtensionKit";
+import type statusBarManager from "@hms.pcService.statusBarManager";
 import { image } from "@kit.ImageKit";
 import { inputConsumer } from "@kit.InputKit";
 import { ComponentContent, NodeContent } from "@ohos.arkui.node";
@@ -74,6 +74,10 @@ interface WireCommand {
   y?: number;
   width?: number;
   height?: number;
+  contentSized?: boolean;
+  clampToDisplay?: boolean;
+  titleBarHidden?: boolean;
+  visible?: boolean;
   display?: string;
   critical?: boolean;
   generation?: number;
@@ -340,6 +344,14 @@ function resolveSubWindowZLevel(kind?: string, level?: string): number {
   return 0;
 }
 
+function clampDecorHeight(height: number): number {
+  return Math.max(37, Math.min(112, Math.round(height)));
+}
+
+function defaultOpaqueWindowColor(colorMode: ThemeColorMode): string {
+  return colorMode === ThemeColorMode.DARK ? "#FF0A0A0A" : "#FFFFFFFF";
+}
+
 function resolveScaleFactor(displayId: number | undefined, fallbackUi: UIContext): number {
   try {
     const screen =
@@ -456,6 +468,7 @@ class SubWindowHost {
   private pendingBounds?: WireCommand;
   private flushingBounds: boolean = false;
   private pendingFocusId?: string;
+  private defaultLimits?: window.WindowLimits;
 
   private readonly onRectChange = (data: window.RectChangeOptions): void => {
     if (this.destroyed) {
@@ -731,7 +744,7 @@ class SubWindowHost {
       });
   }
 
-  private computeInitialRect(cmd: WireCommand): window.Rect {
+  private async computeInitialRect(cmd: WireCommand): Promise<window.Rect> {
     const parentWin =
       (cmd.parentWindowId !== undefined ? this.owner.getSubWindowRef(cmd.parentWindowId) : undefined) ??
       this.owner.mainWindowRef();
@@ -739,66 +752,62 @@ class SubWindowHost {
     try {
       parentProps = parentWin.getWindowProperties();
     } catch {}
-    const displayId = parentProps?.displayId;
-    const scale = resolveScaleFactor(displayId, this.owner.mainUiContext());
-    let screenWidth = Math.round(1600 * scale);
-    let screenHeight = Math.round(1000 * scale);
-    try {
-      const screen =
-        displayId !== undefined
-          ? display.getDisplayByIdSync(displayId)
-          : display.getDefaultDisplaySync();
-      if (screen.width > 0 && screen.height > 0) {
-        screenWidth = screen.width;
-        screenHeight = screen.height;
-      }
-    } catch {}
+    const screen = await resolveTargetDisplay(cmd.display, parentProps?.displayId);
+    const scale = resolveScaleFactor(screen.id, this.owner.mainUiContext());
+    const area = await displayAvailableRectPx(screen);
+    const screenLeft = area.left;
+    const screenTop = area.top;
+    const screenWidth = area.width > 0 ? area.width : Math.round(1600 * scale);
+    const screenHeight = area.height > 0 ? area.height : Math.round(1000 * scale);
     const widthPx = Math.max(120, Math.round((cmd.width ?? 640) * scale));
     const heightPx = Math.max(80, Math.round((cmd.height ?? 520) * scale));
     const parentRect = parentProps?.windowRect ?? {
-      left: Math.round((screenWidth - widthPx) / 2),
-      top: Math.round((screenHeight - heightPx) / 2),
+      left: screenLeft + Math.round((screenWidth - widthPx) / 2),
+      top: screenTop + Math.round((screenHeight - heightPx) / 2),
       width: Math.min(screenWidth, Math.round(1100 * scale)),
       height: Math.min(screenHeight, Math.round(760 * scale)),
     };
 
-    let leftPx = Math.round((screenWidth - widthPx) / 2);
-    let topPx = Math.round((screenHeight - heightPx) / 2);
+    let leftPx = screenLeft + Math.round((screenWidth - widthPx) / 2);
+    let topPx = screenTop + Math.round((screenHeight - heightPx) / 2);
     const pos = cmd.position ?? "auto";
     if (pos === "at" && cmd.x !== undefined && cmd.y !== undefined) {
       leftPx = Math.round(cmd.x * scale);
       topPx = Math.round(cmd.y * scale);
       this.userPositioned = true;
-    } else if (pos === "parentCenter") {
+    } else if (pos === "parentCenter" && !cmd.display) {
       leftPx = Math.round(parentRect.left + (parentRect.width - widthPx) / 2);
       topPx = Math.round(parentRect.top + (parentRect.height - heightPx) / 2);
-    } else if (pos === "center") {
-      leftPx = Math.round((screenWidth - widthPx) / 2);
-      topPx = Math.round((screenHeight - heightPx) / 2);
+    } else if (pos === "center" || pos === "parentCenter") {
+      leftPx = screenLeft + Math.round((screenWidth - widthPx) / 2);
+      topPx = screenTop + Math.round((screenHeight - heightPx) / 2);
     } else if (cmd.kind === "panel") {
       const gap = Math.round(16 * scale);
-      if (parentRect.left + parentRect.width + gap + widthPx <= screenWidth) {
+      if (parentRect.left + parentRect.width + gap + widthPx <= screenLeft + screenWidth) {
         leftPx = parentRect.left + parentRect.width + gap;
-      } else if (parentRect.left - gap - widthPx >= 0) {
+      } else if (parentRect.left - gap - widthPx >= screenLeft) {
         leftPx = parentRect.left - gap - widthPx;
       } else {
-        leftPx = Math.max(0, screenWidth - widthPx - Math.round(24 * scale));
+        leftPx = Math.max(screenLeft, screenLeft + screenWidth - widthPx - Math.round(24 * scale));
       }
-      topPx = Math.max(0, Math.min(screenHeight - heightPx, parentRect.top));
+      topPx = Math.max(
+        screenTop,
+        Math.min(screenTop + Math.max(0, screenHeight - heightPx), parentRect.top),
+      );
     } else if (cmd.kind === "popup" || cmd.kind === "overlay") {
       leftPx = Math.round(parentRect.left + (parentRect.width - widthPx) / 2);
       topPx = Math.round(parentRect.top + Math.min(parentRect.height * 0.16, 120 * scale));
-    } else {
+    } else if (!cmd.display) {
       const step = Math.round(32 * scale);
       const offset = ((this.owner.nextCascade() % 6) + 1) * step;
       leftPx = parentRect.left + offset;
       topPx = parentRect.top + offset;
     }
 
-    const maxLeft = Math.max(0, screenWidth - widthPx);
-    const maxTop = Math.max(0, screenHeight - heightPx);
-    leftPx = Math.max(0, Math.min(maxLeft, leftPx));
-    topPx = Math.max(0, Math.min(maxTop, topPx));
+    const maxLeft = screenLeft + Math.max(0, screenWidth - widthPx);
+    const maxTop = screenTop + Math.max(0, screenHeight - heightPx);
+    leftPx = Math.max(screenLeft, Math.min(maxLeft, leftPx));
+    topPx = Math.max(screenTop, Math.min(maxTop, topPx));
     return { left: leftPx, top: topPx, width: widthPx, height: heightPx };
   }
 
@@ -818,7 +827,10 @@ class SubWindowHost {
     this.minimizable = cmd.minimizable !== false;
     this.closable = cmd.closable !== false;
 
-    const initialRect = this.computeInitialRect(cmd);
+    const initialRect = await this.computeInitialRect(cmd);
+    if (this.destroyed) {
+      return;
+    }
     const decorEnabled = !this.frameNone;
     const options: window.SubWindowOptions = {
       title: cmd.title ?? "",
@@ -836,7 +848,8 @@ class SubWindowHost {
         cmd.kind === "normal" &&
         (cmd.level === undefined || cmd.level === "normal")
       ) {
-        options.zLevelAboveParentLoosened = true;
+        const rawOptions: ESObject = options;
+        rawOptions["zLevelAboveParentLoosened"] = true;
       }
     }
     if (deviceInfo.sdkApiVersion >= 18) {
@@ -862,9 +875,19 @@ class SubWindowHost {
       return;
     }
     this.win = sub;
+    try {
+      this.defaultLimits = sub.getWindowLimits();
+    } catch {}
     this.subscribe(sub);
 
-    if (deviceInfo.sdkApiVersion < 18) {
+    if (cmd.display && deviceInfo.sdkApiVersion >= 15) {
+      try {
+        const targetScreen = await resolveTargetDisplay(cmd.display);
+        await sub.moveWindowToGlobal(initialRect.left, initialRect.top, {
+          displayId: targetScreen.id,
+        });
+      } catch {}
+    } else if (deviceInfo.sdkApiVersion < 18) {
       try {
         await sub.moveWindowTo(initialRect.left, initialRect.top);
       } catch {}
@@ -903,9 +926,9 @@ class SubWindowHost {
         sub.setWindowBackgroundColor("#00000000");
       } catch {}
     }
-    if (this.transparent && cmd.shadow === undefined) {
+    if (this.transparent && cmd.shadow === undefined && deviceInfo.sdkApiVersion >= 17) {
       try {
-        await sub.setWindowShadowEnabled(false);
+        sub.setWindowShadowRadius(0);
       } catch {}
     }
     await this.applyAttributesInternal(cmd);
@@ -1025,6 +1048,10 @@ class SubWindowHost {
         try {
           sub.setWindowBackgroundColor("#00000000");
         } catch {}
+      } else if (this.backdrop === "none" && !this.frameNone) {
+        try {
+          sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
+        } catch {}
       }
     }
     if (cmd.backdrop !== undefined) {
@@ -1033,6 +1060,10 @@ class SubWindowHost {
       if (this.backdrop !== "none") {
         try {
           sub.setWindowBackgroundColor("#00000000");
+        } catch {}
+      } else if (!this.transparent && !this.frameNone) {
+        try {
+          sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
         } catch {}
       }
     }
@@ -1051,36 +1082,56 @@ class SubWindowHost {
         sub.setWindowTitleButtonVisible(false, false, false);
       } catch {}
       this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-    } else if (cmd.titleBarStyle !== undefined && !this.frameNone) {
-      const hidden = cmd.titleBarStyle === "hidden";
-      this.titleBarHidden = hidden;
-      if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
-        this.requestedTitleBarHeight = cmd.titleBarHeight;
+    } else {
+      const restoredFrame = cmd.frame === "default" && this.frameNone;
+      if (restoredFrame) {
+        this.frameNone = false;
+        if (cmd.titleBarStyle === undefined) {
+          this.titleBarHidden = false;
+        }
+        if (!this.transparent && this.backdrop === "none") {
+          try {
+            sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
+          } catch {}
+        }
       }
-      try {
-        sub.setWindowDecorVisible(!hidden);
-      } catch {}
-      if (hidden) {
+      if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
+        const hidden =
+          cmd.titleBarStyle !== undefined ? cmd.titleBarStyle === "hidden" : this.titleBarHidden;
+        this.titleBarHidden = hidden;
+        if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
+          this.requestedTitleBarHeight = cmd.titleBarHeight;
+        }
         try {
-          if (this.requestedTitleBarHeight > 0) {
-            sub.setWindowDecorHeight(this.requestedTitleBarHeight);
-          }
+          sub.setWindowDecorVisible(!hidden);
+        } catch {}
+        if (restoredFrame) {
+          try {
+            sub.setWindowTitleButtonVisible(this.maximizable, this.minimizable, this.closable);
+          } catch {}
+        }
+        if (hidden) {
+          try {
+            if (this.requestedTitleBarHeight > 0) {
+              sub.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
+            }
+          } catch {}
+          this.syncTitleBar();
+        } else {
+          this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
+        }
+      } else if (
+        cmd.titleBarHeight !== undefined &&
+        cmd.titleBarHeight > 0 &&
+        this.titleBarHidden &&
+        !this.frameNone
+      ) {
+        this.requestedTitleBarHeight = cmd.titleBarHeight;
+        try {
+          sub.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
         } catch {}
         this.syncTitleBar();
-      } else {
-        this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
       }
-    } else if (
-      cmd.titleBarHeight !== undefined &&
-      cmd.titleBarHeight > 0 &&
-      this.titleBarHidden &&
-      !this.frameNone
-    ) {
-      this.requestedTitleBarHeight = cmd.titleBarHeight;
-      try {
-        sub.setWindowDecorHeight(cmd.titleBarHeight);
-      } catch {}
-      this.syncTitleBar();
     }
 
     if (
@@ -1110,13 +1161,23 @@ class SubWindowHost {
         this.ui ?? this.owner.mainUiContext(),
       );
       const limits: window.WindowLimits = {};
-      if (cmd.minSize !== undefined && cmd.minSize !== null) {
-        limits.minWidth = Math.max(1, Math.round(cmd.minSize.width * scale));
-        limits.minHeight = Math.max(1, Math.round(cmd.minSize.height * scale));
+      if (cmd.minSize !== undefined) {
+        if (cmd.minSize !== null) {
+          limits.minWidth = Math.max(1, Math.round(cmd.minSize.width * scale));
+          limits.minHeight = Math.max(1, Math.round(cmd.minSize.height * scale));
+        } else {
+          limits.minWidth = this.defaultLimits?.minWidth ?? 1;
+          limits.minHeight = this.defaultLimits?.minHeight ?? 1;
+        }
       }
-      if (cmd.maxSize !== undefined && cmd.maxSize !== null) {
-        limits.maxWidth = Math.max(1, Math.round(cmd.maxSize.width * scale));
-        limits.maxHeight = Math.max(1, Math.round(cmd.maxSize.height * scale));
+      if (cmd.maxSize !== undefined) {
+        if (cmd.maxSize !== null) {
+          limits.maxWidth = Math.max(1, Math.round(cmd.maxSize.width * scale));
+          limits.maxHeight = Math.max(1, Math.round(cmd.maxSize.height * scale));
+        } else {
+          limits.maxWidth = this.defaultLimits?.maxWidth ?? 4096;
+          limits.maxHeight = this.defaultLimits?.maxHeight ?? 4096;
+        }
       }
       try {
         await sub.setWindowLimits(limits);
@@ -1129,10 +1190,6 @@ class SubWindowHost {
           await sub.setSubWindowZLevel(resolveSubWindowZLevel(cmd.kind, cmd.level));
         } catch {}
       }
-      const topmost = cmd.level === "floating" || cmd.level === "aboveDock";
-      try {
-        await sub.setWindowTopmost(topmost);
-      } catch {}
     }
 
     if (cmd.focusable !== undefined) {
@@ -1159,9 +1216,9 @@ class SubWindowHost {
       } catch {}
     }
 
-    if (cmd.shadow !== undefined) {
+    if (cmd.shadow !== undefined && deviceInfo.sdkApiVersion >= 17) {
       try {
-        await sub.setWindowShadowEnabled(cmd.shadow);
+        sub.setWindowShadowRadius(cmd.shadow ? 24 : 0);
       } catch {}
     }
   }
@@ -1486,6 +1543,9 @@ export class NativeDesktop {
   private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private currentCursorStyle?: pointer.PointerStyle;
   private nextCascadeIndex: number = 0;
+  private frameNone: boolean = false;
+  private transparent: boolean = false;
+  private backdrop: string = "none";
   private titleBarHidden: boolean = false;
   private requestedTitleBarHeight: number = 44;
   private closeOnPress: boolean = true;
@@ -1497,6 +1557,10 @@ export class NativeDesktop {
   private mode: string = "normal";
   private minimized: boolean = false;
   private normalBounds?: WireBoundsPayload;
+  private defaultLimits?: window.WindowLimits;
+  private mainQueue: Promise<void> = Promise.resolve();
+  private pendingMainBounds?: WireCommand;
+  private flushingMainBounds: boolean = false;
   private lastWindowStateJson: string = "";
   private lastTitleBarJson: string = "";
   private popupContent?: ComponentContent<PopupMenuParams>;
@@ -1510,6 +1574,8 @@ export class NativeDesktop {
   private trayLastHoverTips: string = "";
   private trayMenuTargets: Map<string, TrayMenuTarget> = new Map();
   private trayQueue: Promise<void> = Promise.resolve();
+  private trayRemoveSyncFn?: () => void;
+  private trayUnsubscribeFn?: () => void;
   private hotkeys: Map<number, RegisteredHotkey> = new Map();
 
   private readonly onTrayIconClick = (_event: emitter.EventData): void => {
@@ -1613,6 +1679,9 @@ export class NativeDesktop {
     } catch {}
     try {
       this.applyWindowStatus(mainWindow.getWindowStatus());
+    } catch {}
+    try {
+      this.defaultLimits = mainWindow.getWindowLimits();
     } catch {}
     this.subscribe();
     this.syncDisplays();
@@ -1778,6 +1847,11 @@ export class NativeDesktop {
           this.toggleMaximize();
         }
         break;
+      case "applyMainWindowLaunch":
+        this.enqueueMain(async (): Promise<void> => {
+          await this.applyMainWindowLaunchAsync(cmd);
+        });
+        break;
       case "quit":
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
@@ -1918,18 +1992,35 @@ export class NativeDesktop {
         this.mainWindow.setWindowTitle(cmd.title).catch((): void => {});
       } catch {}
     }
-    if (
-      cmd.transparent === true ||
-      (cmd.backdrop !== undefined && cmd.backdrop !== "none")
-    ) {
-      try {
-        this.mainWindow.setWindowBackgroundColor("#00000000");
-      } catch {}
+    if (cmd.transparent !== undefined) {
+      this.transparent = cmd.transparent;
+      if (this.transparent) {
+        try {
+          this.mainWindow.setWindowBackgroundColor("#00000000");
+        } catch {}
+      } else if (this.backdrop === "none" && !this.frameNone) {
+        try {
+          this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
+        } catch {}
+      }
+    }
+    if (cmd.backdrop !== undefined) {
+      this.backdrop = cmd.backdrop;
+      if (this.backdrop !== "none") {
+        try {
+          this.mainWindow.setWindowBackgroundColor("#00000000");
+        } catch {}
+      } else if (!this.transparent && !this.frameNone) {
+        try {
+          this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
+        } catch {}
+      }
     }
     if (cmd.closeOnPress !== undefined) {
       this.closeOnPress = cmd.closeOnPress;
     }
     if (cmd.frame === "none") {
+      this.frameNone = true;
       this.titleBarHidden = true;
       try {
         this.mainWindow.setWindowDecorVisible(false);
@@ -1938,31 +2029,60 @@ export class NativeDesktop {
         this.mainWindow.setWindowTitleButtonVisible(false, false, false);
       } catch {}
       this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-    } else if (cmd.titleBarStyle !== undefined) {
-      const hidden = cmd.titleBarStyle === "hidden";
-      this.titleBarHidden = hidden;
-      if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
-        this.requestedTitleBarHeight = cmd.titleBarHeight;
+    } else {
+      const restoredFrame = cmd.frame === "default" && this.frameNone;
+      if (restoredFrame) {
+        this.frameNone = false;
+        if (cmd.titleBarStyle === undefined) {
+          this.titleBarHidden = false;
+        }
+        if (!this.transparent && this.backdrop === "none") {
+          try {
+            this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
+          } catch {}
+        }
       }
-      try {
-        this.mainWindow.setWindowDecorVisible(!hidden);
-      } catch {}
-      if (hidden) {
+      if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
+        const hidden =
+          cmd.titleBarStyle !== undefined ? cmd.titleBarStyle === "hidden" : this.titleBarHidden;
+        this.titleBarHidden = hidden;
+        if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
+          this.requestedTitleBarHeight = cmd.titleBarHeight;
+        }
         try {
-          if (this.requestedTitleBarHeight > 0) {
-            this.mainWindow.setWindowDecorHeight(this.requestedTitleBarHeight);
-          }
+          this.mainWindow.setWindowDecorVisible(!hidden);
+        } catch {}
+        if (restoredFrame) {
+          try {
+            this.mainWindow.setWindowTitleButtonVisible(
+              this.maximizable,
+              this.minimizable,
+              this.closable,
+            );
+          } catch {}
+        }
+        if (hidden) {
+          try {
+            if (this.requestedTitleBarHeight > 0) {
+              this.mainWindow.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
+            }
+          } catch {}
+          this.syncTitleBar();
+        } else {
+          this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
+        }
+      } else if (
+        cmd.titleBarHeight !== undefined &&
+        cmd.titleBarHeight > 0 &&
+        this.titleBarHidden &&
+        !this.frameNone
+      ) {
+        this.requestedTitleBarHeight = cmd.titleBarHeight;
+        try {
+          this.mainWindow.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
         } catch {}
         this.syncTitleBar();
-      } else {
-        this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
       }
-    } else if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0 && this.titleBarHidden) {
-      this.requestedTitleBarHeight = cmd.titleBarHeight;
-      try {
-        this.mainWindow.setWindowDecorHeight(cmd.titleBarHeight);
-      } catch {}
-      this.syncTitleBar();
     }
 
     if (
@@ -1979,7 +2099,7 @@ export class NativeDesktop {
       if (cmd.closable !== undefined) {
         this.closable = cmd.closable;
       }
-      if (cmd.frame !== "none") {
+      if (!this.frameNone) {
         try {
           this.mainWindow.setWindowTitleButtonVisible(
             this.maximizable,
@@ -1992,13 +2112,23 @@ export class NativeDesktop {
 
     if (cmd.minSize !== undefined || cmd.maxSize !== undefined) {
       const limits: window.WindowLimits = {};
-      if (cmd.minSize !== undefined && cmd.minSize !== null) {
-        limits.minWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.width)));
-        limits.minHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.height)));
+      if (cmd.minSize !== undefined) {
+        if (cmd.minSize !== null) {
+          limits.minWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.width)));
+          limits.minHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.height)));
+        } else {
+          limits.minWidth = this.defaultLimits?.minWidth ?? 1;
+          limits.minHeight = this.defaultLimits?.minHeight ?? 1;
+        }
       }
-      if (cmd.maxSize !== undefined && cmd.maxSize !== null) {
-        limits.maxWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.width)));
-        limits.maxHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.height)));
+      if (cmd.maxSize !== undefined) {
+        if (cmd.maxSize !== null) {
+          limits.maxWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.width)));
+          limits.maxHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.height)));
+        } else {
+          limits.maxWidth = this.defaultLimits?.maxWidth ?? 4096;
+          limits.maxHeight = this.defaultLimits?.maxHeight ?? 4096;
+        }
       }
       try {
         this.mainWindow.setWindowLimits(limits).catch((): void => {});
@@ -2043,95 +2173,138 @@ export class NativeDesktop {
     }
   }
 
+  private enqueueMain(task: () => Promise<void>): void {
+    this.mainQueue = this.mainQueue
+      .then(async (): Promise<void> => {
+        if (this.closed) {
+          return;
+        }
+        await task();
+      })
+      .catch((error: Object): void => {
+        console.warn(`[NSH] main window command failed: ${String(error)}`);
+      });
+  }
+
   private applyRequest(cmd: WireCommand): void {
+    if (cmd.action === "setBounds") {
+      this.pendingMainBounds = cmd;
+      if (this.flushingMainBounds) {
+        return;
+      }
+      this.flushingMainBounds = true;
+      this.enqueueMain(async (): Promise<void> => {
+        try {
+          while (!this.closed && this.pendingMainBounds !== undefined) {
+            const next = this.pendingMainBounds;
+            this.pendingMainBounds = undefined;
+            await this.applyBoundsAsync(next.x, next.y, next.width, next.height);
+          }
+        } finally {
+          this.flushingMainBounds = false;
+        }
+      });
+      return;
+    }
     switch (cmd.action) {
       case "show":
       case "focus":
-        try {
-          this.mainWindow.showWindow().catch((): void => {});
-        } catch {}
+        this.enqueueMain(async (): Promise<void> => {
+          try {
+            await this.mainWindow.showWindow();
+          } catch {}
+          this.syncWindowState();
+        });
         break;
       case "hide":
       case "minimize":
-        try {
-          this.mainWindow.minimize().catch((): void => {});
-        } catch {}
+        this.enqueueMain(async (): Promise<void> => {
+          try {
+            await this.mainWindow.minimize();
+          } catch {}
+          this.syncWindowState();
+        });
         break;
       case "restore":
-        try {
-          this.mainWindow
-            .restore()
-            .catch((): void => {
-              this.mainWindow.recover().catch((): void => {});
-            });
-        } catch {
+        this.enqueueMain(async (): Promise<void> => {
           try {
-            this.mainWindow.recover().catch((): void => {});
-          } catch {}
-        }
+            await this.mainWindow.restore();
+          } catch {
+            try {
+              await this.mainWindow.recover();
+            } catch {}
+          }
+          this.syncWindowState();
+        });
         break;
       case "close":
         this.closePopupMenuOnly();
+        this.closeAllSubWindows();
+        this.removeTraySync();
+        this.unregisterAllGlobalShortcuts();
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "setMode":
-        this.setMode(cmd.mode ?? "normal");
-        break;
-      case "setBounds":
-        this.applyBounds(cmd.x, cmd.y, cmd.width, cmd.height);
+        this.enqueueMain(async (): Promise<void> => {
+          await this.setModeAsync(cmd.mode ?? "normal");
+        });
         break;
       case "setContentSize":
-        this.applyBounds(undefined, undefined, cmd.width, cmd.height);
+        this.enqueueMain(async (): Promise<void> => {
+          await this.applyContentSizeAsync(cmd.width, cmd.height);
+        });
         break;
       case "setPlacement":
-        this.applyBounds(cmd.x, cmd.y, cmd.width, cmd.height);
-        if (cmd.mode && cmd.mode !== "normal") {
-          this.setMode(cmd.mode);
-        }
+        this.enqueueMain(async (): Promise<void> => {
+          await this.applyBoundsAsync(cmd.x, cmd.y, cmd.width, cmd.height);
+          if (cmd.mode && cmd.mode !== "normal") {
+            await this.setModeAsync(cmd.mode);
+          }
+        });
         break;
       case "center":
-        void this.centerWindow(cmd.display);
+        this.enqueueMain(async (): Promise<void> => {
+          await this.centerWindow(cmd.display);
+        });
         break;
     }
   }
 
-  private setMode(mode: string): void {
+  private async setModeAsync(mode: string): Promise<void> {
     try {
       if (mode === "maximized") {
-        this.mainWindow
-          .maximize(window.MaximizePresentation.EXIT_IMMERSIVE)
-          .then((): void => this.syncWindowState())
-          .catch((): void => {});
+        await this.mainWindow.maximize(window.MaximizePresentation.EXIT_IMMERSIVE);
       } else if (mode === "fullScreen") {
-        this.mainWindow
-          .maximize(window.MaximizePresentation.ENTER_IMMERSIVE)
-          .then((): void => this.syncWindowState())
-          .catch((): void => {});
+        await this.mainWindow.maximize(window.MaximizePresentation.ENTER_IMMERSIVE);
       } else {
-        this.mainWindow
-          .recover()
-          .then((): void => this.syncWindowState())
-          .catch((): void => {});
+        await this.mainWindow.recover();
       }
+      this.syncWindowState();
     } catch {}
   }
 
   private toggleMaximize(): void {
-    if (this.mode === "maximized" || this.mode === "fullScreen") {
-      this.setMode("normal");
-    } else {
-      this.setMode("maximized");
-    }
+    const next =
+      this.mode === "maximized" || this.mode === "fullScreen" ? "normal" : "maximized";
+    this.enqueueMain(async (): Promise<void> => {
+      await this.setModeAsync(next);
+    });
   }
 
-  private applyBounds(x?: number, y?: number, width?: number, height?: number): void {
+  private async applyBoundsAsync(
+    x?: number,
+    y?: number,
+    width?: number,
+    height?: number,
+  ): Promise<void> {
     try {
-      const rect = this.mainWindow.getWindowProperties().windowRect;
-      const moveX = x !== undefined ? Math.round(this.ui.vp2px(x)) : rect.left;
-      const moveY = y !== undefined ? Math.round(this.ui.vp2px(y)) : rect.top;
-      const sizeW = width !== undefined ? Math.max(1, Math.round(this.ui.vp2px(width))) : rect.width;
-      const sizeH =
-        height !== undefined ? Math.max(1, Math.round(this.ui.vp2px(height))) : rect.height;
+      const props = this.mainWindow.getWindowProperties();
+      const rect = props.windowRect;
+      const scale = resolveScaleFactor(props.displayId, this.ui);
+      const moveX = x !== undefined ? Math.round(x * scale) : rect.left;
+      const moveY = y !== undefined ? Math.round(y * scale) : rect.top;
+      const sizeW = width !== undefined ? Math.max(1, Math.round(width * scale)) : rect.width;
+      const sizeH = height !== undefined ? Math.max(1, Math.round(height * scale)) : rect.height;
       const move =
         (x !== undefined || y !== undefined) &&
         (Math.abs(moveX - rect.left) > 1 || Math.abs(moveY - rect.top) > 1);
@@ -2139,48 +2312,151 @@ export class NativeDesktop {
         (width !== undefined || height !== undefined) &&
         (Math.abs(sizeW - rect.width) > 1 || Math.abs(sizeH - rect.height) > 1);
       if (this.mode !== "normal") {
-        this.mainWindow
-          .recover()
-          .then((): void => {
-            if (move) {
-              this.mainWindow.moveWindowTo(moveX, moveY).catch((): void => {});
-            }
-            if (resize) {
-              this.mainWindow.resize(sizeW, sizeH).catch((): void => {});
-            }
-          })
-          .catch((): void => {});
-        return;
+        try {
+          await this.mainWindow.recover();
+        } catch {}
       }
       if (move) {
-        this.mainWindow.moveWindowTo(moveX, moveY).catch((): void => {});
+        try {
+          await this.mainWindow.moveWindowTo(moveX, moveY);
+        } catch {}
       }
       if (resize) {
-        this.mainWindow.resize(sizeW, sizeH).catch((): void => {});
+        try {
+          await this.mainWindow.resize(sizeW, sizeH);
+        } catch {}
       }
+      this.syncWindowState();
     } catch {}
   }
 
-  private async centerWindow(displayHex?: string): Promise<void> {
+  private async applyContentSizeAsync(width?: number, height?: number): Promise<void> {
+    try {
+      const props = this.mainWindow.getWindowProperties();
+      const rect = props.windowRect;
+      const drawable = props.drawableRect;
+      const scale = resolveScaleFactor(props.displayId, this.ui);
+      const chromeW = drawable.width > 0 ? Math.max(0, rect.width - drawable.width) : 0;
+      const chromeH =
+        this.titleBarHidden || this.frameNone
+          ? 0
+          : drawable.height > 0
+            ? Math.max(0, rect.height - drawable.height)
+            : 0;
+      const targetW =
+        width !== undefined ? Math.max(1, Math.round(width * scale) + chromeW) : rect.width;
+      const targetH =
+        height !== undefined ? Math.max(1, Math.round(height * scale) + chromeH) : rect.height;
+      if (Math.abs(targetW - rect.width) <= 1 && Math.abs(targetH - rect.height) <= 1) {
+        return;
+      }
+      if (this.mode !== "normal") {
+        try {
+          await this.mainWindow.recover();
+        } catch {}
+      }
+      await this.mainWindow.resize(targetW, targetH);
+      this.syncWindowState();
+    } catch {}
+  }
+
+  private async applyMainWindowLaunchAsync(cmd: WireCommand): Promise<void> {
+    try {
+      const props = this.mainWindow.getWindowProperties();
+      const rect = props.windowRect;
+      const drawable = props.drawableRect;
+      const screen = await resolveTargetDisplay(cmd.display, props.displayId);
+      const scale = resolveScaleFactor(screen.id, this.ui);
+      const chromeW =
+        cmd.contentSized && drawable.width > 0 ? Math.max(0, rect.width - drawable.width) : 0;
+      const chromeH =
+        cmd.contentSized &&
+        !this.titleBarHidden &&
+        !this.frameNone &&
+        cmd.titleBarHidden !== true &&
+        drawable.height > 0
+          ? Math.max(0, rect.height - drawable.height)
+          : 0;
+      let targetW =
+        cmd.width !== undefined ? Math.max(1, Math.round(cmd.width * scale) + chromeW) : rect.width;
+      let targetH =
+        cmd.height !== undefined
+          ? Math.max(1, Math.round(cmd.height * scale) + chromeH)
+          : rect.height;
+      if (cmd.clampToDisplay === true) {
+        const area = await displayAvailableRectPx(screen);
+        if (area.width > 0) {
+          targetW = Math.min(targetW, area.width);
+        }
+        if (area.height > 0) {
+          targetH = Math.min(targetH, area.height);
+        }
+      }
+      if (
+        (cmd.width !== undefined || cmd.height !== undefined) &&
+        (Math.abs(targetW - rect.width) > 1 || Math.abs(targetH - rect.height) > 1)
+      ) {
+        try {
+          await this.mainWindow.resize(targetW, targetH);
+        } catch {}
+      }
+      if (cmd.position === "at" && cmd.x !== undefined && cmd.y !== undefined) {
+        const moveX = Math.round(cmd.x * scale);
+        const moveY = Math.round(cmd.y * scale);
+        if (cmd.display && deviceInfo.sdkApiVersion >= 15) {
+          try {
+            await this.mainWindow.moveWindowToGlobal(moveX, moveY, { displayId: screen.id });
+          } catch {
+            try {
+              await this.mainWindow.moveWindowTo(moveX, moveY);
+            } catch {}
+          }
+        } else {
+          try {
+            await this.mainWindow.moveWindowTo(moveX, moveY);
+          } catch {}
+        }
+      } else if (cmd.position === "center" || cmd.position === "parentCenter" || cmd.display) {
+        await this.centerWindow(cmd.display, targetW, targetH);
+      }
+      if (cmd.mode && cmd.mode !== "normal") {
+        await this.setModeAsync(cmd.mode);
+      }
+      if (cmd.visible === false) {
+        try {
+          await this.mainWindow.minimize();
+        } catch {}
+      }
+      this.syncWindowState();
+    } catch {}
+  }
+
+  private async centerWindow(
+    displayHex?: string,
+    overrideW?: number,
+    overrideH?: number,
+  ): Promise<void> {
     if (this.closed) {
       return;
     }
     try {
       const props = this.mainWindow.getWindowProperties();
       const rect = props.windowRect;
+      const w = overrideW ?? rect.width;
+      const h = overrideH ?? rect.height;
       const screen = await resolveTargetDisplay(displayHex, props.displayId);
       const area = await displayAvailableRectPx(screen);
       const minX = area.left;
       const minY = area.top;
-      const maxX = area.left + Math.max(0, area.width - rect.width);
-      const maxY = area.top + Math.max(0, area.height - rect.height);
+      const maxX = area.left + Math.max(0, area.width - w);
+      const maxY = area.top + Math.max(0, area.height - h);
       const targetX = Math.max(
         minX,
-        Math.min(maxX, area.left + Math.round((area.width - rect.width) / 2)),
+        Math.min(maxX, area.left + Math.round((area.width - w) / 2)),
       );
       const targetY = Math.max(
         minY,
-        Math.min(maxY, area.top + Math.round((area.height - rect.height) / 2)),
+        Math.min(maxY, area.top + Math.round((area.height - h) / 2)),
       );
       if (displayHex && deviceInfo.sdkApiVersion >= 15) {
         try {
@@ -2311,6 +2587,13 @@ export class NativeDesktop {
       try {
         defaultId = display.getDefaultDisplaySync().id;
       } catch {}
+      let hasDefault = false;
+      for (let i = 0; i < screens.length; i++) {
+        if (screens[i].id === defaultId) {
+          hasDefault = true;
+          break;
+        }
+      }
       for (let i = 0; i < screens.length; i++) {
         const screen = screens[i];
         const scale =
@@ -2347,7 +2630,7 @@ export class NativeDesktop {
           name: displayLabel,
           bounds,
           visibleBounds,
-          primary: screen.id === defaultId || i === 0,
+          primary: hasDefault ? screen.id === defaultId : i === 0,
           scaleFactor: scale,
           refreshRate: screen.refreshRate > 0 ? screen.refreshRate : undefined,
         });
@@ -2518,17 +2801,40 @@ export class NativeDesktop {
     if (!canIUse("SystemCapability.PCService.StatusBarManager")) {
       return;
     }
+    const kit = await import("@hms.pcService.statusBarManager");
+    if (this.closed || generation !== this.trayGeneration) {
+      return;
+    }
+    this.trayRemoveSyncFn = (): void => {
+      try {
+        kit.default.removeFromStatusBar(this.abilityContext);
+      } catch {}
+    };
+    this.trayUnsubscribeFn = (): void => {
+      try {
+        kit.default.off("statusBarIconClick", this.onTrayIconClick);
+      } catch {}
+      try {
+        kit.default.off("rightMenuClick", this.onTrayRightMenuClick);
+      } catch {}
+    };
     if (deviceInfo.sdkApiVersion >= 26) {
       try {
-        const supported = await statusBarManager.isStatusBarCapabilitySupported(
-          this.abilityContext,
-        );
+        const supported = await kit.default.isStatusBarCapabilitySupported(this.abilityContext);
         if (!supported) {
           return;
         }
       } catch {}
     }
-    this.ensureTraySubscribed();
+    if (!this.traySubscribed) {
+      try {
+        kit.default.on("statusBarIconClick", this.onTrayIconClick);
+        kit.default.on("rightMenuClick", this.onTrayRightMenuClick);
+        this.traySubscribed = true;
+      } catch (error) {
+        console.warn(`[NSH] statusBarManager event subscribe failed: ${String(error)}`);
+      }
+    }
     this.trayClickId = cmd.click ?? 0;
 
     const menuGroups = this.buildStatusBarMenu(generation, cmd.items ?? []);
@@ -2561,7 +2867,24 @@ export class NativeDesktop {
         item.hoverTips = hoverTips;
       }
       try {
-        await this.addToStatusBarAsync(item);
+        await new Promise<void>((resolve, reject) => {
+          try {
+            if (deviceInfo.sdkApiVersion >= 14) {
+              kit.default.addToStatusBar(this.abilityContext, item, (err): void => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve();
+                }
+              });
+            } else {
+              kit.default.addToStatusBar(this.abilityContext, item);
+              resolve();
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
         this.trayAdded = true;
         this.trayLastIconKey = iconKey;
         this.trayLastHoverTips = hoverTips;
@@ -2575,7 +2898,24 @@ export class NativeDesktop {
     }
 
     try {
-      await this.updateStatusBarMenuAsync(menuGroups);
+      await new Promise<void>((resolve, reject) => {
+        try {
+          if (deviceInfo.sdkApiVersion >= 14) {
+            kit.default.updateStatusBarMenu(this.abilityContext, menuGroups, (err): void => {
+              if (err) {
+                reject(err);
+              } else {
+                resolve();
+              }
+            });
+          } else {
+            kit.default.updateStatusBarMenu(this.abilityContext, menuGroups);
+            resolve();
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
     } catch (error) {
       console.warn(`[NSH] updateStatusBarMenu failed: ${String(error)}`);
     }
@@ -2588,7 +2928,24 @@ export class NativeDesktop {
         return;
       }
       try {
-        await this.updateStatusBarIconAsync(icons);
+        await new Promise<void>((resolve, reject) => {
+          try {
+            if (deviceInfo.sdkApiVersion >= 14) {
+              kit.default.updateStatusBarIcon(this.abilityContext, icons, (err): void => {
+                if (err) {
+                  reject(err);
+                } else {
+                  resolve();
+                }
+              });
+            } else {
+              kit.default.updateStatusBarIcon(this.abilityContext, icons);
+              resolve();
+            }
+          } catch (error) {
+            reject(error);
+          }
+        });
         this.trayLastIconKey = iconKey;
       } catch (error) {
         console.warn(`[NSH] updateStatusBarIcon failed: ${String(error)}`);
@@ -2604,7 +2961,7 @@ export class NativeDesktop {
       hoverTips !== this.trayLastHoverTips
     ) {
       try {
-        await statusBarManager.updateStatusBarHoverTips(this.abilityContext, hoverTips);
+        await kit.default.updateStatusBarHoverTips(this.abilityContext, hoverTips);
         this.trayLastHoverTips = hoverTips;
       } catch {}
     }
@@ -2621,7 +2978,25 @@ export class NativeDesktop {
     this.trayLastIconKey = "";
     this.trayLastHoverTips = "";
     try {
-      await this.removeFromStatusBarAsync();
+      const kit = await import("@hms.pcService.statusBarManager");
+      await new Promise<void>((resolve, reject) => {
+        try {
+          if (deviceInfo.sdkApiVersion >= 14) {
+            kit.default.removeFromStatusBar(this.abilityContext, (err): void => {
+              if (err) {
+                reject(err);
+              } else {
+                resolve();
+              }
+            });
+          } else {
+            kit.default.removeFromStatusBar(this.abilityContext);
+            resolve();
+          }
+        } catch (error) {
+          reject(error);
+        }
+      });
     } catch (error) {
       console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
     }
@@ -2636,121 +3011,17 @@ export class NativeDesktop {
       this.trayAdded = false;
       this.trayLastIconKey = "";
       this.trayLastHoverTips = "";
-      try {
-        statusBarManager.removeFromStatusBar(this.abilityContext);
-      } catch {}
+      this.trayRemoveSyncFn?.();
     }
     this.unsubscribeTray();
   }
 
-  private ensureTraySubscribed(): void {
-    if (this.traySubscribed || !canIUse("SystemCapability.PCService.StatusBarManager")) {
-      return;
-    }
-    try {
-      statusBarManager.on("statusBarIconClick", this.onTrayIconClick);
-      statusBarManager.on("rightMenuClick", this.onTrayRightMenuClick);
-      this.traySubscribed = true;
-    } catch (error) {
-      console.warn(`[NSH] statusBarManager event subscribe failed: ${String(error)}`);
-    }
-  }
-
   private unsubscribeTray(): void {
-    if (!this.traySubscribed || !canIUse("SystemCapability.PCService.StatusBarManager")) {
+    if (!this.traySubscribed) {
       return;
     }
     this.traySubscribed = false;
-    try {
-      statusBarManager.off("statusBarIconClick", this.onTrayIconClick);
-    } catch {}
-    try {
-      statusBarManager.off("rightMenuClick", this.onTrayRightMenuClick);
-    } catch {}
-  }
-
-  private addToStatusBarAsync(item: statusBarManager.StatusBarItem): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      try {
-        if (deviceInfo.sdkApiVersion >= 14) {
-          statusBarManager.addToStatusBar(this.abilityContext, item, (err): void => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve();
-            }
-          });
-        } else {
-          statusBarManager.addToStatusBar(this.abilityContext, item);
-          resolve();
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  private removeFromStatusBarAsync(): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      try {
-        if (deviceInfo.sdkApiVersion >= 14) {
-          statusBarManager.removeFromStatusBar(this.abilityContext, (err): void => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve();
-            }
-          });
-        } else {
-          statusBarManager.removeFromStatusBar(this.abilityContext);
-          resolve();
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  private updateStatusBarMenuAsync(groups: statusBarManager.StatusBarGroupMenu[]): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      try {
-        if (deviceInfo.sdkApiVersion >= 14) {
-          statusBarManager.updateStatusBarMenu(this.abilityContext, groups, (err): void => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve();
-            }
-          });
-        } else {
-          statusBarManager.updateStatusBarMenu(this.abilityContext, groups);
-          resolve();
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
-  }
-
-  private updateStatusBarIconAsync(icons: statusBarManager.StatusBarIcon): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      try {
-        if (deviceInfo.sdkApiVersion >= 14) {
-          statusBarManager.updateStatusBarIcon(this.abilityContext, icons, (err): void => {
-            if (err) {
-              reject(err);
-            } else {
-              resolve();
-            }
-          });
-        } else {
-          statusBarManager.updateStatusBarIcon(this.abilityContext, icons);
-          resolve();
-        }
-      } catch (error) {
-        reject(error);
-      }
-    });
+    this.trayUnsubscribeFn?.();
   }
 
   private buildStatusBarMenu(

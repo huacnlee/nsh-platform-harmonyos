@@ -57,17 +57,25 @@ function blurStyleForBackdrop(backdrop: string): BlurStyle {
 @Entry({ routeName: "nshSubWindow" })
 @Component
 struct NshSubWindowPage {
-  private readonly bridge?: SubWindowPageBridge =
-    this.getUIContext().getSharedLocalStorage()?.get<SubWindowPageBridge>(NSH_SUBWINDOW_BRIDGE_KEY);
-  private readonly content: NodeContent = this.bridge?.content ?? new NodeContent();
-  @State private backdrop: string = this.bridge?.backdrop ?? "none";
-  @State private colorMode: ThemeColorMode = this.bridge?.colorMode ?? ThemeColorMode.SYSTEM;
+  private bridge?: SubWindowPageBridge;
+  private content: NodeContent = new NodeContent();
+  @State private backdrop: string = "none";
+  @State private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
 
   aboutToAppear(): void {
-    this.bridge?.bind((nextBackdrop: string, nextColorMode: ThemeColorMode): void => {
-      this.backdrop = nextBackdrop;
-      this.colorMode = nextColorMode;
-    });
+    const bridge = this.getUIContext()
+      .getSharedLocalStorage()
+      ?.get<SubWindowPageBridge>(NSH_SUBWINDOW_BRIDGE_KEY);
+    if (bridge !== undefined) {
+      this.bridge = bridge;
+      this.content = bridge.content;
+      this.backdrop = bridge.backdrop;
+      this.colorMode = bridge.colorMode;
+      bridge.bind((nextBackdrop: string, nextColorMode: ThemeColorMode): void => {
+        this.backdrop = nextBackdrop;
+        this.colorMode = nextColorMode;
+      });
+    }
   }
 
   aboutToDisappear(): void {

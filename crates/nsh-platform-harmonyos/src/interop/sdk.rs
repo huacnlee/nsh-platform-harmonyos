@@ -144,6 +144,9 @@ pub(crate) struct ViewOptions {
     pub test_id: Option<String>,
     pub semantic: bool,
     pub clickable: bool,
+    pub key_focusable: bool,
+    pub focus_command_gen: u32,
+    pub focus_command_focus: bool,
     pub disabled: bool,
     pub accessible: Option<bool>,
     pub hidden: bool,
@@ -388,7 +391,15 @@ pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
         owner.is_some_and(|owner| {
             let mut accepted = false;
             crate::render::node::callback(|| {
-                if action.kind.is_some() {
+                if action.kind.as_deref() == Some("focus") {
+                    if action.action == "focus" {
+                        owner.emit(nsh_core::EventKind::Focus, nsh_core::EventPayload::None);
+                        accepted = true;
+                    } else if action.action == "blur" {
+                        owner.emit(nsh_core::EventKind::Blur, nsh_core::EventPayload::None);
+                        accepted = true;
+                    }
+                } else if action.kind.is_some() {
                     accepted = owner.selection_action(&action)?;
                 } else {
                     let spec = owner.accessibility_state.spec.borrow();

@@ -133,6 +133,7 @@ pub(crate) struct UiContext {
     pub(crate) fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
+    pub(crate) main_window: std::cell::RefCell<crate::services::desktop::MainWindowState>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
 }
 
@@ -181,6 +182,9 @@ impl std::ops::Deref for Mounter {
 }
 
 impl Mounter {
+    pub(crate) fn batch_count(&self) -> u64 {
+        self.batches
+    }
     pub(crate) fn scene_ready(&self) -> Result<()> {
         if let Some(scene) = self.scene.borrow().as_ref() {
             scene.ready()?;
@@ -419,6 +423,7 @@ impl Mounter {
     }
     fn route_back(&self, app_listener: bool) -> Result<()> {
         use nsh_core::navigation::{Back, back_target};
+        let desktop = self.platform.get().os.is_desktop();
         let modal = self
             .modals
             .iter()
@@ -430,7 +435,10 @@ impl Mounter {
                     .iter()
                     .rev()
                     .filter_map(std::rc::Weak::upgrade)
-                    .find(|modal| modal.is_visible())
+                    .find(|modal| {
+                        modal.is_visible()
+                            && (!desktop || !modal.is_desktop_window() || modal.is_desktop_modal())
+                    })
             });
         let target = back_target(
             modal.as_ref().and_then(|modal| modal.node_id()),
@@ -459,14 +467,16 @@ impl Mounter {
                 nsh_core::EventPayload::None,
             ),
             None => {
-                // BackHandler runs in the engine after the native callback has
-                // returned. If it declines and no NSH root can go back, resume
-                // the host router's default action instead of swallowing it.
-                self.host
-                    .send_host_command(crate::app::session::HostCommand {
-                        kind: "back".into(),
-                        ..Default::default()
-                    })?;
+                if !desktop {
+                    // BackHandler runs in the engine after the native callback has
+                    // returned. If it declines and no NSH root can go back, resume
+                    // the host router's default action instead of swallowing it.
+                    self.host
+                        .send_host_command(crate::app::session::HostCommand {
+                            kind: "back".into(),
+                            ..Default::default()
+                        })?;
+                }
             }
         }
         Ok(())
@@ -596,6 +606,7 @@ impl Mounter {
                 if let Some(close_on_press) = attrs.close_on_press {
                     self.desktop.close_on_press = close_on_press;
                 }
+                self.main_window.borrow_mut().apply_attributes(&attrs);
                 if let Some(backdrop) = attrs.backdrop
                     && let Ok(root) = self.node(nsh_core::ROOT_ID)
                 {
@@ -622,6 +633,9 @@ impl Mounter {
                 self.host.desktop_command(&wire_attributes(&attrs))?;
             }
             DesktopCommand::Request(request) => {
+                if matches!(request, nsh_core::desktop::WindowRequest::Close) {
+                    self.close_desktop_children(nsh_core::ROOT_ID)?;
+                }
                 self.host.desktop_command(&wire_request(&request))?;
             }
             DesktopCommand::Quit => {
@@ -717,6 +731,7 @@ impl Mounter {
                     EventPayload::Window(Box::new(WindowEvent::ClosePress { reason })),
                 );
                 if self.desktop.close_on_press {
+                    self.close_desktop_children(nsh_core::ROOT_ID)?;
                     self.control.dispatch_event(
                         nsh_core::ROOT_ID,
                         EventKind::Window,
@@ -738,6 +753,7 @@ impl Mounter {
                 self.desktop_menu_action(id, role)?;
             }
             DesktopEvent::MenuClose { generation } => {
+                self.desktop.selection_menu_target = None;
                 if generation == self.desktop.popup_generation && self.desktop.popup_open {
                     self.desktop.popup_open = false;
                     let (kind, payload) = menu_closed_payload();
@@ -790,6 +806,9 @@ impl Mounter {
                     && let Some(modal) = node.modal.borrow().clone()
                 {
                     modal.on_sub_window_close_press(reason)?;
+                    if !modal.is_visible() {
+                        self.close_desktop_children(window_id)?;
+                    }
                 }
             }
             DesktopEvent::SubWindowBlur { window_id } => {
@@ -797,6 +816,9 @@ impl Mounter {
                     && let Some(modal) = node.modal.borrow().clone()
                 {
                     modal.on_sub_window_blur()?;
+                    if !modal.is_visible() {
+                        self.close_desktop_children(window_id)?;
+                    }
                 }
             }
             DesktopEvent::SubWindowDestroyed { window_id } => {
@@ -804,11 +826,27 @@ impl Mounter {
                     && let Some(modal) = node.modal.borrow().clone()
                 {
                     modal.on_sub_window_destroyed()?;
+                    self.close_desktop_children(window_id)?;
                 }
             }
             DesktopEvent::WindowState(_)
             | DesktopEvent::TitleBar(_)
             | DesktopEvent::Displays(_) => {}
+        }
+        Ok(())
+    }
+    fn close_desktop_children(&self, parent_id: NodeId) -> Result<()> {
+        let children: Vec<(NodeId, Rc<crate::navigation::modal::Modal>)> = self
+            .modals
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .filter(|m| m.is_desktop_window() && m.is_visible())
+            .filter(|m| m.desktop_parent_window_id() == Some(parent_id))
+            .filter_map(|m| m.node_id().map(|id| (id, m)))
+            .collect();
+        for (child_id, child) in children {
+            self.close_desktop_children(child_id)?;
+            child.close_for_parent()?;
         }
         Ok(())
     }
@@ -844,14 +882,13 @@ impl Mounter {
                     return Ok(());
                 }
                 MenuRole::Close => {
-                    if let Some(modal) = self.focused_desktop_modal().or_else(|| {
-                        self.modals
-                            .iter()
-                            .rev()
-                            .filter_map(std::rc::Weak::upgrade)
-                            .find(|m| m.is_visible() && m.is_desktop_window())
-                    }) {
+                    if let Some(modal) = self.focused_desktop_modal() {
                         modal.on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
+                        if !modal.is_visible()
+                            && let Some(window_id) = modal.node_id()
+                        {
+                            self.close_desktop_children(window_id)?;
+                        }
                         return Ok(());
                     }
                     return self.desktop_event(crate::services::desktop::DesktopEvent::ClosePress(
@@ -895,29 +932,56 @@ impl Mounter {
                         .desktop_command(&wire_request(&WindowRequest::SetMode(next)))?;
                     return Ok(());
                 }
-                MenuRole::Copy | MenuRole::SelectAll => {
-                    let selected = self
-                        .selected_text
-                        .borrow()
-                        .as_ref()
-                        .and_then(std::rc::Weak::upgrade);
-                    if let Some(node) = selected
-                        && node.has_selection()
-                    {
-                        let cmd = if role == MenuRole::Copy {
-                            crate::text::selection::controller::Command::Copy
-                        } else {
-                            crate::text::selection::controller::Command::SelectAll
-                        };
-                        node.selection_command(cmd)?;
-                        return Ok(());
+                MenuRole::Copy | MenuRole::SelectAll | MenuRole::Paste => {
+                    if role != MenuRole::Paste {
+                        let selected = self
+                            .selected_text
+                            .borrow()
+                            .as_ref()
+                            .and_then(std::rc::Weak::upgrade);
+                        if let Some(node) = selected
+                            && node.has_selection()
+                        {
+                            let cmd = if role == MenuRole::Copy {
+                                crate::text::selection::controller::Command::Copy
+                            } else {
+                                crate::text::selection::controller::Command::SelectAll
+                            };
+                            node.selection_command(cmd)?;
+                            return Ok(());
+                        }
+                        if role == MenuRole::SelectAll
+                            && let Some(target_id) = self.desktop.selection_menu_target.take()
+                            && let Ok(target) = self.node(target_id)
+                        {
+                            target.selection_select_all_target(true)?;
+                            return Ok(());
+                        }
                     }
-                    if role == MenuRole::SelectAll
-                        && let Some(target_id) = self.desktop.selection_menu_target.take()
-                        && let Ok(target) = self.node(target_id)
+                    let focused_input = self
+                        .dispatcher
+                        .upgrade()
+                        .and_then(|route| route.keyboard.lock().unwrap().input);
+                    if let Some(input_id) = focused_input
+                        && let Ok(node) = self.node(input_id)
+                        && let Some(input) = node.input.borrow().as_ref()
                     {
-                        target.selection_select_all_target(true)?;
-                        return Ok(());
+                        match role {
+                            MenuRole::SelectAll => {
+                                input.selection(0, u32::MAX)?;
+                                return Ok(());
+                            }
+                            MenuRole::Paste => {
+                                self.host.system.paste_to_input(
+                                    &self.host,
+                                    self.dispatcher.clone(),
+                                    input_id,
+                                    false,
+                                )?;
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
                     }
                 }
                 _ => {}
@@ -931,6 +995,18 @@ impl Mounter {
         Ok(())
     }
     pub(crate) fn request_desktop_focus(&self) {
+        let has_input_focus = self
+            .dispatcher
+            .upgrade()
+            .is_some_and(|route| route.keyboard.lock().unwrap().focused.is_some());
+        let has_child_focus = self
+            .key_focus
+            .borrow()
+            .upgrade()
+            .is_some_and(|node| node.visible_in_tree());
+        if has_input_focus || has_child_focus {
+            return;
+        }
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
             let _ = root.native.borrow().request_focus();
         }
@@ -942,6 +1018,7 @@ impl Mounter {
         y: f32,
     ) -> Result<()> {
         use crate::services::desktop::{WireCommand, WireMenuItem, serialize_menu_items};
+        use nsh_core::desktop::MenuRole;
         let Ok(target) = self.node(target_id).cloned() else {
             return Ok(());
         };
@@ -960,7 +1037,7 @@ impl Mounter {
             items.push(WireMenuItem {
                 kind: "action".into(),
                 id: 0,
-                label: "Copy".into(),
+                label: self.desktop.labels.label(MenuRole::Copy).to_owned(),
                 enabled: true,
                 checked: None,
                 shortcut: Some("Ctrl+C".into()),
@@ -972,7 +1049,7 @@ impl Mounter {
         items.push(WireMenuItem {
             kind: "action".into(),
             id: 0,
-            label: "Select All".into(),
+            label: self.desktop.labels.label(MenuRole::SelectAll).to_owned(),
             enabled: true,
             checked: None,
             shortcut: Some("Ctrl+A".into()),
@@ -1024,6 +1101,7 @@ impl Mounter {
     }
     pub(crate) fn key_scroll(
         &self,
+        window: NodeId,
         key_move: nsh_core::scroll::KeyMove,
         horizontal: bool,
     ) -> Result<()> {
@@ -1031,7 +1109,7 @@ impl Mounter {
             .key_focus
             .borrow()
             .upgrade()
-            .filter(|n| n.visible_in_tree());
+            .filter(|n| n.visible_in_tree() && n.key_window_id() == window);
         while let Some(node) = target {
             if let Some(scroll) = node.scroll.borrow().as_ref()
                 && scroll.can_key_scroll(horizontal)
@@ -1040,11 +1118,11 @@ impl Mounter {
             }
             target = node.parent_node.borrow().upgrade();
         }
-        // Fallback: largest visible scroll view on the active surface along that axis.
+        // Fallback: largest visible scroll view on the active window along that axis.
         let best = self
             .nodes
             .values()
-            .filter(|node| node.visible_in_tree())
+            .filter(|node| node.visible_in_tree() && node.key_window_id() == window)
             .filter_map(|node| {
                 let scroll = node.scroll.borrow().clone()?;
                 scroll.can_key_scroll(horizontal).then(|| {
@@ -2076,10 +2154,9 @@ impl Mounter {
                             } else if let Some(input) = self.node(id)?.input.borrow().as_ref() {
                                 input.focus(matches!(command, Command::Focus))?;
                             } else {
-                                self.node(id)?
-                                    .native
-                                    .borrow()
-                                    .set_focus_status(matches!(command, Command::Focus))?;
+                                let node = self.node(id)?.clone();
+                                node.interaction
+                                    .command_focus(&node, matches!(command, Command::Focus))?;
                             }
                         }
                         Command::SetSelection { start, end } => {

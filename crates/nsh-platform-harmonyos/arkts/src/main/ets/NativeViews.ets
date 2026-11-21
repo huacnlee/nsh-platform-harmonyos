@@ -7,6 +7,7 @@ import {
   ComponentContent,
   NodeContent,
 } from "@ohos.arkui.node";
+import { LengthMetrics } from "@kit.ArkUI";
 import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import { NshRuntimeContext } from "./NativeEditors";
@@ -32,6 +33,9 @@ export interface Settings {
   hue: number;
   semantic: boolean;
   clickable: boolean;
+  keyFocusable?: boolean;
+  focusCommandGen?: number;
+  focusCommandFocus?: boolean;
   disabled: boolean;
   accessible?: boolean | null;
   hidden: boolean;
@@ -150,7 +154,22 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       .accessibilitySelected(s.selected);
     node.accessibilityRole(role(s.role));
     node.accessibilityChecked(s.checked === null ? undefined : s.checked);
-    node.enabled(!s.disabled).onClick(s.clickable || s.menu != null ? (): void => {} : undefined);
+    const keyFocusable = s.keyFocusable === true && !s.disabled;
+    node
+      .enabled(!s.disabled)
+      .onClick(s.clickable || keyFocusable || s.menu != null ? (): void => {} : undefined)
+      .focusOnTouch(keyFocusable);
+    if (keyFocusable) {
+      node
+        .focusable(true)
+        .focusBox({ strokeWidth: LengthMetrics.vp(0) })
+        .onFocus((): void => {
+          this.entry.focusEvent("focus");
+        })
+        .onBlur((): void => {
+          this.entry.focusEvent("blur");
+        });
+    }
     if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
     }
@@ -204,6 +223,9 @@ function nativeView(params: ViewParameters) {
   .width(params.settings.width)
   .height(params.settings.height)
   .attributeModifier(new ViewModifier(params.entry, params.settings))
+  .onAppear((): void => {
+    params.entry.appeared();
+  })
   .onAccessibilityActionIntercept(
     (action: AccessibilityAction): AccessibilityActionInterceptResult => {
       if (action === AccessibilityAction.ACCESSIBILITY_CLICK && params.entry.action("activate")) {
@@ -293,6 +315,9 @@ class ViewEntry {
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
   private pointerPosting: PointerPosting;
+  private appearedReady: boolean = false;
+  private focusPending: boolean = false;
+  private lastFocusCommandGen: number = 0;
   constructor(
     settings: Settings,
     context: NshRuntimeContext,
@@ -372,6 +397,7 @@ class ViewEntry {
       }
       this.attached = true;
       this.syncMenu();
+      this.syncFocus();
     } catch (error) {
       if (this.attached) {
         try {
@@ -425,6 +451,53 @@ class ViewEntry {
     }
     if (!this.closed) {
       this.syncMenu();
+      this.syncFocus();
+    }
+  }
+  appeared(): void {
+    this.appearedReady = true;
+    if (this.focusPending && !this.closed && this.context.isActive()) {
+      this.focusPending = false;
+      this.requestViewFocus();
+    }
+  }
+  focusEvent(name: string): void {
+    if (this.closed || !this.context.isActive() || this.settings.keyFocusable !== true) {
+      return;
+    }
+    this.context.viewAction({
+      targetId: this.settings.targetId,
+      action: name,
+      kind: "focus",
+    });
+  }
+  private requestViewFocus(): boolean {
+    const id = this.settings.testId ?? `nsh-view-${this.settings.targetId}`;
+    try {
+      if (this.context.requestFocus) {
+        return this.context.requestFocus(id);
+      }
+      this.ui.getFocusController().requestFocus(id);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  private syncFocus(): void {
+    const gen = this.settings.focusCommandGen ?? 0;
+    if (gen === 0 || gen === this.lastFocusCommandGen) {
+      return;
+    }
+    this.lastFocusCommandGen = gen;
+    if (this.settings.focusCommandFocus === true) {
+      if (!this.appearedReady || !this.requestViewFocus()) {
+        this.focusPending = true;
+      }
+    } else {
+      this.focusPending = false;
+      try {
+        this.ui.getFocusController().clearFocus();
+      } catch (_) {}
     }
   }
   private syncMenu(): void {

@@ -330,5 +330,11 @@ pub(crate) fn nsh_attach_sub_window(
     if crate::app::session::get(session_id).is_err() {
         return Ok(false);
     }
-    crate::navigation::modal::attach_sub_window(env, window_id, content, platform_window_id)
+    crate::navigation::modal::attach_sub_window(
+        env,
+        session_id,
+        window_id,
+        content,
+        platform_window_id,
+    )
 }

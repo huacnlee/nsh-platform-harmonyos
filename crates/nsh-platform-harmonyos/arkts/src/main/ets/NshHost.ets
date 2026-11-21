@@ -566,6 +566,9 @@ class HostSession {
     if (displayId !== undefined) {
       pixelRatio = display.getDisplayByIdSync(displayId).densityPixels;
     }
+    if (pixelRatio > 0) {
+      pixelRatio = Math.round(pixelRatio * 100) / 100;
+    }
     const lifecycle = mainWindow.isWindowShowing()
       ? mainWindow.isFocused()
         ? "active"
@@ -748,7 +751,7 @@ class HostSession {
         newConfig.language ?? "",
         i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
         deviceInfo.deviceType,
-        this.runtimeContext.getUIContext().vp2px(1),
+        Math.round(this.runtimeContext.getUIContext().vp2px(1) * 100) / 100,
         localeDetails.languages,
         localeDetails.timeZone,
         localeDetails.regionalLocale,

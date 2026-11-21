@@ -252,6 +252,10 @@ impl Drop for LoadPermit {
 }
 
 impl Services {
+    pub(crate) fn session_id(&self) -> u32 {
+        self.id
+    }
+
     pub(crate) fn max_refresh_rate(&self) -> u32 {
         crate::app::frame_rate::normalize_display_hz(self.max_refresh_rate.load(Ordering::Relaxed))
     }
