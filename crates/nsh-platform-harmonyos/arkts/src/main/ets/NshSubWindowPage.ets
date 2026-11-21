@@ -83,12 +83,14 @@ struct NshSubWindowPage {
   }
 
   build() {
-    Stack() {
-      ContentSlot(this.content);
-    }
-    .width("100%")
-    .height("100%")
-    .backgroundColor(Color.Transparent)
-    .backgroundBlurStyle(blurStyleForBackdrop(this.backdrop), { colorMode: this.colorMode });
+    WithTheme({ colorMode: this.colorMode }) {
+      Stack() {
+        ContentSlot(this.content);
+      }
+      .width("100%")
+      .height("100%")
+      .backgroundColor(Color.Transparent)
+      .backgroundBlurStyle(blurStyleForBackdrop(this.backdrop), { colorMode: this.colorMode });
+    };
   }
 }

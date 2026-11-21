@@ -436,8 +436,6 @@ pub(crate) enum WireCommand {
         height: Option<f32>,
         content_sized: bool,
         #[serde(skip_serializing_if = "is_false")]
-        clamp_to_display: bool,
-        #[serde(skip_serializing_if = "is_false")]
         title_bar_hidden: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         position: Option<&'static str>,
@@ -631,12 +629,23 @@ pub(crate) fn wire_open_sub_window(
     }
 }
 
-/// Fallback desktop main window content size (vp) when an app omits `defaultSize`
-/// and has no restored placement. HarmonyOS PC's system default (~1100x734 vp) is
-/// shorter than the 1200x800 desktop baseline expected by multi-pane layouts.
-pub(crate) const DEFAULT_DESKTOP_MAIN_WINDOW_SIZE: (f32, f32) = (1200.0, 800.0);
+/// Hit-test margin (vp) along the perimeter of frameless resizable desktop windows.
+pub(crate) const FRAMELESS_RESIZE_MARGIN_VP: f32 = 6.0;
 
-fn clamp_size_to_attributes(size: (f32, f32), attrs: &WindowAttributes) -> (f32, f32) {
+/// Fallback initial content size (vp) when a subwindow omits both `defaultSize` and `placement`.
+/// HarmonyOS `createSubWindowWithOptions` creates a 0×0 window when `windowRect` is omitted.
+pub(crate) fn default_sub_window_size(kind: WindowKind) -> (f32, f32) {
+    match kind {
+        WindowKind::Panel => (320.0, 440.0),
+        WindowKind::Dialog => (420.0, 320.0),
+        WindowKind::Popup => (520.0, 360.0),
+        _ => (640.0, 520.0),
+    }
+}
+
+/// Clamps `size` (vp) to explicit `min_size` / `max_size` window attributes without imposing an
+/// artificial platform floor (HarmonyOS enforces system window minimums via `WindowLimits`).
+pub(crate) fn clamp_window_size(size: (f32, f32), attrs: &WindowAttributes) -> (f32, f32) {
     let (mut w, mut h) = size;
     if let Some(Some(min)) = attrs.min_size {
         if min.width.0.is_finite() && min.width.0 > 0.0 {
@@ -661,7 +670,7 @@ fn clamp_size_to_attributes(size: (f32, f32), attrs: &WindowAttributes) -> (f32,
 pub(crate) fn wire_main_window_launch(
     options: &MainWindowOptions,
     kept: Option<WindowPlacement>,
-) -> WireCommand {
+) -> Option<WireCommand> {
     let visible = (!options.visible_at_launch()).then_some(false);
     let title_bar_hidden = options.attributes.frame == Some(WindowFrameStyle::None)
         || options
@@ -669,47 +678,50 @@ pub(crate) fn wire_main_window_launch(
             .title_bar
             .is_some_and(|tb| tb.style == TitleBarStyle::Hidden);
     if let Some(placement) = kept {
-        return WireCommand::ApplyMainWindowLaunch {
+        return Some(WireCommand::ApplyMainWindowLaunch {
             x: Some(placement.bounds.origin.x.0),
             y: Some(placement.bounds.origin.y.0),
             width: Some(placement.bounds.size.width.0),
             height: Some(placement.bounds.size.height.0),
             content_sized: false,
-            clamp_to_display: false,
             title_bar_hidden,
             position: Some("at"),
             display: None,
             mode: Some(mode_name(placement.mode)),
             visible,
-        };
+        });
     }
-    let fallback_size = options.default_size.is_none();
-    let (width, height) = match options.default_size {
-        Some(size) => clamp_size_to_attributes((size.width.0, size.height.0), &options.attributes),
-        None => clamp_size_to_attributes(DEFAULT_DESKTOP_MAIN_WINDOW_SIZE, &options.attributes),
-    };
+    let size = options
+        .default_size
+        .map(|s| clamp_window_size((s.width.0, s.height.0), &options.attributes));
     let (position, x, y) = match options.default_position {
         Some(WindowPosition::At(point)) => (Some("at"), Some(point.x.0), Some(point.y.0)),
         Some(WindowPosition::Center) => (Some("center"), None, None),
         Some(WindowPosition::ParentCenter) => (Some("parentCenter"), None, None),
-        None if fallback_size => (Some("center"), None, None),
         None => (None, None, None),
     };
     let display = options.display.map(|id| format!("{:016x}", id.0));
     let mode = options.default_mode.map(mode_name);
-    WireCommand::ApplyMainWindowLaunch {
+    if size.is_none()
+        && position.is_none()
+        && display.is_none()
+        && mode.is_none()
+        && visible.is_none()
+    {
+        return None;
+    }
+    Some(WireCommand::ApplyMainWindowLaunch {
         x,
         y,
-        width: Some(width),
-        height: Some(height),
-        content_sized: true,
-        clamp_to_display: fallback_size,
+        width: size.map(|(w, _)| w),
+        height: size.map(|(_, h)| h),
+        content_sized: size.is_some(),
         title_bar_hidden,
         position,
         display,
         mode,
         visible,
-    }
+    })
 }
 
 pub(crate) fn wire_request(request: &WindowRequest) -> WireCommand {
@@ -1414,20 +1426,22 @@ pub(crate) fn apply_resize_delta(
     dx: f32,
     dy: f32,
     min_size: (f32, f32),
-    max_size: (f32, f32),
+    max_size: (Option<f32>, Option<f32>),
 ) -> ((f32, f32), (f32, f32)) {
     let (mut x, mut y) = origin;
     let (mut w, mut h) = size;
-    let max_w = max_size.0.max(min_size.0);
-    let max_h = max_size.1.max(min_size.1);
+    let min_w = min_size.0.max(1.0);
+    let min_h = min_size.1.max(1.0);
+    let max_w = max_size.0.map_or(f32::INFINITY, |v| v.max(min_w));
+    let max_h = max_size.1.map_or(f32::INFINITY, |v| v.max(min_h));
 
     match edge {
         ResizeEdge::Right | ResizeEdge::TopRight | ResizeEdge::BottomRight => {
-            w = (w + dx).clamp(min_size.0, max_w);
+            w = (w + dx).clamp(min_w, max_w);
         }
         ResizeEdge::Left | ResizeEdge::TopLeft | ResizeEdge::BottomLeft => {
             let right = x + w;
-            let next_w = (w - dx).clamp(min_size.0, max_w);
+            let next_w = (w - dx).clamp(min_w, max_w);
             x = right - next_w;
             w = next_w;
         }
@@ -1436,13 +1450,13 @@ pub(crate) fn apply_resize_delta(
 
     match edge {
         ResizeEdge::Bottom | ResizeEdge::BottomRight | ResizeEdge::BottomLeft => {
-            h = (h + dy).clamp(min_size.1, max_h);
+            h = (h + dy).clamp(min_h, max_h);
         }
         ResizeEdge::Top | ResizeEdge::TopRight | ResizeEdge::TopLeft => {
             let bottom = y + h;
-            let next_h = (h - dy).clamp(min_size.1, max_h);
+            let next_h = (h - dy).clamp(min_h, max_h);
             y = (bottom - next_h).max(0.0);
-            h = (bottom - y).clamp(min_size.1, max_h);
+            h = (bottom - y).clamp(min_h, max_h);
         }
         ResizeEdge::Left | ResizeEdge::Right => {}
     }
@@ -1917,7 +1931,7 @@ mod tests {
             50.0,
             0.0,
             (200.0, 150.0),
-            (800.0, 600.0),
+            (Some(800.0), Some(600.0)),
         );
         assert_eq!(origin, (150.0, 50.0));
         assert_eq!(size, (350.0, 300.0));
@@ -1930,20 +1944,20 @@ mod tests {
             350.0,
             0.0,
             (200.0, 150.0),
-            (800.0, 600.0),
+            (Some(800.0), Some(600.0)),
         );
         assert_eq!(origin, (300.0, 50.0));
         assert_eq!(size, (200.0, 300.0));
 
-        // BottomRight grows width/height without moving origin.
+        // BottomRight grows width/height without moving origin, including with no max bound.
         let (origin, size) = apply_resize_delta(
             ResizeEdge::BottomRight,
             (100.0, 50.0),
             (400.0, 300.0),
             40.0,
             -20.0,
-            (200.0, 150.0),
-            (800.0, 600.0),
+            (1.0, 1.0),
+            (None, None),
         );
         assert_eq!(origin, (100.0, 50.0));
         assert_eq!(size, (440.0, 280.0));
@@ -2060,36 +2074,33 @@ mod tests {
     #[test]
     fn main_window_launch_and_state_respect_options_and_kept_placement() {
         let mut options = MainWindowOptions::default();
-        let default_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
-        assert_eq!(default_json["op"], "applyMainWindowLaunch");
-        assert_eq!(default_json["width"], DEFAULT_DESKTOP_MAIN_WINDOW_SIZE.0);
-        assert_eq!(default_json["height"], DEFAULT_DESKTOP_MAIN_WINDOW_SIZE.1);
-        assert_eq!(default_json["contentSized"], true);
-        assert_eq!(default_json["clampToDisplay"], true);
-        assert_eq!(default_json["position"], "center");
-
-        options.attributes.max_size = Some(Some(Size::new(Points(900.0), Points(650.0))));
-        let clamped_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
-        assert_eq!(clamped_json["width"], 900.0);
-        assert_eq!(clamped_json["height"], 650.0);
-        assert_eq!(clamped_json["clampToDisplay"], true);
-        options.attributes.max_size = None;
-        options.attributes.min_size = Some(Some(Size::new(Points(1280.0), Points(900.0))));
-        let min_json = serde_json::to_value(wire_main_window_launch(&options, None)).unwrap();
-        assert_eq!(min_json["width"], 1280.0);
-        assert_eq!(min_json["height"], 900.0);
-        options.attributes.min_size = None;
+        // When no launch overrides are configured, let HarmonyOS pick the system default geometry.
+        assert_eq!(wire_main_window_launch(&options, None), None);
 
         options.default_size = Some(Size::new(Points(720.0), Points(500.0)));
+        options.attributes.max_size = Some(Some(Size::new(Points(640.0), Points(480.0))));
+        let clamped_json =
+            serde_json::to_value(wire_main_window_launch(&options, None).unwrap()).unwrap();
+        assert_eq!(clamped_json["width"], 640.0);
+        assert_eq!(clamped_json["height"], 480.0);
+        assert_eq!(clamped_json["contentSized"], true);
+        options.attributes.max_size = None;
+
+        options.attributes.min_size = Some(Some(Size::new(Points(800.0), Points(600.0))));
+        let min_json =
+            serde_json::to_value(wire_main_window_launch(&options, None).unwrap()).unwrap();
+        assert_eq!(min_json["width"], 800.0);
+        assert_eq!(min_json["height"], 600.0);
+        options.attributes.min_size = None;
+
         options.default_position = Some(WindowPosition::Center);
         options.default_visible = Some(false);
-        let cmd = wire_main_window_launch(&options, None);
+        let cmd = wire_main_window_launch(&options, None).unwrap();
         let json = serde_json::to_value(cmd).unwrap();
         assert_eq!(json["op"], "applyMainWindowLaunch");
         assert_eq!(json["width"], 720.0);
         assert_eq!(json["height"], 500.0);
         assert_eq!(json["contentSized"], true);
-        assert!(json.get("clampToDisplay").is_none());
         assert_eq!(json["position"], "center");
         assert_eq!(json["visible"], false);
 
@@ -2100,14 +2111,19 @@ mod tests {
         );
         kept.mode = WindowMode::Maximized;
         let kept_json =
-            serde_json::to_value(wire_main_window_launch(&options, Some(kept))).unwrap();
+            serde_json::to_value(wire_main_window_launch(&options, Some(kept)).unwrap()).unwrap();
         assert_eq!(kept_json["x"], 100.0);
         assert_eq!(kept_json["y"], 120.0);
         assert_eq!(kept_json["width"], 900.0);
         assert_eq!(kept_json["height"], 640.0);
         assert_eq!(kept_json["contentSized"], false);
-        assert!(kept_json.get("clampToDisplay").is_none());
         assert_eq!(kept_json["mode"], "maximized");
+
+        // Subwindow clamping respects explicit min/max without imposing a 120x80 floor.
+        let mut small_attrs = WindowAttributes::default();
+        assert_eq!(clamp_window_size((48.0, 32.0), &small_attrs), (48.0, 32.0));
+        small_attrs.min_size = Some(Some(Size::new(Points(64.0), Points(40.0))));
+        assert_eq!(clamp_window_size((48.0, 32.0), &small_attrs), (64.0, 40.0));
 
         let mut main_state = MainWindowState::default();
         assert!(main_state.can_resize(WindowMode::Normal));

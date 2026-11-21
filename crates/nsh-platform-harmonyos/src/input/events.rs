@@ -1412,7 +1412,13 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
             modal.desktop_resize_edge((x, y))
         } else if resizable && root.main_window.borrow().frame_none {
             let frame = root.frame.get();
-            crate::services::desktop::resize_edge(x, y, frame.width, frame.height, 6.0)
+            crate::services::desktop::resize_edge(
+                x,
+                y,
+                frame.width,
+                frame.height,
+                crate::services::desktop::FRAMELESS_RESIZE_MARGIN_VP,
+            )
         } else {
             None
         }
@@ -1504,7 +1510,15 @@ fn handle_window_resize_press(
     let frame = owner.frame.get();
     let Some(edge) = explicit.or_else(|| {
         frame_none
-            .then(|| crate::services::desktop::resize_edge(x, y, frame.width, frame.height, 6.0))
+            .then(|| {
+                crate::services::desktop::resize_edge(
+                    x,
+                    y,
+                    frame.width,
+                    frame.height,
+                    crate::services::desktop::FRAMELESS_RESIZE_MARGIN_VP,
+                )
+            })
             .flatten()
     }) else {
         return Ok(false);

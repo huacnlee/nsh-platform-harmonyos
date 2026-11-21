@@ -10,6 +10,8 @@ use ohos_arkui_binding::{
     event::{KeyCode as N, KeyEvent, KeyEventType},
 };
 
+const KEY_SCROLL_LINE_STEP_VP: f32 = 40.0;
+
 impl crate::render::node::Node {
     pub(crate) fn dismiss_keyboard(&self) -> crate::render::node::Result<()> {
         let Some(id) = self
@@ -359,8 +361,14 @@ impl KeyboardWindow {
                         Key::PageDown => Some((KeyMove::Pages(1.0), false)),
                         Key::Home => Some((KeyMove::Start, false)),
                         Key::End => Some((KeyMove::End, false)),
-                        Key::Up => Some((KeyMove::Points(nsh_core::Points(-40.0)), false)),
-                        Key::Down => Some((KeyMove::Points(nsh_core::Points(40.0)), false)),
+                        Key::Up => Some((
+                            KeyMove::Points(nsh_core::Points(-KEY_SCROLL_LINE_STEP_VP)),
+                            false,
+                        )),
+                        Key::Down => Some((
+                            KeyMove::Points(nsh_core::Points(KEY_SCROLL_LINE_STEP_VP)),
+                            false,
+                        )),
                         Key::Char(' ') => Some((KeyMove::Pages(1.0), false)),
                         _ => None,
                     }
@@ -406,7 +414,40 @@ pub(crate) fn install(
 ) -> crate::render::node::Result<()> {
     owner.native.borrow().set_focusable(true)?;
     if owner.platform.get().os.is_desktop() {
-        let _ = owner.native.borrow().set_default_focus(true);
+        // ArkUI delegates focus requested on a container to its first focusable
+        // leaf descendant (e.g. a search TextInput). A childless leaf focus sink
+        // inside the root absorbs surface-level focus so global shortcuts bubble
+        // to `on_key_pre_ime` without focusing an editor or clearing selections.
+        let sink = ohos_arkui_binding::component::built_in_component::Stack::new()?.into_node();
+        {
+            use ohos_arkui_binding::{
+                common::attribute::ArkUINodeAttributeNumber,
+                types::{
+                    advanced::LengthMetricUnit,
+                    attribute::ArkUINodeAttributeType as A,
+                    view::{AccessibilityMode, HitTestMode},
+                },
+            };
+            let node = sink.borrow();
+            node.set_length_metric_unit(LengthMetricUnit::Vp)?;
+            node.width(1.0)?;
+            node.height(1.0)?;
+            node.opacity(0.0)?;
+            node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+            node.set_i32_attribute(
+                A::AccessibilityMode,
+                AccessibilityMode::DisabledForDescendants.into(),
+            )?;
+            node.set_focusable(true)?;
+            let _ = node.set_default_focus(true);
+            let _ = node.set_focus_box([
+                ArkUINodeAttributeNumber::Float(0.0),
+                ArkUINodeAttributeNumber::Float(0.0),
+                ArkUINodeAttributeNumber::Uint(0),
+            ]);
+        }
+        owner.native.borrow_mut().insert_child(sink.clone(), 0)?;
+        *owner.focus_sink.borrow_mut() = Some(sink);
     }
     let weak = std::rc::Rc::downgrade(owner);
     owner.native.borrow_mut().on_key_pre_ime(move |event| {

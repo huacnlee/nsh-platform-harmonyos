@@ -78,6 +78,45 @@ impl SelectionDrag {
         failure.map_or(Ok(()), Err)
     }
 }
+const MOUSE_MULTI_CLICK_MS: f64 = 400.0;
+const MOUSE_MULTI_CLICK_DISTANCE_VP: f32 = 12.0;
+const TOUCH_MULTI_TAP_MS: f64 = 350.0;
+const TOUCH_MULTI_TAP_DISTANCE_VP: f32 = 24.0;
+const WINDOW_DRAG_THRESHOLD_VP: f32 = 3.0;
+
+fn advance_clicks(
+    slot: &mut Option<LastTap>,
+    event_time_ns: i64,
+    window: (f32, f32),
+    max_interval_ms: f64,
+    max_distance: f32,
+) -> u32 {
+    if let Some(last) = slot.as_ref()
+        && last.event_time_ns == event_time_ns
+        && event_time_ns != 0
+    {
+        return last.clicks;
+    }
+    let time_ms = event_time_ns as f64 / 1_000_000.0;
+    let clicks = match slot.as_ref() {
+        Some(last)
+            if time_ms >= last.time_ms
+                && time_ms - last.time_ms <= max_interval_ms
+                && (window.0 - last.window.0).hypot(window.1 - last.window.1) <= max_distance =>
+        {
+            (last.clicks % 3) + 1
+        }
+        _ => 1,
+    };
+    *slot = Some(LastTap {
+        time_ms,
+        window,
+        clicks,
+        event_time_ns,
+    });
+    clicks
+}
+
 #[derive(Default)]
 pub(crate) struct Touches {
     fingers: Vec<Finger>,
@@ -106,67 +145,31 @@ impl Touches {
         self.last_pointer
     }
     pub(crate) fn record_mouse_press(&mut self, event_time_ns: i64, window: (f32, f32)) -> u32 {
-        if let Some(last) = &self.last_mouse_press
-            && last.event_time_ns == event_time_ns
-            && event_time_ns != 0
-        {
-            return last.clicks;
-        }
-        let time_ms = event_time_ns as f64 / 1_000_000.0;
-        let max_dist = 12.0;
-        let clicks = match &self.last_mouse_press {
-            Some(last)
-                if time_ms >= last.time_ms
-                    && time_ms - last.time_ms <= 400.0
-                    && (window.0 - last.window.0).hypot(window.1 - last.window.1) <= max_dist =>
-            {
-                (last.clicks % 3) + 1
-            }
-            _ => 1,
-        };
-        self.last_mouse_press = Some(LastTap {
-            time_ms,
-            window,
-            clicks,
+        advance_clicks(
+            &mut self.last_mouse_press,
             event_time_ns,
-        });
-        clicks
+            window,
+            MOUSE_MULTI_CLICK_MS,
+            MOUSE_MULTI_CLICK_DISTANCE_VP,
+        )
     }
     pub(crate) fn record_down(&mut self, scale: f32, input: &ArkUIInputEvent) {
         if input.action != UIInputAction::Down || input.pointer_count() != 1 {
             return;
         }
         let event_time_ns = input.event_time();
-        if self
-            .last_tap
-            .as_ref()
-            .is_some_and(|last| last.event_time_ns == event_time_ns)
-        {
-            return;
-        }
-        let time_ms = event_time_ns as f64 / 1_000_000.0;
         let window = (
             input.pointer_window_x_by_index(0),
             input.pointer_window_y_by_index(0),
         );
         self.record_pointer(window);
-        let max_dist = 24.0 * scale.max(1.0);
-        let clicks = match &self.last_tap {
-            Some(last)
-                if time_ms >= last.time_ms
-                    && time_ms - last.time_ms <= 350.0
-                    && (window.0 - last.window.0).hypot(window.1 - last.window.1) <= max_dist =>
-            {
-                (last.clicks % 3) + 1
-            }
-            _ => 1,
-        };
-        self.last_tap = Some(LastTap {
-            time_ms,
-            window,
-            clicks,
+        let _ = advance_clicks(
+            &mut self.last_tap,
             event_time_ns,
-        });
+            window,
+            TOUCH_MULTI_TAP_MS,
+            TOUCH_MULTI_TAP_DISTANCE_VP * scale.max(1.0),
+        );
     }
     pub(crate) fn clicks(&self) -> u32 {
         self.last_tap.as_ref().map_or(1, |tap| tap.clicks)
@@ -184,7 +187,9 @@ impl Touches {
                 owner.selection_menu_show(false)?;
             }
         }
-        root.clear_text_selection()?;
+        if !root.platform.get().os.is_desktop() {
+            root.clear_text_selection()?;
+        }
         if let Some(back) = self.back.take()
             && back.active
             && let Some(screen) = back.screen.upgrade()
@@ -518,10 +523,10 @@ impl Touches {
                     let total_dx = display_point.0 - resize.start_display.0;
                     let total_dy = display_point.1 - resize.start_display.1;
                     let main = owner.main_window.borrow();
-                    let min_w = main.min_size.map_or(120.0, |s| s.width.0.max(120.0));
-                    let min_h = main.min_size.map_or(80.0, |s| s.height.0.max(80.0));
-                    let max_w = main.max_size.map_or(16384.0, |s| s.width.0.max(min_w));
-                    let max_h = main.max_size.map_or(16384.0, |s| s.height.0.max(min_h));
+                    let min_w = main.min_size.map_or(1.0, |s| s.width.0.max(1.0));
+                    let min_h = main.min_size.map_or(1.0, |s| s.height.0.max(1.0));
+                    let max_w = main.max_size.map(|s| s.width.0);
+                    let max_h = main.max_size.map(|s| s.height.0);
                     drop(main);
                     let (next_origin, next_size) = crate::services::desktop::apply_resize_delta(
                         resize.edge,
@@ -575,7 +580,7 @@ impl Touches {
             return Ok(false);
         };
         if (window_point.0 - pending.start_window.0).hypot(window_point.1 - pending.start_window.1)
-            < 3.0
+            < WINDOW_DRAG_THRESHOLD_VP
         {
             return Ok(false);
         }

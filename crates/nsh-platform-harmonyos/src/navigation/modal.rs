@@ -13,7 +13,7 @@ use nsh_core::{
     Points,
     desktop::{
         CloseReason, OpenWindow, WindowAttributes, WindowCloseCause, WindowControl, WindowEvent,
-        WindowFrameStyle, WindowKind, WindowMode, WindowPosition, WindowRequest, WindowState,
+        WindowFrameStyle, WindowMode, WindowPosition, WindowRequest, WindowState,
     },
 };
 use ohos_arkui_binding::{
@@ -250,16 +250,7 @@ impl Modal {
         })
     }
     fn clamp_desktop_size(attrs: &WindowAttributes, size: Size) -> Size {
-        let mut w = size.width.max(120.0);
-        let mut h = size.height.max(80.0);
-        if let Some(Some(min)) = attrs.min_size {
-            w = w.max(min.width.0);
-            h = h.max(min.height.0);
-        }
-        if let Some(Some(max)) = attrs.max_size {
-            w = w.min(max.width.0);
-            h = h.min(max.height.0);
-        }
+        let (w, h) = crate::services::desktop::clamp_window_size((size.width, size.height), attrs);
         Size::new(w, h)
     }
     pub(crate) fn open_desktop_window(&self, open: OpenWindow) -> Result<()> {
@@ -270,11 +261,9 @@ impl Modal {
             .placement
             .map(|p| Size::new(p.bounds.size.width.0, p.bounds.size.height.0))
             .or_else(|| open.options.default_size.map(Into::into))
-            .unwrap_or_else(|| match open.options.kind {
-                WindowKind::Panel => Size::new(320.0, 440.0),
-                WindowKind::Dialog => Size::new(420.0, 320.0),
-                WindowKind::Popup => Size::new(520.0, 360.0),
-                _ => Size::new(640.0, 520.0),
+            .unwrap_or_else(|| {
+                let (w, h) = crate::services::desktop::default_sub_window_size(open.options.kind);
+                Size::new(w, h)
             });
         let size = Self::clamp_desktop_size(&open.options.attributes, requested);
         let origin = open
@@ -605,7 +594,13 @@ impl Modal {
         }
         let owner = self.owner.upgrade()?;
         let frame = owner.frame.get();
-        crate::services::desktop::resize_edge(local.0, local.1, frame.width, frame.height, 6.0)
+        crate::services::desktop::resize_edge(
+            local.0,
+            local.1,
+            frame.width,
+            frame.height,
+            crate::services::desktop::FRAMELESS_RESIZE_MARGIN_VP,
+        )
     }
     pub(crate) fn desktop_resize_anchor(&self) -> Option<((f32, f32), (f32, f32))> {
         let slot = self.desktop.borrow();
@@ -644,22 +639,14 @@ impl Modal {
                 .attrs
                 .min_size
                 .flatten()
-                .map_or(120.0, |s| s.width.0.max(120.0));
+                .map_or(1.0, |s| s.width.0.max(1.0));
             let min_h = win
                 .attrs
                 .min_size
                 .flatten()
-                .map_or(80.0, |s| s.height.0.max(80.0));
-            let max_w = win
-                .attrs
-                .max_size
-                .flatten()
-                .map_or(16384.0, |s| s.width.0.max(min_w));
-            let max_h = win
-                .attrs
-                .max_size
-                .flatten()
-                .map_or(16384.0, |s| s.height.0.max(min_h));
+                .map_or(1.0, |s| s.height.0.max(1.0));
+            let max_w = win.attrs.max_size.flatten().map(|s| s.width.0);
+            let max_h = win.attrs.max_size.flatten().map(|s| s.height.0);
             let (next_origin, next_size) = crate::services::desktop::apply_resize_delta(
                 edge,
                 start_origin,
@@ -1467,7 +1454,7 @@ impl Modal {
                 .desktop
                 .borrow()
                 .as_ref()
-                .map_or_else(|| Size::new(640.0, 480.0), |w| w.content_size);
+                .map_or_else(Size::default, |w| w.content_size);
             let scale = self.sub_window_scale(&owner);
             let available = if let Some(constraint) = event.layout_constraint_in_measure() {
                 let bound = |value: i32, fallback: f32| {

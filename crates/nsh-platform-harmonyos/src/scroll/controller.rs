@@ -29,6 +29,8 @@ use crate::{
     scroll::motion::{ZoomFrame, ZoomMotion, focal_offset, resisted_scale},
 };
 
+const KEY_SCROLL_PAGE_OVERLAP_VP: f32 = 40.0;
+
 pub(crate) struct Scroller {
     pub(crate) native: NativeNode,
     pub(crate) wrapper: NativeNode,
@@ -544,7 +546,9 @@ impl Scroller {
         };
         let target = match key_move {
             KeyMove::Points(d) => (cur + d.0).clamp(min, max),
-            KeyMove::Pages(n) => (cur + n * (vp - 40.0).max(40.0)).clamp(min, max),
+            KeyMove::Pages(n) => (cur
+                + n * (vp - KEY_SCROLL_PAGE_OVERLAP_VP).max(KEY_SCROLL_PAGE_OVERLAP_VP))
+            .clamp(min, max),
             KeyMove::Start => min,
             KeyMove::End => max,
         };

@@ -364,11 +364,12 @@ impl Mounter {
     }
     pub(crate) fn cancel_input(&self) -> Result<()> {
         let mut result = Ok(());
+        let desktop = self.platform.get().os.is_desktop();
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
             result = result.and(self.touches.borrow_mut().cancel(root));
         }
         for node in self.nodes.values() {
-            if let Some(input) = node.input.borrow().as_ref() {
+            if !desktop && let Some(input) = node.input.borrow().as_ref() {
                 result = result.and(input.suspend());
             }
             if let Some(scroll) = node.scroll.borrow().as_ref() {
@@ -954,6 +955,11 @@ impl Mounter {
                             && let Some(target_id) = self.desktop.selection_menu_target.take()
                             && let Ok(target) = self.node(target_id)
                         {
+                            if let Ok(window) = self.node(target.key_window_id())
+                                && let Some(sink) = window.focus_sink.borrow().as_ref()
+                            {
+                                let _ = sink.borrow().request_focus();
+                            }
                             target.selection_select_all_target(true)?;
                             return Ok(());
                         }
@@ -1008,7 +1014,11 @@ impl Mounter {
             return;
         }
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
-            let _ = root.native.borrow().request_focus();
+            if let Some(sink) = root.focus_sink.borrow().as_ref() {
+                let _ = sink.borrow().request_focus();
+            } else {
+                let _ = root.native.borrow().request_focus();
+            }
         }
     }
     pub(crate) fn desktop_selection_menu(

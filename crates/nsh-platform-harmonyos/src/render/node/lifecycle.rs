@@ -35,6 +35,7 @@ impl Node {
             #[cfg(feature = "api-23")]
             accessibility_provider: crate::accessibility::provider::State::default(),
             native,
+            focus_sink: RefCell::new(None),
             wrapper: RefCell::default(),
             mount_parent: RefCell::default(),
             id,
@@ -449,6 +450,7 @@ impl Node {
             }
         }
         let anchors = [
+            self.focus_sink.borrow().clone(),
             self.component
                 .borrow()
                 .as_ref()
@@ -611,6 +613,23 @@ impl Drop for Node {
             callback(|| {
                 self.detach_component(&component)?;
                 component.dispose()
+            });
+        }
+        if let Some(sink) = self.focus_sink.borrow_mut().take() {
+            callback(|| {
+                let index = self
+                    .native
+                    .borrow()
+                    .children()
+                    .iter()
+                    .position(|child| Rc::ptr_eq(child, &sink));
+                if let Some(index) = index {
+                    self.native.borrow_mut().remove_child(index)?;
+                }
+                if Rc::strong_count(&sink) == 1 {
+                    sink.borrow_mut().dispose()?;
+                }
+                Ok(())
             });
         }
         if let Some(wrapper) = self.wrapper.borrow_mut().take() {

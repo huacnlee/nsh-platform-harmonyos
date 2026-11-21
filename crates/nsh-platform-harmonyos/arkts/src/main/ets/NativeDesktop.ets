@@ -1,6 +1,6 @@
 import { common } from "@kit.AbilityKit";
 import { util } from "@kit.ArkTS";
-import { LengthMetrics, window } from "@kit.ArkUI";
+import { ColorMetrics, window } from "@kit.ArkUI";
 import { deviceInfo, emitter } from "@kit.BasicServicesKit";
 import type statusBarManager from "@hms.pcService.statusBarManager";
 import { image } from "@kit.ImageKit";
@@ -9,6 +9,7 @@ import { ComponentContent, NodeContent } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import display from "@ohos.display";
 import pointer from "@ohos.multimodalInput.pointer";
+import { NativeMenuCleanup } from "./NativeMenus";
 import {
   NSH_SUBWINDOW_BRIDGE_KEY,
   NSH_SUBWINDOW_ROUTE,
@@ -75,7 +76,6 @@ interface WireCommand {
   width?: number;
   height?: number;
   contentSized?: boolean;
-  clampToDisplay?: boolean;
   titleBarHidden?: boolean;
   visible?: boolean;
   display?: string;
@@ -136,16 +136,35 @@ interface WireTitleBarPayload {
   left: number;
 }
 
-interface PopupMenuParams {
+interface PopupMenuContentParams {
   owner: NativeDesktop;
   generation: number;
-  x: number;
-  y: number;
-  windowWidth: number;
-  windowHeight: number;
   items: WireMenuItem[];
   colorMode: ThemeColorMode;
 }
+
+interface PopupMenuAnchorParams {
+  anchorId: string;
+  x: number;
+  y: number;
+  onReady: (uniqueId: number) => void;
+}
+
+interface PopupMenuLease {
+  windowId?: number;
+  generation: number;
+  ui: UIContext;
+  anchorContent: ComponentContent<PopupMenuAnchorParams>;
+  menuContent?: ComponentContent<PopupMenuContentParams>;
+  opening: Promise<void>;
+  retired: boolean;
+  disappeared: boolean;
+  settled: boolean;
+}
+
+// HarmonyOS `statusBarManager` API limits (`@hms.pcService.statusBarManager.d.ts`).
+const STATUS_BAR_MAX_MENU_ITEMS: number = 20;
+const STATUS_BAR_MAX_HOVER_TIPS_CHARS: number = 128;
 
 export function isDesktopDevice(deviceType: string | undefined): boolean {
   const normalized = (deviceType ?? "").trim();
@@ -210,6 +229,18 @@ struct DesktopSubmenuView {
                           }
                         : undefined,
                   }).enabled(item.enabled !== false);
+                } else if (item.destructive) {
+                  MenuItem({
+                    content: item.label ?? "",
+                    labelInfo: item.shortcut,
+                  })
+                    .selected(item.checked === true)
+                    .selectIcon(item.checked !== undefined)
+                    .enabled(item.enabled !== false)
+                    .contentFontColor($r("sys.color.warning"))
+                    .onClick((): void => {
+                      this.owner?.selectPopupMenuItem(this.generation, item.id ?? 0, item.role);
+                    });
                 } else {
                   MenuItem({
                     content: item.label ?? "",
@@ -218,9 +249,6 @@ struct DesktopSubmenuView {
                     .selected(item.checked === true)
                     .selectIcon(item.checked !== undefined)
                     .enabled(item.enabled !== false)
-                    .contentFontColor(
-                      item.destructive ? "#D92D20" : $r("sys.color.font_primary"),
-                    )
                     .onClick((): void => {
                       this.owner?.selectPopupMenuItem(this.generation, item.id ?? 0, item.role);
                     });
@@ -232,99 +260,61 @@ struct DesktopSubmenuView {
         },
         (_group: WireMenuItem[], groupIndex: number): string => `g:${groupIndex}`,
       );
-    }
-    .menuItemGroupDivider({
-      strokeWidth: LengthMetrics.vp(0.5),
-      color: $r("sys.color.comp_divider"),
-      startMargin: LengthMetrics.vp(8),
-      endMargin: LengthMetrics.vp(8),
-    })
-    .padding(4);
-  }
-}
-
-@Component
-struct DesktopPopupOverlay {
-  owner?: NativeDesktop;
-  generation: number = 0;
-  x: number = 0;
-  y: number = 0;
-  windowWidth: number = 0;
-  windowHeight: number = 0;
-  items: WireMenuItem[] = [];
-  colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
-  @State private menuWidth: number = 180;
-  @State private menuHeight: number = 0;
-
-  private clampedX(): number {
-    const winW = this.windowWidth > 0 ? this.windowWidth : this.owner?.windowWidthVp() ?? 0;
-    if (winW <= 0) {
-      return Math.max(8, this.x);
-    }
-    return Math.max(8, Math.min(winW - this.menuWidth - 8, this.x));
-  }
-
-  private clampedY(): number {
-    const winH = this.windowHeight > 0 ? this.windowHeight : this.owner?.windowHeightVp() ?? 0;
-    if (winH <= 0 || this.menuHeight <= 0) {
-      return Math.max(8, this.y);
-    }
-    return Math.max(8, Math.min(winH - this.menuHeight - 8, this.y));
-  }
-
-  build() {
-    WithTheme({ colorMode: this.colorMode }) {
-      Stack({ alignContent: Alignment.TopStart }) {
-        Column() {
-          DesktopSubmenuView({
-            owner: this.owner,
-            generation: this.generation,
-            items: this.items,
-          });
-        }
-        .backgroundColor($r("sys.color.comp_background_primary"))
-        .borderRadius(12)
-        .border({ width: 0.5, color: $r("sys.color.comp_divider") })
-        .shadow(ShadowStyle.OUTER_DEFAULT_MD)
-        .onAreaChange((_old: Area, area: Area): void => {
-          const w = Number(area.width);
-          const h = Number(area.height);
-          if (w > 0) {
-            this.menuWidth = w;
-          }
-          if (h > 0) {
-            this.menuHeight = h;
-          }
-        })
-        .position({ x: this.clampedX(), y: this.clampedY() })
-        .onClick((): void => {});
-      }
-      .width("100%")
-      .height("100%")
-      .backgroundColor(Color.Transparent)
-      .onClick((): void => {
-        this.owner?.dismissPopupMenu(this.generation);
-      })
-      .onKeyEvent((event: KeyEvent): void => {
-        if (event.type === KeyType.Down && event.keyCode === 2070) {
-          this.owner?.dismissPopupMenu(this.generation);
-        }
-      });
     };
   }
 }
 
 @Builder
-function desktopPopupBuilder(params: PopupMenuParams) {
-  DesktopPopupOverlay({
-    owner: params.owner,
-    generation: params.generation,
+function desktopPopupMenuBuilder(params: PopupMenuContentParams) {
+  WithTheme({ colorMode: params.colorMode }) {
+    DesktopSubmenuView({
+      owner: params.owner,
+      generation: params.generation,
+      items: params.items,
+    });
+  };
+}
+
+@Component
+struct DesktopPopupAnchor {
+  anchorId: string = "";
+  x: number = 0;
+  y: number = 0;
+  onReady?: (uniqueId: number) => void;
+  private readyFired: boolean = false;
+
+  build() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      Column()
+        .id(this.anchorId)
+        .width(1)
+        .height(1)
+        .position({ x: this.x, y: this.y })
+        .hitTestBehavior(HitTestMode.None)
+        .onAreaChange((): void => {
+          if (this.readyFired) {
+            return;
+          }
+          const frame = this.getUIContext().getFrameNodeById(this.anchorId);
+          if (frame !== null) {
+            this.readyFired = true;
+            this.onReady?.(frame.getUniqueId());
+          }
+        });
+    }
+    .width("100%")
+    .height("100%")
+    .hitTestBehavior(HitTestMode.None);
+  }
+}
+
+@Builder
+function desktopPopupAnchorBuilder(params: PopupMenuAnchorParams) {
+  DesktopPopupAnchor({
+    anchorId: params.anchorId,
     x: params.x,
     y: params.y,
-    windowWidth: params.windowWidth,
-    windowHeight: params.windowHeight,
-    items: params.items,
-    colorMode: params.colorMode,
+    onReady: params.onReady,
   });
 }
 
@@ -344,12 +334,25 @@ function resolveSubWindowZLevel(kind?: string, level?: string): number {
   return 0;
 }
 
+// HarmonyOS `Window.setWindowDecorHeight` requires an integer in `[37, 112]` vp.
 function clampDecorHeight(height: number): number {
   return Math.max(37, Math.min(112, Math.round(height)));
 }
 
-function defaultOpaqueWindowColor(colorMode: ThemeColorMode): string {
-  return colorMode === ThemeColorMode.DARK ? "#FF0A0A0A" : "#FFFFFFFF";
+function resolveSystemWindowBackground(
+  abilityContext: common.UIAbilityContext,
+): string | ColorMetrics | undefined {
+  if (deviceInfo.sdkApiVersion >= 18) {
+    try {
+      return ColorMetrics.resourceColor($r("sys.color.background_primary"));
+    } catch {}
+  }
+  try {
+    const argb = abilityContext.resourceManager.getColorSync($r("sys.color.background_primary").id);
+    return `#${(argb >>> 0).toString(16).padStart(8, "0").toUpperCase()}`;
+  } catch {
+    return undefined;
+  }
 }
 
 function resolveScaleFactor(displayId: number | undefined, fallbackUi: UIContext): number {
@@ -382,14 +385,27 @@ const FNV_OFFSET_64: bigint = BigInt("0xcbf29ce484222325");
 const FNV_PRIME_64: bigint = BigInt("0x00000100000001b3");
 const MASK_64: bigint = BigInt("0xffffffffffffffff");
 
-// Matches `nsh_core::desktop::DisplayId::from_name` (64-bit FNV-1a, 16 lowercase hex digits).
-function displayIdHex(idName: string): string {
+// 64-bit FNV-1a hex digest; matches `nsh_core::desktop::DisplayId::from_name` for ASCII names.
+function fnv1a64Hex(input: string): string {
   let hash: bigint = FNV_OFFSET_64;
-  for (let i = 0; i < idName.length; i++) {
-    hash = hash ^ BigInt(idName.charCodeAt(i) & 0xff);
+  for (let i = 0; i < input.length; i++) {
+    hash = hash ^ BigInt(input.charCodeAt(i) & 0xff);
     hash = (hash * FNV_PRIME_64) & MASK_64;
   }
   return hash.toString(16).padStart(16, "0");
+}
+
+function displayIdHex(idName: string): string {
+  return fnv1a64Hex(idName);
+}
+
+function trayIconDigest(icon?: WireTrayIcon): string {
+  if (!icon) {
+    return "default";
+  }
+  return fnv1a64Hex(
+    `${icon.format}|${icon.width ?? 0}x${icon.height ?? 0}|${icon.whiteBase64 ?? ""}|${icon.blackBase64 ?? ""}|${icon.dataBase64 ?? ""}`,
+  );
 }
 
 async function resolveTargetDisplay(
@@ -448,8 +464,10 @@ class SubWindowHost {
   private frameNone: boolean = false;
   private transparent: boolean = false;
   private backdrop: string = "none";
+  private backgroundOverridden: boolean = false;
+  private shadowDisabled: boolean = false;
   private titleBarHidden: boolean = false;
-  private requestedTitleBarHeight: number = 40;
+  private requestedTitleBarHeight?: number = undefined;
   private maximizable: boolean = true;
   private minimizable: boolean = true;
   private closable: boolean = true;
@@ -609,8 +627,25 @@ class SubWindowHost {
   }
 
   setColorMode(mode: ThemeColorMode): void {
-    if (!this.destroyed) {
-      this.pageBridge?.setColorMode(mode);
+    if (this.destroyed) {
+      return;
+    }
+    this.pageBridge?.setColorMode(mode);
+    if (this.backgroundOverridden && !this.transparent && this.backdrop === "none" && !this.frameNone) {
+      this.applyOpaqueBackground();
+    }
+  }
+
+  private applyOpaqueBackground(): void {
+    const sub = this.win;
+    if (!sub || this.destroyed) {
+      return;
+    }
+    const bg = resolveSystemWindowBackground(this.owner.abilityContextRef());
+    if (bg !== undefined) {
+      try {
+        sub.setWindowBackgroundColor(bg);
+      } catch {}
     }
   }
 
@@ -757,57 +792,55 @@ class SubWindowHost {
     const area = await displayAvailableRectPx(screen);
     const screenLeft = area.left;
     const screenTop = area.top;
-    const screenWidth = area.width > 0 ? area.width : Math.round(1600 * scale);
-    const screenHeight = area.height > 0 ? area.height : Math.round(1000 * scale);
-    const widthPx = Math.max(120, Math.round((cmd.width ?? 640) * scale));
-    const heightPx = Math.max(80, Math.round((cmd.height ?? 520) * scale));
-    const parentRect = parentProps?.windowRect ?? {
-      left: screenLeft + Math.round((screenWidth - widthPx) / 2),
-      top: screenTop + Math.round((screenHeight - heightPx) / 2),
-      width: Math.min(screenWidth, Math.round(1100 * scale)),
-      height: Math.min(screenHeight, Math.round(760 * scale)),
-    };
+    const screenWidth = area.width;
+    const screenHeight = area.height;
+    const widthPx = Math.max(1, Math.round((cmd.width ?? 1) * scale));
+    const heightPx = Math.max(1, Math.round((cmd.height ?? 1) * scale));
+    const parentRect = parentProps?.windowRect;
 
     let leftPx = screenLeft + Math.round((screenWidth - widthPx) / 2);
     let topPx = screenTop + Math.round((screenHeight - heightPx) / 2);
     const pos = cmd.position ?? "auto";
     if (pos === "at" && cmd.x !== undefined && cmd.y !== undefined) {
-      leftPx = Math.round(cmd.x * scale);
-      topPx = Math.round(cmd.y * scale);
       this.userPositioned = true;
-    } else if (pos === "parentCenter" && !cmd.display) {
+      return {
+        left: Math.round(cmd.x * scale),
+        top: Math.round(cmd.y * scale),
+        width: widthPx,
+        height: heightPx,
+      };
+    } else if (pos === "parentCenter" && !cmd.display && parentRect !== undefined) {
       leftPx = Math.round(parentRect.left + (parentRect.width - widthPx) / 2);
       topPx = Math.round(parentRect.top + (parentRect.height - heightPx) / 2);
     } else if (pos === "center" || pos === "parentCenter") {
       leftPx = screenLeft + Math.round((screenWidth - widthPx) / 2);
       topPx = screenTop + Math.round((screenHeight - heightPx) / 2);
-    } else if (cmd.kind === "panel") {
+    } else if (cmd.kind === "panel" && parentRect !== undefined) {
       const gap = Math.round(16 * scale);
       if (parentRect.left + parentRect.width + gap + widthPx <= screenLeft + screenWidth) {
         leftPx = parentRect.left + parentRect.width + gap;
       } else if (parentRect.left - gap - widthPx >= screenLeft) {
         leftPx = parentRect.left - gap - widthPx;
       } else {
-        leftPx = Math.max(screenLeft, screenLeft + screenWidth - widthPx - Math.round(24 * scale));
+        leftPx = screenLeft + Math.max(0, screenWidth - widthPx);
       }
-      topPx = Math.max(
-        screenTop,
-        Math.min(screenTop + Math.max(0, screenHeight - heightPx), parentRect.top),
-      );
-    } else if (cmd.kind === "popup" || cmd.kind === "overlay") {
+      topPx = parentRect.top;
+    } else if ((cmd.kind === "popup" || cmd.kind === "overlay") && parentRect !== undefined) {
       leftPx = Math.round(parentRect.left + (parentRect.width - widthPx) / 2);
-      topPx = Math.round(parentRect.top + Math.min(parentRect.height * 0.16, 120 * scale));
-    } else if (!cmd.display) {
+      topPx = Math.round(parentRect.top + (parentRect.height - heightPx) / 2);
+    } else if (!cmd.display && parentRect !== undefined) {
       const step = Math.round(32 * scale);
       const offset = ((this.owner.nextCascade() % 6) + 1) * step;
       leftPx = parentRect.left + offset;
       topPx = parentRect.top + offset;
     }
 
-    const maxLeft = screenLeft + Math.max(0, screenWidth - widthPx);
-    const maxTop = screenTop + Math.max(0, screenHeight - heightPx);
-    leftPx = Math.max(screenLeft, Math.min(maxLeft, leftPx));
-    topPx = Math.max(screenTop, Math.min(maxTop, topPx));
+    if (screenWidth > 0 && screenHeight > 0) {
+      const maxLeft = screenLeft + Math.max(0, screenWidth - widthPx);
+      const maxTop = screenTop + Math.max(0, screenHeight - heightPx);
+      leftPx = Math.max(screenLeft, Math.min(maxLeft, leftPx));
+      topPx = Math.max(screenTop, Math.min(maxTop, topPx));
+    }
     return { left: leftPx, top: topPx, width: widthPx, height: heightPx };
   }
 
@@ -922,11 +955,13 @@ class SubWindowHost {
     } catch {}
 
     if (this.transparent || this.frameNone || this.backdrop !== "none") {
+      this.backgroundOverridden = true;
       try {
         sub.setWindowBackgroundColor("#00000000");
       } catch {}
     }
     if (this.transparent && cmd.shadow === undefined && deviceInfo.sdkApiVersion >= 17) {
+      this.shadowDisabled = true;
       try {
         sub.setWindowShadowRadius(0);
       } catch {}
@@ -1045,26 +1080,24 @@ class SubWindowHost {
     if (cmd.transparent !== undefined) {
       this.transparent = cmd.transparent;
       if (this.transparent) {
+        this.backgroundOverridden = true;
         try {
           sub.setWindowBackgroundColor("#00000000");
         } catch {}
-      } else if (this.backdrop === "none" && !this.frameNone) {
-        try {
-          sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
-        } catch {}
+      } else if (this.backgroundOverridden && this.backdrop === "none" && !this.frameNone) {
+        this.applyOpaqueBackground();
       }
     }
     if (cmd.backdrop !== undefined) {
       this.backdrop = cmd.backdrop;
       this.pageBridge?.setBackdrop(this.backdrop);
       if (this.backdrop !== "none") {
+        this.backgroundOverridden = true;
         try {
           sub.setWindowBackgroundColor("#00000000");
         } catch {}
-      } else if (!this.transparent && !this.frameNone) {
-        try {
-          sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
-        } catch {}
+      } else if (this.backgroundOverridden && !this.transparent && !this.frameNone) {
+        this.applyOpaqueBackground();
       }
     }
     if (cmd.title !== undefined) {
@@ -1089,10 +1122,8 @@ class SubWindowHost {
         if (cmd.titleBarStyle === undefined) {
           this.titleBarHidden = false;
         }
-        if (!this.transparent && this.backdrop === "none") {
-          try {
-            sub.setWindowBackgroundColor(defaultOpaqueWindowColor(this.owner.activeColorMode()));
-          } catch {}
+        if (this.backgroundOverridden && !this.transparent && this.backdrop === "none") {
+          this.applyOpaqueBackground();
         }
       }
       if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
@@ -1112,7 +1143,7 @@ class SubWindowHost {
         }
         if (hidden) {
           try {
-            if (this.requestedTitleBarHeight > 0) {
+            if (this.requestedTitleBarHeight !== undefined) {
               sub.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
             }
           } catch {}
@@ -1161,27 +1192,34 @@ class SubWindowHost {
         this.ui ?? this.owner.mainUiContext(),
       );
       const limits: window.WindowLimits = {};
+      let hasLimits = false;
       if (cmd.minSize !== undefined) {
         if (cmd.minSize !== null) {
           limits.minWidth = Math.max(1, Math.round(cmd.minSize.width * scale));
           limits.minHeight = Math.max(1, Math.round(cmd.minSize.height * scale));
-        } else {
-          limits.minWidth = this.defaultLimits?.minWidth ?? 1;
-          limits.minHeight = this.defaultLimits?.minHeight ?? 1;
+          hasLimits = true;
+        } else if (this.defaultLimits !== undefined) {
+          limits.minWidth = this.defaultLimits.minWidth;
+          limits.minHeight = this.defaultLimits.minHeight;
+          hasLimits = true;
         }
       }
       if (cmd.maxSize !== undefined) {
         if (cmd.maxSize !== null) {
           limits.maxWidth = Math.max(1, Math.round(cmd.maxSize.width * scale));
           limits.maxHeight = Math.max(1, Math.round(cmd.maxSize.height * scale));
-        } else {
-          limits.maxWidth = this.defaultLimits?.maxWidth ?? 4096;
-          limits.maxHeight = this.defaultLimits?.maxHeight ?? 4096;
+          hasLimits = true;
+        } else if (this.defaultLimits !== undefined) {
+          limits.maxWidth = this.defaultLimits.maxWidth;
+          limits.maxHeight = this.defaultLimits.maxHeight;
+          hasLimits = true;
         }
       }
-      try {
-        await sub.setWindowLimits(limits);
-      } catch {}
+      if (hasLimits) {
+        try {
+          await sub.setWindowLimits(limits);
+        } catch {}
+      }
     }
 
     if (cmd.level !== undefined && !this.isModal) {
@@ -1217,9 +1255,23 @@ class SubWindowHost {
     }
 
     if (cmd.shadow !== undefined && deviceInfo.sdkApiVersion >= 17) {
-      try {
-        sub.setWindowShadowRadius(cmd.shadow ? 24 : 0);
-      } catch {}
+      if (!cmd.shadow) {
+        this.shadowDisabled = true;
+        try {
+          sub.setWindowShadowRadius(0);
+        } catch {}
+      } else if (this.shadowDisabled) {
+        // HarmonyOS has no `getWindowShadowRadius` API; leave native shadow untouched unless
+        // re-enabling after an explicit disable.
+        this.shadowDisabled = false;
+        const scale = resolveScaleFactor(
+          sub.getWindowProperties().displayId,
+          this.ui ?? this.owner.mainUiContext(),
+        );
+        try {
+          sub.setWindowShadowRadius(Math.round(16 * scale));
+        } catch {}
+      }
     }
   }
 
@@ -1431,20 +1483,20 @@ class SubWindowHost {
       const rect = sub.getTitleButtonRect();
       this.reportTitleBar(rect);
     } catch {
-      let height = this.requestedTitleBarHeight;
+      let height = this.requestedTitleBarHeight ?? 0;
       try {
         const decor = sub.getWindowDecorHeight();
         if (decor > 0) {
-          height = decor;
+          height = Math.max(height, decor);
         }
       } catch {}
-      this.emitTitleBar({ top: height, right: 136, bottom: 0, left: 0 });
+      this.emitTitleBar({ top: height, right: 0, bottom: 0, left: 0 });
     }
   }
 
   private reportTitleBar(rect: window.TitleButtonRect): void {
     const sub = this.win;
-    let height = this.requestedTitleBarHeight;
+    let height = this.requestedTitleBarHeight ?? 0;
     if (sub) {
       try {
         const decor = sub.getWindowDecorHeight();
@@ -1546,8 +1598,9 @@ export class NativeDesktop {
   private frameNone: boolean = false;
   private transparent: boolean = false;
   private backdrop: string = "none";
+  private backgroundOverridden: boolean = false;
   private titleBarHidden: boolean = false;
-  private requestedTitleBarHeight: number = 44;
+  private requestedTitleBarHeight?: number = undefined;
   private closeOnPress: boolean = true;
   private maximizable: boolean = true;
   private minimizable: boolean = true;
@@ -1563,8 +1616,8 @@ export class NativeDesktop {
   private flushingMainBounds: boolean = false;
   private lastWindowStateJson: string = "";
   private lastTitleBarJson: string = "";
-  private popupContent?: ComponentContent<PopupMenuParams>;
-  private popupUi?: UIContext;
+  private readonly popupMenus: NativeMenuCleanup = new NativeMenuCleanup();
+  private popupLease?: PopupMenuLease;
   private popupGeneration: number = 0;
   private trayAdded: boolean = false;
   private traySubscribed: boolean = false;
@@ -1696,6 +1749,10 @@ export class NativeDesktop {
     return this.ui;
   }
 
+  abilityContextRef(): common.UIAbilityContext {
+    return this.abilityContext;
+  }
+
   getSubWindowRef(windowId: number): window.Window | undefined {
     return this.subWindows.get(windowId)?.windowRef();
   }
@@ -1727,6 +1784,10 @@ export class NativeDesktop {
 
   onSubWindowRemoved(windowId: number): void {
     this.subWindows.delete(windowId);
+    if (this.popupLease !== undefined && this.popupLease.windowId === windowId) {
+      this.popupLease.disappeared = true;
+      this.closePopupMenuOnly();
+    }
   }
 
   updateCursor(style?: pointer.PointerStyle): void {
@@ -1738,9 +1799,21 @@ export class NativeDesktop {
 
   setColorMode(mode: ThemeColorMode): void {
     this.colorMode = mode;
+    if (this.backgroundOverridden && !this.transparent && this.backdrop === "none" && !this.frameNone) {
+      this.applyOpaqueBackground();
+    }
     this.subWindows.forEach((sub: SubWindowHost): void => {
       sub.setColorMode(mode);
     });
+  }
+
+  private applyOpaqueBackground(): void {
+    const bg = resolveSystemWindowBackground(this.abilityContext);
+    if (bg !== undefined) {
+      try {
+        this.mainWindow.setWindowBackgroundColor(bg);
+      } catch {}
+    }
   }
 
   requestComponentFocus(componentId: string): boolean {
@@ -1905,6 +1978,9 @@ export class NativeDesktop {
     if (this.closed || generation !== this.popupGeneration) {
       return;
     }
+    if (this.popupLease !== undefined && this.popupLease.generation === generation) {
+      this.popupLease.settled = true;
+    }
     this.closePopupMenuOnly();
     this.emit("menu-select", JSON.stringify({ generation, id, role }));
   }
@@ -1912,6 +1988,9 @@ export class NativeDesktop {
   dismissPopupMenu(generation: number): void {
     if (this.closed || generation !== this.popupGeneration) {
       return;
+    }
+    if (this.popupLease !== undefined && this.popupLease.generation === generation) {
+      this.popupLease.settled = true;
     }
     this.closePopupMenuOnly();
     this.emit("menu-close", JSON.stringify({ generation }));
@@ -1923,6 +2002,7 @@ export class NativeDesktop {
     }
     this.closed = true;
     this.closePopupMenuOnly();
+    void this.popupMenus.settled();
     this.closeAllSubWindows();
     this.removeTraySync();
     this.unregisterAllGlobalShortcuts();
@@ -1995,25 +2075,23 @@ export class NativeDesktop {
     if (cmd.transparent !== undefined) {
       this.transparent = cmd.transparent;
       if (this.transparent) {
+        this.backgroundOverridden = true;
         try {
           this.mainWindow.setWindowBackgroundColor("#00000000");
         } catch {}
-      } else if (this.backdrop === "none" && !this.frameNone) {
-        try {
-          this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
-        } catch {}
+      } else if (this.backgroundOverridden && this.backdrop === "none" && !this.frameNone) {
+        this.applyOpaqueBackground();
       }
     }
     if (cmd.backdrop !== undefined) {
       this.backdrop = cmd.backdrop;
       if (this.backdrop !== "none") {
+        this.backgroundOverridden = true;
         try {
           this.mainWindow.setWindowBackgroundColor("#00000000");
         } catch {}
-      } else if (!this.transparent && !this.frameNone) {
-        try {
-          this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
-        } catch {}
+      } else if (this.backgroundOverridden && !this.transparent && !this.frameNone) {
+        this.applyOpaqueBackground();
       }
     }
     if (cmd.closeOnPress !== undefined) {
@@ -2036,10 +2114,8 @@ export class NativeDesktop {
         if (cmd.titleBarStyle === undefined) {
           this.titleBarHidden = false;
         }
-        if (!this.transparent && this.backdrop === "none") {
-          try {
-            this.mainWindow.setWindowBackgroundColor(defaultOpaqueWindowColor(this.colorMode));
-          } catch {}
+        if (this.backgroundOverridden && !this.transparent && this.backdrop === "none") {
+          this.applyOpaqueBackground();
         }
       }
       if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
@@ -2063,7 +2139,7 @@ export class NativeDesktop {
         }
         if (hidden) {
           try {
-            if (this.requestedTitleBarHeight > 0) {
+            if (this.requestedTitleBarHeight !== undefined) {
               this.mainWindow.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
             }
           } catch {}
@@ -2112,27 +2188,34 @@ export class NativeDesktop {
 
     if (cmd.minSize !== undefined || cmd.maxSize !== undefined) {
       const limits: window.WindowLimits = {};
+      let hasLimits = false;
       if (cmd.minSize !== undefined) {
         if (cmd.minSize !== null) {
           limits.minWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.width)));
           limits.minHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.height)));
-        } else {
-          limits.minWidth = this.defaultLimits?.minWidth ?? 1;
-          limits.minHeight = this.defaultLimits?.minHeight ?? 1;
+          hasLimits = true;
+        } else if (this.defaultLimits !== undefined) {
+          limits.minWidth = this.defaultLimits.minWidth;
+          limits.minHeight = this.defaultLimits.minHeight;
+          hasLimits = true;
         }
       }
       if (cmd.maxSize !== undefined) {
         if (cmd.maxSize !== null) {
           limits.maxWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.width)));
           limits.maxHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.height)));
-        } else {
-          limits.maxWidth = this.defaultLimits?.maxWidth ?? 4096;
-          limits.maxHeight = this.defaultLimits?.maxHeight ?? 4096;
+          hasLimits = true;
+        } else if (this.defaultLimits !== undefined) {
+          limits.maxWidth = this.defaultLimits.maxWidth;
+          limits.maxHeight = this.defaultLimits.maxHeight;
+          hasLimits = true;
         }
       }
-      try {
-        this.mainWindow.setWindowLimits(limits).catch((): void => {});
-      } catch {}
+      if (hasLimits) {
+        try {
+          this.mainWindow.setWindowLimits(limits).catch((): void => {});
+        } catch {}
+      }
     }
 
     if (cmd.level !== undefined) {
@@ -2377,21 +2460,12 @@ export class NativeDesktop {
         drawable.height > 0
           ? Math.max(0, rect.height - drawable.height)
           : 0;
-      let targetW =
+      const targetW =
         cmd.width !== undefined ? Math.max(1, Math.round(cmd.width * scale) + chromeW) : rect.width;
-      let targetH =
+      const targetH =
         cmd.height !== undefined
           ? Math.max(1, Math.round(cmd.height * scale) + chromeH)
           : rect.height;
-      if (cmd.clampToDisplay === true) {
-        const area = await displayAvailableRectPx(screen);
-        if (area.width > 0) {
-          targetW = Math.min(targetW, area.width);
-        }
-        if (area.height > 0) {
-          targetH = Math.min(targetH, area.height);
-        }
-      }
       if (
         (cmd.width !== undefined || cmd.height !== undefined) &&
         (Math.abs(targetW - rect.width) > 1 || Math.abs(targetH - rect.height) > 1)
@@ -2478,16 +2552,16 @@ export class NativeDesktop {
       const rect = this.mainWindow.getTitleButtonRect();
       this.reportTitleBar(rect);
     } catch {
-      let height = this.requestedTitleBarHeight;
+      let height = this.requestedTitleBarHeight ?? 0;
       try {
         const decor = this.mainWindow.getWindowDecorHeight();
         if (decor > 0) {
-          height = decor;
+          height = Math.max(height, decor);
         }
       } catch {}
       this.emitTitleBar({
         top: height,
-        right: 136,
+        right: 0,
         bottom: 0,
         left: 0,
       });
@@ -2495,7 +2569,7 @@ export class NativeDesktop {
   }
 
   private reportTitleBar(rect: window.TitleButtonRect): void {
-    let height = this.requestedTitleBarHeight;
+    let height = this.requestedTitleBarHeight ?? 0;
     try {
       const decor = this.mainWindow.getWindowDecorHeight();
       if (decor > 0) {
@@ -2666,55 +2740,154 @@ export class NativeDesktop {
     const targetUi = sub?.uiContext() ?? this.ui;
     const winW = sub ? sub.widthVp() : this.windowWidthVp();
     const winH = sub ? sub.heightVp() : this.windowHeightVp();
+    const centered = x === undefined || y === undefined;
+    const posX = Math.max(0, x ?? winW / 2);
+    const posY = Math.max(0, y ?? winH / 2);
+    const anchorId = `nsh-desktop-popup-${generation}`;
     this.popupGeneration = generation;
-    const posX = x ?? Math.max(16, winW * 0.5 - 90);
-    const posY = y ?? Math.max(48, winH * 0.35);
-    const content = new ComponentContent<PopupMenuParams>(
+
+    let lease: PopupMenuLease | undefined = undefined;
+    const anchorContent = new ComponentContent<PopupMenuAnchorParams>(
       targetUi,
-      wrapBuilder(desktopPopupBuilder),
+      wrapBuilder(desktopPopupAnchorBuilder),
       {
-        owner: this,
-        generation,
+        anchorId,
         x: posX,
         y: posY,
-        windowWidth: winW,
-        windowHeight: winH,
-        items,
-        colorMode: this.colorMode,
+        onReady: (uniqueId: number): void => {
+          if (lease !== undefined) {
+            this.presentPopupMenu(lease, uniqueId, items, sub === undefined, centered);
+          }
+        },
       },
-      { nestingBuilderSupported: true },
     );
-    this.popupContent = content;
-    this.popupUi = targetUi;
+    lease = {
+      windowId,
+      generation,
+      ui: targetUi,
+      anchorContent,
+      opening: Promise.resolve(),
+      retired: false,
+      disappeared: false,
+      settled: false,
+    };
+    this.popupLease = lease;
     try {
-      targetUi.getOverlayManager().addComponentContent(content);
+      targetUi.getOverlayManager().addComponentContent(anchorContent);
     } catch (error) {
-      console.error(`[NSH] desktop popup menu failed: ${String(error)}`);
-      if (this.popupContent === content) {
-        this.popupContent = undefined;
-        this.popupUi = undefined;
+      console.error(`[NSH] desktop popup menu anchor failed: ${String(error)}`);
+      if (this.popupLease === lease) {
+        this.popupLease = undefined;
       }
+      lease.retired = true;
+      lease.disappeared = true;
+      lease.settled = true;
       try {
-        content.dispose();
+        anchorContent.dispose();
       } catch {}
       this.emit("menu-close", JSON.stringify({ generation }));
     }
   }
 
-  private closePopupMenuOnly(): void {
-    const content = this.popupContent;
-    const targetUi = this.popupUi ?? this.ui;
-    if (content === undefined) {
+  private presentPopupMenu(
+    lease: PopupMenuLease,
+    anchorUniqueId: number,
+    items: WireMenuItem[],
+    allowSubWindow: boolean,
+    centered: boolean,
+  ): void {
+    if (this.closed || lease.retired || this.popupLease !== lease) {
       return;
     }
-    this.popupContent = undefined;
-    this.popupUi = undefined;
-    try {
-      targetUi.getOverlayManager().removeComponentContent(content);
-    } catch {}
-    try {
-      content.dispose();
-    } catch {}
+    const menuContent = new ComponentContent<PopupMenuContentParams>(
+      lease.ui,
+      wrapBuilder(desktopPopupMenuBuilder),
+      {
+        owner: this,
+        generation: lease.generation,
+        items,
+        colorMode: this.colorMode,
+      },
+      { nestingBuilderSupported: true },
+    );
+    lease.menuContent = menuContent;
+    const options: MenuOptions = {
+      placement: centered ? Placement.Bottom : Placement.BottomLeft,
+      showInSubWindow: allowSubWindow,
+      backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+      backgroundBlurStyleOptions: { colorMode: this.colorMode },
+      onDisappear: (): void => {
+        lease.disappeared = true;
+        this.onPopupMenuDisappeared(lease);
+      },
+    };
+    lease.opening = lease.ui
+      .getPromptAction()
+      .openMenu(menuContent, { id: anchorUniqueId }, options);
+    lease.opening.catch((error: Error): void => {
+      lease.disappeared = true;
+      console.error(`[NSH] desktop popup menu failed: ${String(error)}`);
+      this.onPopupMenuDisappeared(lease);
+    });
+  }
+
+  private onPopupMenuDisappeared(lease: PopupMenuLease): void {
+    if (this.popupLease === lease) {
+      this.popupLease = undefined;
+    }
+    const shouldEmitClose = !this.closed && !lease.settled;
+    lease.settled = true;
+    this.retirePopupLease(lease);
+    if (shouldEmitClose) {
+      this.emit("menu-close", JSON.stringify({ generation: lease.generation }));
+    }
+  }
+
+  private closePopupMenuOnly(): void {
+    const lease = this.popupLease;
+    if (lease === undefined) {
+      return;
+    }
+    this.popupLease = undefined;
+    lease.settled = true;
+    this.retirePopupLease(lease);
+  }
+
+  private retirePopupLease(lease: PopupMenuLease): void {
+    if (lease.retired) {
+      return;
+    }
+    lease.retired = true;
+    const removeAnchor = (): void => {
+      try {
+        lease.ui.getOverlayManager().removeComponentContent(lease.anchorContent);
+      } catch {}
+      try {
+        lease.anchorContent.dispose();
+      } catch {}
+    };
+    const menuContent = lease.menuContent;
+    if (menuContent === undefined) {
+      removeAnchor();
+      return;
+    }
+    this.popupMenus.retire(
+      lease,
+      lease.opening,
+      (): Promise<void> =>
+        lease.disappeared
+          ? Promise.resolve()
+          : lease.ui
+              .getPromptAction()
+              .closeMenu(menuContent)
+              .catch((): void => {}),
+      (): void => {
+        try {
+          menuContent.dispose();
+        } catch {}
+        removeAnchor();
+      },
+    );
   }
 
   private registerGlobalShortcut(id: number, preKeys: number[], finalKey: number): void {
@@ -2839,8 +3012,11 @@ export class NativeDesktop {
 
     const menuGroups = this.buildStatusBarMenu(generation, cmd.items ?? []);
     const rawTips = (cmd.tooltip ?? "").trim() || (cmd.title ?? "").trim();
-    const hoverTips = rawTips.length > 128 ? rawTips.substring(0, 128) : rawTips;
-    const iconKey = cmd.icon ? JSON.stringify(cmd.icon) : "default";
+    const hoverTips =
+      rawTips.length > STATUS_BAR_MAX_HOVER_TIPS_CHARS
+        ? rawTips.substring(0, STATUS_BAR_MAX_HOVER_TIPS_CHARS)
+        : rawTips;
+    const iconKey = trayIconDigest(cmd.icon);
 
     if (!this.trayAdded) {
       const icons = await this.decodeTrayIcons(cmd.icon);
@@ -3045,7 +3221,7 @@ export class NativeDesktop {
       children: WireMenuItem[],
       out: statusBarManager.StatusBarSubMenuItem[],
     ): void => {
-      for (let i = 0; i < children.length && out.length < 20; i++) {
+      for (let i = 0; i < children.length && out.length < STATUS_BAR_MAX_MENU_ITEMS; i++) {
         const child = children[i];
         if (child.kind === "separator" || child.enabled === false) {
           continue;
@@ -3080,10 +3256,10 @@ export class NativeDesktop {
 
     const wireGroups = splitMenuGroups(items);
     const result: statusBarManager.StatusBarGroupMenu[] = [];
-    for (let g = 0; g < wireGroups.length && topLevelCount < 20; g++) {
+    for (let g = 0; g < wireGroups.length && topLevelCount < STATUS_BAR_MAX_MENU_ITEMS; g++) {
       const group = wireGroups[g];
       const outGroup: statusBarManager.StatusBarMenuItem[] = [];
-      for (let i = 0; i < group.length && topLevelCount < 20; i++) {
+      for (let i = 0; i < group.length && topLevelCount < STATUS_BAR_MAX_MENU_ITEMS; i++) {
         const item = group[i];
         if (item.enabled === false) {
           continue;

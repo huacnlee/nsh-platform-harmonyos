@@ -1121,13 +1121,12 @@ impl Runtime {
                 nsh_engine::FileStorage::open(directory) as Arc<dyn nsh_engine::StorageBackend>
             });
         let main_window_launch = if os.is_desktop() {
-            let options = main_window_options.as_ref().cloned().unwrap_or_default();
-            let kept = storage
-                .as_deref()
-                .and_then(|backend| options.kept_placement(backend, &initial_displays));
-            Some(crate::services::desktop::wire_main_window_launch(
-                &options, kept,
-            ))
+            main_window_options.as_ref().and_then(|options| {
+                let kept = storage
+                    .as_deref()
+                    .and_then(|backend| options.kept_placement(backend, &initial_displays));
+                crate::services::desktop::wire_main_window_launch(options, kept)
+            })
         } else {
             None
         };
