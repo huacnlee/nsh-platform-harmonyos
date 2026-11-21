@@ -262,23 +262,37 @@ impl System {
         request: nsh_core::file_dialog::FileRequest,
     ) -> napi_ohos::Result<()> {
         use nsh_core::file_dialog::FileRequest as F;
+        let fail = |message: String| {
+            if let Some(route) = route.upgrade() {
+                route.send(Message::HostEvent(
+                    EventKind::FileRequest,
+                    EventPayload::file_failed(id, message),
+                ));
+            }
+            Ok(())
+        };
         match request {
-            F::OpenPath(path) => self.submit(
-                host,
-                Request {
-                    route,
-                    kind: EventKind::FileRequest,
-                    id,
-                    stream: false,
-                    answer: true,
-                    paste: None,
-                },
-                SystemCommand {
-                    op: "file-open-path".into(),
-                    uri: Some(path.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ),
+            F::OpenPath(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
+                }
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-open-path".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+            }
             F::OpenDialog(dialog) => {
                 let mode = match dialog.kind {
                     nsh_core::file_dialog::OpenDialogKind::Folders => "folders",
@@ -330,7 +344,9 @@ impl System {
                 )
             }
             F::RevealPath(path) => {
-                let target = reveal_target_path(&path);
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
+                }
                 self.submit(
                     host,
                     Request {
@@ -343,36 +359,33 @@ impl System {
                     },
                     SystemCommand {
                         op: "file-reveal-path".into(),
-                        uri: Some(target.to_string_lossy().into_owned()),
+                        uri: Some(path.to_string_lossy().into_owned()),
                         ..Default::default()
                     },
                 )
             }
-            F::MoveToTrash(path) => self.submit(
-                host,
-                Request {
-                    route,
-                    kind: EventKind::FileRequest,
-                    id,
-                    stream: false,
-                    answer: true,
-                    paste: None,
-                },
-                SystemCommand {
-                    op: "file-move-to-trash".into(),
-                    uri: Some(path.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ),
-            _ => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::FileRequest,
-                        EventPayload::file_failed(id, "unsupported file request on HarmonyOS"),
-                    ));
+            F::MoveToTrash(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
                 }
-                Ok(())
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-move-to-trash".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
             }
+            _ => fail("unsupported file request on HarmonyOS".into()),
         }
     }
 
@@ -1131,19 +1144,24 @@ fn format_ohos_save_choices(filters: &[nsh_core::file_dialog::FileFilter]) -> Ve
     out
 }
 
-/// Resolves the directory path to open when revealing `path` in the system file manager.
-///
-/// HarmonyOS's public SDK does not expose an API to open a folder with a specific child item
-/// highlighted, so revealing a file falls back to opening its parent directory.
+/// Validates that a file path passed to `open_path`, `reveal_path`, or `move_to_trash`
+/// is absolute (or already a `file://` URI) and exists on disk when given as a filesystem path.
 #[allow(dead_code)]
-fn reveal_target_path(path: &std::path::Path) -> std::path::PathBuf {
-    if path.is_dir() {
-        return path.to_path_buf();
+fn validate_existing_file_request_path(path: &std::path::Path) -> Result<(), String> {
+    let raw = path.to_string_lossy();
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
     }
-    match path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
-        _ => path.to_path_buf(),
+    if raw.contains("://") {
+        return Ok(());
     }
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    if !path.exists() {
+        return Err(format!("path does not exist: {}", path.display()));
+    }
+    Ok(())
 }
 
 /// Parses the JSON array of chosen paths returned by `NativeSystem.ets` file dialogs.
@@ -1322,16 +1340,21 @@ mod tests {
         assert!(parse_file_request_paths(None).is_empty());
     }
     #[test]
-    fn reveal_target_path_prefers_existing_dir_or_parent_dir() {
+    fn file_request_path_validation_rejects_relative_and_missing_paths() {
         let temp_dir = std::env::temp_dir();
-        assert_eq!(reveal_target_path(&temp_dir), temp_dir);
-        assert_eq!(
-            reveal_target_path(std::path::Path::new("/storage/docs/note.md")),
-            std::path::PathBuf::from("/storage/docs")
+        assert!(validate_existing_file_request_path(&temp_dir).is_ok());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "file://docs/storage/Users/currentUser/Documents/a.txt"
+            ))
+            .is_ok()
         );
-        assert_eq!(
-            reveal_target_path(std::path::Path::new("note.md")),
-            std::path::PathBuf::from("note.md")
+        assert!(validate_existing_file_request_path(std::path::Path::new("note.md")).is_err());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "/nonexistent-nsh-path-12345/note.md"
+            ))
+            .is_err()
         );
     }
 }

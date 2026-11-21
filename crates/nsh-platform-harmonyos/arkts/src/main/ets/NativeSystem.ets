@@ -1,7 +1,6 @@
 import { NativeShare } from "./NativeShare";
 import { common, wantConstant } from "@kit.AbilityKit";
 import { fileUri, picker } from "@kit.CoreFileKit";
-import { fileManagerService } from "@kit.FileManagerServiceKit";
 import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAudio } from "./NativeAudio";
 import { NativeClipboard } from "./NativeClipboard";
@@ -163,15 +162,13 @@ export class NativeSystem {
       } else if (request.op === "file-reveal-path") {
         const path = request.uri ?? "";
         const uri = path.includes("://") ? path : fileUri.getUriFromPath(path);
-        try {
-          await this.context.startAbility({
-            action: "ohos.want.action.viewData",
-            uri,
-            flags: wantConstant.Flags.FLAG_AUTH_READ_URI_PERMISSION,
-          });
-        } catch {
-          await this.context.openLink(uri);
-        }
+        await this.context.startAbility({
+          action: "ohos.want.action.viewData",
+          uri: "filemanager://openDirectory",
+          parameters: {
+            fileUri: uri,
+          },
+        });
         reply({} as SystemReply);
       } else if (request.op === "file-move-to-trash") {
         if (!canIUse("SystemCapability.FileManagement.FileManagerService.Core")) {
@@ -179,7 +176,18 @@ export class NativeSystem {
         }
         const path = request.uri ?? "";
         const uri = path.includes("://") ? path : fileUri.getUriFromPath(path);
-        const trashedUri = await fileManagerService.deleteToTrash(uri);
+        const kit = await import("@hms.filemanagement.fileManagerService");
+        let trashedUri = "";
+        try {
+          trashedUri = await kit.default.deleteToTrash(uri);
+        } catch (err) {
+          if (path.startsWith("/data/storage/")) {
+            throw new Error(
+              `moving app sandbox files to trash is not supported on HarmonyOS (${String(err)})`,
+            );
+          }
+          throw new Error(String(err));
+        }
         let trashedPath = trashedUri ?? "";
         if (trashedPath.startsWith("file://")) {
           try {
