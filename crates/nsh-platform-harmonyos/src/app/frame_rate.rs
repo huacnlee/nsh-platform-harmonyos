@@ -1,7 +1,8 @@
 //! Single owner of the window-associated `NativeVSync` expected frame-rate
-//! range. Both UI frame scheduling and shader animations submit demands here;
-//! `FrameRate` arbitrates the combined `(min, max, expected)` range and updates
-//! its applied cache only when the underlying setter succeeds.
+//! range. Both UI frame scheduling and shader animations submit demands here.
+//! Demand changes only record the next range. The frame source publishes it
+//! after an actual NativeVSync callback, and releases it when that source stops.
+//! Idle boundaries survive coalescing; the applied cache records only success.
 
 use std::sync::{Arc, Mutex, mpsc};
 
@@ -15,12 +16,46 @@ pub(crate) struct RateRange {
     pub(crate) expected: i32,
 }
 
+impl RateRange {
+    /// Preserve the backend's API 20 DisplaySync bound at the UI API boundary.
+    /// This does not change the panel's capability or the NativeVSync vote.
+    pub(crate) fn for_display_sync(self) -> Self {
+        Self {
+            min: self.min.min(144),
+            max: self.max.min(144),
+            expected: self.expected.min(144),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum UiDemand {
     #[default]
     Idle,
     Uncapped,
     Capped(i32),
+}
+
+impl UiDemand {
+    /// An absent consumer is distinct from a running animation without a cap.
+    pub(crate) fn from_animation(active: bool, rate: Option<f32>) -> Self {
+        if !active {
+            Self::Idle
+        } else if let Some(rate) = rate.filter(|rate| rate.is_finite() && *rate > 0.0) {
+            Self::Capped((rate.round() as i32).max(1))
+        } else {
+            Self::Uncapped
+        }
+    }
+
+    /// A cap applies only while every running consumer permits it.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Idle, demand) | (demand, Self::Idle) => demand,
+            (Self::Uncapped, _) | (_, Self::Uncapped) => Self::Uncapped,
+            (Self::Capped(left), Self::Capped(right)) => Self::Capped(left.max(right)),
+        }
+    }
 }
 
 pub(crate) trait RateSink: Send + Sync {
@@ -55,6 +90,7 @@ struct State {
     ui_demand: UiDemand,
     hz: u32,
     applied: Option<RateRange>,
+    pending: PendingRates,
 }
 
 impl State {
@@ -64,10 +100,10 @@ impl State {
     /// (`shader_votes > 0`), the shared `NativeVSync` handle must run at full
     /// panel `hz` so active shaders are never down-throttled by a concurrent
     /// `UiDemand::Capped` UI animation; as soon as the last shader vote drops,
-    /// any active UI cap immediately resumes. If strict per-animation UI rate
-    /// limiting is ever required alongside an active shader, throttle that
-    /// consumer per-deadline inside `Animator` rather than lowering the shared
-    /// VSync rate range here.
+    /// any active UI cap resumes on the next published frame. If strict
+    /// per-animation UI rate limiting is ever required alongside an active
+    /// shader, throttle that consumer per-deadline inside `Animator` rather than
+    /// lowering the shared VSync rate range here.
     fn desired(&self) -> RateRange {
         let hz = self.hz as i32;
         if self.shader_votes > 0 {
@@ -91,60 +127,121 @@ impl State {
                     max: hz,
                     expected: hz,
                 },
-                UiDemand::Idle => RateRange {
-                    min: 0,
-                    max: hz,
-                    expected: hz.min(60),
-                },
+                UiDemand::Idle => self.idle(),
             }
+        }
+    }
+
+    fn idle(&self) -> RateRange {
+        let hz = self.hz as i32;
+        RateRange {
+            min: 0,
+            max: hz,
+            expected: hz.min(60),
+        }
+    }
+}
+
+/// One release boundary followed by the latest frame range. A release removes
+/// older, unsent frame work, but a later frame cannot erase that release.
+#[derive(Default)]
+struct PendingRates {
+    release: Option<RateRange>,
+    frame: Option<RateRange>,
+}
+
+#[derive(Clone, Copy)]
+enum RateUpdate {
+    Release(RateRange),
+    Frame(RateRange),
+}
+
+impl RateUpdate {
+    fn range(self) -> RateRange {
+        match self {
+            Self::Release(range) | Self::Frame(range) => range,
+        }
+    }
+}
+
+impl PendingRates {
+    fn release(&mut self, range: RateRange) {
+        self.release = Some(range);
+        self.frame = None;
+    }
+
+    fn take(&mut self) -> Option<RateUpdate> {
+        self.release
+            .take()
+            .map(RateUpdate::Release)
+            .or_else(|| self.frame.take().map(RateUpdate::Frame))
+    }
+
+    fn retry(&mut self, update: RateUpdate) {
+        match update {
+            // A failed release must still precede the following active range.
+            RateUpdate::Release(range) => {
+                self.release.get_or_insert(range);
+            }
+            // A newer release or frame supersedes this failed frame.
+            RateUpdate::Frame(range) if self.release.is_none() && self.frame.is_none() => {
+                self.frame = Some(range);
+            }
+            RateUpdate::Frame(_) => {}
         }
     }
 }
 
 pub(crate) struct FrameRate {
-    #[cfg(target_env = "ohos")]
-    vsync: Arc<Vsync>,
     sink: Arc<dyn RateSink>,
     state: Arc<Mutex<State>>,
-    updates: Option<RateUpdates>,
+    updates: RateUpdates,
 }
 
 /// NativeVSync's range setter calls RS SyncFrameRateRange with TF_SYNC. Keep
-/// that IPC off both the UI and compositor threads. The mailbox carries only
-/// a wake; the worker reads the latest arbitration result when it can apply it.
+/// that IPC off both the UI and compositor threads. The channel carries only a
+/// bounded wake; State owns the two pending publication slots, not live demand.
 struct RateUpdates(mpsc::SyncSender<()>);
 
 impl RateUpdates {
-    fn new(sink: Arc<dyn RateSink>, state: Arc<Mutex<State>>) -> std::io::Result<Self> {
+    fn spawn(
+        sink: Arc<dyn RateSink>,
+        state: Arc<Mutex<State>>,
+    ) -> std::io::Result<(Self, std::thread::JoinHandle<()>)> {
         let (send, receive) = mpsc::sync_channel(1);
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name("nsh-frame-rate".into())
             .spawn(move || {
                 while receive.recv().is_ok() {
                     loop {
-                        let desired = {
-                            let state = state.lock().unwrap();
-                            let desired = state.desired();
-                            if state.applied == Some(desired) {
-                                break;
-                            }
-                            desired
+                        let (update, applied) = {
+                            let mut state = state.lock().unwrap();
+                            (state.pending.take(), state.applied)
                         };
+                        let Some(update) = update else { break };
+                        let range = update.range();
+                        if applied == Some(range) {
+                            continue;
+                        }
                         // No arbitration lock is held while RS processes its IPC.
-                        #[cfg(target_env = "ohos")]
-                        let _trace =
-                            crate::render::composition::trace::Scope::new(c"NSH frame rate IPC");
-                        let status = sink.set_range(desired);
+                        let status = Self::apply_range(&*sink, range);
                         if status == 0 {
-                            state.lock().unwrap().applied = Some(desired);
+                            state.lock().unwrap().applied = Some(range);
                         } else {
+                            state.lock().unwrap().pending.retry(update);
                             log::warn!("OHOS VSync rate vote failed: {status}");
+                            // Only another publication wakes a retry. There is
+                            // no polling clock or failed-IPC spin loop.
                             break;
                         }
                     }
                 }
             })?;
-        Ok(Self(send))
+        Ok((Self(send), worker))
+    }
+
+    fn apply_range(sink: &dyn RateSink, range: RateRange) -> i32 {
+        sink.set_range(range)
     }
 
     fn wake(&self) -> i32 {
@@ -165,53 +262,30 @@ impl FrameRate {
             vsync: vsync.clone(),
             host,
         });
-        let hz = sink.read_display_hz();
+        let hz = normalize_display_hz(sink.read_display_hz());
         let state = Arc::new(Mutex::new(State {
             shader_votes: 0,
             ui_demand: UiDemand::Idle,
             hz,
             applied: None,
+            pending: PendingRates::default(),
         }));
-        let updates = RateUpdates::new(sink.clone(), state.clone())?;
+        let (updates, _) = RateUpdates::spawn(sink.clone(), state.clone())?;
         Ok(Arc::new(Self {
-            vsync,
             sink,
             state,
-            updates: Some(updates),
+            updates,
         }))
-    }
-
-    #[cfg(test)]
-    fn with_sink(sink: Box<dyn RateSink>) -> Arc<Self> {
-        let hz = normalize_display_hz(sink.read_display_hz());
-        Arc::new(Self {
-            #[cfg(target_env = "ohos")]
-            vsync: unreachable!(),
-            sink: sink.into(),
-            state: Arc::new(Mutex::new(State {
-                shader_votes: 0,
-                ui_demand: UiDemand::Idle,
-                hz,
-                applied: None,
-            })),
-            updates: None,
-        })
-    }
-
-    #[cfg(target_env = "ohos")]
-    pub(crate) fn vsync(&self) -> &Vsync {
-        &self.vsync
     }
 
     /// Applies the initial baseline range and returns the raw status code so
     /// surface startup can fail fast if the native VSync handle rejects it.
     pub(crate) fn apply_initial(&self) -> i32 {
-        let mut state = self.state.lock().unwrap();
         // Called once before either UI or shader frame demand can be published.
-        let desired = state.desired();
-        let status = self.sink.set_range(desired);
+        let desired = self.state.lock().unwrap().idle();
+        let status = RateUpdates::apply_range(&*self.sink, desired);
         if status == 0 {
-            state.applied = Some(desired);
+            self.state.lock().unwrap().applied = Some(desired);
         }
         status
     }
@@ -220,7 +294,39 @@ impl FrameRate {
         let mut state = self.state.lock().unwrap();
         self.maybe_refresh_hz(&mut state);
         state.ui_demand = demand;
-        let _ = self.sync_locked(&mut state, true);
+    }
+
+    /// Called by the active frame source after a real NativeVSync callback:
+    /// RS has refreshed this connection's request time before this vote arrives.
+    /// The source serializes this with release and its active-state changes.
+    pub(crate) fn publish_frame(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.maybe_refresh_hz(&mut state);
+        state.pending.frame = Some(state.desired());
+        self.wake();
+    }
+
+    /// Releases the source's vote without discarding consumer demands needed
+    /// after a background/foreground transition. A later publish cannot erase
+    /// this Idle boundary while its IPC is pending.
+    pub(crate) fn release(&self) {
+        let mut state = self.state.lock().unwrap();
+        self.maybe_refresh_hz(&mut state);
+        let idle = state.idle();
+        state.pending.release(idle);
+        self.wake();
+    }
+
+    /// The UI source uses this same arbitration for its system frame divider.
+    /// NativeVSync publishes it asynchronously after an actual native callback.
+    pub(crate) fn desired_range(&self) -> RateRange {
+        let mut state = self.state.lock().unwrap();
+        self.maybe_refresh_hz(&mut state);
+        state.desired()
+    }
+
+    pub(crate) fn has_shader_demand(&self) -> bool {
+        self.state.lock().unwrap().shader_votes > 0
     }
 
     pub(crate) fn vote(self: &Arc<Self>) -> Vote {
@@ -232,34 +338,21 @@ impl FrameRate {
 
     fn update_vote(&self, delta: isize) {
         let mut state = self.state.lock().unwrap();
-        self.maybe_refresh_hz(&mut state);
         if delta > 0 {
             state.shader_votes = state.shader_votes.saturating_add(delta as usize);
         } else if delta < 0 {
             state.shader_votes = state.shader_votes.saturating_sub((-delta) as usize);
         }
-        let _ = self.sync_locked(&mut state, true);
     }
 
     fn maybe_refresh_hz(&self, state: &mut State) {
         state.hz = normalize_display_hz(self.sink.read_display_hz());
     }
 
-    fn sync_locked(&self, state: &mut State, log_failure: bool) -> i32 {
-        let desired = state.desired();
-        if state.applied == Some(desired) {
-            return 0;
+    fn wake(&self) {
+        if self.updates.wake() != 0 {
+            log::error!("OHOS VSync rate publisher stopped");
         }
-        if let Some(updates) = &self.updates {
-            return updates.wake();
-        }
-        let status = self.sink.set_range(desired);
-        if status == 0 {
-            state.applied = Some(desired);
-        } else if log_failure {
-            log::warn!("OHOS VSync rate vote failed: {status}");
-        }
-        status
     }
 }
 
@@ -269,14 +362,13 @@ pub(crate) struct Vote {
 }
 
 impl Vote {
-    pub(crate) fn update(&mut self, active: bool) {
+    pub(crate) fn update(&mut self, active: bool) -> bool {
         if self.active == active {
-            // Still allow periodic display-rate refresh and failed-setter retry.
-            self.rate.update_vote(0);
-            return;
+            return false;
         }
         self.active = active;
         self.rate.update_vote(if active { 1 } else { -1 });
+        true
     }
 }
 
@@ -301,94 +393,400 @@ pub(crate) fn normalize_display_hz(raw: u32) -> u32 {
 #[cfg(all(test, not(target_env = "ohos")))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::Duration;
+
+    const IDLE: RateRange = RateRange {
+        min: 0,
+        max: 120,
+        expected: 60,
+    };
+    const FULL: RateRange = RateRange {
+        min: 120,
+        max: 120,
+        expected: 120,
+    };
+    const CAPPED: RateRange = RateRange {
+        min: 0,
+        max: 30,
+        expected: 30,
+    };
 
     struct MockSink {
         hz: AtomicU32,
-        next_status: AtomicI32,
         calls: Mutex<Vec<RateRange>>,
     }
 
     impl MockSink {
-        fn new(hz: u32) -> Arc<Self> {
+        fn new() -> Arc<Self> {
             Arc::new(Self {
-                hz: AtomicU32::new(hz),
-                next_status: AtomicI32::new(0),
+                hz: AtomicU32::new(120),
                 calls: Mutex::new(Vec::new()),
             })
         }
-
-        fn last(&self) -> Option<RateRange> {
-            self.calls.lock().unwrap().last().copied()
-        }
-
-        fn len(&self) -> usize {
-            self.calls.lock().unwrap().len()
-        }
     }
 
-    struct SharedSink(Arc<MockSink>);
-    impl RateSink for SharedSink {
+    impl RateSink for MockSink {
         fn set_range(&self, range: RateRange) -> i32 {
-            let status = self.0.next_status.swap(0, Ordering::SeqCst);
-            self.0.calls.lock().unwrap().push(range);
-            status
+            self.calls.lock().unwrap().push(range);
+            0
         }
 
         fn read_display_hz(&self) -> u32 {
-            self.0.hz.load(Ordering::SeqCst)
+            self.hz.load(Ordering::Relaxed)
         }
     }
 
     struct BlockingSink {
+        initial: AtomicBool,
+        calls: Mutex<Vec<RateRange>>,
         entered: mpsc::Sender<RateRange>,
-        release: Mutex<mpsc::Receiver<i32>>,
+        responses: Mutex<mpsc::Receiver<i32>>,
     }
+
     impl RateSink for BlockingSink {
         fn set_range(&self, range: RateRange) -> i32 {
+            self.calls.lock().unwrap().push(range);
+            // Startup is synchronous, before the worker receives publications.
+            if self.initial.swap(false, Ordering::Relaxed) {
+                return 0;
+            }
             self.entered.send(range).unwrap();
-            self.release.lock().unwrap().recv().unwrap()
+            self.responses
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .expect("test must complete each native setter")
         }
+
         fn read_display_hz(&self) -> u32 {
             120
         }
     }
 
-    #[test]
-    fn slow_rs_ipc_does_not_block_demands_or_apply_an_obsolete_range_last() {
+    fn blocking_sink() -> (
+        Arc<BlockingSink>,
+        mpsc::Receiver<RateRange>,
+        mpsc::Sender<i32>,
+    ) {
         let (entered, calls) = mpsc::channel();
-        let (release, responses) = mpsc::channel();
-        let mut rate = FrameRate::with_sink(Box::new(BlockingSink {
-            entered,
-            release: Mutex::new(responses),
+        let (reply, responses) = mpsc::channel();
+        (
+            Arc::new(BlockingSink {
+                initial: AtomicBool::new(true),
+                calls: Mutex::new(Vec::new()),
+                entered,
+                responses: Mutex::new(responses),
+            }),
+            calls,
+            reply,
+        )
+    }
+
+    fn start(sink: Arc<dyn RateSink>) -> (Arc<FrameRate>, JoinHandle<()>) {
+        let state = Arc::new(Mutex::new(State {
+            shader_votes: 0,
+            ui_demand: UiDemand::Idle,
+            hz: normalize_display_hz(sink.read_display_hz()),
+            applied: None,
+            pending: PendingRates::default(),
         }));
-        let rate_mut = Arc::get_mut(&mut rate).unwrap();
-        let baseline = rate_mut.state.lock().unwrap().desired();
-        rate_mut.state.lock().unwrap().applied = Some(baseline);
-        rate_mut.updates =
-            Some(RateUpdates::new(rate_mut.sink.clone(), rate_mut.state.clone()).unwrap());
-        let next = || {
-            calls
-                .recv_timeout(std::time::Duration::from_secs(2))
-                .unwrap()
-        };
+        let (updates, worker) = RateUpdates::spawn(sink.clone(), state.clone()).unwrap();
+        let rate = Arc::new(FrameRate {
+            sink,
+            state,
+            updates,
+        });
+        assert_eq!(rate.apply_initial(), 0);
+        (rate, worker)
+    }
 
+    fn next(calls: &mpsc::Receiver<RateRange>) -> RateRange {
+        calls.recv_timeout(Duration::from_secs(2)).unwrap()
+    }
+
+    fn finish(rate: Arc<FrameRate>, worker: JoinHandle<()>) -> Option<RateRange> {
+        let state = rate.state.clone();
+        drop(rate);
+        // Closing the actual publication channel drains its queued work before
+        // joining. No sleep or synchronous test-only setter bypass is needed.
+        worker.join().unwrap();
+        state.lock().unwrap().applied
+    }
+
+    #[test]
+    fn idle_graph_does_not_uncap_css_animation() {
+        let sink = MockSink::new();
+        let (rate, worker) = start(sink.clone());
+        let graph = UiDemand::from_animation(false, None);
+        let slower_css = UiDemand::from_animation(true, Some(15.0));
+        let css = UiDemand::from_animation(true, Some(30.0));
+        let finished_motion = UiDemand::from_animation(false, Some(120.0));
+        let demand = UiDemand::Idle
+            .merge(graph)
+            .merge(slower_css)
+            .merge(css)
+            .merge(finished_motion);
+        assert_eq!(demand, UiDemand::Capped(30));
+        assert_eq!(css.merge(slower_css).merge(graph), demand);
+        rate.set_ui_demand(demand);
+        rate.publish_frame();
+        assert_eq!(finish(rate, worker), Some(CAPPED));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, CAPPED]);
+    }
+
+    #[test]
+    fn uncapped_motion_overrides_then_restores_capped_consumers() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        let capped = UiDemand::from_animation(true, Some(30.0))
+            .merge(UiDemand::from_animation(true, Some(15.0)));
+        rate.set_ui_demand(capped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), CAPPED);
+        reply.send(0).unwrap();
+
+        // Modal, navigation, image fades, scrolling and selection report a
+        // running consumer without a cap; none may inherit another's 30 Hz.
+        let motion = UiDemand::from_animation(true, None);
+        assert_eq!(motion.merge(capped), capped.merge(motion));
+        rate.set_ui_demand(capped.merge(motion));
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        reply.send(0).unwrap();
+
+        let finished = UiDemand::from_animation(false, None);
+        rate.set_ui_demand(capped.merge(finished));
+        rate.publish_frame();
+        assert_eq!(next(&calls), CAPPED);
+        reply.send(0).unwrap();
+        rate.set_ui_demand(finished);
+        rate.release();
+        assert_eq!(next(&calls), IDLE);
+        reply.send(0).unwrap();
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(
+            *sink.calls.lock().unwrap(),
+            [IDLE, CAPPED, FULL, CAPPED, IDLE]
+        );
+    }
+
+    #[test]
+    fn demand_changes_wait_for_a_real_frame_publication() {
+        let sink = MockSink::new();
+        let (rate, worker) = start(sink.clone());
         rate.set_ui_demand(UiDemand::Uncapped);
-        assert_eq!(next().expected, 120);
-        // RS is still blocked. Arbitration remains usable and intermediate
-        // demands coalesce, including a return to the previously applied value.
-        assert!(rate.state.try_lock().is_ok());
-        rate.set_ui_demand(UiDemand::Capped(30));
-        rate.set_ui_demand(UiDemand::Idle);
-        release.send(0).unwrap();
-        assert_eq!(next(), baseline);
+        let mut shader = rate.vote();
+        assert!(shader.update(true));
+        assert!(!shader.update(true));
+        drop(shader);
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE]);
 
-        // A failed setter cannot poison the success cache. A new wake retries
-        // the latest demand even when its value is unchanged.
+        let sink = MockSink::new();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(finish(rate, worker), Some(FULL));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL]);
+    }
+
+    #[test]
+    fn blocked_setter_preserves_release_before_latest_active_range() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        assert!(rate.state.try_lock().is_ok());
+
+        // All changes happen while RS is blocked. Obsolete frame ranges may
+        // coalesce, but the real release separating active periods must survive.
+        rate.release();
         rate.set_ui_demand(UiDemand::Capped(30));
-        release.send(-1).unwrap();
-        assert_eq!(next().expected, 30);
-        release.send(0).unwrap();
+        rate.publish_frame();
+        rate.set_ui_demand(UiDemand::Capped(15));
+        rate.publish_frame();
+        rate.release();
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        reply.send(0).unwrap();
+        assert_eq!(next(&calls), IDLE);
+        reply.send(0).unwrap();
+        assert_eq!(next(&calls), FULL);
+        reply.send(0).unwrap();
+
+        assert_eq!(finish(rate, worker), Some(FULL));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL, IDLE, FULL]);
+    }
+
+    #[test]
+    fn repeated_active_frames_do_not_repeat_a_successful_setter() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        for _ in 0..1000 {
+            rate.publish_frame();
+        }
+        reply.send(0).unwrap();
+        assert_eq!(finish(rate, worker), Some(FULL));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL]);
+    }
+
+    #[test]
+    fn final_release_discards_unsent_active_work_and_keeps_demands() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        rate.release();
+        rate.publish_frame();
+        rate.release();
+        assert_eq!(rate.state.lock().unwrap().ui_demand, UiDemand::Uncapped);
+        reply.send(0).unwrap();
+        assert_eq!(next(&calls), IDLE);
+        reply.send(0).unwrap();
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL, IDLE]);
+    }
+
+    #[test]
+    fn failed_frame_does_not_poison_cache_and_next_publication_retries() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Capped(30));
+        rate.publish_frame();
+        assert_eq!(next(&calls), CAPPED);
+        reply.send(-1).unwrap();
+        rate.publish_frame();
+        assert_eq!(next(&calls), CAPPED);
+        assert_eq!(rate.state.lock().unwrap().applied, Some(IDLE));
+        reply.send(0).unwrap();
+        assert_eq!(finish(rate, worker), Some(CAPPED));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, CAPPED, CAPPED]);
+    }
+
+    #[test]
+    fn failed_release_still_precedes_the_next_active_publication() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        rate.release();
+        rate.publish_frame();
+        reply.send(0).unwrap();
+        assert_eq!(next(&calls), IDLE);
+        reply.send(-1).unwrap();
+        rate.publish_frame();
+        assert_eq!(next(&calls), IDLE);
+        assert_eq!(rate.state.lock().unwrap().applied, Some(FULL));
+        reply.send(0).unwrap();
+        assert_eq!(next(&calls), FULL);
+        reply.send(0).unwrap();
+        assert_eq!(finish(rate, worker), Some(FULL));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL, IDLE, IDLE, FULL]);
+    }
+
+    #[test]
+    fn release_supersedes_a_failed_active_publication() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        rate.release();
+        reply.send(-1).unwrap();
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL]);
+    }
+
+    #[test]
+    fn shader_and_capped_ui_arbitrate_only_at_frame_publication() {
+        let (sink, calls, reply) = blocking_sink();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Capped(30));
+        let mut shader = rate.vote();
+        assert!(!rate.has_shader_demand());
+        assert!(shader.update(true));
+        assert!(rate.has_shader_demand());
+        rate.publish_frame();
+        assert_eq!(next(&calls), FULL);
+        reply.send(0).unwrap();
+
+        assert!(shader.update(false));
+        assert!(!shader.update(false));
+        assert!(!rate.has_shader_demand());
+        rate.publish_frame();
+        assert_eq!(next(&calls), CAPPED);
+        reply.send(0).unwrap();
+
+        rate.set_ui_demand(UiDemand::Idle);
+        rate.release();
+        assert_eq!(next(&calls), IDLE);
+        reply.send(0).unwrap();
+        drop(shader);
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, FULL, CAPPED, IDLE]);
+    }
+
+    #[test]
+    fn published_uncapped_range_uses_the_current_panel_rate() {
+        let sink = MockSink::new();
+        let (rate, worker) = start(sink.clone());
+        rate.set_ui_demand(UiDemand::Uncapped);
+        sink.hz.store(144, Ordering::Relaxed);
+        rate.publish_frame();
+        let expected = RateRange {
+            min: 144,
+            max: 144,
+            expected: 144,
+        };
+        assert_eq!(finish(rate, worker), Some(expected));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE, expected]);
+    }
+
+    #[test]
+    fn legacy_display_sync_bound_does_not_change_native_arbitration() {
+        for hz in [30, 60, 120, 144] {
+            let range = RateRange {
+                min: 0,
+                max: hz,
+                expected: hz,
+            };
+            assert_eq!(range.for_display_sync(), range);
+        }
+        let native = RateRange {
+            min: 240,
+            max: 240,
+            expected: 240,
+        };
+        assert_eq!(
+            native.for_display_sync(),
+            RateRange {
+                min: 144,
+                max: 144,
+                expected: 144
+            }
+        );
+        assert_eq!(native.max, 240);
+        let idle = RateRange {
+            min: 0,
+            max: 240,
+            expected: 60,
+        };
+        assert_eq!(
+            idle.for_display_sync(),
+            RateRange {
+                min: 0,
+                max: 144,
+                expected: 60
+            }
+        );
     }
 
     #[test]
@@ -397,120 +795,5 @@ mod tests {
         assert_eq!(normalize_display_hz(10), 30);
         assert_eq!(normalize_display_hz(120), 120);
         assert_eq!(normalize_display_hz(360), 240);
-    }
-
-    #[test]
-    fn shader_and_capped_ui_arbitrate_without_clobbering_each_other() {
-        let sink = MockSink::new(120);
-        let rate = FrameRate::with_sink(Box::new(SharedSink(sink.clone())));
-        assert_eq!(rate.apply_initial(), 0);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 0,
-                max: 120,
-                expected: 60,
-            })
-        );
-
-        let mut shader = rate.vote();
-        shader.update(true);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 120,
-                max: 120,
-                expected: 120,
-            })
-        );
-
-        // A 30 Hz local UI animation must not downgrade the active 120 Hz shader.
-        rate.set_ui_demand(UiDemand::Capped(30));
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 120,
-                max: 120,
-                expected: 120,
-            })
-        );
-
-        // When the shader stops, the still-running 30 Hz UI cap takes effect.
-        shader.update(false);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 0,
-                max: 30,
-                expected: 30,
-            })
-        );
-
-        // When the last UI animation stops, the normal baseline range is restored.
-        rate.set_ui_demand(UiDemand::Idle);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 0,
-                max: 120,
-                expected: 60,
-            })
-        );
-    }
-
-    #[test]
-    fn failed_setter_does_not_poison_applied_cache_and_retries() {
-        let sink = MockSink::new(120);
-        let rate = FrameRate::with_sink(Box::new(SharedSink(sink.clone())));
-        assert_eq!(rate.apply_initial(), 0);
-
-        sink.next_status.store(-1, Ordering::SeqCst);
-        rate.set_ui_demand(UiDemand::Capped(30));
-        let calls_after_failure = sink.len();
-
-        // Retrying the same demand must invoke the setter again because the prior call failed.
-        rate.set_ui_demand(UiDemand::Capped(30));
-        assert_eq!(sink.len(), calls_after_failure + 1);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 0,
-                max: 30,
-                expected: 30,
-            })
-        );
-    }
-
-    #[test]
-    fn uncapped_ui_uses_the_panel_rate_without_a_shader_vote() {
-        let sink = MockSink::new(120);
-        let rate = FrameRate::with_sink(Box::new(SharedSink(sink.clone())));
-        rate.set_ui_demand(UiDemand::Uncapped);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 120,
-                max: 120,
-                expected: 120
-            })
-        );
-        rate.set_ui_demand(UiDemand::Capped(30));
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 0,
-                max: 30,
-                expected: 30
-            })
-        );
-        rate.set_ui_demand(UiDemand::Uncapped);
-        assert_eq!(
-            sink.last(),
-            Some(RateRange {
-                min: 120,
-                max: 120,
-                expected: 120
-            })
-        );
     }
 }

@@ -41,6 +41,7 @@ struct UiSession {
     services: Arc<Services>,
     tab_bar: std::rc::Rc<crate::interop::component::TabFactory>,
     apply_batch: std::rc::Rc<FunctionRef<crate::interop::sdk::Batch, ()>>,
+    frame_factory: std::rc::Rc<super::frame_source::Factory>,
     surfaces: Vec<crate::app::surface::LifecycleRoute>,
     ui_context: Option<(Env, ObjectRef)>,
 }
@@ -82,6 +83,7 @@ pub(crate) struct AvoidArea {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInit {
     pub speech_available: bool,
+    pub share_available: Option<bool>,
     pub sdk_api_version: i32,
     pub device_type: String,
     pub cache_dir: String,
@@ -197,8 +199,10 @@ type PendingPick = (u32, nsh_core::picker::Pick, Weak<Dispatcher>);
 
 pub(crate) struct Services {
     pub(crate) speech_available: bool,
+    pub(crate) share_available: bool,
     id: u32,
     active: AtomicBool,
+    appearance: std::sync::atomic::AtomicU8,
     pixel_ratio: AtomicU32,
     max_refresh_rate: AtomicU32,
     loads: AtomicUsize,
@@ -397,6 +401,7 @@ impl Services {
         &self,
         event: ohos_arkui_binding::event::KeyEvent<'_>,
         route: &Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
     ) -> bool {
         self.is_foreground()
             && self
@@ -404,7 +409,7 @@ impl Services {
                 .lock()
                 .unwrap()
                 .as_ref()
-                .is_some_and(|keyboard| keyboard.event(event, route))
+                .is_some_and(|keyboard| keyboard.event(event, route, owner))
     }
 
     pub(crate) fn modifiers(&self) -> nsh_core::keymap::Modifiers {
@@ -459,6 +464,22 @@ impl Services {
             route.status_bar_configured.store(true, Ordering::Release);
             *route.status_bar.lock().unwrap() = Some((config, dark));
             self.apply_selected_status();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn set_appearance(&self, appearance: nsh_core::platform::Appearance) -> Result<()> {
+        let (code, name) = match appearance {
+            nsh_core::platform::Appearance::System => (0u8, "system"),
+            nsh_core::platform::Appearance::Light => (1u8, "light"),
+            nsh_core::platform::Appearance::Dark => (2u8, "dark"),
+        };
+        if self.appearance.swap(code, Ordering::AcqRel) != code {
+            self.send_host_command(HostCommand {
+                kind: "appearance".into(),
+                text: Some(name.into()),
+                ..Default::default()
+            })?;
         }
         Ok(())
     }
@@ -689,6 +710,17 @@ impl Services {
             .ok_or_else(|| Error::from_reason("OHOS UI session closed"))
     }
 
+    pub(crate) fn frame_factory(&self) -> Result<std::rc::Rc<super::frame_source::Factory>> {
+        UI_SESSIONS
+            .with(|sessions| {
+                sessions
+                    .borrow()
+                    .get(&self.id)
+                    .map(|session| session.frame_factory.clone())
+            })
+            .ok_or_else(|| Error::from_reason("OHOS UI session closed"))
+    }
+
     pub(crate) fn create(
         init: HostInit,
         platform_window_id: i32,
@@ -696,6 +728,7 @@ impl Services {
         apply_batch: FunctionRef<crate::interop::sdk::Batch, ()>,
         command_tsfn: HostCommandCallback,
         tab_bar: crate::interop::component::TabFactory,
+        frame_factory: super::frame_source::Factory,
     ) -> Result<u32> {
         if platform_window_id < 0 {
             return Err(Error::from_reason("platformWindowId must be nonnegative"));
@@ -710,8 +743,10 @@ impl Services {
         let (queue, receiver) = mpsc::sync_channel(256);
         let services = Arc::new(Self {
             speech_available: init.speech_available,
+            share_available: init.share_available.unwrap_or(false),
             id,
             active: AtomicBool::new(true),
+            appearance: std::sync::atomic::AtomicU8::new(0),
             pixel_ratio: AtomicU32::new((init.pixel_ratio as f32).to_bits()),
             max_refresh_rate: AtomicU32::new(
                 init.max_refresh_rate
@@ -790,6 +825,7 @@ impl Services {
                     tab_bar: std::rc::Rc::new(tab_bar),
                     services: services.clone(),
                     apply_batch: std::rc::Rc::new(apply_batch),
+                    frame_factory: std::rc::Rc::new(frame_factory),
                     surfaces: Vec::new(),
                     ui_context: None,
                 },
@@ -867,6 +903,13 @@ impl Services {
         *environment = NshEnvironment::snapshot(next);
         drop(environment);
         self.broadcast(|| Message::HostEnvironment(changes.clone()));
+        Ok(())
+    }
+
+    pub(crate) fn notify_fonts_changed(&self) -> Result<()> {
+        self.check()?;
+        crate::text::fonts::Fonts::on_system_font_changed();
+        self.broadcast(|| Message::HostFontsChanged);
         Ok(())
     }
 

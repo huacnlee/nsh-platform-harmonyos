@@ -1,9 +1,10 @@
+import { NativeShare } from "./NativeShare";
 import { common, wantConstant } from "@kit.AbilityKit";
 import { fileUri } from "@kit.CoreFileKit";
 import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAudio } from "./NativeAudio";
-import { NativeClipboard, ClipboardReply } from "./NativeClipboard";
-import { NativeNotifications, NotificationReply } from "./NativeNotifications";
+import { NativeClipboard } from "./NativeClipboard";
+import { NativeNotifications } from "./NativeNotifications";
 import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 
 // The system bridge uses the same typed completion for every service.
@@ -32,6 +33,8 @@ export interface SystemReply {
 
 export interface SystemRequest {
   op: string;
+  paths?: string[];
+  html?: string;
   text?: string;
   uri?: string;
   asset?: string;
@@ -56,6 +59,7 @@ export class NativeSystem {
   private readonly notifications: NativeNotifications;
   private readonly speech: NativeSpeech;
   private readonly audio: NativeAudio;
+  private readonly share: NativeShare = new NativeShare();
   private readonly reply: (key: number, event: SystemReply) => void;
   private active: Set<number> = new Set();
   private listening?: number;
@@ -91,6 +95,16 @@ export class NativeSystem {
             request.uri ?? request.text ?? "",
             request.hasOnly ?? false,
             () => this.active.has(key),
+            request.html,
+          ),
+        );
+      } else if (request.op === "share") {
+        reply(
+          await this.share.show(
+            this.context,
+            key,
+            request,
+            () => !this.closed && this.active.has(key),
           ),
         );
       } else if (request.op === "notification-permission") {
@@ -158,11 +172,7 @@ export class NativeSystem {
         );
         return;
       } else if (request.op === "audio-play") {
-        this.audio.playSound(
-          request.count ?? 0,
-          request.volume ?? 1,
-          request.rate ?? 1,
-        );
+        this.audio.playSound(request.count ?? 0, request.volume ?? 1, request.rate ?? 1);
       } else if (request.op === "audio-stop") {
         this.audio.stopSound(request.count ?? 0);
       } else if (request.op === "audio-unload") {
@@ -194,10 +204,7 @@ export class NativeSystem {
       reply({
         error: String(error),
         code: "ERR_NSH_HOST_ERROR",
-        phase:
-          request.op.startsWith("speech-") || request.op === "audio-open"
-            ? "end"
-            : undefined,
+        phase: request.op.startsWith("speech-") || request.op === "audio-open" ? "end" : undefined,
         has: false,
         shown: false,
         permission: "unavailable",
@@ -206,6 +213,7 @@ export class NativeSystem {
     this.active.delete(key);
   }
   cancel(key: number): void {
+    this.share.cancel(key);
     this.active.delete(key);
     this.clipboard.cancel(key);
     if (this.listening === key) {
@@ -224,5 +232,6 @@ export class NativeSystem {
     this.notifications.close();
     this.speech.close();
     this.audio.close();
+    this.share.close();
   }
 }

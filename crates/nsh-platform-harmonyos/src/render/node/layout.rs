@@ -6,7 +6,10 @@ use nsh_core::ViewKind;
 use ohos_arkui_binding::{
     api::node_custom_event::NodeCustomEvent,
     component::attribute::{ArkUICommonAttribute, ArkUIEvent},
-    types::{advanced::NodeDirtyFlag, attribute::ArkUINodeAttributeType as Attribute},
+    types::{
+        advanced::{LengthMetricUnit, NodeDirtyFlag},
+        attribute::ArkUINodeAttributeType as Attribute,
+    },
 };
 
 use super::{Node, Result, callback};
@@ -33,7 +36,14 @@ impl Node {
             callback(|| {
                 if let Some(node) = weak.upgrade() {
                     node.layout(event)?;
-                    node.invalidate_scene();
+                    if node.scene_active()
+                        || node.input.borrow().is_some()
+                        || node.scroll.borrow().is_some()
+                        || node.modal.borrow().is_some()
+                        || node.screen.borrow().is_some()
+                    {
+                        node.invalidate_scene();
+                    }
                 }
                 Ok(())
             })
@@ -79,12 +89,35 @@ impl Node {
         self.raw_frame.set(raw);
         let frame = self.adjusted_frame(raw);
         let old = self.frame.replace(frame);
-        if old == frame {
+        let uninitialized = self.applied_layout_size.get().0 == 0;
+        if old == frame && !uninitialized {
             return Ok(());
         }
         self.invalidate_composites();
-        self.invalidate_scene();
+        if self.scene_active()
+            || self
+                .parent_node
+                .borrow()
+                .upgrade()
+                .is_some_and(|parent| parent.scene_active())
+            || self.effects_plan().requires_scene
+            || self
+                .scene
+                .borrow()
+                .as_ref()
+                .is_some_and(|scene| scene.has_inactive_requirements())
+        {
+            self.invalidate_scene();
+        }
         self.update_layout_bounds()?;
+        if old == frame {
+            return Ok(());
+        }
+        if let Some(parent) = self.parent_node.borrow().upgrade()
+            && let Some(scroll) = parent.scroll.borrow().as_ref()
+        {
+            scroll.sync_inferred_size()?;
+        }
         self.invalidate_ink(self.applied.get().ink_outset)?;
         let size_changed = old.width != frame.width || old.height != frame.height;
         if size_changed {
@@ -111,21 +144,21 @@ impl Node {
             if let Some(video) = self.video.borrow().as_ref() {
                 video.frame(Size::new(frame.width, frame.height))?;
             }
-            let style = self.style.borrow();
-            self.apply_borders(&style)?;
-            self.apply_clip()?;
-            if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-                layer.update(self, &style)?;
+            if !self.style_deferred.get() {
+                let style = self.style.borrow();
+                self.apply_borders(&style)?;
+                self.apply_clip()?;
+                if !style.transform.is_identity()
+                    || self.extra.get().1 != crate::render::transition::Extra::NONE
+                {
+                    self.transform(&style, |_| None)?;
+                }
+                drop(style);
+                self.animator.apply_node(self)?;
             }
-            if !style.transform.is_identity()
-                || self.extra.get().1 != crate::render::transition::Extra::NONE
-            {
-                self.transform(&style, |_| None)?;
-            }
-            drop(style);
-            self.animator.apply_node(self)?;
             if let Some(scroll) = self.scroll.borrow().as_ref() {
                 scroll.viewport(Size::new(frame.width, frame.height))?;
+                scroll.sync_inferred_size()?;
             }
             if let Some(screen) = self.screen.borrow().as_ref()
                 && screen.insets_initialized()
@@ -155,7 +188,18 @@ impl Node {
         self.applied_layout_size.set((0, 0, 0));
         self.applied_position.set((0, 0, 0));
     }
+    pub(crate) fn ensure_initial_layout_bounds(&self) -> Result<()> {
+        if self.applied_layout_size.get().0 == 0 {
+            self.update_layout_bounds()?;
+        }
+        Ok(())
+    }
     pub(crate) fn update_layout_bounds(&self) -> Result<()> {
+        if self.batch_created.get() && self.kind != ViewKind::Modal {
+            self.bounds_deferred.set(true);
+            return Ok(());
+        }
+        self.bounds_deferred.set(false);
         let frame = self.frame.get();
         // Header slots have core-measured sizes, but the native bar owns their
         // positions. Rewrapping for scene export must preserve that placement.
@@ -199,8 +243,16 @@ impl Node {
             self.applied_layout_size.set((ptr, width, height));
         }
         if self.applied_position.get() != (ptr, x, y) {
-            native.set_position([x as f32 / self.scale.get(), y as f32 / self.scale.get()])?;
-            self.applied_position.set((ptr, x, y));
+            if self.applied_position.get().0 == 0 && x == 0 && y == 0 {
+                self.applied_position.set((ptr, 0, 0));
+            } else {
+                native.set_length_metric_unit(LengthMetricUnit::Px)?;
+                let positioned = native.set_position([x as f32, y as f32]);
+                let unit_restored = native.set_length_metric_unit(LengthMetricUnit::Vp);
+                positioned?;
+                unit_restored?;
+                self.applied_position.set((ptr, x, y));
+            }
         }
         Ok(())
     }
@@ -244,9 +296,6 @@ impl Node {
             height = height.max(1);
         }
         event.set_measured_size(width, height)?;
-        if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-            layer.measure(event)?;
-        }
         if let Some(input) = self.input.borrow().as_ref() {
             input.measure(event)?;
         } else if let Some(image) = self.image.borrow().as_ref() {
@@ -299,11 +348,13 @@ impl Node {
         Ok(())
     }
     pub(super) fn layout(&self, event: &NodeCustomEvent) -> Result<()> {
-        if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-            layer.layout(event)?;
-        }
         let position = event.position_in_layout();
         event.set_layout_position(position.x, position.y)?;
+        if self.wrapper.borrow().is_none()
+            && let Some(modal) = self.modal.borrow().as_ref()
+        {
+            modal.laid_out();
+        }
         #[cfg(feature = "api-23")]
         self.accessibility_provider.bounds(self)?;
         if let Some(input) = self.input.borrow().as_ref() {

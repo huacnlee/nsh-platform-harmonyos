@@ -81,6 +81,7 @@ pub(super) struct Ui {
     closed: Cell<bool>,
     controls: Cell<bool>,
     visibility: Cell<super::controls::Controls>,
+    hide_timer: RefCell<Option<tokio::task::JoinHandle<()>>>,
     size: Cell<Size>,
     fullscreen_size: Cell<Size>,
     state: Cell<UiState>,
@@ -322,6 +323,7 @@ impl Ui {
             closed: Cell::new(false),
             controls: Cell::new(false),
             visibility: Cell::new(super::controls::Controls::default()),
+            hide_timer: RefCell::default(),
             size: Cell::new(Size::default()),
             fullscreen_size: Cell::new(Size::default()),
             state: Cell::new(UiState::default()),
@@ -349,7 +351,7 @@ impl Ui {
                     visibility.toggle(ui.state.get().playing, ui.now());
                     ui.visibility.set(visibility);
                     ui.apply_visibility()?;
-                    ui.track_controls();
+                    ui.schedule_controls_hide();
                     Ok(())
                 });
             }
@@ -400,8 +402,8 @@ impl Ui {
                 let mut visibility = self.visibility.get();
                 visibility.show(self.state.get().playing, self.now());
                 self.visibility.set(visibility);
-                self.track_controls();
             }
+            self.schedule_controls_hide();
         }
         self.apply_visibility()?;
         self.layout()
@@ -462,6 +464,7 @@ impl Ui {
                 .position(|child| Rc::ptr_eq(child, &self.native))
                 .ok_or_else(|| napi_ohos::Error::from_reason("Video native parent is missing"))?;
             self.detach(&self.parent)?;
+            root.promote_direct_paint()?;
             if let Err(error) = root.native.borrow_mut().add_child(self.native.clone()) {
                 callback(|| {
                     self.parent
@@ -535,7 +538,7 @@ impl Ui {
         visibility.show(self.state.get().playing, self.now());
         self.visibility.set(visibility);
         self.apply_visibility()?;
-        self.track_controls();
+        self.schedule_controls_hide();
         bars?;
         Ok(())
     }
@@ -555,11 +558,38 @@ impl Ui {
     fn now(&self) -> f64 {
         self.owner.upgrade().map_or(0.0, |node| node.animator.now())
     }
-    fn track_controls(&self) {
-        if self.controls.get()
-            && let Some(owner) = self.owner.upgrade()
-        {
-            owner.animator.track(&owner);
+    fn schedule_controls_hide(&self) {
+        self.cancel_hide_timer();
+        if self.closed.get() || !self.controls.get() {
+            return;
+        }
+        let Some(deadline) = self.visibility.get().deadline() else {
+            return;
+        };
+        let token = self.token;
+        let delay = std::time::Duration::from_secs_f64((deadline - self.now()).max(0.0) / 1000.0);
+        *self.hide_timer.borrow_mut() = Dispatcher::after(
+            &self.route,
+            delay,
+            Box::new(move || {
+                let ui = LIVE.with_borrow(|live| live.get(&token).and_then(Weak::upgrade));
+                let Some(ui) = ui.filter(|ui| !ui.closed.get() && ui.controls.get()) else {
+                    return;
+                };
+                let mut visibility = ui.visibility.get();
+                // An expired task can already be queued when another touch refreshes
+                // the deadline or playback pauses. It owns only its original deadline.
+                if visibility.expire(deadline, ui.now()) {
+                    ui.visibility.set(visibility);
+                    ui.hide_timer.borrow_mut().take();
+                    callback(|| ui.apply_visibility());
+                }
+            }),
+        );
+    }
+    fn cancel_hide_timer(&self) {
+        if let Some(timer) = self.hide_timer.borrow_mut().take() {
+            timer.abort();
         }
     }
     pub(super) fn apply_visibility(&self) -> Result<()> {
@@ -567,16 +597,6 @@ impl Ui {
             .borrow()
             .set_i32_attribute(A::Visibility, i32::from(!self.visibility.get().visible))?;
         Ok(())
-    }
-    pub(super) fn tick(&self, now: f64) -> Result<bool> {
-        if !self.controls.get() {
-            return Ok(false);
-        }
-        let mut visibility = self.visibility.get();
-        let active = visibility.tick(now);
-        self.visibility.set(visibility);
-        self.apply_visibility()?;
-        Ok(active)
     }
     fn layout(&self) -> Result<()> {
         let fullscreen = self.fullscreen.get();
@@ -613,6 +633,7 @@ impl Ui {
     }
     pub(super) fn begin_retirement(self: &Rc<Self>) {
         self.closed.set(true);
+        self.cancel_hide_timer();
         callback(|| self.set_fullscreen(false));
         if let Some(owner) = self.owner.upgrade() {
             let mut fullscreen = owner.fullscreen_video.borrow_mut();
@@ -631,6 +652,7 @@ impl Ui {
         }
     }
     fn complete_retirement(&self) -> Result<()> {
+        self.cancel_hide_timer();
         if self.fullscreen.replace(false) {
             callback(|| {
                 self.host.video_fullscreen(self.route.clone(), false)?;
@@ -734,7 +756,7 @@ pub(crate) fn update(token: u64, state: UiState) {
                 visibility.show(state.playing, ui.now());
                 ui.visibility.set(visibility);
                 ui.apply_visibility()?;
-                ui.track_controls();
+                ui.schedule_controls_hide();
             }
             if ui.playing.replace(state.playing) != state.playing {
                 ui.toggle.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;

@@ -169,7 +169,7 @@ impl Plane {
         if let Some(composite) = self.composite.borrow().as_ref()
             && composite.generation == generation
         {
-            composite.ready();
+            composite.ready(owner);
             drop_failed = composite.is_failed();
         }
         if drop_failed {

@@ -10,7 +10,7 @@ use ohos_arkui_binding::{
 };
 
 use super::{Node, Result};
-use crate::{render::geometry::Rect, text::typography::argb};
+use crate::{app::frame_rate::UiDemand, render::geometry::Rect, text::typography::argb};
 
 impl Node {
     pub(super) fn navigated(&self) -> bool {
@@ -132,7 +132,7 @@ impl Node {
         self.animator.track(self);
         Ok(true)
     }
-    pub(crate) fn tick_transition(&self, now: f64) -> Result<(bool, bool)> {
+    pub(crate) fn tick_transition(&self, now: f64) -> Result<(UiDemand, bool)> {
         let screen = self.screen.borrow().clone();
         let (navigation_active, navigation_removed) = screen
             .as_ref()
@@ -146,27 +146,28 @@ impl Node {
             .map(|image| image.tick(now))
             .transpose()?
             .unwrap_or(false);
-        let video_active = self
-            .video
-            .borrow()
-            .as_ref()
-            .map(|video| video.tick(now))
-            .transpose()?
-            .unwrap_or(false);
+        let demand = UiDemand::from_animation(image_active || navigation_active, None);
         let Some(mut live) = self.live.borrow_mut().take() else {
-            return Ok((
-                image_active || navigation_active || video_active,
-                navigation_removed,
-            ));
+            return Ok((demand, navigation_removed));
         };
         let step = if self.platform.get().reduce_motion {
             live.finish(&mut self.style.borrow_mut())
         } else {
             live.step(now, self.frame.get(), &mut self.style.borrow_mut())
         };
-        if live.recolor {
+        // A completed exit returns the upstream default style together with
+        // `removed`. Keep the last exit sample until the mounter detaches it;
+        // applying that default would flash the disappearing subtree back on.
+        if step.removed {
+            return Ok((UiDemand::Idle, true));
+        }
+        let recolor = live.recolor;
+        let demand = demand.merge(UiDemand::from_animation(step.active, live.frame_rate()));
+        if recolor {
             self.invalidate_paint()?;
-            self.invalidate_scene();
+            if self.scene_active() {
+                self.invalidate_scene();
+            }
         }
         if step.active {
             *self.live.borrow_mut() = Some(live);
@@ -185,6 +186,10 @@ impl Node {
             }
             self.restore_style()?;
             self.invalidate_paint()?;
+        } else if self.in_culled_subtree.get() {
+            if previous != (step.opacity, step.extra) {
+                self.anim_deferred.set(true);
+            }
         } else {
             let style = self.style.borrow();
             if previous.0 != step.opacity {
@@ -196,10 +201,7 @@ impl Node {
             drop(style);
             self.animator.apply_node(self)?;
         }
-        Ok((
-            step.active || image_active || navigation_active || video_active,
-            step.removed || navigation_removed,
-        ))
+        Ok((demand, step.removed || navigation_removed))
     }
     pub(crate) fn finish_removal(&self) -> Result<()> {
         self.set_leaving(false);
@@ -261,6 +263,9 @@ impl Node {
                     let color = Some(crate::render::animation::color(*value));
                     if self.tint.replace(color) != color {
                         self.invalidate_paint()?;
+                        if self.scene_active() {
+                            self.invalidate_scene();
+                        }
                     }
                 }
                 P::Opacity => opacity = Some(value.number().clamp(0.0, 1.0)),
@@ -270,33 +275,43 @@ impl Node {
                 _ => {}
             }
         }
-        if self.animated_opacity.replace(opacity) != opacity {
+        let opacity_changed = self.animated_opacity.replace(opacity) != opacity;
+        if self.in_culled_subtree.get() {
+            if opacity_changed || bg.is_some() || border_color.is_some() || has_transform {
+                self.anim_deferred.set(true);
+            }
+            drop(style);
+            if !component_props.is_empty() {
+                if let Some(component) = self.component.borrow().as_ref() {
+                    component.props(component_props)?;
+                } else {
+                    self.component_animated.borrow_mut().clear();
+                }
+            }
+            return Ok(());
+        }
+        if opacity_changed {
             self.apply_opacity(style.opacity)?;
         }
         if let Some(bg) = bg {
-            self.apply_background_color(bg)?;
+            self.apply_background_color_for(bg, &style)?;
+            if self.scene_active() {
+                self.invalidate_scene();
+            }
         }
         if let Some(color) = border_color {
             let colors = [argb(color); 4];
             let mut applied = self.applied.get();
             if applied.border_color != colors {
-                self.native.borrow().set_number_attribute(
-                    Attribute::BorderColor,
-                    colors.into_iter().map(Number::Uint).collect(),
-                )?;
+                let values = colors.map(Number::Uint);
+                self.native
+                    .borrow()
+                    .set_number_slice_attribute(Attribute::BorderColor, &values)?;
                 applied.border_color = colors;
                 self.applied.set(applied);
-            }
-        }
-        if bg.is_some() {
-            let mut presented = style.clone();
-            if let Some(bg) = bg {
-                presented.background_color = bg;
-            }
-            self.ensure_shadow_layer(&presented)?;
-            self.apply_shadow(&presented)?;
-            if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-                layer.update(self, &presented)?;
+                if self.scene_active() {
+                    self.invalidate_scene();
+                }
             }
         }
         if has_transform {
@@ -322,7 +337,11 @@ impl Node {
             if let Some(color) = border_color {
                 animated_style.borders.colors.fill(color);
             }
-            image.style(&animated_style)?;
+            let filter_matrix = match self.effects_plan_for(&animated_style).native_color_filter {
+                crate::render::effects::NativeColorFilter::ImageMatrix(matrix) => Some(matrix),
+                _ => None,
+            };
+            image.style(&animated_style, filter_matrix)?;
         }
         drop(style);
         if !component_props.is_empty() {

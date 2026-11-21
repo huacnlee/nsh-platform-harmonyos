@@ -1,15 +1,12 @@
-//! Shadow routing and conservative physical paint bounds, independent of ArkUI.
-use nsh_core::{BoxShadow, ViewStyle};
+//! Shadow routing, uniform-gradient folding and conservative physical paint bounds.
+use nsh_core::{BoxShadow, Color, Gradient, ViewStyle};
 
-/// The native shadow caster is the border box, without CSS spread or custom corners.
+/// The native shadow caster is the border box, without CSS spread.
 pub(crate) fn visible_shadow(layer: &BoxShadow, inset: bool) -> bool {
     layer.inset == inset && layer.is_visible()
 }
 
-pub(crate) fn native_box_shadow(style: &ViewStyle) -> Option<BoxShadow> {
-    if style.continuous_corners || style.background_color.0 & 0xff != 0xff {
-        return None;
-    }
+pub(crate) fn native_box_shadow(style: &ViewStyle, scale: f32) -> Option<BoxShadow> {
     let mut outer = style
         .effects
         .as_ref()?
@@ -17,8 +14,77 @@ pub(crate) fn native_box_shadow(style: &ViewStyle) -> Option<BoxShadow> {
         .iter()
         .filter(|s| !s.inset && s.is_visible());
     let shadow = *outer.next()?;
-    // Tiny CSS blurs cannot be represented by ArkUI's radius-to-sigma conversion.
-    (outer.next().is_none() && shadow.spread.0 == 0.0 && shadow.blur.0 >= 2.0).then_some(shadow)
+    // Rosen's RSShadow::IsValid requires radius > 0 after ConvertRadiusToSigma,
+    // and CustomShadow with isFilled=false clips out the RRect interior natively.
+    (outer.next().is_none()
+        && shadow.spread.0 == 0.0
+        && native_radius(shadow.blur.0 * scale * 0.5) > 0.0)
+        .then_some(shadow)
+}
+
+pub(crate) fn has_non_native_outer_shadow(style: &ViewStyle, scale: f32) -> bool {
+    native_box_shadow(style, scale).is_none()
+        && style
+            .effects
+            .as_ref()
+            .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()))
+}
+
+pub(crate) fn uniform_gradient_color(gradient: &Gradient) -> Option<Color> {
+    let first = gradient.stops.first()?.color;
+    gradient
+        .stops
+        .iter()
+        .all(|stop| stop.color == first)
+        .then_some(first)
+}
+
+fn src_over(fg: Color, bg: Color) -> Color {
+    let fa = fg.0 & 0xff;
+    if fa == 0 {
+        return bg;
+    }
+    if fa == 0xff || (bg.0 & 0xff) == 0 {
+        return fg;
+    }
+    let af = fa as f64 / 255.0;
+    let ab = (bg.0 & 0xff) as f64 / 255.0;
+    let out_a = af + ab * (1.0 - af);
+    if out_a <= 0.0 {
+        return Color::TRANSPARENT;
+    }
+    let blend = |shift: u32| -> u8 {
+        let cf = ((fg.0 >> shift) & 0xff) as f64;
+        let cb = ((bg.0 >> shift) & 0xff) as f64;
+        (((cf * af + cb * ab * (1.0 - af)) / out_a)
+            .round()
+            .clamp(0.0, 255.0)) as u8
+    };
+    Color::rgba(
+        blend(24),
+        blend(16),
+        blend(8),
+        (out_a * 255.0).round().clamp(0.0, 255.0) as u8,
+    )
+}
+
+/// Folds bottom-most constant-color `backgroundImage` ramps into `base` and
+/// returns `(native_background_color, remaining_top_gradient_count)`.
+pub(crate) fn effective_background(base: Color, style: &ViewStyle) -> (Color, usize) {
+    let Some(effects) = style.effects.as_ref() else {
+        return (base, 0);
+    };
+    let images = effects.background_images.as_slice();
+    let mut color = base;
+    let mut remaining = images.len();
+    while remaining > 0 {
+        let Some(uniform) = uniform_gradient_color(&images[remaining - 1]) else {
+            break;
+        };
+        color = src_over(uniform, color);
+        remaining -= 1;
+    }
+    (color, remaining)
 }
 
 /// ArkUI/Rosen converts a Skia radius to sigma with radius / sqrt(3) + 0.5.
@@ -109,19 +175,40 @@ mod tests {
     #[test]
     fn native_route_preserves_css_features() {
         let mut s = style(vec![shadow()]);
-        assert!(native_box_shadow(&s).is_some());
+        assert!(native_box_shadow(&s, 3.25).is_some());
         Arc::make_mut(s.effects.as_mut().unwrap())
             .box_shadows
             .push(BoxShadow {
                 inset: true,
                 ..shadow()
             });
-        assert!(native_box_shadow(&s).is_some());
+        assert!(native_box_shadow(&s, 3.25).is_some());
         s.continuous_corners = true;
-        assert!(native_box_shadow(&s).is_none());
-        s.continuous_corners = false;
+        assert!(native_box_shadow(&s, 3.25).is_some());
         s.background_color = Color::TRANSPARENT;
-        assert!(native_box_shadow(&s).is_none());
+        assert!(native_box_shadow(&s, 3.25).is_some());
+        // 1vp blur at 3.25x density has sigma 1.625 > 0.5 -> native radius > 0.
+        assert!(
+            native_box_shadow(
+                &style(vec![BoxShadow {
+                    blur: Points(1.0),
+                    ..shadow()
+                }]),
+                3.25
+            )
+            .is_some()
+        );
+        // At 1x density, 1vp blur has sigma 0.5 -> native radius == 0 -> non-native.
+        assert!(
+            native_box_shadow(
+                &style(vec![BoxShadow {
+                    blur: Points(1.0),
+                    ..shadow()
+                }]),
+                1.0
+            )
+            .is_none()
+        );
         for layers in [
             vec![shadow(), shadow()],
             vec![BoxShadow {
@@ -130,11 +217,69 @@ mod tests {
             }],
             vec![BoxShadow {
                 blur: Points(0.0),
+                offset_y: Points(1.0),
                 ..shadow()
             }],
         ] {
-            assert!(native_box_shadow(&style(layers)).is_none());
+            let candidate = style(layers);
+            assert!(native_box_shadow(&candidate, 3.25).is_none());
+            assert!(has_non_native_outer_shadow(&candidate, 3.25));
         }
+    }
+    #[test]
+    fn uniform_gradients_fold_into_background_color_in_stack_order() {
+        use nsh_core::{ColorStop, GradientKind, geometry::Radians};
+        let uniform = |color| Gradient {
+            kind: GradientKind::Linear {
+                angle: Radians(std::f32::consts::PI),
+            },
+            stops: vec![
+                ColorStop {
+                    color,
+                    position: None,
+                },
+                ColorStop {
+                    color,
+                    position: None,
+                },
+            ],
+            repeating: false,
+        };
+        let ramp = Gradient {
+            kind: GradientKind::Linear {
+                angle: Radians(std::f32::consts::PI),
+            },
+            stops: vec![
+                ColorStop {
+                    color: Color(0xff0000ff),
+                    position: None,
+                },
+                ColorStop {
+                    color: Color(0x0000ffff),
+                    position: None,
+                },
+            ],
+            repeating: false,
+        };
+        let mut s = ViewStyle {
+            background_color: Color(0x112233ff),
+            effects: Some(Arc::new(Effects {
+                background_images: vec![uniform(Color(0x33353bff))],
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_background(s.background_color, &s),
+            (Color(0x33353bff), 0)
+        );
+        // Top ramp over bottom uniform layer folds only the bottom layer.
+        Arc::make_mut(s.effects.as_mut().unwrap()).background_images =
+            vec![ramp, uniform(Color(0xffffffff))];
+        assert_eq!(
+            effective_background(s.background_color, &s),
+            (Color(0xffffffff), 1)
+        );
     }
     #[test]
     fn bounds_cover_offsets_spread_blur_and_density() {

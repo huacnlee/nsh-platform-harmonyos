@@ -32,6 +32,8 @@ pub(crate) enum Command {
 
 struct View {
     effects: Effects,
+    pending_layer: Option<Arc<ShaderLayer>>,
+    pending_slots: Vec<(u16, AnimationValue)>,
     window: Option<Window>,
     size: (u32, u32),
     scale: f32,
@@ -40,6 +42,7 @@ struct View {
     shown: bool,
     dirty: bool,
     window_dirty: bool,
+    warmed: bool,
     failed: bool,
 }
 impl View {
@@ -52,7 +55,50 @@ impl View {
             && self.size.1 > 0
             && (self.dirty || self.window_dirty || self.effects.wants_frame())
     }
-    fn render(&mut self) -> Result<(), gles::Error> {
+    fn waiting_for_precompile(&self, precompiler: Option<&super::precompile::Precompiler>) -> bool {
+        self.pending_layer
+            .as_ref()
+            .is_some_and(|layer| precompiler.is_some_and(|p| p.is_compiling(layer.shader.hash())))
+    }
+    fn can_warmup(&self, precompiler: Option<&super::precompile::Precompiler>) -> bool {
+        !self.failed
+            && !self.shown
+            && !self.warmed
+            && !self.waiting_for_precompile(precompiler)
+            && self.window.is_some()
+            && self.size.0 > 0
+            && self.size.1 > 0
+    }
+    fn install_pending_layer(
+        &mut self,
+        key: Key,
+        gpu: &TextureContext,
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> Result<bool, gles::Error> {
+        let Some(layer) = self.pending_layer.as_ref() else {
+            return Ok(true);
+        };
+        if !gles::has_program(gpu, layer)
+            && precompiler.is_some_and(|p| p.submit_or_compiling(layer))
+        {
+            return Ok(false);
+        }
+        let layer = self.pending_layer.take().unwrap();
+        self.effects.layers(&[(key.id, layer)])?;
+        for (slot, value) in self.pending_slots.drain(..) {
+            self.effects.slot(key.id, slot, value);
+        }
+        Ok(true)
+    }
+    fn render(
+        &mut self,
+        key: Key,
+        gpu: &TextureContext,
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> Result<bool, gles::Error> {
+        if !self.install_pending_layer(key, gpu, precompiler)? {
+            return Ok(false);
+        }
         let (width, height, scale) =
             super::geometry::Coverage::shader(self.box_size, self.overflow).pixels(self.scale);
         let needs_redraw = self.dirty || self.window_dirty;
@@ -66,11 +112,12 @@ impl View {
         {
             self.dirty = true;
             self.window_dirty = true;
-            return Ok(());
+            return Ok(true);
         }
         self.dirty = false;
         self.window_dirty = false;
-        Ok(())
+        self.warmed = true;
+        Ok(true)
     }
     fn handle_render_error(&mut self, key: Key, error: &gles::Error, route: Option<&Dispatcher>) {
         log::warn!("shader fill: {error}");
@@ -152,6 +199,8 @@ impl Fills {
                 }
                 let view = self.views.entry(key).or_insert_with(|| View {
                     effects: Effects::new(gpu),
+                    pending_layer: None,
+                    pending_slots: Vec::new(),
                     window: None,
                     size: (0, 0),
                     scale: 1.0,
@@ -160,22 +209,29 @@ impl Fills {
                     shown: false,
                     dirty: true,
                     window_dirty: false,
+                    warmed: false,
                     failed: false,
                 });
                 view.overflow = layer.overflow.0.max(0.0);
                 view.failed = false;
-                match view.effects.layers(&[(key.id, layer)]) {
-                    Ok(()) => {
-                        view.dirty = true;
-                    }
-                    Err(error) => {
-                        view.handle_render_error(key, &error, route);
-                    }
-                }
+                view.warmed = false;
+                view.pending_layer = Some(layer);
+                view.pending_slots.clear();
+                view.dirty = true;
             }
             Command::Slot(key, slot, value) => {
                 if let Some(view) = self.views.get_mut(&key) {
-                    view.effects.slot(key.id, slot, value);
+                    if view.pending_layer.is_some() {
+                        if let Some((_, existing)) =
+                            view.pending_slots.iter_mut().find(|(s, _)| *s == slot)
+                        {
+                            *existing = value;
+                        } else {
+                            view.pending_slots.push((slot, value));
+                        }
+                    } else {
+                        view.effects.slot(key.id, slot, value);
+                    }
                 }
             }
             Command::Size(key, size, scale) => {
@@ -242,6 +298,7 @@ impl Fills {
                     view.window = Some(gpu.window(window));
                     view.window_dirty = true;
                     view.dirty = true;
+                    view.warmed = false;
                     view.failed = false;
                 }
             }
@@ -255,18 +312,63 @@ impl Fills {
             Command::Remove(key) => self.remove(key),
         }
     }
-    pub(super) fn render(&mut self, route: Option<&Dispatcher>) {
-        let _trace = super::trace::Scope::new(c"NSH fills");
+    pub(super) fn sample(&mut self, time: std::time::Duration) {
+        for view in self.views.values_mut() {
+            view.effects.sample(time);
+        }
+    }
+    pub(super) fn render(
+        &mut self,
+        gpu: &TextureContext,
+        precompiler: Option<&super::precompile::Precompiler>,
+        route: Option<&Dispatcher>,
+    ) {
         for (&key, view) in &mut self.views {
             if !view.needs_wake() {
                 continue;
             }
-            if let Err(error) = view.render() {
+            if let Err(error) = view.render(key, gpu, precompiler) {
                 view.handle_render_error(key, &error, route);
             }
         }
     }
     pub(super) fn animating(&self) -> bool {
         self.views.values().any(View::needs_wake)
+    }
+    pub(super) fn has_pending_warmup(
+        &self,
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> bool {
+        self.views.values().any(|view| view.can_warmup(precompiler))
+    }
+    pub(super) fn warmup_one(
+        &mut self,
+        gpu: &TextureContext,
+        precompiler: Option<&super::precompile::Precompiler>,
+        route: Option<&Dispatcher>,
+    ) {
+        let Some((&key, view)) = self
+            .views
+            .iter_mut()
+            .find(|(_, view)| view.can_warmup(precompiler))
+        else {
+            return;
+        };
+        match view.render(key, gpu, precompiler) {
+            Ok(true) => {
+                // Mark attempted so an offscreen surface whose consumer is not yet
+                // attached never spins the idle warmup loop; `dirty`/`window_dirty`
+                // remain set until presentation succeeds.
+                view.warmed = true;
+            }
+            Ok(false) => {
+                // Deferred because the shader just entered off-thread compilation;
+                // `Task::ShaderWarmed` will re-trigger warmup once ready.
+            }
+            Err(error) => {
+                view.warmed = true;
+                view.handle_render_error(key, &error, route);
+            }
+        }
     }
 }

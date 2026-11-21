@@ -226,6 +226,10 @@ pub(crate) struct WebView {
     props: RefCell<Option<WebProps>>,
     applied_source: RefCell<Option<WebSource>>,
     applied_document: RefCell<Option<DocumentSettings>>,
+    pending_settings: RefCell<Option<WebSettings>>,
+    pending_commands: RefCell<Vec<WebCommand>>,
+    arkts_mounted: Cell<bool>,
+    waiting_transition: Cell<bool>,
     load_generation: Cell<u32>,
     ready: Cell<bool>,
     closed: Cell<bool>,
@@ -245,7 +249,9 @@ impl WebView {
             Evaluations::new(
                 owner.id,
                 Box::new(move |id, kind, payload| control.dispatch_event(id, kind, payload)),
-                Box::new(move |delay, work| Dispatcher::after(&dispatcher, delay, work)),
+                Box::new(move |delay, work| {
+                    let _ = Dispatcher::after(&dispatcher, delay, work);
+                }),
             )
         };
         let mut target = None;
@@ -286,6 +292,10 @@ impl WebView {
             props: RefCell::new(None),
             applied_source: RefCell::new(None),
             applied_document: RefCell::new(None),
+            pending_settings: RefCell::new(None),
+            pending_commands: RefCell::new(Vec::new()),
+            arkts_mounted: Cell::new(false),
+            waiting_transition: Cell::new(false),
             load_generation: Cell::new(0),
             closed: Cell::new(false),
         })
@@ -317,8 +327,16 @@ impl WebView {
             self.route.borrow_mut().take();
             *self.applied_source.borrow_mut() = None;
             *self.applied_document.borrow_mut() = None;
+            *self.pending_settings.borrow_mut() = None;
+            self.pending_commands.borrow_mut().clear();
+            let was_mounted = self.arkts_mounted.replace(false);
+            self.waiting_transition.set(false);
             if let Some(target) = self.target.borrow_mut().take() {
-                node.web_remove(target);
+                if was_mounted {
+                    node.web_remove(target);
+                } else {
+                    target.invalidate()?;
+                }
             }
             return Ok(());
         }
@@ -502,7 +520,11 @@ impl WebView {
             }
             _ => return Err(Error::Unsupported("WebView command")),
         };
-        node.web_command(web_command);
+        if self.arkts_mounted.get() {
+            node.web_command(web_command);
+        } else {
+            self.pending_commands.borrow_mut().push(web_command);
+        }
         Ok(())
     }
 
@@ -513,10 +535,18 @@ impl WebView {
         self.evaluations.dispose();
         self.route_ref.borrow_mut().take();
         self.route.borrow_mut().take();
+        *self.pending_settings.borrow_mut() = None;
+        self.pending_commands.borrow_mut().clear();
+        let was_mounted = self.arkts_mounted.replace(false);
+        self.waiting_transition.set(false);
         if let Some(node) = self.node.upgrade()
             && let Some(target) = self.target.borrow_mut().take()
         {
-            node.web_remove(target);
+            if was_mounted {
+                node.web_remove(target);
+            } else {
+                target.invalidate()?;
+            }
         } else if let Some(target) = self.target.borrow_mut().take() {
             target.invalidate()?;
         }
@@ -554,8 +584,16 @@ impl WebView {
         *self.route_ref.borrow_mut() = Some(entry);
         *self.applied_source.borrow_mut() = None;
         *self.applied_document.borrow_mut() = None;
+        *self.pending_settings.borrow_mut() = None;
+        self.pending_commands.borrow_mut().clear();
+        let was_mounted = self.arkts_mounted.replace(false);
+        self.waiting_transition.set(false);
         if let Some(old) = self.target.replace(Some(attachment)) {
-            node.web_remove(old);
+            if was_mounted {
+                node.web_remove(old);
+            } else {
+                old.invalidate()?;
+            }
         }
         Ok(id)
     }
@@ -644,7 +682,7 @@ impl WebView {
             .injected_js_before
             .as_ref()
             .map_or_else(|| BRIDGE.to_owned(), |script| format!("{BRIDGE}\n{script}"));
-        node.web_update(WebSettings {
+        let settings = WebSettings {
             target_id,
             shared_cookies,
             clear_cookies: !shared_cookies && (first_document || new_document),
@@ -663,8 +701,104 @@ impl WebView {
                 .join("downloads")
                 .display()
                 .to_string(),
-        });
+        };
+        if self.arkts_mounted.get() {
+            node.web_update(settings);
+        } else {
+            *self.pending_settings.borrow_mut() = Some(settings);
+            if node.flushing_batch.get() {
+                node.deferred_webs.borrow_mut().push(self.node.clone());
+            } else {
+                self.flush_mount_gate(node)?;
+            }
+        }
         Ok(())
+    }
+
+    pub(crate) fn flush_mount_gate(&self, node: &Node) -> Result<()> {
+        if self.closed.get()
+            || !self.ready.get()
+            || !node.active.get()
+            || node.pending_delete.get()
+            || self.arkts_mounted.get()
+            || self.waiting_transition.get()
+            || self.pending_settings.borrow().is_none()
+        {
+            return Ok(());
+        }
+        // Defer ArkWeb creation until any enclosing Screen/Modal entrance
+        // transition settles so `CreateNWeb` never stalls push/open animation.
+        let mut cursor = node.parent_node.borrow().upgrade();
+        while let Some(ancestor) = cursor {
+            if let Some(screen) = ancestor.screen.borrow().as_ref().cloned()
+                && screen.is_entering()
+            {
+                self.waiting_transition.set(true);
+                let weak = self.node.clone();
+                screen.when_settled(move |entered| {
+                    crate::render::node::callback(|| {
+                        if let Some(node) = weak.upgrade()
+                            && let Some(web) = node.web.borrow().as_ref()
+                        {
+                            web.on_transition_settled(&node, entered);
+                        }
+                        Ok(())
+                    });
+                });
+                return Ok(());
+            }
+            if let Some(modal) = ancestor.modal.borrow().as_ref().cloned()
+                && modal.is_entering()
+            {
+                self.waiting_transition.set(true);
+                let weak = self.node.clone();
+                modal.when_settled(move |entered| {
+                    crate::render::node::callback(|| {
+                        if let Some(node) = weak.upgrade()
+                            && let Some(web) = node.web.borrow().as_ref()
+                        {
+                            web.on_transition_settled(&node, entered);
+                        }
+                        Ok(())
+                    });
+                });
+                return Ok(());
+            }
+            cursor = ancestor.parent_node.borrow().upgrade();
+        }
+        self.emit_arkts_mount(node);
+        Ok(())
+    }
+
+    fn on_transition_settled(&self, node: &Node, entered: bool) {
+        self.waiting_transition.set(false);
+        if !entered
+            || self.closed.get()
+            || !self.ready.get()
+            || !node.active.get()
+            || node.pending_delete.get()
+            || self.arkts_mounted.get()
+        {
+            *self.pending_settings.borrow_mut() = None;
+            self.pending_commands.borrow_mut().clear();
+            return;
+        }
+        self.emit_arkts_mount(node);
+    }
+
+    fn emit_arkts_mount(&self, node: &Node) {
+        let Some(settings) = self.pending_settings.borrow_mut().take() else {
+            return;
+        };
+        let target_id = settings.target_id;
+        self.arkts_mounted.set(true);
+        node.web_update(settings);
+        let commands = std::mem::take(&mut *self.pending_commands.borrow_mut());
+        for command in commands {
+            if command.target_id == target_id {
+                node.web_command(command);
+            }
+        }
     }
 }
 

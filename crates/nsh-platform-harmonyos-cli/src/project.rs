@@ -34,6 +34,8 @@ pub(crate) struct AppConfig {
     pub(crate) schemes: Vec<String>,
     /// Explicit `capabilities.speech` opt-in to `ohos.permission.MICROPHONE`.
     pub(crate) speech: bool,
+    /// Standalone apps declaring WebView can initialize ArkWeb before accepting input.
+    webview: bool,
 }
 
 const RESERVED_SCHEMES: &[&str] = &[
@@ -118,6 +120,7 @@ impl AppConfig {
                 }),
             schemes,
             speech,
+            webview: json["capabilities"]["webview"].is_object(),
         }
     }
 }
@@ -293,6 +296,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         ("{{signingConfigs}}", signing),
         ("{{productSigning}}", product_signing),
         ("{{requestPermissions}}", request_permissions(config.speech)),
+        ("{{usesWebView}}", config.webview.to_string()),
         ("{{skills}}", ability_skills(&config.schemes)),
     ];
 
@@ -432,11 +436,13 @@ mod tests {
             ("counter", "com.example.counter", 1, false)
         );
         assert!(bare.schemes.is_empty());
+        assert!(!bare.webview);
         let speech = AppConfig::from_json(
             &std::env::temp_dir().join("apps").join("speech"),
-            &serde_json::json!({ "capabilities": { "speech": true } }),
+            &serde_json::json!({ "capabilities": { "speech": true, "webview": {} } }),
         );
         assert!(speech.speech);
+        assert!(speech.webview);
     }
 
     #[test]
@@ -509,10 +515,35 @@ mod tests {
             compile_api: MIN_API,
         };
         write(&out, &config, &contents).unwrap();
+        let index = join_relative(&out, "entry/src/main/ets/pages/Index.ets");
+        assert!(
+            fs::read_to_string(&index)
+                .unwrap()
+                .contains("if (false) {\n      prepareWebEngine();")
+        );
         let app = fs::read_to_string(join_all(&out, ["AppScope", "app.json5"])).unwrap();
         assert!(
             app.contains("\"bundleName\": \"com.example.counter\""),
             "{app}"
+        );
+        assert!(
+            app.contains("\"configuration\": \"$profile:configuration\""),
+            "{app}"
+        );
+        let configuration = fs::read_to_string(join_all(
+            &out,
+            [
+                "AppScope",
+                "resources",
+                "base",
+                "profile",
+                "configuration.json",
+            ],
+        ))
+        .unwrap();
+        assert!(
+            configuration.contains("\"fontSizeScale\": \"followSystem\""),
+            "{configuration}"
         );
         let strings = fs::read_to_string(join_all(
             &out,
@@ -606,9 +637,14 @@ mod tests {
 
         let speech = AppConfig::from_json(
             &dir.join("speech"),
-            &serde_json::json!({ "capabilities": { "speech": true } }),
+            &serde_json::json!({ "capabilities": { "speech": true, "webview": {} } }),
         );
         write(&out, &speech, &contents).unwrap();
+        assert!(
+            fs::read_to_string(index)
+                .unwrap()
+                .contains("if (true) {\n      prepareWebEngine();")
+        );
         let module =
             fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap();
         assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");

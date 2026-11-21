@@ -2,13 +2,9 @@
 //! Coordinates in pictures start at the top left; only presentation flips rows.
 
 mod filters;
-use std::{
-    rc::Rc,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{cell::Cell, rc::Rc, sync::Arc, time::Duration};
 
-pub(super) use filters::Filters;
+pub(super) use filters::{FilterProgram, Filters, precompile as precompile_filters};
 use glow::HasContext;
 use nsh_core::{
     NodeId,
@@ -313,6 +309,7 @@ pub(super) struct Compiled {
     gl: Rc<glow::Context>,
     native: glow::Program,
     pictures: Vec<(glow::UniformLocation, ShaderInput)>,
+    warmed: Cell<bool>,
 }
 impl Drop for Compiled {
     fn drop(&mut self) {
@@ -328,63 +325,228 @@ struct Program {
     gpu: TextureContext,
     compiled: Rc<Compiled>,
     buffers: [glow::Buffer; 2],
-    empty: Target,
 }
-pub(super) fn is_compiled(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
+pub(super) fn has_program(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
     gpu.programs.borrow().contains_key(&layer.shader.hash())
 }
+pub(super) fn is_warmed(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
+    gpu.programs
+        .borrow()
+        .get(&layer.shader.hash())
+        .is_some_and(|compiled| compiled.warmed.get())
+}
+
+fn adapt_vertex_source(vertex: &str) -> String {
+    // Core's GLSL targets a displayed canvas. Our intermediate pictures have
+    // their first row at the top; adapt clip space in the vertex stage instead
+    // of copying and flipping every shader output.
+    vertex.replacen('\n', "\n#define main nsh_ohos_vertex\n", 1)
+        + "\n#undef main\nvoid main() { nsh_ohos_vertex(); gl_Position.y = -gl_Position.y; }\n"
+}
+
+/// # Safety
+/// Caller must hold `gl`'s owning context current on this thread.
+unsafe fn compile_from_source(
+    gl: &glow::Context,
+    vertex: &str,
+    fragment: &str,
+    retrievable_hint: bool,
+) -> Result<glow::Program> {
+    // SAFETY: upheld by caller; validated core-generated GLSL sources.
+    unsafe {
+        let native = gl.create_program()?;
+        let compile = || -> Result<()> {
+            for (kind, source) in [
+                (glow::VERTEX_SHADER, vertex),
+                (glow::FRAGMENT_SHADER, fragment),
+            ] {
+                let shader = gl.create_shader(kind)?;
+                gl.shader_source(shader, source);
+                gl.compile_shader(shader);
+                if !gl.get_shader_compile_status(shader) {
+                    let error = gl.get_shader_info_log(shader);
+                    gl.delete_shader(shader);
+                    return Err(Error::Shader(error));
+                }
+                gl.attach_shader(native, shader);
+                gl.delete_shader(shader);
+            }
+            if retrievable_hint {
+                gl.program_binary_retrievable_hint(native, true);
+            }
+            gl.link_program(native);
+            if !gl.get_program_link_status(native) {
+                return Err(Error::Shader(gl.get_program_info_log(native)));
+            }
+            Ok(())
+        };
+        if let Err(error) = compile() {
+            gl.delete_program(native);
+            return Err(error);
+        }
+        Ok(native)
+    }
+}
+
+/// # Safety
+/// Caller must hold `gpu.context` current on this thread and own `native`.
+unsafe fn warmup_draw_program(
+    gpu: &TextureContext,
+    native: glow::Program,
+    pictures: &[(glow::UniformLocation, ShaderInput)],
+    layer: &ShaderLayer,
+    finish: bool,
+) -> Result<()> {
+    let gl = &gpu.gl;
+    let buffers = gpu.warmup_buffers();
+    let empty = gpu.empty_picture();
+    let builtin_words = builtins(
+        nsh_core::Size::new(Points(1.0), Points(1.0)),
+        0.0,
+        1.0,
+        nsh_core::geometry::Percentage(0.0),
+        Points(layer.overflow.0.max(0.0)),
+    );
+    // SAFETY: warmup FBO, UBOs, empty texture and program belong to `gpu.context`.
+    unsafe {
+        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(gpu.warmup_fbo()));
+        gl.viewport(0, 0, 1, 1);
+        gl.disable(glow::BLEND);
+        gl.disable(glow::SCISSOR_TEST);
+        gl.disable(glow::DEPTH_TEST);
+        gl.use_program(Some(native));
+        for (binding, data) in [builtin_words.as_slice(), layer.uniforms.as_ref()]
+            .into_iter()
+            .enumerate()
+        {
+            let bytes =
+                std::slice::from_raw_parts(data.as_ptr().cast(), std::mem::size_of_val(data));
+            gl.bind_buffer(glow::UNIFORM_BUFFER, Some(buffers[binding]));
+            gl.buffer_data_u8_slice(glow::UNIFORM_BUFFER, bytes, glow::DYNAMIC_DRAW);
+            gl.bind_buffer_base(glow::UNIFORM_BUFFER, binding as u32, Some(buffers[binding]));
+        }
+        for (index, (location, _)) in pictures.iter().enumerate() {
+            gl.active_texture(glow::TEXTURE0 + index as u32);
+            gl.bind_texture(glow::TEXTURE_2D, Some(empty.0));
+            gl.uniform_1_i32(Some(location), index as i32);
+        }
+        gl.draw_arrays(glow::TRIANGLES, 0, 3);
+        gl.flush();
+        if finish {
+            gl.finish();
+        }
+        let error = gl.get_error();
+        if error != glow::NO_ERROR {
+            return Err(Error::Draw(error));
+        }
+    }
+    Ok(())
+}
+
+/// Compiles, links, and executes a 1x1 warmup draw on `gpu` (typically the
+/// off-thread precompiler's independent EGL context) to populate the driver's
+/// pipeline cache and optionally extract an ES 3.0 `ProgramBinary`. The
+/// temporary GL program is always deleted before returning.
+pub(super) fn precompile_to_binary(
+    gpu: &TextureContext,
+    layer: &ShaderLayer,
+) -> Result<Option<glow::ProgramBinary>> {
+    let source = layer
+        .shader
+        .glsl_es()
+        .map_err(|e| Error::Shader(e.to_string()))?;
+    let vertex = adapt_vertex_source(&source.vertex);
+    let _current = gpu.context.enter()?;
+    let gl = &gpu.gl;
+    // SAFETY: `gpu.context` is current; temporary `native` is always deleted below.
+    unsafe {
+        let native =
+            compile_from_source(gl, &vertex, &source.fragment, gpu.supports_program_binary)?;
+        for (binding, name) in [
+            source.builtins_block.as_deref(),
+            source.uniforms_block.as_deref(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            if let Some(name) = name
+                && let Some(index) = gl.get_uniform_block_index(native, name)
+            {
+                gl.uniform_block_binding(native, index, binding as u32);
+            }
+        }
+        let pictures: Vec<_> = source
+            .pictures
+            .iter()
+            .filter_map(|(name, input)| {
+                gl.get_uniform_location(native, name)
+                    .map(|location| (location, *input))
+            })
+            .collect();
+        let draw_result = warmup_draw_program(gpu, native, &pictures, layer, true);
+        let binary = if draw_result.is_ok() && gpu.supports_program_binary {
+            let bin = gl.get_program_binary(native);
+            while gl.get_error() != glow::NO_ERROR {}
+            bin
+        } else {
+            None
+        };
+        gl.use_program(None);
+        gl.delete_program(native);
+        draw_result?;
+        Ok(binary)
+    }
+}
+
 pub(super) fn precompile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<()> {
-    Program::compile(gpu, layer).map(|_| ())
+    let compiled = Program::compile(gpu, layer)?;
+    if compiled.warmed.get() {
+        return Ok(());
+    }
+    let _current = gpu.context.enter()?;
+    // SAFETY: `gpu.context` is current and `compiled.native` belongs to it.
+    unsafe {
+        warmup_draw_program(gpu, compiled.native, &compiled.pictures, layer, false)?;
+    }
+    compiled.warmed.set(true);
+    Ok(())
 }
 
 impl Program {
     fn compile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Rc<Compiled>> {
         let _current = gpu.context.enter()?;
         let gl = &gpu.gl;
+        let hash = layer.shader.hash();
         // SAFETY: validated core-generated GLSL and all program objects are
         // compiled and used exclusively on this worker's current context.
         unsafe {
-            if let Some(cached) = gpu.programs.borrow().get(&layer.shader.hash()).cloned() {
+            if let Some(cached) = gpu.programs.borrow().get(&hash).cloned() {
                 return Ok(cached);
             }
             let source = layer
                 .shader
                 .glsl_es()
                 .map_err(|e| Error::Shader(e.to_string()))?;
-            // Core's GLSL targets a displayed canvas. Our intermediate pictures
-            // have their first row at the top; adapt clip space in the vertex
-            // stage instead of copying and flipping every shader output.
-            let vertex = source
-                .vertex
-                .replacen('\n', "\n#define main nsh_ohos_vertex\n", 1)
-                + "\n#undef main\nvoid main() { nsh_ohos_vertex(); gl_Position.y = -gl_Position.y; }\n";
-            let native = gl.create_program()?;
-            let compile = || -> Result<()> {
-                for (kind, source) in [
-                    (glow::VERTEX_SHADER, &vertex),
-                    (glow::FRAGMENT_SHADER, &source.fragment),
-                ] {
-                    let shader = gl.create_shader(kind)?;
-                    gl.shader_source(shader, source);
-                    gl.compile_shader(shader);
-                    if !gl.get_shader_compile_status(shader) {
-                        let error = gl.get_shader_info_log(shader);
-                        gl.delete_shader(shader);
-                        return Err(Error::Shader(error));
-                    }
-                    gl.attach_shader(native, shader);
-                    gl.delete_shader(shader);
+            let mut from_binary = false;
+            let native = if gpu.supports_program_binary
+                && let Some(binary) = gpu.take_program_binary(hash)
+            {
+                let program = gl.create_program()?;
+                gl.program_binary(program, &binary);
+                let ok = gl.get_program_link_status(program) && gl.get_error() == glow::NO_ERROR;
+                if ok {
+                    from_binary = true;
+                    program
+                } else {
+                    while gl.get_error() != glow::NO_ERROR {}
+                    gl.delete_program(program);
+                    let vertex = adapt_vertex_source(&source.vertex);
+                    compile_from_source(gl, &vertex, &source.fragment, false)?
                 }
-                gl.link_program(native);
-                if !gl.get_program_link_status(native) {
-                    return Err(Error::Shader(gl.get_program_info_log(native)));
-                }
-                Ok(())
+            } else {
+                let vertex = adapt_vertex_source(&source.vertex);
+                compile_from_source(gl, &vertex, &source.fragment, false)?
             };
-            if let Err(error) = compile() {
-                gl.delete_program(native);
-                return Err(error);
-            }
             for (binding, name) in [
                 source.builtins_block.as_deref(),
                 source.uniforms_block.as_deref(),
@@ -411,23 +573,14 @@ impl Program {
                 gl: gpu.gl.clone(),
                 native,
                 pictures,
+                warmed: Cell::new(from_binary),
             });
-            gpu.programs
-                .borrow_mut()
-                .insert(layer.shader.hash(), compiled.clone());
+            gpu.programs.borrow_mut().insert(hash, compiled.clone());
             Ok(compiled)
         }
     }
 
     fn new(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Self> {
-        let empty = Target::upload(
-            gpu,
-            &RgbaFrame {
-                width: 1,
-                height: 1,
-                pixels: vec![0; 4],
-            },
-        )?;
         let compiled = Self::compile(gpu, layer)?;
         let _current = gpu.context.enter()?;
         let gl = &gpu.gl;
@@ -450,7 +603,6 @@ impl Program {
                 gpu: gpu.clone(),
                 compiled,
                 buffers: [first, second],
-                empty,
             })
         }
     }
@@ -467,6 +619,7 @@ impl Program {
     ) -> Result<()> {
         let _current = self.gpu.context.enter()?;
         let gl = &self.gpu.gl;
+        let empty = self.gpu.empty_picture();
         // SAFETY: both UBO slices stay borrowed for upload; all target, sampler
         // and program objects belong to this current context. Draw uses no VBO.
         unsafe {
@@ -492,10 +645,10 @@ impl Program {
             for (index, (location, slot)) in self.compiled.pictures.iter().enumerate() {
                 let picture = match *slot {
                     ShaderInput::Content => content,
-                    ShaderInput::Backdrop => backdrop.unwrap_or_else(|| self.empty.picture()),
-                    ShaderInput::From => from.unwrap_or_else(|| self.empty.picture()),
-                    ShaderInput::To => to.unwrap_or_else(|| self.empty.picture()),
-                    _ => self.empty.picture(),
+                    ShaderInput::Backdrop => backdrop.unwrap_or(empty),
+                    ShaderInput::From => from.unwrap_or(empty),
+                    ShaderInput::To => to.unwrap_or(empty),
+                    _ => empty,
                 };
                 gl.active_texture(glow::TEXTURE0 + index as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(picture.0));
@@ -507,6 +660,7 @@ impl Program {
                 return Err(Error::Draw(error));
             }
         }
+        self.compiled.warmed.set(true);
         Ok(())
     }
 }
@@ -529,10 +683,10 @@ struct Effect {
     program: Program,
     words: Vec<u32>,
     progress: f32,
-    clock: Instant,
+    clock: Option<Duration>,
     elapsed: Duration,
     dirty: bool,
-    transition: Option<(Instant, Duration, bool)>,
+    transition: Option<(Option<Duration>, Duration, bool)>,
     pending: Option<(Duration, bool)>,
     navigation: bool,
     reverse_inputs: bool,
@@ -549,8 +703,12 @@ pub(super) struct Effects {
     gpu: TextureContext,
     views: Vec<Effect>,
     output: Option<Target>,
+    recycled_output: Option<Target>,
     shown: Option<usize>,
     direct_output: bool,
+    pub(super) before_screen: Option<Target>,
+    pub(super) capture_before: Option<NodeId>,
+    time: Duration,
 }
 impl Effects {
     pub(super) fn new(gpu: &TextureContext) -> Self {
@@ -558,13 +716,37 @@ impl Effects {
             gpu: gpu.clone(),
             views: Vec::new(),
             output: None,
+            recycled_output: None,
             shown: None,
             direct_output: false,
+            before_screen: None,
+            capture_before: None,
+            time: Duration::ZERO,
+        }
+    }
+    /// Only the surface's display pump advances shader time. Input textures
+    /// arriving between frames are drawn at this last sampled timestamp.
+    pub(super) fn sample(&mut self, time: Duration) {
+        self.time = self.time.max(time);
+        for view in &mut self.views {
+            view.clock.get_or_insert(self.time);
+            if let Some((start, _, _)) = &mut view.transition {
+                start.get_or_insert(self.time);
+            }
         }
     }
     pub(super) fn layers(&mut self, layers: &[(NodeId, Arc<ShaderLayer>)]) -> Result<()> {
-        self.views
-            .retain(|view| layers.iter().any(|(id, _)| *id == view.id));
+        let mut i = 0;
+        while i < self.views.len() {
+            if layers.iter().any(|(id, _)| *id == self.views[i].id) {
+                i += 1;
+            } else {
+                let removed = self.views.remove(i);
+                if let Some(output) = removed.output {
+                    self.recycled_output = Some(output);
+                }
+            }
+        }
         if self.shown.is_some_and(|index| index >= self.views.len()) {
             self.direct_output = false;
         }
@@ -594,10 +776,18 @@ impl Effects {
                             }
                         }
                     }
-                    if !view.layer.paused {
-                        view.elapsed += view.clock.elapsed();
+                    if !view.layer.paused
+                        && let Some(clock) = view.clock
+                    {
+                        view.elapsed += self.time.saturating_sub(clock);
                     }
-                    view.clock = Instant::now();
+                    // A newly resumed layer waits for its first display frame,
+                    // so an idle interval is never counted as animation time.
+                    view.clock = if view.layer.paused != layer.paused {
+                        None
+                    } else {
+                        view.clock.map(|_| self.time)
+                    };
                     view.layer = layer.clone();
                     view.words = words;
                     if !same || layer.progress_slot().is_none() {
@@ -614,7 +804,7 @@ impl Effects {
                         program: Program::new(&self.gpu, layer)?,
                         words: layer.uniforms.to_vec(),
                         progress: layer.progress.0,
-                        clock: Instant::now(),
+                        clock: None,
                         elapsed: Duration::ZERO,
                         dirty: true,
                         transition: None,
@@ -724,7 +914,7 @@ impl Effects {
         };
         let coverage = Coverage::shader(box_size, view.layer.overflow.0);
         self.render_size(
-            view.program.empty.picture(),
+            self.gpu.empty_picture(),
             size,
             changed,
             scale,
@@ -746,6 +936,18 @@ impl Effects {
         let mut changed = changed;
         let mut shown = None;
         for (index, view) in self.views.iter_mut().enumerate() {
+            if self.capture_before == Some(view.id) {
+                let resize = self
+                    .before_screen
+                    .as_ref()
+                    .is_none_or(|target| (target.width, target.height) != (picture.1, picture.2));
+                if resize {
+                    self.before_screen = Some(Target::new(&self.gpu, picture.1, picture.2)?);
+                }
+                if resize || changed {
+                    self.before_screen.as_ref().unwrap().blit(picture)?;
+                }
+            }
             let layer_coverage = Coverage::shader(coverage.box_size, view.layer.overflow.0);
             let (width, height, effective_scale) = layer_coverage.pixels(scale);
             let layer_size = (width.max(1), height.max(1));
@@ -777,16 +979,25 @@ impl Effects {
                 view.from = Some(target);
                 view.from_coverage = Some(layer_coverage);
             }
-            let now = Instant::now();
+            let now = self.time;
             if let Some((duration, backwards)) = view.pending.take() {
-                view.transition = Some((now, duration, backwards));
+                // The first usable input may arrive on a texture notification.
+                // Draw its initial state now and anchor it on the next display
+                // frame instead of starting from a stale pre-idle timestamp.
+                view.transition = Some((None, duration, backwards));
             }
             let progress = view
                 .transition
                 .map_or(view.progress, |(start, duration, backwards)| {
-                    let p = (now.saturating_duration_since(start).as_secs_f32()
-                        / duration.as_secs_f32().max(f32::MIN_POSITIVE))
-                    .clamp(0.0, 1.0);
+                    let p = if duration.is_zero() {
+                        1.0
+                    } else {
+                        (start
+                            .map_or(Duration::ZERO, |start| now.saturating_sub(start))
+                            .as_secs_f32()
+                            / duration.as_secs_f32())
+                        .clamp(0.0, 1.0)
+                    };
                     if backwards { 1.0 - p } else { p }
                 });
             let transitioning = view.transition.is_some();
@@ -822,13 +1033,21 @@ impl Effects {
                     .as_ref()
                     .is_none_or(|t| (t.width, t.height) != layer_size)
                 {
-                    view.output = Some(Target::new(&self.gpu, layer_size.0, layer_size.1)?);
+                    let reused = self
+                        .recycled_output
+                        .take()
+                        .filter(|t| (t.width, t.height) == layer_size);
+                    view.output = Some(match reused {
+                        Some(target) => target,
+                        None => Target::new(&self.gpu, layer_size.0, layer_size.1)?,
+                    });
                 }
                 let time = view.elapsed
                     + if view.layer.paused {
                         Duration::ZERO
                     } else {
-                        view.clock.elapsed()
+                        view.clock
+                            .map_or(Duration::ZERO, |clock| now.saturating_sub(clock))
                     };
                 let output = view.output.as_ref().unwrap();
                 if let Some(backdrop) = backdrop {
@@ -875,7 +1094,8 @@ impl Effects {
                 shown = Some(index);
             }
             if view.transition.is_some_and(|(start, duration, _)| {
-                now.saturating_duration_since(start) >= duration
+                duration.is_zero()
+                    || start.is_some_and(|start| now.saturating_sub(start) >= duration)
             }) {
                 view.progress = progress;
                 view.transition = None;
@@ -913,6 +1133,9 @@ impl Effects {
         self.shown = None;
         self.direct_output = false;
         self.output = None;
+    }
+    pub(super) fn release_recycled(&mut self) {
+        self.recycled_output = None;
     }
     pub(super) fn output(&self) -> Option<&Target> {
         if self.direct_output {

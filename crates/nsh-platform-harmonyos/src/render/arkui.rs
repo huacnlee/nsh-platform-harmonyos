@@ -38,7 +38,7 @@ impl crate::render::mount::UiContext {
         pending.editors.retain(|update| update.target_id != id);
         pending.commands.retain(|command| command.target_id != id);
         drop(pending);
-        let target = self.retire_unattached(target);
+        let target = self.retire_unattached(target, false);
         if let Some(target) = target {
             let mut pending = self.arkui.borrow_mut();
             if !pending.remove_editors.contains(&id) {
@@ -83,7 +83,8 @@ impl crate::render::mount::UiContext {
             .web_commands
             .retain(|command| command.target_id != id);
         drop(pending);
-        let target = self.retire_unattached(target);
+        // ArkTS can already own a WebEntry while its first frame callback is pending.
+        let target = self.retire_unattached(target, true);
         if let Some(target) = target {
             let mut pending = self.arkui.borrow_mut();
             if !pending.remove_webs.contains(&id) {
@@ -94,17 +95,22 @@ impl crate::render::mount::UiContext {
         }
         self.editor_wake();
     }
-    fn retire_unattached(&self, target: NativeAttachment) -> Option<NativeAttachment> {
-        if self.host.check().is_ok() && !matches!(target.with_child(|_| ()), Ok(None)) {
+    fn retire_unattached(
+        &self,
+        target: NativeAttachment,
+        mount_can_be_deferred: bool,
+    ) -> Option<NativeAttachment> {
+        let host_active = self.host.check().is_ok();
+        if host_active && !matches!(target.with_child(|_| ()), Ok(None)) {
             return Some(target);
         }
-        // No SDK owner needs a removal turn in these states. Release the
-        // attachment's strong node handles before Node's recursive disposal.
+        // Release native node handles before recursive disposal. A deferred builder
+        // still needs its removal turn and a valid target ID for retirement.
         if let Err(error) = target.invalidate() {
             log::error!("OHOS attachment retirement failed; retaining owner: {error}");
             return Some(target);
         }
-        None
+        (host_active && mount_can_be_deferred).then_some(target)
     }
     fn editor_wake(&self) {
         if !self.flushing_batch.get()
@@ -114,7 +120,6 @@ impl crate::render::mount::UiContext {
         }
     }
     pub(crate) fn flush_arkui(&self) -> crate::render::node::Result<()> {
-        let _trace = super::composition::trace::Scope::new(c"NSH ArkUI flush");
         if self.host.check().is_err() {
             return Ok(());
         }
@@ -124,7 +129,11 @@ impl crate::render::mount::UiContext {
         let owners: Vec<_> = {
             let mut nodes = self.composite_nodes.borrow_mut();
             nodes.retain(|node| node.strong_count() != 0);
-            nodes.iter().filter_map(std::rc::Weak::upgrade).collect()
+            nodes
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .filter(|owner| owner.composite_dirty.get())
+                .collect()
         };
         for owner in owners {
             if owner.composite_dirty.get() {
@@ -165,16 +174,6 @@ impl crate::render::mount::UiContext {
                         && !pending.remove_views.contains(&update.target_id)
                     {
                         pending.views.push(update);
-                    }
-                }
-                for picture in batch.pictures {
-                    if !pending
-                        .pictures
-                        .iter()
-                        .any(|next| next.target_id == picture.target_id)
-                        && !pending.remove_views.contains(&picture.target_id)
-                    {
-                        pending.pictures.push(picture);
                     }
                 }
                 for update in batch.webs {
@@ -243,20 +242,13 @@ impl crate::render::mount::UiContext {
             self.editor_wake();
         }
     }
-    pub(crate) fn picture_request(&self, request: crate::interop::sdk::PictureRequest) {
-        let mut pending = self.arkui.borrow_mut();
-        pending
-            .pictures
-            .retain(|old| old.target_id != request.target_id);
-        pending.pictures.push(request);
-    }
     pub(crate) fn view_remove(&self, target: NativeAttachment) {
         let id = target.id();
         self.arkui
             .borrow_mut()
             .views
             .retain(|update| update.target_id != id);
-        if let Some(target) = self.retire_unattached(target) {
+        if let Some(target) = self.retire_unattached(target, false) {
             let mut pending = self.arkui.borrow_mut();
             if !pending.remove_views.contains(&id) {
                 pending.remove_views.push(id);

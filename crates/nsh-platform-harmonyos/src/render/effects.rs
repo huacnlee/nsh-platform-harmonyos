@@ -72,6 +72,96 @@ pub(crate) fn resolve_native_node_opacity(
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) enum NativeColorFilter {
+    #[default]
+    None,
+    Grayscale(f32),
+    Sepia(f32),
+    Invert(f32),
+    Contrast(f32),
+    ImageMatrix([f32; 20]),
+}
+
+struct ClassifiedFilters {
+    can_run_natively: bool,
+    blur: f32,
+    opacity: f32,
+    color_filter: NativeColorFilter,
+}
+
+fn classify_native_filters(
+    filters: &[Filter],
+    supports_image_color_filter: bool,
+) -> ClassifiedFilters {
+    let mut blur = 0.0_f32;
+    let mut opacity = 1.0_f32;
+    let mut color_filter = NativeColorFilter::None;
+    let mut color_count = 0_usize;
+
+    for filter in filters.iter().copied().filter(|f| !is_noop_filter(f)) {
+        match filter {
+            Filter::Blur(radius) => blur += radius.0.max(0.0),
+            Filter::Opacity(v) => opacity *= v.clamp(0.0, 1.0),
+            other => {
+                color_count += 1;
+                if color_count > 1 {
+                    return ClassifiedFilters {
+                        can_run_natively: false,
+                        blur: 0.0,
+                        opacity: 1.0,
+                        color_filter: NativeColorFilter::None,
+                    };
+                }
+                if supports_image_color_filter && let Some(matrix) = other.color_matrix() {
+                    color_filter = NativeColorFilter::ImageMatrix(matrix);
+                } else {
+                    color_filter = match other {
+                        // Rosen's SetGrayScale/SetSepia multiply alpha by v unless v == 1.0,
+                        // and SetBrightness adds (v - 1) instead of multiplying by v.
+                        Filter::Grayscale(v) if (v - 1.0).abs() <= 1e-4 => {
+                            NativeColorFilter::Grayscale(1.0)
+                        }
+                        Filter::Sepia(v) if (v - 1.0).abs() <= 1e-4 => {
+                            NativeColorFilter::Sepia(1.0)
+                        }
+                        Filter::Invert(v) if (0.0..=1.0).contains(&v) => {
+                            NativeColorFilter::Invert(v.clamp(0.0, 1.0))
+                        }
+                        Filter::Contrast(v) if (0.0..10.0).contains(&v) => {
+                            NativeColorFilter::Contrast(v)
+                        }
+                        _ => {
+                            return ClassifiedFilters {
+                                can_run_natively: false,
+                                blur: 0.0,
+                                opacity: 1.0,
+                                color_filter: NativeColorFilter::None,
+                            };
+                        }
+                    };
+                }
+            }
+        }
+    }
+
+    if color_count > 0 && blur > 0.0 {
+        return ClassifiedFilters {
+            can_run_natively: false,
+            blur: 0.0,
+            opacity: 1.0,
+            color_filter: NativeColorFilter::None,
+        };
+    }
+
+    ClassifiedFilters {
+        can_run_natively: true,
+        blur,
+        opacity,
+        color_filter,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct EffectsContext {
     pub(crate) has_shaders: bool,
@@ -80,6 +170,7 @@ pub(crate) struct EffectsContext {
     pub(crate) scene_active: bool,
     pub(crate) composite_active: bool,
     pub(crate) has_native_paint: bool,
+    pub(crate) supports_image_color_filter: bool,
 }
 
 /// Single-source projection of where a node's filters, backdrop filters, and
@@ -96,6 +187,10 @@ pub(crate) struct EffectsPlan {
     pub(crate) native_backdrop_blur: f32,
     /// Layer blend mode written to `visual_node()` (`Attribute::BlendMode`).
     pub(crate) native_blend: BlendMode,
+    /// Native color filter written to `visual_node()` or `ImageView`.
+    pub(crate) native_color_filter: NativeColorFilter,
+    /// Multiplicative factor from `Filter::Opacity` folded into `visual_node()` opacity.
+    pub(crate) native_filter_opacity: f32,
     /// Whether this node's own style/shaders require surface `Scene` composition.
     pub(crate) requires_scene: bool,
     /// Whether this node requires a native snapshot for `Composite`.
@@ -109,37 +204,37 @@ impl EffectsPlan {
         let backdrop_filters = effects.map_or(&[][..], |e| e.backdrop_filters.as_slice());
         let has_masks = effects.is_some_and(|e| !e.mask_images.is_empty());
 
+        let classified = classify_native_filters(filters, ctx.supports_image_color_filter);
+        let non_native_filter = !classified.can_run_natively;
         let non_blur_filter = has_non_blur_filter(filters);
         let active_backdrops = active_filter_count(backdrop_filters);
         let non_blur_backdrop = has_non_blur_filter(backdrop_filters);
 
         // A sampled subtree is rendered in isolation. Compose its backdrop in
         // Scene so the picture does not depend on the live window behind it.
-        let own_texture = non_blur_filter || ctx.has_shaders || ctx.navigation_capture;
+        let own_texture = non_native_filter || ctx.has_shaders || ctx.navigation_capture;
         let requires_scene = style.blend_mode == BlendMode::PlusDarker
             || ctx.shader_samples_backdrop
             || has_masks
             || active_backdrops > 1
             || non_blur_backdrop
-            || (active_backdrops > 0 && own_texture);
+            || (active_backdrops > 0 && (own_texture || non_blur_filter));
 
         let requires_texture = ctx.navigation_capture
             || (ctx.scene_active && ctx.has_native_paint)
-            || non_blur_filter
+            || non_native_filter
             || ctx.has_shaders;
 
         let native_active = !ctx.scene_active && !requires_texture && !ctx.composite_active;
         let mut native_blur = 0.0;
         let mut native_backdrop_blur = 0.0;
+        let mut native_color_filter = NativeColorFilter::None;
+        let mut native_filter_opacity = 1.0;
         if native_active {
-            for filter in filters {
-                if let Filter::Blur(radius) = filter
-                    && radius.0 > 0.0
-                {
-                    native_blur += radius.0;
-                }
-            }
-            if active_backdrops <= 1 && !non_blur_backdrop {
+            native_blur = classified.blur;
+            native_color_filter = classified.color_filter;
+            native_filter_opacity = classified.opacity;
+            if active_backdrops <= 1 && !non_blur_backdrop && !requires_scene {
                 for filter in backdrop_filters {
                     if let Filter::Blur(radius) = filter
                         && radius.0 > 0.0
@@ -160,6 +255,8 @@ impl EffectsPlan {
             native_blur,
             native_backdrop_blur,
             native_blend,
+            native_color_filter,
+            native_filter_opacity,
             requires_scene,
             requires_texture,
         }
@@ -369,5 +466,49 @@ mod tests {
         assert_eq!(resolve_native_node_opacity(true, true, 0.8), 0.0);
         assert!((resolve_native_node_opacity(false, false, 0.75) - 0.75).abs() < 1e-6);
         assert!((resolve_native_node_opacity(false, true, 0.25) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn image_and_exact_color_filters_route_natively_without_texture_export() {
+        for filter in [
+            Filter::Grayscale(1.0),
+            Filter::Sepia(1.0),
+            Filter::Brightness(0.5),
+            Filter::Saturate(1.5),
+            Filter::HueRotate(Radians(1.2)),
+        ] {
+            let style = ViewStyle {
+                effects: Some(Arc::new(Effects {
+                    filters: vec![filter, Filter::Opacity(0.8)],
+                    ..Default::default()
+                })),
+                ..ViewStyle::default()
+            };
+            let image_plan = EffectsPlan::compute(
+                &style,
+                EffectsContext {
+                    supports_image_color_filter: true,
+                    ..EffectsContext::default()
+                },
+            );
+            assert!(!image_plan.requires_texture);
+            assert!(!image_plan.requires_scene);
+            assert!(matches!(
+                image_plan.native_color_filter,
+                NativeColorFilter::ImageMatrix(_)
+            ));
+            assert!((image_plan.native_filter_opacity - 0.8).abs() < 1e-6);
+        }
+
+        let view_grayscale = ViewStyle {
+            effects: Some(Arc::new(Effects {
+                filters: vec![Filter::Grayscale(1.0)],
+                ..Default::default()
+            })),
+            ..ViewStyle::default()
+        };
+        let plan = EffectsPlan::compute(&view_grayscale, EffectsContext::default());
+        assert!(!plan.requires_texture);
+        assert_eq!(plan.native_color_filter, NativeColorFilter::Grayscale(1.0));
     }
 }

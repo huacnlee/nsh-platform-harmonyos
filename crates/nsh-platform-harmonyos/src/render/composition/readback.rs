@@ -242,12 +242,254 @@ impl Drop for BlitFramebuffer {
     }
 }
 
+struct ReadbackProgram {
+    context: Rc<Context>,
+    gl: Rc<glow::Context>,
+    program: glow::Program,
+    transform_loc: Option<glow::UniformLocation>,
+    y_scale_loc: Option<glow::UniformLocation>,
+    image_loc: Option<glow::UniformLocation>,
+    vertices: glow::Buffer,
+}
+impl ReadbackProgram {
+    fn new(context: &Rc<Context>, gl: &Rc<glow::Context>) -> Result<Self, Error> {
+        let _current = context.enter()?;
+        // SAFETY: program and static quad VBO belong exclusively to this worker's owned context.
+        unsafe {
+            let program = gl
+                .create_program()
+                .map_err(|_| failed("readback program"))?;
+            let compile = || -> Result<(), Error> {
+                for (kind, source) in [
+                    (
+                        glow::VERTEX_SHADER,
+                        "attribute vec2 position; uniform mat4 transform; uniform float y_scale; varying vec2 uv; void main() { gl_Position = vec4(position, 0.0, 1.0); uv = (transform * vec4(position.x * 0.5 + 0.5, 0.5 + position.y * y_scale, 0.0, 1.0)).xy; }",
+                    ),
+                    (
+                        glow::FRAGMENT_SHADER,
+                        "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 uv; uniform samplerExternalOES image; void main() { gl_FragColor = texture2D(image, uv); }",
+                    ),
+                ] {
+                    let shader = gl
+                        .create_shader(kind)
+                        .map_err(|_| failed("readback shader"))?;
+                    gl.shader_source(shader, source);
+                    gl.compile_shader(shader);
+                    let compiled = gl.get_shader_compile_status(shader);
+                    if compiled {
+                        gl.attach_shader(program, shader);
+                    }
+                    gl.delete_shader(shader);
+                    if !compiled {
+                        return Err(failed("compile readback shader"));
+                    }
+                }
+                gl.bind_attrib_location(program, 0, "position");
+                gl.link_program(program);
+                if !gl.get_program_link_status(program) {
+                    return Err(failed("link readback program"));
+                }
+                Ok(())
+            };
+            if let Err(error) = compile() {
+                gl.delete_program(program);
+                return Err(error);
+            }
+            let transform_loc = gl.get_uniform_location(program, "transform");
+            let y_scale_loc = gl.get_uniform_location(program, "y_scale");
+            let image_loc = gl.get_uniform_location(program, "image");
+            let vertices = match gl.create_buffer() {
+                Ok(vertices) => vertices,
+                Err(_) => {
+                    gl.delete_program(program);
+                    return Err(failed("readback vertices"));
+                }
+            };
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
+            let points: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
+            let bytes =
+                std::slice::from_raw_parts(points.as_ptr().cast(), std::mem::size_of_val(&points));
+            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
+            Ok(Self {
+                context: context.clone(),
+                gl: gl.clone(),
+                program,
+                transform_loc,
+                y_scale_loc,
+                image_loc,
+                vertices,
+            })
+        }
+    }
+}
+impl Drop for ReadbackProgram {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            // SAFETY: program and VBO belong to this worker's owned context.
+            unsafe {
+                self.gl.delete_buffer(self.vertices);
+                self.gl.delete_program(self.program);
+            }
+        }
+    }
+}
+
+struct WarmupResources {
+    context: Rc<Context>,
+    gl: Rc<glow::Context>,
+    empty_texture: glow::Texture,
+    warmup_texture: glow::Texture,
+    warmup_fbo: glow::Framebuffer,
+    warmup_buffers: [glow::Buffer; 2],
+}
+impl WarmupResources {
+    fn new(context: &Rc<Context>, gl: &Rc<glow::Context>) -> Result<Self, Error> {
+        let _current = context.enter()?;
+        struct Guard<'a> {
+            gl: &'a glow::Context,
+            empty_texture: Option<glow::Texture>,
+            warmup_texture: Option<glow::Texture>,
+            warmup_fbo: Option<glow::Framebuffer>,
+            buf0: Option<glow::Buffer>,
+            buf1: Option<glow::Buffer>,
+        }
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                // SAFETY: partial construction runs in the active owned context.
+                unsafe {
+                    if let Some(object) = self.buf1 {
+                        self.gl.delete_buffer(object);
+                    }
+                    if let Some(object) = self.buf0 {
+                        self.gl.delete_buffer(object);
+                    }
+                    if let Some(object) = self.warmup_fbo {
+                        self.gl.delete_framebuffer(object);
+                    }
+                    if let Some(object) = self.warmup_texture {
+                        self.gl.delete_texture(object);
+                    }
+                    if let Some(object) = self.empty_texture {
+                        self.gl.delete_texture(object);
+                    }
+                }
+            }
+        }
+        let mut guard = Guard {
+            gl,
+            empty_texture: None,
+            warmup_texture: None,
+            warmup_fbo: None,
+            buf0: None,
+            buf1: None,
+        };
+        // SAFETY: all warmup resources are created in the current owned context.
+        unsafe {
+            let empty_texture = gl.create_texture().map_err(|_| failed("empty texture"))?;
+            guard.empty_texture = Some(empty_texture);
+            gl.bind_texture(glow::TEXTURE_2D, Some(empty_texture));
+            for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::LINEAR as i32);
+            }
+            for parameter in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::CLAMP_TO_EDGE as i32);
+            }
+            gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                1,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(Some(&[0, 0, 0, 0])),
+            );
+
+            let warmup_texture = gl.create_texture().map_err(|_| failed("warmup texture"))?;
+            guard.warmup_texture = Some(warmup_texture);
+            gl.bind_texture(glow::TEXTURE_2D, Some(warmup_texture));
+            for parameter in [glow::TEXTURE_MIN_FILTER, glow::TEXTURE_MAG_FILTER] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::LINEAR as i32);
+            }
+            for parameter in [glow::TEXTURE_WRAP_S, glow::TEXTURE_WRAP_T] {
+                gl.tex_parameter_i32(glow::TEXTURE_2D, parameter, glow::CLAMP_TO_EDGE as i32);
+            }
+            gl.tex_image_2d(
+                glow::TEXTURE_2D,
+                0,
+                glow::RGBA8 as i32,
+                1,
+                1,
+                0,
+                glow::RGBA,
+                glow::UNSIGNED_BYTE,
+                glow::PixelUnpackData::Slice(None),
+            );
+
+            let warmup_fbo = gl.create_framebuffer().map_err(|_| failed("warmup FBO"))?;
+            guard.warmup_fbo = Some(warmup_fbo);
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(warmup_fbo));
+            gl.framebuffer_texture_2d(
+                glow::FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(warmup_texture),
+                0,
+            );
+            if gl.check_framebuffer_status(glow::FRAMEBUFFER) != glow::FRAMEBUFFER_COMPLETE {
+                return Err(failed("incomplete warmup FBO"));
+            }
+
+            let buf0 = gl.create_buffer().map_err(|_| failed("warmup UBO"))?;
+            guard.buf0 = Some(buf0);
+            let buf1 = gl.create_buffer().map_err(|_| failed("warmup UBO"))?;
+            guard.buf1 = Some(buf1);
+
+            guard.empty_texture = None;
+            guard.warmup_texture = None;
+            guard.warmup_fbo = None;
+            guard.buf0 = None;
+            guard.buf1 = None;
+            Ok(Self {
+                context: context.clone(),
+                gl: gl.clone(),
+                empty_texture,
+                warmup_texture,
+                warmup_fbo,
+                warmup_buffers: [buf0, buf1],
+            })
+        }
+    }
+}
+impl Drop for WarmupResources {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            // SAFETY: warmup resources belong to this worker's owned context.
+            unsafe {
+                for buffer in self.warmup_buffers {
+                    self.gl.delete_buffer(buffer);
+                }
+                self.gl.delete_framebuffer(self.warmup_fbo);
+                self.gl.delete_texture(self.warmup_texture);
+                self.gl.delete_texture(self.empty_texture);
+            }
+        }
+    }
+}
+
 /// A thread-bound offscreen context shared by NativeImage readers on one worker.
 #[derive(Clone)]
 pub(crate) struct TextureContext {
     pub(super) context: Rc<Context>,
     pub(super) gl: Rc<glow::Context>,
     blit_fbo: Rc<BlitFramebuffer>,
+    warmup: Rc<WarmupResources>,
+    readback_program: Rc<std::cell::RefCell<Option<Rc<ReadbackProgram>>>>,
+    pub(super) filter_program: Rc<std::cell::RefCell<Option<Rc<super::gles::FilterProgram>>>>,
+    binary_store: Rc<std::cell::RefCell<Option<super::precompile::BinaryStore>>>,
+    pub(super) supports_program_binary: bool,
     max_texture_size: u32,
     pub(super) programs:
         Rc<std::cell::RefCell<rustc_hash::FxHashMap<u64, Rc<super::gles::Compiled>>>>,
@@ -255,6 +497,35 @@ pub(crate) struct TextureContext {
 impl TextureContext {
     pub(super) fn blit_framebuffer(&self) -> glow::Framebuffer {
         self.blit_fbo.raw
+    }
+    pub(super) fn empty_picture(&self) -> (glow::Texture, u32, u32) {
+        (self.warmup.empty_texture, 1, 1)
+    }
+    pub(super) fn warmup_fbo(&self) -> glow::Framebuffer {
+        self.warmup.warmup_fbo
+    }
+    pub(super) fn warmup_buffers(&self) -> [glow::Buffer; 2] {
+        self.warmup.warmup_buffers
+    }
+    pub(super) fn attach_binary_store(&self, store: super::precompile::BinaryStore) {
+        *self.binary_store.borrow_mut() = Some(store);
+    }
+    pub(super) fn take_program_binary(&self, hash: u64) -> Option<glow::ProgramBinary> {
+        self.binary_store
+            .borrow()
+            .as_ref()
+            .and_then(|store| store.take(hash))
+    }
+    fn readback_program(&self) -> Result<Rc<ReadbackProgram>, Error> {
+        if let Some(cached) = self.readback_program.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let compiled = Rc::new(ReadbackProgram::new(&self.context, &self.gl)?);
+        *self.readback_program.borrow_mut() = Some(compiled.clone());
+        Ok(compiled)
+    }
+    pub(super) fn precompile_readback(&self) -> Result<(), Error> {
+        self.readback_program().map(|_| ())
     }
     pub(super) fn window(&self, native: ohos_native_window_binding::NativeWindow) -> Window {
         Window {
@@ -286,6 +557,12 @@ impl TextureContext {
             .ok()
             .filter(|limit| *limit > 0)
             .ok_or(failed("GLES texture limit"))?;
+        // SAFETY: standard ES 3.0 query on the current owned context.
+        let supports_program_binary = unsafe {
+            let formats = gl.get_parameter_i32(glow::NUM_PROGRAM_BINARY_FORMATS);
+            while gl.get_error() != glow::NO_ERROR {}
+            formats > 0
+        };
         // SAFETY: persistent read-only blit FBO created in the owned GLES context.
         let blit_raw = unsafe { gl.create_framebuffer() }.map_err(|_| failed("blit FBO"))?;
         let gl = Rc::new(gl);
@@ -294,11 +571,17 @@ impl TextureContext {
             gl: gl.clone(),
             raw: blit_raw,
         });
+        let warmup = Rc::new(WarmupResources::new(&context, &gl)?);
         drop(current);
         Ok(Self {
             context,
             gl,
             blit_fbo,
+            warmup,
+            readback_program: Rc::default(),
+            filter_program: Rc::default(),
+            binary_store: Rc::default(),
+            supports_program_binary,
             max_texture_size,
             programs: Rc::default(),
         })
@@ -397,7 +680,6 @@ impl Window {
         Ok(current)
     }
     pub(super) fn present(&self) -> Result<(), Error> {
-        let _trace = super::trace::Scope::new(c"NSH present");
         self.context
             .egl
             .swap_buffers(
@@ -422,8 +704,6 @@ struct Objects {
     texture: Option<glow::Texture>,
     target: Option<glow::Texture>,
     framebuffer: Option<glow::Framebuffer>,
-    program: Option<glow::Program>,
-    vertices: Option<glow::Buffer>,
 }
 impl Drop for Objects {
     fn drop(&mut self) {
@@ -433,12 +713,6 @@ impl Drop for Objects {
         if let Ok(_current) = self.context.enter() {
             // SAFETY: partial construction retains each allocated object in its creating context.
             unsafe {
-                if let Some(object) = self.vertices {
-                    self.gl.delete_buffer(object);
-                }
-                if let Some(object) = self.program {
-                    self.gl.delete_program(object);
-                }
                 if let Some(object) = self.framebuffer {
                     self.gl.delete_framebuffer(object);
                 }
@@ -466,11 +740,7 @@ pub(crate) struct TextureReader {
     texture: glow::Texture,
     target: glow::Texture,
     framebuffer: glow::Framebuffer,
-    program: glow::Program,
-    transform_loc: Option<glow::UniformLocation>,
-    y_scale_loc: Option<glow::UniformLocation>,
-    image_loc: Option<glow::UniformLocation>,
-    vertices: glow::Buffer,
+    readback: Rc<ReadbackProgram>,
     size: (u32, u32),
     allocated: (u32, u32),
     last_transform: [f32; 16],
@@ -484,6 +754,7 @@ impl TextureReader {
         gpu: &TextureContext,
         callback: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, Error> {
+        let readback = gpu.readback_program()?;
         let context = gpu.context.clone();
         let current = context.enter()?;
         let gl = gpu.gl.clone();
@@ -493,21 +764,10 @@ impl TextureReader {
             texture: None,
             target: None,
             framebuffer: None,
-            program: None,
-            vertices: None,
         };
         // SAFETY: all objects belong to the current owned context. The construction
         // guard deletes every allocated object if any later step fails.
-        let (
-            texture,
-            target,
-            framebuffer,
-            program,
-            transform_loc,
-            y_scale_loc,
-            image_loc,
-            vertices,
-        ) = unsafe {
+        let (texture, target, framebuffer) = unsafe {
             let texture = gl
                 .create_texture()
                 .map_err(|_| failed("external texture"))?;
@@ -527,61 +787,7 @@ impl TextureReader {
                 .create_framebuffer()
                 .map_err(|_| failed("readback framebuffer"))?;
             objects.framebuffer = Some(framebuffer);
-            let program = gl
-                .create_program()
-                .map_err(|_| failed("readback program"))?;
-            objects.program = Some(program);
-            for (kind, source) in [
-                (
-                    glow::VERTEX_SHADER,
-                    "attribute vec2 position; uniform mat4 transform; uniform float y_scale; varying vec2 uv; void main() { gl_Position = vec4(position, 0.0, 1.0); uv = (transform * vec4(position.x * 0.5 + 0.5, 0.5 + position.y * y_scale, 0.0, 1.0)).xy; }",
-                ),
-                (
-                    glow::FRAGMENT_SHADER,
-                    "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 uv; uniform samplerExternalOES image; void main() { gl_FragColor = texture2D(image, uv); }",
-                ),
-            ] {
-                let shader = gl
-                    .create_shader(kind)
-                    .map_err(|_| failed("readback shader"))?;
-                gl.shader_source(shader, source);
-                gl.compile_shader(shader);
-                let compiled = gl.get_shader_compile_status(shader);
-                if compiled {
-                    gl.attach_shader(program, shader);
-                }
-                gl.delete_shader(shader);
-                if !compiled {
-                    return Err(failed("compile readback shader"));
-                }
-            }
-            gl.bind_attrib_location(program, 0, "position");
-            gl.link_program(program);
-            if !gl.get_program_link_status(program) {
-                return Err(failed("link readback program"));
-            }
-            let transform_loc = gl.get_uniform_location(program, "transform");
-            let y_scale_loc = gl.get_uniform_location(program, "y_scale");
-            let image_loc = gl.get_uniform_location(program, "image");
-            let vertices = gl
-                .create_buffer()
-                .map_err(|_| failed("readback vertices"))?;
-            objects.vertices = Some(vertices);
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vertices));
-            let points: [f32; 8] = [-1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0];
-            let bytes =
-                std::slice::from_raw_parts(points.as_ptr().cast(), std::mem::size_of_val(&points));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-            (
-                texture,
-                target,
-                framebuffer,
-                program,
-                transform_loc,
-                y_scale_loc,
-                image_loc,
-                vertices,
-            )
+            (texture, target, framebuffer)
         };
         // SAFETY: this worker restores this same context for updates and Drop;
         // the image is always destroyed before its external texture.
@@ -598,8 +804,6 @@ impl TextureReader {
         objects.texture = None;
         objects.target = None;
         objects.framebuffer = None;
-        objects.program = None;
-        objects.vertices = None;
         drop(current);
         Ok(Self {
             surface: Some(surface),
@@ -609,11 +813,7 @@ impl TextureReader {
             texture,
             target,
             framebuffer,
-            program,
-            transform_loc,
-            y_scale_loc,
-            image_loc,
-            vertices,
+            readback,
             size: (0, 0),
             allocated: (0, 0),
             last_transform: [
@@ -696,13 +896,17 @@ impl TextureReader {
             gl.disable(glow::BLEND);
             gl.disable(glow::SCISSOR_TEST);
             gl.disable(glow::DEPTH_TEST);
-            gl.use_program(Some(self.program));
-            gl.uniform_matrix_4_f32_slice(self.transform_loc.as_ref(), false, &self.last_transform);
-            gl.uniform_1_f32(self.y_scale_loc.as_ref(), y_scale);
-            gl.uniform_1_i32(self.image_loc.as_ref(), 0);
+            gl.use_program(Some(self.readback.program));
+            gl.uniform_matrix_4_f32_slice(
+                self.readback.transform_loc.as_ref(),
+                false,
+                &self.last_transform,
+            );
+            gl.uniform_1_f32(self.readback.y_scale_loc.as_ref(), y_scale);
+            gl.uniform_1_i32(self.readback.image_loc.as_ref(), 0);
             gl.active_texture(glow::TEXTURE0);
             gl.bind_texture(TEXTURE_EXTERNAL_OES, Some(self.texture));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.vertices));
+            gl.bind_buffer(glow::ARRAY_BUFFER, Some(self.readback.vertices));
             gl.enable_vertex_attrib_array(0);
             gl.vertex_attrib_pointer_f32(0, 2, glow::FLOAT, false, 0, 0);
             gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
@@ -770,9 +974,37 @@ impl TextureReader {
         self.target_dirty = false;
         Ok(Some((self.target, width, height)))
     }
+    /// Draw an unfiltered producer directly into the display queue. Captures
+    /// can still resolve this same OES frame with ensure_texture().
+    pub(super) fn present_input(&self, window: &Window) -> Result<bool, Error> {
+        let (width, height) = self.size;
+        let draw = || -> Result<(), Error> {
+            let _current = window.enter(width, height)?;
+            // SAFETY: this worker owns both the window and OES texture on the
+            // same EGL context. The default framebuffer belongs to this window.
+            unsafe {
+                self.gl.bind_framebuffer(glow::FRAMEBUFFER, None);
+                self.draw_oes(width, height, 0.5)?;
+            }
+            window.present()
+        };
+        match draw() {
+            Ok(()) => Ok(true),
+            Err(error) if error.output_unavailable() => {
+                window.on_present_unavailable();
+                let _current = self.context.enter()?;
+                // SAFETY: clear pending errors from the failed window submit.
+                unsafe { while self.gl.get_error() != glow::NO_ERROR {} }
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    pub(super) fn has_frame(&self) -> bool {
+        self.has_oes_frame
+    }
     /// Resolve a producer buffer to a top-left RGBA texture, entirely on GPU.
     pub(super) fn update_texture(&mut self) -> Result<bool, Error> {
-        let _trace = super::trace::Scope::new(c"NSH acquire input");
         let updated = self.drain_oes()?;
         let dirty = self.target_dirty || self.allocated != self.size;
         Ok(self.ensure_texture()?.is_some() && (updated || dirty))
@@ -841,8 +1073,6 @@ impl Drop for TextureReader {
             // SAFETY: native image has retired before its texture; all objects
             // are deleted on their creating thread in their current context.
             unsafe {
-                self.gl.delete_buffer(self.vertices);
-                self.gl.delete_program(self.program);
                 self.gl.delete_framebuffer(self.framebuffer);
                 self.gl.delete_texture(self.target);
                 self.gl.delete_texture(self.texture);

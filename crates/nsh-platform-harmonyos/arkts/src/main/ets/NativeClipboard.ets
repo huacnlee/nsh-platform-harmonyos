@@ -29,11 +29,12 @@ function pastePrompt(request: PasteRequest) {
       icon: PasteIconStyle.LINES,
       text: PasteDescription.PASTE,
       buttonType: ButtonType.Capsule,
-    }).onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
-      if (result === PasteButtonOnClickResult.SUCCESS) {
-        request.read();
-      }
     })
+      .onClick((_event: ClickEvent, result: PasteButtonOnClickResult) => {
+        if (result === PasteButtonOnClickResult.SUCCESS) {
+          request.read();
+        }
+      })
   }
   .padding(24)
   .backgroundColor($r("sys.color.ohos_id_color_dialog_bg"))
@@ -119,13 +120,21 @@ export class NativeClipboard {
     text: string,
     hasOnly: boolean,
     live: () => boolean,
+    html?: string,
   ): Promise<ClipboardReply> {
     if (this.closed) {
       throw new Error("clipboard owner is closed");
     }
     const board = pasteboard.getSystemPasteboard();
     if (op === "clipboard-write") {
-      await board.setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text));
+      if (html !== undefined) {
+        const formats: Record<string, pasteboard.ValueType> = {};
+        formats[pasteboard.MIMETYPE_TEXT_PLAIN] = text;
+        formats[pasteboard.MIMETYPE_TEXT_HTML] = html;
+        await board.setData(pasteboard.createData(formats));
+      } else {
+        await board.setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text));
+      }
       return {};
     }
     if (op === "clipboard-write-image") {

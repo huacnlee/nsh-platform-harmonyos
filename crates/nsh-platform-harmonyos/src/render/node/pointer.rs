@@ -46,6 +46,11 @@ impl Node {
                 self.host.activate(self.dispatcher.clone());
             }
             if matches!(event, EventKind::Focus | EventKind::Blur) {
+                if event == EventKind::Focus {
+                    self.key_focus.replace(self.weak.clone());
+                } else if self.key_focus.borrow().ptr_eq(&self.weak) {
+                    self.key_focus.replace(Default::default());
+                }
                 if matches!(self.kind, ViewKind::Input | ViewKind::Native)
                     && let Some(route) = self.dispatcher.upgrade()
                 {

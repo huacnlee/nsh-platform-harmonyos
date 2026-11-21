@@ -72,8 +72,6 @@ mod web_evaluation;
 #[path = "../../src/app/frame_rate.rs"]
 #[allow(dead_code)]
 mod frame_rate;
-#[path = "../../src/render/composition/picture.rs"]
-mod picture;
 
 #[path = "../../src/render/composition/mailbox.rs"]
 #[allow(dead_code)]
@@ -86,3 +84,6 @@ mod video_mailbox;
 #[path = "../../src/render/composition/scene_policy.rs"]
 #[allow(dead_code)]
 mod scene_policy;
+
+#[path = "../../src/text/family.rs"]
+mod text_family;

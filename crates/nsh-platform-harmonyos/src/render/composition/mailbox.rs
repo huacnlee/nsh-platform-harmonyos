@@ -80,6 +80,12 @@ pub(crate) trait Coalesce: Sized {
     /// must never be merged or reordered.
     fn is_barrier(&self) -> bool;
 
+    /// A merged sampling command must run after the state updates preceding
+    /// its newest occurrence, while remaining inside the same barrier segment.
+    fn merge_at_tail(&self) -> bool {
+        false
+    }
+
     /// Attempts to merge `incoming` into `self` in place. When merged, `incoming`
     /// is consumed (`take()`) and `true` is returned.
     fn try_merge(&mut self, incoming: &mut Option<Self>) -> bool;
@@ -165,9 +171,14 @@ impl<T: Coalesce> CommandSender<T> {
             state.barrier_watermark = state.items.len();
         } else {
             let watermark = state.barrier_watermark;
+            let merge_at_tail = item.merge_at_tail();
             let mut incoming = Some(item);
-            for existing in state.items.range_mut(watermark..) {
-                if existing.try_merge(&mut incoming) {
+            for at in watermark..state.items.len() {
+                if state.items[at].try_merge(&mut incoming) {
+                    if merge_at_tail {
+                        let merged = state.items.remove(at).expect("merged item exists");
+                        state.items.push_back(merged);
+                    }
                     return Ok(());
                 }
             }
@@ -199,6 +210,39 @@ impl<T> CommandReceiver<T> {
                 return Err(());
             }
             state = self.inner.ready.wait(state).unwrap();
+        }
+    }
+
+    pub(crate) fn recv_timeout(&self, timeout: std::time::Duration) -> Result<Option<T>, ()> {
+        let mut state = self.inner.state.lock().unwrap();
+        if let Some(item) = state.items.pop_front() {
+            state.barrier_watermark = state.barrier_watermark.saturating_sub(1);
+            return Ok(Some(item));
+        }
+        if state.closed {
+            return Err(());
+        }
+        if timeout.is_zero() {
+            return Ok(None);
+        }
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            let (next, result) = self.inner.ready.wait_timeout(state, remaining).unwrap();
+            state = next;
+            if let Some(item) = state.items.pop_front() {
+                state.barrier_watermark = state.barrier_watermark.saturating_sub(1);
+                return Ok(Some(item));
+            }
+            if state.closed {
+                return Err(());
+            }
+            if result.timed_out() {
+                return Ok(None);
+            }
         }
     }
 
@@ -251,20 +295,27 @@ mod tests {
     #[derive(Debug, PartialEq, Eq)]
     enum MockTask {
         Slot(u32, u16, i32),
-        Frame,
+        Frame(u64),
+        Wake(usize),
         Capture(u32),
         Drain,
     }
 
     impl Coalesce for MockTask {
         fn is_barrier(&self) -> bool {
-            matches!(self, Self::Capture(_) | Self::Drain)
+            matches!(self, Self::Wake(_) | Self::Capture(_) | Self::Drain)
+        }
+
+        fn merge_at_tail(&self) -> bool {
+            matches!(self, Self::Frame(_))
         }
 
         fn try_merge(&mut self, incoming: &mut Option<Self>) -> bool {
             match (self, incoming.as_ref()) {
-                (Self::Frame, Some(Self::Frame)) => {
-                    incoming.take();
+                (Self::Frame(timestamp), Some(Self::Frame(_))) => {
+                    if let Some(Self::Frame(next)) = incoming.take() {
+                        *timestamp = (*timestamp).max(next);
+                    }
                     true
                 }
                 (Self::Slot(k1, s1, v1), Some(Self::Slot(k2, s2, _))) if k1 == k2 && s1 == s2 => {
@@ -284,7 +335,7 @@ mod tests {
 
         for i in 0..500 {
             tx.send(MockTask::Slot(1, 0, i)).unwrap();
-            tx.send(MockTask::Frame).unwrap();
+            tx.send(MockTask::Frame(i as u64)).unwrap();
         }
         // 1000 rapid updates collapse into just 2 queued entries.
         assert_eq!(tx.queued_len(), 2);
@@ -298,11 +349,82 @@ mod tests {
         assert_eq!(tx.queued_len(), 5);
 
         assert_eq!(rx.recv(), Ok(MockTask::Slot(1, 0, 499)));
-        assert_eq!(rx.recv(), Ok(MockTask::Frame));
+        assert_eq!(rx.recv(), Ok(MockTask::Frame(499)));
         assert_eq!(rx.recv(), Ok(MockTask::Capture(99)));
         assert_eq!(rx.recv(), Ok(MockTask::Slot(1, 0, 999)));
         assert_eq!(rx.recv(), Ok(MockTask::Drain));
         drop(tx);
         assert_eq!(rx.recv(), Err(()));
+    }
+
+    #[test]
+    fn newest_frame_samples_new_uniforms_without_crossing_capture() {
+        let (tx, rx) = command_channel();
+        tx.send(MockTask::Frame(100)).unwrap();
+        tx.send(MockTask::Slot(1, 0, 7)).unwrap();
+        tx.send(MockTask::Frame(120)).unwrap();
+        tx.send(MockTask::Frame(110)).unwrap();
+        tx.send(MockTask::Capture(9)).unwrap();
+        tx.send(MockTask::Slot(1, 0, 8)).unwrap();
+        tx.send(MockTask::Frame(130)).unwrap();
+
+        assert_eq!(rx.recv(), Ok(MockTask::Slot(1, 0, 7)));
+        assert_eq!(rx.recv(), Ok(MockTask::Frame(120)));
+        assert_eq!(rx.recv(), Ok(MockTask::Capture(9)));
+        assert_eq!(rx.recv(), Ok(MockTask::Slot(1, 0, 8)));
+        assert_eq!(rx.recv(), Ok(MockTask::Frame(130)));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[test]
+    fn frames_stay_bounded_while_gated_wakes_are_replenished() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        for owners in [1, 8, 128] {
+            let (tx, rx) = command_channel();
+            let queued: Vec<_> = (0..owners).map(|_| AtomicBool::new(false)).collect();
+            for timestamp in 1..=2000 {
+                // The compositor's Shared.queued gate allows one outstanding
+                // texture wake per live owner; its release occurs on dequeue.
+                for (id, flag) in queued.iter().enumerate() {
+                    if !flag.swap(true, Ordering::AcqRel) {
+                        tx.send(MockTask::Wake(id)).unwrap();
+                    }
+                    tx.send(MockTask::Frame(timestamp)).unwrap();
+                }
+                assert!(tx.queued_len() <= owners * 2 + 1);
+                if let Some(MockTask::Wake(id)) = rx.try_recv() {
+                    queued[id].store(false, Ordering::Release);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recv_timeout_returns_promptly_on_item_timeout_and_close() {
+        use std::time::Duration;
+
+        let (tx, rx) = command_channel::<MockTask>();
+        assert_eq!(rx.recv_timeout(Duration::from_millis(5)), Ok(None));
+
+        tx.send(MockTask::Frame(42)).unwrap();
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)),
+            Ok(Some(MockTask::Frame(42)))
+        );
+
+        let sender = tx.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            sender.send(MockTask::Drain).unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1)),
+            Ok(Some(MockTask::Drain))
+        );
+        handle.join().unwrap();
+
+        drop(tx);
+        assert_eq!(rx.recv_timeout(Duration::from_millis(50)), Err(()));
     }
 }

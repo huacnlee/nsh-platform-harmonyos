@@ -1,5 +1,5 @@
 import { NativeMenuItem, NativeMenuCleanup } from "./NativeMenus";
-import { PointerPosting, NativeRetirement } from "./NativePointer";
+import { PointerPosting } from "./NativePointer";
 import {
   BuilderNode,
   NodeRenderType,
@@ -10,8 +10,6 @@ import {
 import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import { NshRuntimeContext } from "./NativeEditors";
-
-
 
 interface ViewAction {
   name: string;
@@ -57,19 +55,6 @@ interface TextureInsets {
 interface ViewParameters {
   entry: ViewEntry;
   settings: Settings;
-}
-export interface PictureRequest {
-  targetId: number;
-  generation: number;
-  scale: number;
-}
-export interface PicturePixels {
-  width: number;
-  height: number;
-  stride: number;
-  format: number;
-  alpha: number;
-  pixels: Uint8Array;
 }
 interface MenuParameters {
   entry: ViewEntry;
@@ -169,7 +154,10 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
     if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
     }
-    if (deviceInfo.sdkApiVersion >= 26 && typeof (node as ActionsAttribute).accessibilityCustomActions === "function") {
+    if (
+      deviceInfo.sdkApiVersion >= 26 &&
+      typeof (node as ActionsAttribute).accessibilityCustomActions === "function"
+    ) {
       const actions: CustomAction[] = s.actions.map((action: ViewAction): CustomAction => {
         return {
           name: action.label,
@@ -180,7 +168,9 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       });
       (node as ActionsAttribute).accessibilityCustomActions(actions);
     } else if (s.api26 && s.actions.length > 0) {
-      console.warn("[NSH] runtime lacks ArkUI accessibilityCustomActions; degrading custom actions");
+      console.warn(
+        "[NSH] runtime lacks ArkUI accessibilityCustomActions; degrading custom actions",
+      );
     }
   }
 }
@@ -193,14 +183,13 @@ struct ViewMenuContent {
       ForEach(
         this.menu.items,
         (item: NativeMenuItem) => {
-          MenuItem({ content: item.label })
-            .onClick((): void => {
-              this.entry.action(item.name, "menu", this.menu.generation);
-            });
+          MenuItem({ content: item.label }).onClick((): void => {
+            this.entry.action(item.name, "menu", this.menu.generation);
+          });
         },
         (item: NativeMenuItem): string => item.name,
       )
-    }.padding(8);
+    }.padding(4);
   }
 }
 @Builder
@@ -256,7 +245,6 @@ struct SourceRoot {
     }
     .width(captureWidth(this.state.settings))
     .height(captureHeight(this.state.settings))
-    .id(`nsh-picture-${this.state.settings.targetId}`)
     .padding(this.state.settings.textureInsets ?? { left: 0, top: 0, right: 0, bottom: 0 })
     .clip(false)
     .hitTestBehavior(HitTestMode.Transparent);
@@ -305,7 +293,6 @@ class ViewEntry {
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
   private pointerPosting: PointerPosting;
-  private retirement: NativeRetirement = new NativeRetirement();
   constructor(
     settings: Settings,
     context: NshRuntimeContext,
@@ -329,43 +316,6 @@ class ViewEntry {
   }
   get settings(): Settings {
     return this.state.settings;
-  }
-  async picture(request: PictureRequest): Promise<void> {
-    if (this.closed) {
-      return;
-    }
-    try {
-      const picture = await this.ui.getComponentSnapshot().get(`nsh-picture-${request.targetId}`, {
-        scale: request.scale,
-        waitUntilRenderFinished: true,
-      });
-      try {
-        const info = await picture.getImageInfo();
-        const byteLength = picture.getPixelBytesNumber();
-        if (this.closed) {
-          return;
-        }
-        if (info.size.width > 4096 || info.size.height > 4096 || byteLength > 67108864) {
-          throw new Error("Shader content picture exceeds the pixel budget");
-        }
-        const pixels = new ArrayBuffer(byteLength);
-        await picture.readPixelsToBuffer(pixels);
-        if (!this.closed) {
-          this.context.nativePicture(request.targetId, request.generation, {
-            width: info.size.width, height: info.size.height,
-            stride: byteLength / info.size.height,
-            format: info.pixelFormat, alpha: info.alphaType,
-            pixels: new Uint8Array(pixels),
-          });
-        }
-      } finally {
-        await picture.release();
-      }
-    } catch (error) {
-      if (!this.closed) {
-        this.context.nativePicture(request.targetId, request.generation, undefined, String(error));
-      }
-    }
   }
   isClosed(): boolean {
     return this.closed;
@@ -394,7 +344,9 @@ class ViewEntry {
     try {
       this.disposeBuilders();
     } catch (error) {
-      console.error(`[NSH] failed to clean up aborted wrapper ${this.settings.targetId}: ${String(error)}`);
+      console.error(
+        `[NSH] failed to clean up aborted wrapper ${this.settings.targetId}: ${String(error)}`,
+      );
     }
   }
   create(): void {
@@ -402,7 +354,9 @@ class ViewEntry {
     let stage: string = "build";
     try {
       const params: ViewParameters = { entry: this, settings: this.settings };
-      this.textureNode?.build(wrapBuilder(sourceContent), params, { nestingBuilderSupported: true });
+      this.textureNode?.build(wrapBuilder(sourceContent), params, {
+        nestingBuilderSupported: true,
+      });
       this.node.build(wrapBuilder(viewContent), params, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("Native wrapper creation was cancelled");
@@ -435,6 +389,13 @@ class ViewEntry {
       }
     }
   }
+  private static sameCaptureSize(a: Settings, b: Settings): boolean {
+    const aw = a.width + (a.textureInsets?.left ?? 0) + (a.textureInsets?.right ?? 0);
+    const ah = a.height + (a.textureInsets?.top ?? 0) + (a.textureInsets?.bottom ?? 0);
+    const bw = b.width + (b.textureInsets?.left ?? 0) + (b.textureInsets?.right ?? 0);
+    const bh = b.height + (b.textureInsets?.top ?? 0) + (b.textureInsets?.bottom ?? 0);
+    return aw === bw && ah === bh;
+  }
   update(settings: Settings): void {
     if (this.closed) {
       throw new Error("Native wrapper is already closed");
@@ -442,11 +403,19 @@ class ViewEntry {
     if (settings.targetId !== this.settings.targetId) {
       throw new Error("Native wrapper target cannot change");
     }
+    const previous = this.state.settings;
     this.state.settings = settings;
     const params: ViewParameters = { entry: this, settings: settings };
     this.sdkBusy = true;
     try {
-      this.node.update(params);
+      if (this.textureNode) {
+        this.textureNode.update(params);
+        if (!ViewEntry.sameCaptureSize(previous, settings)) {
+          this.node.update(params);
+        }
+      } else {
+        this.node.update(params);
+      }
     } finally {
       this.sdkBusy = false;
       if (this.disposePending) {
@@ -577,24 +546,25 @@ class ViewEntry {
     }
     this.closed = true;
     this.retirementFailure = undefined;
+    quarantinedViews.add(this);
     try {
       if (this.menuLease) {
         this.retireMenu(this.menuLease);
         this.menuLease = undefined;
       }
-      this.retirement.detachThenDispose(
-        (): void => {
-          if (this.attached && !this.retiredNative) {
-            if (!cleanup.retireNativeNode(this.settings.targetId)) {
-              throw new Error("Native wrapper retirement was rejected");
-            }
-            this.retiredNative = true;
-          }
-        },
-        (): void => this.disposeBuilders(),
-        this.pointerPosting,
-      );
-      quarantinedViews.delete(this);
+      if (this.attached && !this.retiredNative) {
+        if (!cleanup.retireNativeNode(this.settings.targetId)) {
+          throw new Error("Native wrapper retirement was rejected");
+        }
+        this.retiredNative = true;
+      }
+      // Detachment and builder disposal have separate ownership. A failed
+      // builder remains retryable even after its native target is retired.
+      if (this.pointerPosting.busy) {
+        this.pointerPosting.retirements.push((): void => this.disposeBuilders());
+      } else {
+        this.disposeBuilders();
+      }
     } catch (error) {
       quarantinedViews.add(this);
       this.retirementFailure = new Error(`Native wrapper retirement failed: ${String(error)}`);
@@ -602,6 +572,7 @@ class ViewEntry {
     }
   }
   private disposeBuilders(): void {
+    quarantinedViews.add(this);
     if (this.sdkBusy) {
       this.disposePending = true;
       return;
@@ -614,7 +585,7 @@ class ViewEntry {
         failure ??= error instanceof Error ? error : new Error(String(error));
       }
     };
-    this.textureController?.clear();
+    step((): void => this.textureController?.clear());
     if (!this.nodeDisposed) {
       step((): void => {
         this.node.dispose();
@@ -633,6 +604,7 @@ class ViewEntry {
       console.error(`[NSH] wrapper disposal failed: ${String(failure)}`);
       throw failure;
     }
+    this.retirementFailure = undefined;
     quarantinedViews.delete(this);
   }
 }
@@ -640,11 +612,6 @@ export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
   private pointerPosting: PointerPosting = new PointerPosting();
-  pictures(requests: PictureRequest[]): void {
-    for (const request of requests) {
-      this.entries.get(request.targetId)?.picture(request);
-    }
-  }
   private retryQuarantined(context: NshRuntimeContext): void {
     for (const view of Array.from(quarantinedViews)) {
       if (!view.belongsTo(context)) {
@@ -690,12 +657,7 @@ export class NativeViews {
         if (entry) {
           entry.update(state);
         } else {
-          const created = new ViewEntry(
-            state,
-            context,
-            this.menus,
-            this.pointerPosting,
-          );
+          const created = new ViewEntry(state, context, this.menus, this.pointerPosting);
           created.create();
           this.entries.set(state.targetId, created);
         }

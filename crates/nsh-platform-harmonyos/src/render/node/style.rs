@@ -2,7 +2,7 @@
 
 use std::rc::Rc;
 
-use nsh_core::{Points, ViewKind, ViewStyle};
+use nsh_core::{ViewKind, ViewStyle};
 use ohos_arkui_binding::{
     common::attribute::ArkUINodeAttributeNumber as Number,
     component::attribute::ArkUICommonAttribute,
@@ -57,36 +57,54 @@ impl Node {
                 || c.right == Some(self.id)
                 || c.title_view == Some(self.id))
     }
-    pub(crate) fn style(self: &Rc<Self>, style: &ViewStyle) -> Result<()> {
-        self.invalidate_composites();
+    pub(super) fn can_defer_style(&self, style: &ViewStyle) -> bool {
+        self.batch_created.get()
+            && self.id != nsh_core::ROOT_ID
+            && !matches!(self.kind, ViewKind::Screen | ViewKind::Modal)
+            && !self.scene_root.get()
+            && !self.has_selection()
+            && !self.wrapper_owns_semantics()
+            && self.wrapper.borrow().is_none()
+            && self.image.borrow().is_none()
+            && self.live.borrow().is_none()
+            && !self.effects_plan_for(style).requires_texture
+    }
+    fn ensure_outlined_paint(&self, style: &ViewStyle) -> Result<()> {
         if style.outline.width.0 > 0.0 && self.outlined.borrow().is_none() {
-            let weak = Rc::downgrade(self);
-            let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
-                if let Some(node) = weak.upgrade()
-                    && !node.scene_active()
-                {
-                    let outset = (node.applied.get().ink_outset * node.scale.get()).ceil();
-                    canvas.save();
-                    canvas.translate(outset, outset);
-                    let frame = node.frame.get();
-                    node.decoration.outline(
-                        canvas,
-                        &node.style.borrow(),
-                        Size::new(frame.width, frame.height),
-                        node.scale.get(),
-                    );
-                    canvas.restore();
-                }
-            })?;
-            paint.native.borrow().z_index(i32::MAX)?;
-            self.native.borrow_mut().add_child(paint.native.clone())?;
+            if self.drawing.borrow().is_some() {
+                self.promote_direct_paint()?;
+            }
+            let allow_direct =
+                self.drawing.borrow().is_none() && self.native.borrow().children().is_empty();
+            let weak = self.weak.clone();
+            let paint = crate::render::paint_node::PaintNode::new_attached(
+                &self.native,
+                i32::MAX,
+                allow_direct,
+                move |canvas| {
+                    if let Some(node) = weak.upgrade()
+                        && !node.scene_active()
+                    {
+                        let outset = (node.applied.get().ink_outset * node.scale.get()).ceil();
+                        canvas.save();
+                        canvas.translate(outset, outset);
+                        let frame = node.frame.get();
+                        node.decoration.outline(
+                            canvas,
+                            &node.style.borrow(),
+                            Size::new(frame.width, frame.height),
+                            node.scale.get(),
+                        );
+                        canvas.restore();
+                    }
+                },
+            )?;
             *self.outlined.borrow_mut() = Some(paint);
         }
-        if self.style.borrow().effects != style.effects
-            || self.style.borrow().outline != style.outline
-        {
-            self.invalidate_paint()?;
-        }
+        Ok(())
+    }
+    pub(crate) fn style(self: &Rc<Self>, style: &ViewStyle) -> Result<()> {
+        self.invalidate_composites();
         let cursor_changed = self.style.borrow().cursor != style.cursor;
         let mut target = Box::new(style.clone());
         if self.live.borrow().is_some() || target.transition.is_some() || target.animation.is_some()
@@ -103,18 +121,68 @@ impl Node {
                 );
             self.animator.track(self);
         }
+        let (paint_dirty, had_effects, hidden_changed) = {
+            let prev = self.style.borrow();
+            let dirty = prev.effects != target.effects
+                || prev.outline != target.outline
+                || ((prev.border_radius != target.border_radius
+                    || prev.corner_radius != target.corner_radius
+                    || prev.borders.widths != target.borders.widths)
+                    && (prev.effects.is_some()
+                        || target.effects.is_some()
+                        || prev.outline.is_visible()
+                        || target.outline.is_visible()));
+            (dirty, prev.effects.is_some(), prev.hidden != target.hidden)
+        };
+        let has_effects = target.effects.is_some();
         self.styled.set(true);
         *self.style.borrow_mut() = target;
+        if hidden_changed {
+            if let Some(parent) = self.parent_node.borrow().upgrade()
+                && let Some(scroll) = parent.scroll.borrow().as_ref()
+            {
+                scroll.sync_inferred_size()?;
+            }
+            if let Some(scene) = self.scene.borrow().as_ref()
+                && (scene.has_inactive_requirements() || scene.is_ancestor_of_active_root(self))
+            {
+                scene.invalidate();
+            }
+        }
         if cursor_changed {
             self.set_events(self.interaction.mask())?;
             self.cursor.update(self, self.interaction.hovered())?;
         }
-        if let Some(scene) = self.scene.borrow().as_ref() {
+        if self.can_defer_style(&self.style.borrow()) {
+            if had_effects
+                && !has_effects
+                && let Some(scene) = self.scene.borrow().as_ref()
+            {
+                scene.require(self);
+            }
+            self.style_deferred.set(true);
+            if paint_dirty {
+                self.paint_deferred.set(true);
+            }
+            return Ok(());
+        }
+        if (had_effects || has_effects || !self.shader_layers.borrow().is_empty())
+            && let Some(scene) = self.scene.borrow().as_ref()
+        {
             scene.require(self);
         }
         self.ensure_wrapper()?;
-        self.restore_style()
+        self.restore_style()?;
+        if paint_dirty {
+            self.invalidate_paint()?;
+        }
+        Ok(())
     }
+    pub(crate) fn applied_box_colors(&self) -> (u32, [u32; 4]) {
+        let applied = self.applied.get();
+        (applied.background_color, applied.border_color)
+    }
+
     pub(super) fn sync_visual_node(&self, visual: &NativeNode) {
         let ptr = Rc::as_ptr(visual) as usize;
         let mut applied = self.applied.get();
@@ -124,6 +192,10 @@ impl Node {
             applied.transform = None;
             applied.transform_center = [f32::NAN; 3];
             applied.blur = 0.0;
+            applied.grayscale = 0.0;
+            applied.sepia = 0.0;
+            applied.invert = 0.0;
+            applied.contrast = 1.0;
             applied.blend = nsh_core::BlendMode::Normal;
             applied.z_index = 0;
             self.applied.set(applied);
@@ -159,9 +231,9 @@ impl Node {
         let hosts_retainable = self.shaders.hosts_retainable();
         let unhidden = hosts_retainable && self.unhidden_for_effects(style);
         let shaders = self.shader_layers.borrow();
-        let has_shaders = !shaders.is_empty()
+        let has_shaders = (!shaders.is_empty() || !self.modal_screen_layers.borrow().is_empty())
             && hosts_retainable
-            && (unhidden || (surface_active && self.shaders.has_navigation_layer(self.id)));
+            && (unhidden || (surface_active && self.shaders.navigation_key(self.id).is_some()));
         let shader_samples_backdrop = has_shaders
             && self.id != nsh_core::ROOT_ID
             && shaders.iter().any(|(_, layer)| {
@@ -184,7 +256,8 @@ impl Node {
                 navigation_capture: surface_active && self.navigation_capture.get(),
                 scene_active: self.scene_active(),
                 composite_active,
-                has_native_paint: self.has_native_paint(style),
+                has_native_paint: self.needs_scene_texture_snapshot(style),
+                supports_image_color_filter: self.supports_image_color_filter(style),
             },
         )
     }
@@ -215,6 +288,7 @@ impl Node {
         Ok(())
     }
     pub(super) fn apply_effects(&self, style: &ViewStyle) -> Result<()> {
+        use crate::render::effects::NativeColorFilter;
         let visual = self.visual_node();
         self.sync_visual_node(&visual);
         let plan = self.effects_plan_for(style);
@@ -235,6 +309,51 @@ impl Node {
                 .set_f32_attribute(Attribute::BackdropBlur, backdrop_blur)?;
             applied.backdrop_blur = backdrop_blur;
         }
+        let (grayscale, sepia, invert, contrast) = match plan.native_color_filter {
+            NativeColorFilter::Grayscale(v) => (v, 0.0, 0.0, 1.0),
+            NativeColorFilter::Sepia(v) => (0.0, v, 0.0, 1.0),
+            NativeColorFilter::Invert(v) => (0.0, 0.0, v, 1.0),
+            NativeColorFilter::Contrast(v) => (0.0, 0.0, 0.0, v),
+            NativeColorFilter::None | NativeColorFilter::ImageMatrix(_) => (0.0, 0.0, 0.0, 1.0),
+        };
+        if applied.grayscale != grayscale {
+            if grayscale == 0.0 {
+                visual.borrow().reset_attribute(Attribute::GrayScale)?;
+            } else {
+                visual
+                    .borrow()
+                    .set_f32_attribute(Attribute::GrayScale, grayscale)?;
+            }
+            applied.grayscale = grayscale;
+        }
+        if applied.sepia != sepia {
+            if sepia == 0.0 {
+                visual.borrow().reset_attribute(Attribute::Sepia)?;
+            } else {
+                visual.borrow().set_f32_attribute(Attribute::Sepia, sepia)?;
+            }
+            applied.sepia = sepia;
+        }
+        if applied.invert != invert {
+            if invert == 0.0 {
+                visual.borrow().reset_attribute(Attribute::Invert)?;
+            } else {
+                visual
+                    .borrow()
+                    .set_f32_attribute(Attribute::Invert, invert)?;
+            }
+            applied.invert = invert;
+        }
+        if applied.contrast != contrast {
+            if contrast == 1.0 {
+                visual.borrow().reset_attribute(Attribute::Contrast)?;
+            } else {
+                visual
+                    .borrow()
+                    .set_f32_attribute(Attribute::Contrast, contrast)?;
+            }
+            applied.contrast = contrast;
+        }
         if applied.blend != plan.native_blend {
             let mode = crate::render::decor::arkui_blend_mode(plan.native_blend);
             visual
@@ -252,6 +371,10 @@ impl Node {
         native.reset_attribute(Attribute::Transform)?;
         native.reset_attribute(Attribute::TransformCenter)?;
         native.reset_attribute(Attribute::Blur)?;
+        native.reset_attribute(Attribute::GrayScale)?;
+        native.reset_attribute(Attribute::Sepia)?;
+        native.reset_attribute(Attribute::Invert)?;
+        native.reset_attribute(Attribute::Contrast)?;
         native.reset_attribute(Attribute::BlendMode)?;
         native.reset_attribute(Attribute::ZIndex)?;
         native.opacity(1.0)?;
@@ -284,16 +407,33 @@ impl Node {
         if scene_active {
             self.invalidate_scene();
         }
+        let scene_exported = scene_active
+            && self
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_some_and(|wrapper| wrapper.composite.borrow().is_some());
+        let filter_opacity = if scene_active {
+            1.0
+        } else {
+            self.effects_plan().native_filter_opacity
+        };
         self.interaction.opacity(
             self,
             crate::render::effects::resolve_native_node_opacity(
-                self.native_visibility_hidden(),
-                scene_active,
-                self.visual_opacity_for(style_opacity),
+                self.native_visibility_hidden()
+                    || (self.culled_by_scroll.get() && !self.navigation_capture.get()),
+                scene_exported,
+                self.visual_opacity_for(style_opacity) * filter_opacity,
             ),
         )
     }
-    pub(super) fn apply_background_color(&self, color: nsh_core::Color) -> Result<()> {
+    pub(super) fn apply_background_color_for(
+        &self,
+        base_color: nsh_core::Color,
+        style: &ViewStyle,
+    ) -> Result<()> {
+        let (color, _) = crate::render::shadow_geometry::effective_background(base_color, style);
         let default_surface_bg = self.kind == ViewKind::Screen
             || self.modal.borrow().as_ref().is_some_and(|modal| {
                 modal.presentation() != nsh_core::ModalPresentation::FullScreen
@@ -347,7 +487,16 @@ impl Node {
             }
         }
         let widths = style.borders.widths.to_array().map(|v| v.0);
-        let colors = style.borders.colors.map(argb);
+        let mut colors = style.borders.colors.map(argb);
+        // Rosen's `RSBorder::ApplyFourLine` fast path requires uniform color
+        // across all 4 slots (`colors_.size() == 1`); otherwise `DrawBorderBase`
+        // allocates a full `canvas.SaveLayer` offscreen render pass even when
+        // 3 of the 4 border widths are zero (e.g. single-side dividers/bars).
+        if let Some(first_active) = (0..4).find(|&i| widths[i] > 0.0).map(|i| colors[i])
+            && (0..4).all(|i| widths[i] <= 0.0 || colors[i] == first_active)
+        {
+            colors = [first_active; 4];
+        }
         let border_style = match style.borders.style {
             nsh_core::BorderStyle::Solid => 0,
             nsh_core::BorderStyle::Dashed => 1,
@@ -356,24 +505,18 @@ impl Node {
         let mut applied = self.applied.get();
         let node = self.native.borrow();
         if applied.border_radius != radius {
-            node.set_number_attribute(
-                Attribute::BorderRadius,
-                radius.into_iter().map(Number::Float).collect(),
-            )?;
+            let values = radius.map(Number::Float);
+            node.set_number_slice_attribute(Attribute::BorderRadius, &values)?;
             applied.border_radius = radius;
         }
         if applied.border_width != widths {
-            node.set_number_attribute(
-                Attribute::BorderWidth,
-                widths.into_iter().map(Number::Float).collect(),
-            )?;
+            let values = widths.map(Number::Float);
+            node.set_number_slice_attribute(Attribute::BorderWidth, &values)?;
             applied.border_width = widths;
         }
         if applied.border_color != colors {
-            node.set_number_attribute(
-                Attribute::BorderColor,
-                colors.into_iter().map(Number::Uint).collect(),
-            )?;
+            let values = colors.map(Number::Uint);
+            node.set_number_slice_attribute(Attribute::BorderColor, &values)?;
             applied.border_color = colors;
         }
         if applied.border_style != border_style {
@@ -415,11 +558,12 @@ impl Node {
     }
     pub(super) fn apply_shadow(&self, style: &ViewStyle) -> Result<()> {
         use crate::render::shadow_geometry::{native_box_shadow, native_radius};
-        let next = native_box_shadow(style).map(|shadow| {
+        let scale = self.scale.get();
+        let next = native_box_shadow(style, scale).map(|shadow| {
             (
-                native_radius(shadow.blur.0 * self.scale.get() * 0.5),
-                shadow.offset_x.0 * self.scale.get(),
-                shadow.offset_y.0 * self.scale.get(),
+                native_radius(shadow.blur.0 * scale * 0.5),
+                shadow.offset_x.0 * scale,
+                shadow.offset_y.0 * scale,
                 argb(shadow.color),
             )
         });
@@ -450,80 +594,6 @@ impl Node {
     pub(crate) fn apply_clip(&self) -> Result<()> {
         let clip = self.clips_children();
         let mut applied = self.applied.get();
-        let style = self.style.borrow();
-        let frame = self.frame.get();
-        let size = Size::new(frame.width, frame.height);
-        let shape = (clip && style.continuous_corners && size.width > 0.0 && size.height > 0.0)
-            .then(|| {
-                (
-                    size,
-                    nsh_core::canvas::fit_radii(
-                        size.into(),
-                        style
-                            .corner_radius
-                            .map(|r| r.unwrap_or(style.border_radius)),
-                    )
-                    .to_array()
-                    .map(|r| r.0),
-                )
-            });
-        if applied.clip_shape != shape {
-            if let Some((size, radii)) = shape {
-                use std::fmt::Write;
-
-                use ohos_arkui_binding::common::attribute::ArkUINodeCompositeAttributeItem;
-                let mut path = String::new();
-                nsh_core::shape::rounded_rect(
-                    nsh_core::Bounds::new(
-                        nsh_core::Point::default(),
-                        nsh_core::Size::new(
-                            Points(size.width * self.scale.get()),
-                            Points(size.height * self.scale.get()),
-                        ),
-                    ),
-                    nsh_core::Corners::from(radii.map(|r| {
-                        nsh_core::Size::new(
-                            Points(r * self.scale.get()),
-                            Points(r * self.scale.get()),
-                        )
-                    })),
-                    true,
-                    false,
-                    &mut |segment| {
-                        match segment {
-                            nsh_core::shape::Segment::Move(p) => {
-                                write!(path, "M {} {} ", p.x.0, p.y.0)
-                            }
-                            nsh_core::shape::Segment::Line(p) => {
-                                write!(path, "L {} {} ", p.x.0, p.y.0)
-                            }
-                            nsh_core::shape::Segment::Cubic([a, b, c]) => write!(
-                                path,
-                                "C {} {} {} {} {} {} ",
-                                a.x.0, a.y.0, b.x.0, b.y.0, c.x.0, c.y.0
-                            ),
-                            nsh_core::shape::Segment::Close => write!(path, "Z"),
-                        }
-                        .expect("write path string");
-                    },
-                );
-                self.native.borrow().set_attribute(
-                    Attribute::ClipShape,
-                    ArkUINodeCompositeAttributeItem::new()
-                        .with_number_values(vec![
-                            Number::Int(3),
-                            Number::Float(size.width),
-                            Number::Float(size.height),
-                        ])
-                        .with_string(path)
-                        .into(),
-                )?;
-            } else {
-                self.native.borrow().reset_attribute(Attribute::ClipShape)?;
-            }
-            applied.clip_shape = shape;
-            self.applied.set(applied);
-        }
         if applied.clip != clip {
             self.native
                 .borrow()
@@ -540,46 +610,44 @@ impl Node {
         }
         Ok(())
     }
-    pub(super) fn ensure_shadow_layer(&self, style: &ViewStyle) -> Result<()> {
-        let needs_shadow_layer = self.shadow_layer.borrow().is_none()
-            && crate::render::shadow_geometry::native_box_shadow(style).is_none()
-            && style
-                .effects
-                .as_ref()
-                .is_some_and(|e| e.box_shadows.iter().any(|s| !s.inset && s.is_visible()));
-        if needs_shadow_layer && let Some(owner) = self.weak.upgrade() {
-            self.enable_layout();
-            *self.shadow_layer.borrow_mut() =
-                Some(crate::render::shadow::ShadowLayer::new(&owner)?);
-        }
-        Ok(())
-    }
     pub(super) fn apply_style(&self, style: &ViewStyle) -> Result<()> {
-        if style.effects.as_ref().is_some_and(|effects| {
-            !effects.background_images.is_empty()
-                || effects
+        use crate::render::shadow_geometry::{effective_background, has_non_native_outer_shadow};
+        self.style_deferred.set(false);
+        self.ensure_outlined_paint(style)?;
+        let (_, remaining_gradients) = effective_background(style.background_color, style);
+        let needs_drawing = remaining_gradients > 0
+            || has_non_native_outer_shadow(style, self.scale.get())
+            || style.effects.as_ref().is_some_and(|effects| {
+                effects
                     .box_shadows
                     .iter()
                     .any(|shadow| shadow.inset && shadow.is_visible())
-        }) {
+            });
+        if needs_drawing {
             self.enable_drawing()?;
         }
+        if let Some(paint) = self.drawing.borrow().as_ref() {
+            let bounds = self.compute_drawing_bounds(style);
+            if self.drawing_bounds.replace(bounds) != bounds {
+                paint.bounds(bounds)?;
+            }
+        }
         crate::render::decor::warn_repeating_conic(self, style);
-        self.ensure_shadow_layer(style)?;
         if let Some(wrapper) = self.wrapper.borrow().as_ref()
             && let Some(composite) = wrapper.composite.borrow().as_ref()
         {
             composite.update(self)?;
         }
         if let Some(image) = self.image.borrow().as_ref() {
-            image.style(style)?;
+            let filter_matrix = match self.effects_plan_for(style).native_color_filter {
+                crate::render::effects::NativeColorFilter::ImageMatrix(matrix) => Some(matrix),
+                _ => None,
+            };
+            image.style(style, filter_matrix)?;
         }
-        self.apply_background_color(style.background_color)?;
+        self.apply_background_color_for(style.background_color, style)?;
         self.apply_borders(style)?;
         self.apply_shadow(style)?;
-        if let Some(layer) = self.shadow_layer.borrow().as_ref() {
-            layer.update(self, style)?;
-        }
         self.apply_ink_outset(style)?;
         self.apply_clip()?;
         self.apply_visual_style(style)

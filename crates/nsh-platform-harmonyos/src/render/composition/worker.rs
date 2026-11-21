@@ -1,6 +1,7 @@
 //! One compositor worker per surface; inputs and replies are generation scoped.
 use std::{
     cell::{Cell, RefCell},
+    collections::BTreeMap,
     rc::Rc,
     sync::{
         Arc, Mutex, Weak,
@@ -42,6 +43,10 @@ struct Settings {
     insets: [u32; 4],
     scene: bool,
     capture: bool,
+    keep_gpu_input: bool,
+    navigation: Option<crate::render::shader::navigation::Key>,
+    backdrop: Option<NodeId>,
+    first_screen_layer: Option<NodeId>,
     shaders: Vec<(NodeId, Arc<ShaderLayer>)>,
 }
 impl Settings {
@@ -49,7 +54,11 @@ impl Settings {
         u64::from(self.width) * u64::from(self.height)
     }
     fn native_output(&self) -> bool {
-        self.gpu && !self.capture && self.filters.is_empty() && self.shaders.is_empty()
+        self.gpu
+            && !self.keep_gpu_input
+            && !self.capture
+            && self.filters.is_empty()
+            && self.shaders.is_empty()
     }
 }
 struct Output {
@@ -59,19 +68,21 @@ struct Output {
 }
 struct State {
     settings: Settings,
-    initial_picture: Option<super::picture::Picture>,
     screen_origin: Option<(i32, i32)>,
     output: Option<Output>,
-    presented: bool,
+    settings_revision: u64,
+    presented_navigation: Option<crate::render::shader::navigation::Key>,
     published_geom: Option<(u32, u32, u32, u32)>,
     initialized: Option<std::result::Result<Option<u64>, String>>,
     output_surface: Option<u64>,
+    /// Producer destination acknowledged by the UI attachment.
+    surface: Option<u64>,
     closed: bool,
 }
 struct Shared {
     released: AtomicBool,
     active: AtomicBool,
-    present_gate: Mutex<bool>,
+
     awaiting_origin: AtomicBool,
     state: Mutex<State>,
     queued: AtomicBool,
@@ -85,18 +96,30 @@ pub(crate) struct Key {
     overlay: bool,
 }
 impl Key {
-    fn slot(self) -> usize {
-        self.id as usize * 2 + usize::from(self.overlay)
+    pub(super) fn is_overlay(self) -> bool {
+        self.overlay
+    }
+    fn slot(self) -> (NodeId, bool) {
+        (self.id, self.overlay)
     }
 }
+
+impl Shared {
+    fn accepts_revision(&self, revision: u64) -> bool {
+        let state = self.state.lock().unwrap();
+        !state.closed && state.settings_revision == revision
+    }
+}
+
 enum Task {
     Create {
         key: Key,
         shared: Arc<Shared>,
     },
     Precompile(Vec<Arc<ShaderLayer>>),
+    ShaderWarmed,
     Fill(super::fill::Command),
-    Frame,
+    Frame(u64),
     Resume,
     Wake(Key, Weak<Shared>),
     Slot(Key, NodeId, u16, AnimationValue),
@@ -104,6 +127,7 @@ enum Task {
     Capture {
         key: crate::render::shader::navigation::Key,
         source: Key,
+        before_screen: bool,
     },
     CancelCapture(crate::render::shader::navigation::Key),
     Navigation(Navigation<()>),
@@ -115,10 +139,19 @@ enum Task {
     Close,
 }
 impl Coalesce for Task {
+    fn merge_at_tail(&self) -> bool {
+        matches!(self, Self::Frame(_))
+    }
+
     fn is_barrier(&self) -> bool {
         use super::fill::Command as FillCmd;
         match self {
-            Self::Frame | Self::Resume | Self::Plan | Self::Precompile(_) | Self::Slot(..) => false,
+            Self::Frame(_)
+            | Self::Resume
+            | Self::Plan
+            | Self::Precompile(_)
+            | Self::ShaderWarmed
+            | Self::Slot(..) => false,
             Self::Fill(FillCmd::Slot(..) | FillCmd::Size(..) | FillCmd::Shown(..)) => false,
             Self::Create { .. }
             | Self::Fill(
@@ -143,9 +176,15 @@ impl Coalesce for Task {
     fn try_merge(&mut self, incoming: &mut Option<Self>) -> bool {
         use super::fill::Command as FillCmd;
         match (self, incoming.as_ref()) {
-            (Self::Frame, Some(Self::Frame))
-            | (Self::Resume, Some(Self::Resume))
-            | (Self::Plan, Some(Self::Plan)) => {
+            (Self::Frame(timestamp), Some(Self::Frame(_))) => {
+                if let Some(Self::Frame(next)) = incoming.take() {
+                    *timestamp = (*timestamp).max(next);
+                }
+                true
+            }
+            (Self::Resume, Some(Self::Resume))
+            | (Self::Plan, Some(Self::Plan))
+            | (Self::ShaderWarmed, Some(Self::ShaderWarmed)) => {
                 incoming.take();
                 true
             }
@@ -210,6 +249,7 @@ struct Snapshot {
 struct PendingCapture {
     key: crate::render::shader::navigation::Key,
     source: Key,
+    before_screen: bool,
 }
 pub(crate) struct Worker {
     send: CommandSender<Task>,
@@ -289,16 +329,19 @@ impl Worker {
         let thread = std::thread::Builder::new()
             .name("nsh-compositor".into())
             .spawn(move || {
-                let vsync = rate.vsync();
                 let mut vote = rate.vote();
-                let mut entries: Vec<Option<Entry>> = Vec::new();
+                let mut entries = Entries::new();
                 let mut gpu: Option<TextureContext> = None;
                 let mut gpu_error_reported = false;
                 let mut scene: Option<ScenePlan> = None;
                 let mut scene_stats = super::scene_policy::SceneStats::default();
                 let mut fills = super::fill::Fills::default();
-                let mut frame_pending = false;
+                let mut clock = crate::render::frame_clock::FrameClock::default();
                 let mut scene_dirty = false;
+                let mut readback_warmed = false;
+                let mut filters_warmed = false;
+                let mut precompiler: Option<super::precompile::Precompiler> = None;
+                let mut precompiler_failed = false;
                 let mut pending_precompiles: std::collections::VecDeque<Arc<ShaderLayer>> =
                     std::collections::VecDeque::new();
                 let mut pending_captures: Vec<PendingCapture> = Vec::new();
@@ -306,10 +349,84 @@ impl Worker {
                     crate::render::shader::navigation::Key,
                     Snapshot,
                 )> = Vec::new();
+                const WINDOW_GRACE: std::time::Duration = std::time::Duration::from_millis(50);
+                let ensure_precompiler = |precompiler: &mut Option<super::precompile::Precompiler>,
+                                          failed: &mut bool,
+                                          gpu: &Option<TextureContext>,
+                                          callback: &CommandSender<Task>| {
+                    if precompiler.is_none() && !*failed {
+                        let notify = callback.clone();
+                        match super::precompile::Precompiler::spawn(move || {
+                            let _ = notify.send(Task::ShaderWarmed);
+                        }) {
+                            Some(p) => {
+                                if let Some(gpu) = gpu.as_ref() {
+                                    gpu.attach_binary_store(p.binary_store());
+                                }
+                                *precompiler = Some(p);
+                            }
+                            None => *failed = true,
+                        }
+                    }
+                };
                 loop {
-                    let task = if pending_precompiles.is_empty() {
+                    // Publish demand after every command, including failure and
+                    // retirement paths that continue the loop. The UI owns the
+                    // only NativeVSync request and supplies our frame timestamp.
+                    let animating = route
+                        .upgrade()
+                        .is_some_and(|r| r.active.load(Ordering::Acquire))
+                        && (scene_dirty
+                            || fills.animating()
+                            || entries.values().any(|entry| {
+                                let pending_nav =
+                                    entry.navigation.as_ref().is_some_and(|n| !n.complete);
+                                (entry.window.is_some() || entry.settings.scene || pending_nav)
+                                    && entry.shared.active.load(Ordering::Acquire)
+                                    && entry.shared.animating.load(Ordering::Acquire)
+                            }));
+                    if vote.update(animating)
+                        && let Some(route) = route.upgrade()
+                    {
+                        route.send(Message::CompositeDemand);
+                    }
+                    let nav_active = entries
+                        .values()
+                        .any(|entry| entry.navigation.as_ref().is_some_and(|n| !n.complete));
+                    let has_idle_work = !pending_precompiles.is_empty()
+                        || (!nav_active
+                            && gpu.is_some()
+                            && (!readback_warmed
+                                || !filters_warmed
+                                || fills.has_pending_warmup(precompiler.as_ref())));
+                    let window_grace = if has_idle_work {
+                        entries
+                            .values()
+                            .filter(|entry| {
+                                entry.settings.gpu
+                                    && entry.window.is_none()
+                                    && entry.shared.active.load(Ordering::Acquire)
+                                    && !entry.shared.state.lock().unwrap().closed
+                            })
+                            .filter_map(|entry| {
+                                entry
+                                    .window_wait_since
+                                    .and_then(|since| WINDOW_GRACE.checked_sub(since.elapsed()))
+                                    .filter(|remaining| !remaining.is_zero())
+                            })
+                            .min()
+                    } else {
+                        None
+                    };
+                    let task = if !has_idle_work {
                         match receive.recv() {
                             Ok(task) => task,
+                            Err(()) => break,
+                        }
+                    } else if let Some(wait) = window_grace {
+                        match receive.recv_timeout(wait) {
+                            Ok(Some(task)) => task,
+                            Ok(None) => continue,
                             Err(()) => break,
                         }
                     } else if let Some(task) = receive.try_recv() {
@@ -318,6 +435,9 @@ impl Worker {
                         if gpu.is_none() {
                             match TextureContext::new() {
                                 Ok(ctx) => {
+                                    if let Some(p) = precompiler.as_ref() {
+                                        ctx.attach_binary_store(p.binary_store());
+                                    }
                                     gpu = Some(ctx);
                                     gpu_error_reported = false;
                                 }
@@ -329,19 +449,40 @@ impl Worker {
                             }
                         }
                         if let Some(gpu) = gpu.as_ref() {
+                            let mut did_work = false;
                             while let Some(layer) = pending_precompiles.pop_front() {
-                                if super::gles::is_compiled(gpu, &layer) {
+                                if super::gles::is_warmed(gpu, &layer) {
                                     continue;
                                 }
                                 if let Err(error) = super::gles::precompile(gpu, &layer) {
                                     log::warn!("shader precompile: {error}");
                                 }
+                                did_work = true;
                                 break;
+                            }
+                            if !did_work && !nav_active {
+                                if !readback_warmed {
+                                    readback_warmed = true;
+                                    if let Err(error) = gpu.precompile_readback() {
+                                        log::warn!("readback precompile: {error}");
+                                    }
+                                } else if !filters_warmed {
+                                    filters_warmed = true;
+                                    if let Err(error) = super::gles::precompile_filters(gpu) {
+                                        log::warn!("filter precompile: {error}");
+                                    }
+                                } else if fills.has_pending_warmup(precompiler.as_ref()) {
+                                    fills.warmup_one(
+                                        gpu,
+                                        precompiler.as_ref(),
+                                        route.upgrade().as_deref(),
+                                    );
+                                }
                             }
                         }
                         continue;
                     };
-                    let frame = matches!(&task, Task::Frame);
+                    let frame = matches!(&task, Task::Frame(_));
                     let mut repaint = false;
                     let mut fill_frame = false;
                     match task {
@@ -362,11 +503,9 @@ impl Worker {
                             } else {
                                 pending_captures.clear();
                             }
-                            for slot in &mut entries {
-                                if let Some(entry) = slot.take() {
-                                    retire_entry(entry, &route);
+                            for entry in std::mem::take(&mut entries).into_values() {
+                                retire_entry(entry, &route);
                                 }
-                            }
                             completed_fills.lock().unwrap().extend(fills.clear());
                             worker_drained.store(true, Ordering::Release);
                             if let Some(route) = route.upgrade() {
@@ -378,7 +517,27 @@ impl Worker {
                             }
                         }
                         Task::Precompile(layers) => {
-                            pending_precompiles.extend(layers);
+                            ensure_precompiler(&mut precompiler, &mut precompiler_failed, &gpu, &callback);
+                            if let Some(p) = precompiler.as_ref() {
+                                for layer in layers {
+                                    if gpu
+                                        .as_ref()
+                                        .is_none_or(|g| !super::gles::has_program(g, &layer))
+                                    {
+                                        p.submit_or_compiling(&layer);
+                                    }
+                                }
+                            } else {
+                                pending_precompiles.extend(layers);
+                            }
+                        }
+                        Task::ShaderWarmed => {
+                            fill_frame = true;
+                            for entry in entries.values() {
+                                if entry.waiting_for_shader {
+                                    wake(&callback, entry.key, &entry.shared);
+                                }
+                            }
                         }
                         Task::Fill(super::fill::Command::Remove(key)) => {
                             fills.remove(key);
@@ -389,9 +548,27 @@ impl Worker {
                         }
                         Task::Fill(command) => {
                             let upgraded = route.upgrade();
+                            if let super::fill::Command::Layer(_, ref layer) = command {
+                                ensure_precompiler(
+                                    &mut precompiler,
+                                    &mut precompiler_failed,
+                                    &gpu,
+                                    &callback,
+                                );
+                                if let Some(p) = precompiler.as_ref()
+                                    && gpu
+                                        .as_ref()
+                                        .is_none_or(|g| !super::gles::has_program(g, layer))
+                                {
+                                    p.submit_or_compiling(layer);
+                                }
+                            }
                             if gpu.is_none() {
                                 match TextureContext::new() {
                                     Ok(ctx) => {
+                                        if let Some(p) = precompiler.as_ref() {
+                                            ctx.attach_binary_store(p.binary_store());
+                                        }
                                         gpu = Some(ctx);
                                         gpu_error_reported = false;
                                     }
@@ -416,7 +593,6 @@ impl Worker {
                             // all fills after each command starves later exports.
                         }
                         Task::Resume => {
-                            frame_pending = false;
                             repaint = scene.is_some();
                             fill_frame = true;
                             fills.mark_windows_dirty();
@@ -424,7 +600,7 @@ impl Worker {
                                 .upgrade()
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
                             {
-                                for entry in entries.iter_mut().flatten() {
+                                for entry in entries.values_mut() {
                                     if entry.window.is_some() {
                                         entry.window_dirty = true;
                                     }
@@ -432,11 +608,26 @@ impl Worker {
                                 }
                             }
                         }
-                        Task::Frame => {
-                            repaint = scene.is_some();
+                        Task::Frame(timestamp) => {
+                            let time = std::time::Duration::from_secs_f64(
+                                clock.sample(Some(timestamp), 0.0) / 1000.0,
+                            );
+                            fills.sample(time);
+                            for entry in entries.values_mut() {
+                                entry.shaders.sample(time);
+                            }
+                            repaint = scene.is_some()
+                                && entries.values().any(|entry| {
+                                    entry.settings.scene
+                                        && (entry
+                                            .navigation
+                                            .as_ref()
+                                            .is_some_and(|nav| !nav.complete)
+                                            || (entry.shared.active.load(Ordering::Acquire)
+                                                && entry.shared.animating.load(Ordering::Acquire)))
+                                });
                             fill_frame = true;
-                            frame_pending = false;
-                            for entry in entries.iter().flatten() {
+                            for entry in entries.values() {
                                 if route
                                     .upgrade()
                                     .is_some_and(|r| r.active.load(Ordering::Acquire))
@@ -468,40 +659,63 @@ impl Worker {
                                 if shared.state.lock().unwrap().closed {
                                     return Err("composite retired".into());
                                 }
-                                let occupied_others = entries
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(idx, slot)| *idx != key.slot() && slot.is_some())
-                                    .count();
+                                let occupied_others = entries.len() - usize::from(entries.contains_key(&key.slot()));
                                 if occupied_others >= MAX_LAYERS {
                                     return Err("compositor layer budget exceeded".into());
                                 }
                                 let settings = shared.state.lock().unwrap().settings.clone();
                                 check_pixels(&entries, key, settings.pixels())?;
                                 if gpu.is_none() {
-                                    gpu = Some(TextureContext::new().map_err(|error| error.to_string())?);
+                                    let ctx = TextureContext::new().map_err(|error| error.to_string())?;
+                                    if let Some(p) = precompiler.as_ref() {
+                                        ctx.attach_binary_store(p.binary_store());
+                                    }
+                                    gpu = Some(ctx);
                                 }
                                 let mut reader = create_input(gpu.as_ref().unwrap(), &settings, key, &shared, &callback)?;
                                 let id = reader.as_mut().map(TextureReader::id).transpose().map_err(|e| e.to_string())?;
-                                pending_precompiles.extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
-                                entries.resize_with(entries.len().max(key.slot() + 1), || None);
-                                if let Some(old) = entries[key.slot()].take() {
+                                if !settings.shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
+                                    if let Some(p) = precompiler.as_ref() {
+                                        for (_, layer) in &settings.shaders {
+                                            if !super::gles::has_program(gpu.as_ref().unwrap(), layer) {
+                                                p.submit_or_compiling(layer);
+                                            }
+                                        }
+                                    } else {
+                                        pending_precompiles
+                                            .extend(settings.shaders.iter().map(|(_, layer)| layer.clone()));
+                                    }
+                                }
+
+                                if let Some(old) = entries.remove(&key.slot()) {
                                     retire_entry(old, &route);
                                 }
-                                entries[key.slot()] = Some(Entry {
+                                let window_wait_since = settings.gpu.then(std::time::Instant::now);
+                                entries.insert(key.slot(), Entry {
                                     key,
                                     shared: shared.clone(),
                                     reader,
-                                    initial_picture: None,
                                     gpu: gpu.as_ref().unwrap().clone(),
                                     settings,
                                     scene_source: None,
                                     scene_output: None,
                                     shaders: super::gles::Effects::new(gpu.as_ref().unwrap()),
                                     filters: super::gles::Filters::new(gpu.as_ref().unwrap()),
+                                    modal_composition: None,
+                                    backdrop_dirty: false,
                                     filtered: None,
                                     window: None,
+                                    window_wait_since,
                                     window_dirty: false,
+                                    waiting_for_shader: false,
+                                    pending_slots: Vec::new(),
+                                    pending_transitions: Vec::new(),
                                     pending_readback_bytes: 0,
                                     navigation: None,
                                     completed: None,
@@ -510,8 +724,10 @@ impl Worker {
                             })();
                             if result.is_err() {
                                 shared.released.store(true, Ordering::Release);
+                                shared.state.lock().unwrap().initialized = Some(result);
+                            } else if let Some(entry) = entries.get(&key.slot()) {
+                                entry.publish_input(entry.settings.native_output(), result);
                             }
-                            shared.state.lock().unwrap().initialized = Some(result);
                             if let Some(route) = route.upgrade() {
                                 route.send(Message::Composite {
                                     id: key.id,
@@ -521,8 +737,7 @@ impl Worker {
                         }
                         Task::Wake(key, weak_shared) => {
                             let Some(entry) = entries
-                                .get(key.slot())
-                                .and_then(Option::as_ref)
+                                .get(&key.slot())
                                 .filter(|entry| entry.key == key)
                             else {
                                 if let Some(shared) = weak_shared.upgrade() {
@@ -532,7 +747,7 @@ impl Worker {
                             };
                             entry.shared.queued.store(false, Ordering::Release);
                             if entry.shared.state.lock().unwrap().closed {
-                                if let Some(old) = entries[key.slot()].take() {
+                                if let Some(old) = entries.remove(&key.slot()) {
                                     retire_entry(old, &route);
                                 }
                                 if let Some(route) = route.upgrade() {
@@ -547,22 +762,50 @@ impl Worker {
                                 .upgrade()
                                 .is_some_and(|r| r.active.load(Ordering::Acquire))
                             {
-                                vote.update(false);
                                 continue;
                             }
                             let was_animating = entry.shared.animating.load(Ordering::Acquire);
-                            let settings = entry.shared.state.lock().unwrap().settings.clone();
+                            let (settings, revision) = {
+                                let state = entry.shared.state.lock().unwrap();
+                                (state.settings.clone(), state.settings_revision)
+                            };
+                            let backdrop = settings.backdrop.and_then(|id| entries.get(&(id, false)).filter(|source| !source.shared.state.lock().unwrap().closed)
+                                .and_then(|source| source.shaders.before_screen.as_ref()).map(super::gles::Target::picture));
                             let result =
                                 check_pixels(&entries, key, settings.pixels()).and_then(|()| {
-                                    let entry = entries[key.slot()].as_mut().unwrap();
+                                    if !settings.shaders.is_empty() && !settings.scene {
+                                        ensure_precompiler(
+                                            &mut precompiler,
+                                            &mut precompiler_failed,
+                                            &gpu,
+                                            &callback,
+                                        );
+                                    }
+                                    let entry = entries.get_mut(&key.slot()).unwrap();
                                     entry.update_input(&settings, &callback)?;
-                                    entry.render(settings)
+                                    entry.render(
+                                        settings,
+                                        revision,
+                                        backdrop,
+                                        precompiler.as_ref(),
+                                    )
                                 });
                             let upgraded = route.upgrade();
                             match result {
-                                Ok(changed) => repaint = changed,
+                                Ok(changed) => {
+                                    let is_scene = entries
+                                        .get(&key.slot())
+                                        .is_some_and(|entry| entry.settings.scene);
+                                    repaint = changed && is_scene;
+                                    if changed {
+                                        for above in entries.values_mut().filter(|e| e.settings.backdrop == Some(key.id)) {
+                                            above.backdrop_dirty = true;
+                                            wake(&callback, above.key, &above.shared);
+                                        }
+                                    }
+                                },
                                 Err(error) => {
-                                    let entry = entries[key.slot()].as_mut().unwrap();
+                                    let entry = entries.get_mut(&key.slot()).unwrap();
                                     entry.shared.animating.store(false, Ordering::Release);
                                     entry.shared.awaiting_origin.store(false, Ordering::Release);
                                     if let Some(navigation) = entry.navigation.take()
@@ -597,15 +840,16 @@ impl Worker {
                                 upgraded.as_deref(),
                             );
                             let completed_nav =
-                                entries[key.slot()].as_mut().unwrap().completed.take();
+                                entries.get_mut(&key.slot()).unwrap().completed.take();
                             if let Some(route) = &upgraded {
-                                let shared = &entries[key.slot()].as_ref().unwrap().shared;
+                                let shared = &entries.get(&key.slot()).unwrap().shared;
                                 let started_animating =
                                     !was_animating && shared.animating.load(Ordering::Acquire);
                                 let publish = {
                                     let state = shared.state.lock().unwrap();
-                                    !state.settings.scene
-                                        && (state.output.is_some() || state.initialized.is_some() || started_animating)
+                                    state.initialized.is_some()
+                                        || (!state.settings.scene
+                                            && (state.output.is_some() || started_animating))
                                 };
                                 if publish && !shared.posted.swap(true, Ordering::AcqRel) {
                                     route.send(Message::Composite {
@@ -621,55 +865,92 @@ impl Worker {
                             }
                         }
                         Task::Slot(key, id, slot, value) => {
-                            repaint = scene.is_some();
                             if let Some(entry) = entries
-                                .get_mut(key.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&key.slot())
                                 .filter(|entry| entry.key == key)
                             {
-                                if let Err(error) = entry
-                                    .shaders
-                                    .layers(&entry.shared.state.lock().unwrap().settings.shaders)
-                                {
-                                    log::warn!("shader layers: {error}");
+                                repaint = scene.is_some() && entry.settings.scene;
+                                let shaders = entry.shared.state.lock().unwrap().settings.shaders.clone();
+                                if !entry.settings.scene && !shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
                                 }
-                                entry.shaders.slot(id, slot, value);
-                                wake(&callback, key, &entry.shared);
+                                if entry.waiting_for_shader
+                                    || (!entry.settings.scene
+                                        && entry.needs_shader_warmup(&shaders, precompiler.as_ref()))
+                                {
+                                    entry.waiting_for_shader = true;
+                                    if let Some((_, _, existing)) = entry
+                                        .pending_slots
+                                        .iter_mut()
+                                        .find(|(eid, eslot, _)| *eid == id && *eslot == slot)
+                                    {
+                                        *existing = value;
+                                    } else {
+                                        entry.pending_slots.push((id, slot, value));
+                                    }
+                                } else {
+                                    if let Err(error) = entry.shaders.layers(&shaders) {
+                                        log::warn!("shader layers: {error}");
+                                    }
+                                    entry.shaders.slot(id, slot, value);
+                                    wake(&callback, key, &entry.shared);
+                                }
                             }
                         }
                         Task::Transition(key, id, duration) => {
-                            repaint = scene.is_some();
                             if let Some(entry) = entries
-                                .get_mut(key.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&key.slot())
                                 .filter(|entry| entry.key == key)
                             {
-                                if let Err(error) = entry
-                                    .shaders
-                                    .layers(&entry.shared.state.lock().unwrap().settings.shaders)
-                                    .and_then(|()| entry.shaders.transition(id, duration))
-                                {
-                                    log::warn!("shader transition: {error}");
+                                repaint = scene.is_some() && entry.settings.scene;
+                                let shaders = entry.shared.state.lock().unwrap().settings.shaders.clone();
+                                if !entry.settings.scene && !shaders.is_empty() {
+                                    ensure_precompiler(
+                                        &mut precompiler,
+                                        &mut precompiler_failed,
+                                        &gpu,
+                                        &callback,
+                                    );
                                 }
-                                wake(&callback, key, &entry.shared);
+                                if entry.waiting_for_shader
+                                    || (!entry.settings.scene
+                                        && entry.needs_shader_warmup(&shaders, precompiler.as_ref()))
+                                {
+                                    entry.waiting_for_shader = true;
+                                    entry.pending_transitions.push((id, duration));
+                                } else {
+                                    if let Err(error) = entry
+                                        .shaders
+                                        .layers(&shaders)
+                                        .and_then(|()| entry.shaders.transition(id, duration))
+                                    {
+                                        log::warn!("shader transition: {error}");
+                                    }
+                                    wake(&callback, key, &entry.shared);
+                                }
                             }
                         }
                         Task::Capture {
                             key,
                             source,
+                            before_screen,
                         } => {
                             captured.retain(|(k, _)| k.owner != key.owner);
                             pending_captures.retain(|p| p.key.owner != key.owner);
                             let upgraded = route.upgrade();
                             let entry = entries
-                                .get_mut(source.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&source.slot())
                                 .filter(|entry| {
                                     entry.key == source
                                         && !entry.shared.state.lock().unwrap().closed
                                 });
                             if let Some(entry) = entry {
-                                match entry.snapshot() {
+                                match entry.snapshot(before_screen) {
                                     Ok(Some(snapshot)) => {
                                         captured.push((key, snapshot));
                                         if let Some(route) = &upgraded {
@@ -688,7 +969,8 @@ impl Worker {
                                         pending_captures.push(PendingCapture {
                                             key,
                                             source,
-                                                        });
+                                            before_screen,
+                                        });
                                     }
                                     Err(error) => {
                                         log::warn!("shader navigation capture: {error}");
@@ -727,8 +1009,7 @@ impl Worker {
                                 complete: false,
                             };
                             if let Some(entry) = entries
-                                .get_mut(request.target.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&request.target.slot())
                                 .filter(|e| e.key == request.target)
                             {
                                 if request.snapshot.is_none() {
@@ -774,20 +1055,21 @@ impl Worker {
                         }
                         Task::Window(key, window) => {
                             if let Some(entry) = entries
-                                .get_mut(key.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&key.slot())
                                 .filter(|e| e.key == key)
                             {
                                 let output_surface = window.surface_id().map_err(|e| e.to_string());
                                 let input_surface = entry.reader.as_mut().map(TextureReader::id)
                                     .transpose().map_err(|e| e.to_string());
-                                {
+                                let first_window = {
                                     let mut state = entry.shared.state.lock().unwrap();
+                                    let available =
+                                        state.output_surface.is_none() && output_surface.is_ok();
                                     state.output_surface = output_surface.as_ref().ok().copied();
-                                    // Notify the UI that its native export target is available.
-                                    state.initialized = Some(output_surface.and(input_surface));
-                                }
+                                    available
+                                };
                                 let raw = window.raw() as usize;
+                                entry.window_wait_since = None;
                                 if let Some(existing) = entry.window.as_ref()
                                     && existing.raw() == raw
                                 {
@@ -795,20 +1077,44 @@ impl Worker {
                                     entry.window_dirty = true;
                                 } else {
                                     entry.window = Some(gpu.as_ref().unwrap().window(window));
-                                    entry.shared.state.lock().unwrap().published_geom = None;
+                                    let mut state = entry.shared.state.lock().unwrap();
+                                    state.published_geom = None;
+                                    state.presented_navigation = None;
                                     entry.window_dirty = true;
+                                }
+                                let native_output = entry.settings.native_output();
+                                let destination = if native_output {
+                                    if let Some(window) = &entry.window {
+                                        window.release_egl();
+                                    }
+                                    output_surface.map(Some)
+                                } else {
+                                    output_surface.and(input_surface)
+                                };
+                                entry.publish_input(native_output, destination);
+                                if first_window
+                                    && key.id == nsh_core::ROOT_ID
+                                    && !key.is_overlay()
+                                    && let Some(route) = route.upgrade()
+                                {
+                                    // The input may have been published before its output window existed.
+                                    route.send(Message::Composite {
+                                        id: key.id,
+                                        generation: key.generation,
+                                    });
                                 }
                                 wake(&callback, key, &entry.shared);
                             }
                         }
                         Task::RetireWindow(key, released) => {
                             if let Some(entry) = entries
-                                .get_mut(key.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&key.slot())
                                 .filter(|entry| entry.key == key)
                             {
                                 entry.window = None;
-                                entry.shared.state.lock().unwrap().output_surface = None;
+                                let mut state = entry.shared.state.lock().unwrap();
+                                state.output_surface = None;
+                                state.presented_navigation = None;
                             }
                             released.store(true, Ordering::Release);
                             if let Some(route) = route.upgrade() {
@@ -820,37 +1126,39 @@ impl Worker {
                         }
                         Task::WindowGone(key, raw) => {
                             if let Some(entry) = entries
-                                .get_mut(key.slot())
-                                .and_then(Option::as_mut)
+                                .get_mut(&key.slot())
                                 .filter(|e| e.key == key)
                                 && entry.window.as_ref().is_some_and(|w| w.raw() == raw)
                             {
                                 entry.window = None;
-                                entry.shared.state.lock().unwrap().output_surface = None;
+                                let mut state = entry.shared.state.lock().unwrap();
+                                state.output_surface = None;
+                                state.presented_navigation = None;
                             }
                         }
                     }
                     let upgraded_for_frame = route.upgrade();
                     if fill_frame
+                        && let Some(gpu) = gpu.as_ref()
                         && upgraded_for_frame
                             .as_ref()
                             .is_some_and(|r| r.active.load(Ordering::Acquire))
                     {
-                        fills.render( upgraded_for_frame.as_deref());
+                        fills.render(gpu, precompiler.as_ref(), upgraded_for_frame.as_deref());
                     }
                     // Many exports wake together during navigation. Compose their latest
                     // pictures once on VSync, so command delivery never waits for a full
                     // scene raster after each individual texture notification.
                     scene_dirty = scene.is_some() && (scene_dirty || repaint);
                     if frame
-                        && std::mem::take(&mut scene_dirty)
                         && let Some(scene) = &scene
+                        && std::mem::take(&mut scene_dirty)
                     {
                         let upgraded = upgraded_for_frame;
-                        if let Some(gpu) = gpu.as_ref() {
+                        {
                             let mut active_planes = 0usize;
                             let mut pre_readback_bytes = 0u64;
-                            for entry in entries.iter_mut().flatten() {
+                            for entry in entries.values_mut() {
                                 if entry.settings.scene
                                     && entry.shared.active.load(Ordering::Acquire)
                                 {
@@ -861,7 +1169,7 @@ impl Worker {
                             }
                             let mut scene_sources = SceneEntries {
                                 entries: &mut entries,
-                                gpu,
+                                gpu: &mut gpu,
                                 readback_bytes: pre_readback_bytes,
                                 upload_bytes: 0,
                             };
@@ -884,7 +1192,7 @@ impl Worker {
                                     snap.window_upload_bytes,
                                 );
                             }
-                            for entry in entries.iter_mut().flatten() {
+                            for entry in entries.values_mut() {
                                 if failed
                                     && entry.settings.scene
                                     && let Some(nav) = entry.navigation.as_mut()
@@ -925,8 +1233,7 @@ impl Worker {
                         }
                         pending_captures.retain(|pending| {
                             let live = entries
-                                .get(pending.source.slot())
-                                .and_then(Option::as_ref)
+                                .get(&pending.source.slot())
                                 .is_some_and(|entry| {
                                     entry.key == pending.source
                                         && !entry.shared.state.lock().unwrap().closed
@@ -945,40 +1252,14 @@ impl Worker {
                             }
                         });
                     }
-                    // Shader clocks advance on the window's native VSync, just
-                    // like fill shaders. UI callbacks only update ownership and
-                    // uniforms; they must not divide the GPU presentation rate.
-                    let animating = route
-                        .upgrade()
-                        .is_some_and(|r| r.active.load(Ordering::Acquire))
-                        && (scene_dirty
-                            || fills.animating()
-                            || entries.iter().flatten().any(|entry| {
-                                let pending_nav =
-                                    entry.navigation.as_ref().is_some_and(|n| !n.complete);
-                                (entry.window.is_some() || entry.settings.scene || pending_nav)
-                                    && entry.shared.active.load(Ordering::Acquire)
-                                    && entry.shared.animating.load(Ordering::Acquire)
-                            }));
-                    vote.update(animating);
-                    if !frame_pending && animating {
-                        let send = callback.clone();
-                        let status = vsync.request_frame_once(move |_| {
-                            let _ = send.send(Task::Frame);
-                        });
-                        if status == 0 {
-                            frame_pending = true;
-                        } else {
-                            log::warn!("OHOS compositor VSync request failed: {status}");
-                            if let Some(route) = route.upgrade() {
-                                route.request_frame();
-                            }
-                        }
-                    }
                 }
                 // Deterministic exit handshake: release every remaining entry,
                 // retired window, and pending navigation even on early shutdown.
-                vote.update(false);
+                if vote.update(false)
+                    && let Some(route) = route.upgrade()
+                {
+                    route.send(Message::CompositeDemand);
+                }
                 drop(scene);
                 drop(captured);
                 if let Some(route) = route.upgrade() {
@@ -1024,12 +1305,11 @@ impl Worker {
                         _ => {}
                     }
                 }
-                for slot in &mut entries {
-                    if let Some(entry) = slot.take() {
-                        retire_entry(entry, &route);
+                for entry in std::mem::take(&mut entries).into_values() {
+                    retire_entry(entry, &route);
                     }
-                }
                 completed_fills.lock().unwrap().extend(fills.clear());
+                drop(precompiler);
                 drop(gpu);
                 worker_drained.store(true, Ordering::Release);
                 if let Some(route) = route.upgrade() {
@@ -1058,6 +1338,11 @@ impl Worker {
     }
     pub(crate) fn wake(&self) {
         let _ = self.send.send(Task::Resume);
+    }
+    /// Samples the same display frame as the UI animator. The command mailbox
+    /// coalesces queued frames to their latest timestamp under worker backpressure.
+    pub(crate) fn frame(&self, timestamp: u64) {
+        let _ = self.send.send(Task::Frame(timestamp));
     }
     pub(crate) fn cancel_capture(&self, key: crate::render::shader::navigation::Key) {
         let _ = self.send.send(Task::CancelCapture(key));
@@ -1131,7 +1416,7 @@ fn fail_captures_for_source(
     });
 }
 fn fulfill_captures(
-    entries: &mut [Option<Entry>],
+    entries: &mut Entries,
     pending_captures: &mut Vec<PendingCapture>,
     captured: &mut Vec<(crate::render::shader::navigation::Key, Snapshot)>,
     only_source: Option<Key>,
@@ -1144,13 +1429,9 @@ fn fulfill_captures(
         if only_source.is_some_and(|source| pending.source != source) {
             return true;
         }
-        let Some(entry) = entries
-            .get_mut(pending.source.slot())
-            .and_then(Option::as_mut)
-            .filter(|entry| {
-                entry.key == pending.source && !entry.shared.state.lock().unwrap().closed
-            })
-        else {
+        let Some(entry) = entries.get_mut(&pending.source.slot()).filter(|entry| {
+            entry.key == pending.source && !entry.shared.state.lock().unwrap().closed
+        }) else {
             if let Some(route) = route {
                 route.send(Message::Navigation(
                     crate::render::shader::navigation::Event::Failed(pending.key),
@@ -1158,7 +1439,7 @@ fn fulfill_captures(
             }
             return false;
         };
-        match entry.snapshot() {
+        match entry.snapshot(pending.before_screen) {
             Ok(Some(snapshot)) => {
                 captured.retain(|(k, _)| k.owner != pending.key.owner);
                 captured.push((pending.key, snapshot));
@@ -1182,15 +1463,10 @@ fn fulfill_captures(
         }
     });
 }
-fn check_pixels(
-    entries: &[Option<Entry>],
-    key: Key,
-    pixels: u64,
-) -> std::result::Result<(), String> {
+fn check_pixels(entries: &Entries, key: Key, pixels: u64) -> std::result::Result<(), String> {
     if pixels > 16_777_216
         || entries
-            .iter()
-            .flatten()
+            .values()
             .filter(|entry| entry.key.slot() != key.slot())
             .map(|entry| entry.settings.pixels())
             .sum::<u64>()
@@ -1202,20 +1478,28 @@ fn check_pixels(
         Ok(())
     }
 }
+// Node IDs grow throughout a session. Only live producers take space or participate in a frame.
+type Entries = BTreeMap<(NodeId, bool), Entry>;
+
 struct Entry {
     key: Key,
     shared: Arc<Shared>,
     reader: Option<TextureReader>,
-    initial_picture: Option<super::gles::Target>,
     gpu: TextureContext,
     settings: Settings,
     scene_source: Option<Image>,
     scene_output: Option<(super::geometry::Coverage, (f32, f32))>,
     shaders: super::gles::Effects,
     filters: super::gles::Filters,
+    modal_composition: Option<super::gles::Filters>,
+    backdrop_dirty: bool,
     filtered: Option<super::gles::Target>,
     window: Option<super::readback::Window>,
+    window_wait_since: Option<std::time::Instant>,
     window_dirty: bool,
+    waiting_for_shader: bool,
+    pending_slots: Vec<(NodeId, u16, AnimationValue)>,
+    pending_transitions: Vec<(NodeId, std::time::Duration)>,
     pending_readback_bytes: u64,
     navigation: Option<Navigation<Option<Snapshot>>>,
     completed: Option<crate::render::shader::navigation::Key>,
@@ -1244,6 +1528,22 @@ fn create_input(
     Ok(Some(reader))
 }
 impl Entry {
+    fn publish_input(
+        &self,
+        native_output: bool,
+        destination: std::result::Result<Option<u64>, String>,
+    ) {
+        let mut state = self.shared.state.lock().unwrap();
+        // An engine commit may have changed producers while this worker was
+        // creating its input. Such a reply must not migrate the native tree.
+        if state.settings.native_output() != native_output {
+            return;
+        }
+        if destination.as_ref().is_ok_and(|id| *id == state.surface) {
+            return;
+        }
+        state.initialized = Some(destination);
+    }
     fn update_input(
         &mut self,
         settings: &Settings,
@@ -1251,53 +1551,102 @@ impl Entry {
     ) -> std::result::Result<(), String> {
         if self.reader.is_some() == settings.native_output() {
             self.reader = create_input(&self.gpu, settings, self.key, &self.shared, callback)?;
-            let id = self
-                .reader
+        }
+        let id = if settings.native_output() {
+            if let Some(window) = &self.window {
+                window.release_egl();
+            }
+            self.shared.state.lock().unwrap().output_surface
+        } else {
+            self.reader
                 .as_mut()
                 .map(TextureReader::id)
                 .transpose()
-                .map_err(|e| e.to_string())?;
-            self.shared.state.lock().unwrap().initialized = Some(Ok(id));
-        }
+                .map_err(|e| e.to_string())?
+        };
+        // Comparing with the UI's acknowledged destination also covers a fast
+        // native -> GPU -> native reversal coalesced into one worker wake.
+        self.publish_input(settings.native_output(), Ok(id));
         Ok(())
     }
-    fn render(&mut self, settings: Settings) -> std::result::Result<bool, String> {
-        let _trace = super::trace::Scope::new(c"NSH composite");
-        if let Some(navigation) = &self.navigation {
-            if !settings
-                .shaders
-                .iter()
-                .any(|(id, _)| *id == navigation.key.owner)
-            {
-                if let Some(navigation) = self.navigation.take()
-                    && !navigation.complete
-                {
-                    self.completed = Some(navigation.key);
-                }
-            } else if navigation.complete {
-                // Keep the terminal picture until its generation is retired by the UI.
-                return Ok(false);
-            }
+    fn needs_shader_warmup(
+        &self,
+        shaders: &[(NodeId, Arc<ShaderLayer>)],
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> bool {
+        !shaders.is_empty()
+            && shaders.iter().any(|(_, layer)| {
+                !super::gles::has_program(&self.gpu, layer)
+                    && precompiler.is_some_and(|p| p.submit_or_compiling(layer))
+            })
+    }
+    fn render(
+        &mut self,
+        settings: Settings,
+        revision: u64,
+        backdrop: Option<super::gles::Picture>,
+        precompiler: Option<&super::precompile::Precompiler>,
+    ) -> std::result::Result<bool, String> {
+        let installed = self.navigation.as_ref().map(|nav| nav.key);
+        if settings.navigation.is_some() && settings.navigation != installed {
+            // The settings and captured picture travel separately. Keep the
+            // previous buffer on screen until the picture for this generation arrives.
+            return Ok(false);
         }
-        let mut changed = self.settings != settings || std::mem::take(&mut self.window_dirty);
+        if settings.navigation.is_none() {
+            if let Some(old) = self.navigation.take()
+                && !old.complete
+            {
+                self.completed = Some(old.key);
+            }
+        } else if self.navigation.as_ref().is_some_and(|nav| nav.complete) {
+            // Keep the terminal picture until its generation is retired by the UI.
+            return Ok(false);
+        }
+        let was_waiting = std::mem::take(&mut self.waiting_for_shader);
+        if !settings.scene
+            && !settings.native_output()
+            && self.needs_shader_warmup(&settings.shaders, precompiler)
+        {
+            // Keep draining producer buffers so RSRenderThread never stalls
+            // while the shader compiles on the background precompile thread.
+            if let Some(reader) = self.reader.as_mut() {
+                reader
+                    .resize(settings.width, settings.height)
+                    .map_err(|e| e.to_string())?;
+                reader.drain_oes().map_err(|e| e.to_string())?;
+            }
+            self.waiting_for_shader = true;
+            self.shared.animating.store(true, Ordering::Release);
+            return Ok(false);
+        }
+        let mut changed =
+            self.settings != settings || std::mem::take(&mut self.window_dirty) || was_waiting;
+        changed |= std::mem::take(&mut self.backdrop_dirty);
+        self.shaders.capture_before = settings.first_screen_layer;
+        if settings.first_screen_layer.is_none() {
+            self.shaders.before_screen = None;
+        }
+        if settings.backdrop.is_none() {
+            self.modal_composition = None;
+        }
         self.shaders.layers(&settings.shaders)?;
-        self.settings = settings;
-        let initial = self.shared.state.lock().unwrap().initial_picture.take();
-        if self.settings.scene || self.settings.native_output() {
-            self.initial_picture = None;
-        } else if let Some(picture) = initial {
-            let _trace = super::trace::Scope::new(c"NSH initial picture upload");
-            let (width, height) = (picture.width, picture.height);
-            self.initial_picture = Some(super::gles::Target::upload(
-                &self.gpu,
-                &RgbaFrame {
-                    width,
-                    height,
-                    pixels: picture.into_rgba()?,
-                },
-            )?);
+        for (id, slot, value) in self.pending_slots.drain(..) {
+            self.shaders.slot(id, slot, value);
             changed = true;
         }
+        for (id, duration) in self.pending_transitions.drain(..) {
+            if let Err(error) = self.shaders.transition(id, duration) {
+                log::warn!("shader transition: {error}");
+            }
+            changed = true;
+        }
+        if !self.settings.gpu && settings.gpu && self.window.is_none() {
+            self.window_wait_since = Some(std::time::Instant::now());
+        } else if !settings.gpu {
+            self.window_wait_since = None;
+        }
+        self.settings = settings;
         let direct = !self.settings.scene;
         let x = -(self.settings.insets[0] as f32);
         let y = -(self.settings.insets[1] as f32);
@@ -1305,6 +1654,7 @@ impl Entry {
             self.scene_source = None;
             self.scene_output = None;
             self.shaders.clear_output();
+            self.shaders.release_recycled();
             self.filtered = None;
             self.shared.awaiting_origin.store(false, Ordering::Release);
             self.shared.animating.store(false, Ordering::Release);
@@ -1320,11 +1670,40 @@ impl Entry {
         reader
             .resize(self.settings.width, self.settings.height)
             .map_err(|e| e.to_string())?;
+        if direct
+            && self.settings.keep_gpu_input
+            && !self.settings.capture
+            && self.settings.filters.is_empty()
+            && self.settings.shaders.is_empty()
+        {
+            changed |= reader.drain_oes().map_err(|e| e.to_string())?;
+            self.shared.animating.store(false, Ordering::Release);
+            self.shaders.clear_output();
+            self.filtered = None;
+            if !changed || !reader.has_frame() {
+                return Ok(false);
+            }
+            let Some(window) = self.window.as_ref() else {
+                return Ok(false);
+            };
+            if !self.shared.accepts_revision(revision) {
+                return Ok(false);
+            }
+            if !reader.present_input(window).map_err(|e| e.to_string())? {
+                self.window_dirty = true;
+                self.shared.animating.store(true, Ordering::Release);
+                return Ok(false);
+            }
+            return Ok(self.record_gpu_output(
+                revision,
+                self.settings.width,
+                self.settings.height,
+                x,
+                y,
+            ));
+        }
         if direct {
             changed |= reader.update_texture().map_err(|e| e.to_string())?;
-            if reader.texture().is_some() {
-                self.initial_picture = None;
-            }
         } else if let Some(frame) = reader.read().map_err(|e| e.to_string())? {
             self.pending_readback_bytes += frame.pixels.len() as u64;
             let mut image = Image::new(frame);
@@ -1340,16 +1719,7 @@ impl Entry {
             return Ok(false);
         }
         if direct {
-            let Some(source) = self
-                .reader
-                .as_ref()
-                .and_then(TextureReader::texture)
-                .or_else(|| {
-                    self.initial_picture
-                        .as_ref()
-                        .map(super::gles::Target::picture)
-                })
-            else {
+            let Some(source) = self.reader.as_ref().and_then(TextureReader::texture) else {
                 // Only the producer can supply the first input. In particular,
                 // offscreen native subtrees need not export a frame at all.
                 // Their frame-available callback resumes this entry when ready.
@@ -1388,10 +1758,20 @@ impl Entry {
             } else {
                 source
             };
+            let picture = if self.settings.backdrop.is_some() {
+                let Some(back) = backdrop else {
+                    return Ok(false);
+                };
+                self.modal_composition
+                    .get_or_insert_with(|| super::gles::Filters::new(&self.gpu))
+                    .over(picture, back)?
+            } else {
+                picture
+            };
             let repaint =
                 self.shaders
                     .render(picture, changed, self.settings.scale, coverage, None)?;
-            let published = self.publish_gpu(repaint, x, y)?;
+            let published = self.publish_gpu(revision, repaint, x, y)?;
             if published
                 && self.window.is_some()
                 && let Some(navigation) = &mut self.navigation
@@ -1417,7 +1797,7 @@ impl Entry {
             insets: self.settings.insets.map(|v| v as f32 / self.settings.scale),
         }
     }
-    fn snapshot(&mut self) -> std::result::Result<Option<Snapshot>, String> {
+    fn snapshot(&mut self, before_screen: bool) -> std::result::Result<Option<Snapshot>, String> {
         if let Some((coverage, origin)) = self.scene_output
             && let Some(output) = self.shaders.output()
         {
@@ -1430,12 +1810,17 @@ impl Entry {
         if self.settings.scene {
             return Ok(None);
         }
-        let picture = self.shaders.output().map(super::gles::Target::picture).or(
-            match self.reader.as_mut() {
+        let output = if before_screen {
+            self.shaders.before_screen.as_ref()
+        } else {
+            self.shaders.output()
+        };
+        let picture = output
+            .map(super::gles::Target::picture)
+            .or(match self.reader.as_mut() {
                 Some(reader) => reader.ensure_texture().map_err(|e| e.to_string())?,
                 None => None,
-            },
-        );
+            });
         let origin = self
             .shared
             .state
@@ -1499,12 +1884,29 @@ impl Entry {
         )?;
         Ok(true)
     }
-    fn record_gpu_output(&self, width: u32, height: u32, x: f32, y: f32) {
-        self.shared.state.lock().unwrap().presented = true;
-        self.record_geometry(width, height, x, y);
+    fn record_gpu_output(&self, revision: u64, width: u32, height: u32, x: f32, y: f32) -> bool {
+        let navigation = self
+            .navigation
+            .as_ref()
+            .filter(|nav| nav.snapshot.is_none())
+            .map(|nav| nav.key);
+        let mut state = self.shared.state.lock().unwrap();
+        if state.closed || state.settings_revision != revision {
+            return false;
+        }
+        if state.presented_navigation != navigation {
+            state.presented_navigation = navigation;
+            // Geometry is often unchanged for a full-screen transition. The
+            // first submission for this key must still wake modal presentation.
+            state.published_geom = None;
+        }
+        Self::set_geometry(&mut state, width, height, x, y);
+        true
     }
     fn record_geometry(&self, width: u32, height: u32, x: f32, y: f32) {
-        let mut state = self.shared.state.lock().unwrap();
+        Self::set_geometry(&mut self.shared.state.lock().unwrap(), width, height, x, y);
+    }
+    fn set_geometry(state: &mut State, width: u32, height: u32, x: f32, y: f32) {
         let geometry = (width, height, x.to_bits(), y.to_bits());
         if state.published_geom == Some(geometry) {
             return;
@@ -1521,7 +1923,13 @@ impl Entry {
         });
     }
 
-    fn publish_gpu(&mut self, repaint: bool, x: f32, y: f32) -> std::result::Result<bool, String> {
+    fn publish_gpu(
+        &mut self,
+        revision: u64,
+        repaint: bool,
+        x: f32,
+        y: f32,
+    ) -> std::result::Result<bool, String> {
         let pending_nav = self.navigation.as_ref().is_some_and(|nav| !nav.complete);
         self.shared
             .animating
@@ -1535,36 +1943,43 @@ impl Entry {
         if !repaint {
             return Ok(false);
         }
-        let presented = {
-            let gate = self.shared.present_gate.lock().unwrap();
-            if !*gate || self.shared.state.lock().unwrap().settings != self.settings {
-                self.shared.animating.store(false, Ordering::Release);
-                return Ok(false);
-            }
-            output.present(window)?
-        };
+        if !self.shared.accepts_revision(revision) {
+            return Ok(false);
+        }
+        // Window replacement and destruction are serialized on this worker.
+        // A UI settings change only invalidates the reply from the old frame.
+        let presented = output.present(window)?;
         if !presented {
             self.window_dirty = true;
             self.shared.animating.store(true, Ordering::Release);
             return Ok(false);
         }
         let (_, width, height) = output.picture();
-        self.record_gpu_output(width, height, x, y);
-        Ok(true)
+        Ok(self.record_gpu_output(revision, width, height, x, y))
     }
 }
 
 struct SceneEntries<'a> {
-    entries: &'a mut [Option<Entry>],
-    gpu: &'a TextureContext,
+    entries: &'a mut Entries,
+    gpu: &'a mut Option<TextureContext>,
     readback_bytes: u64,
     upload_bytes: u64,
 }
 impl super::draw::Sources for SceneEntries<'_> {
+    fn navigation(&self, key: Key) -> Option<crate::render::shader::navigation::Key> {
+        let entry = self
+            .entries
+            .get(&key.slot())
+            .filter(|entry| entry.key == key)?;
+        entry
+            .navigation
+            .as_ref()
+            .filter(|nav| nav.snapshot.is_none())
+            .map(|nav| nav.key)
+    }
     fn image(&self, key: Key) -> Option<(&Image, f32)> {
         self.entries
-            .get(key.slot())
-            .and_then(Option::as_ref)
+            .get(&key.slot())
             .filter(|entry| entry.key == key)
             .and_then(|entry| {
                 entry
@@ -1582,8 +1997,7 @@ impl super::draw::Sources for SceneEntries<'_> {
     ) -> std::result::Result<Image, String> {
         let Some(entry) = self
             .entries
-            .get_mut(key.slot())
-            .and_then(Option::as_mut)
+            .get_mut(&key.slot())
             .filter(|entry| entry.key == key)
         else {
             return Ok(image);
@@ -1603,7 +2017,10 @@ impl super::draw::Sources for SceneEntries<'_> {
             ],
         };
         let (width, height, effective_scale) = coverage.pixels(scale);
-        let gpu = self.gpu;
+        if self.gpu.is_none() {
+            *self.gpu = Some(TextureContext::new().map_err(|error| error.to_string())?);
+        }
+        let gpu = self.gpu.as_ref().unwrap();
         let upload_bytes = &mut self.upload_bytes;
         let mut upload = |image: &Image| -> std::result::Result<super::gles::Target, String> {
             let resized = image.resized(width, height);
@@ -1689,9 +2106,7 @@ fn next_composite_generation() -> u32 {
 pub(crate) struct Composite {
     owner: std::rc::Weak<Node>,
     presentation: RefCell<Option<super::presentation::Presentation>>,
-    surface: Cell<Option<u64>>,
     failed: Cell<bool>,
-    initial_picture: Cell<bool>,
     pub(crate) generation: u32,
     key: Key,
     shared: Arc<Shared>,
@@ -1704,15 +2119,19 @@ impl Composite {
     pub(crate) fn is_failed(&self) -> bool {
         self.failed.get()
     }
-    pub(crate) fn has_presented(&self, owner: &Node) -> bool {
+    pub(crate) fn has_presented(
+        &self,
+        owner: &Node,
+        key: crate::render::shader::navigation::Key,
+    ) -> bool {
         if owner.scene_active() {
             owner
                 .scene
                 .borrow()
                 .as_ref()
-                .is_some_and(|scene| scene.has_output_for(owner.id))
+                .is_some_and(|scene| scene.has_navigation_frame(owner.id, key))
         } else {
-            self.shared.state.lock().unwrap().presented
+            self.shared.state.lock().unwrap().presented_navigation == Some(key)
         }
     }
     pub(crate) fn new(owner: &Rc<Node>) -> Result<Self> {
@@ -1734,17 +2153,18 @@ impl Composite {
         let shared = Arc::new(Shared {
             released: AtomicBool::new(false),
             active: AtomicBool::new(true),
-            present_gate: Mutex::new(true),
+
             awaiting_origin: AtomicBool::new(false),
             state: Mutex::new(State {
                 settings: initial_settings.clone(),
-                initial_picture: None,
                 screen_origin: initial_origin,
                 output: None,
-                presented: false,
+                settings_revision: 0,
+                presented_navigation: None,
                 published_geom: None,
                 initialized: None,
                 output_surface: None,
+                surface: None,
                 closed: false,
             }),
             queued: AtomicBool::new(false),
@@ -1798,17 +2218,7 @@ impl Composite {
         Ok(Self {
             owner: Rc::downgrade(owner),
             presentation: RefCell::new(presentation),
-            surface: Cell::new(None),
             failed: Cell::new(false),
-            // An already displayed root cannot export before there is an output:
-            // ArkUI removes its source RS node from the display tree first.
-            initial_picture: Cell::new(
-                owner.id == nsh_core::ROOT_ID
-                    && !overlay
-                    && initial_settings.gpu
-                    && !initial_settings.scene
-                    && !initial_settings.native_output(),
-            ),
             generation,
             key,
             shared,
@@ -1825,11 +2235,6 @@ impl Composite {
             return Ok(false);
         }
         let settings = settings(owner, self.key.overlay)?;
-        if !settings.gpu || settings.scene || settings.native_output() {
-            // This sample belongs to the direct GPU input. A scene/native
-            // producer change cancels it, including an asynchronous reply.
-            self.initial_picture.set(false);
-        }
         if settings.gpu && self.presentation.borrow().is_none() {
             let layer = super::presentation::Presentation::new(
                 owner,
@@ -1864,7 +2269,7 @@ impl Composite {
                 settings.density,
             )?;
         }
-        let _present = self.shared.present_gate.lock().unwrap();
+
         let mut state = self.shared.state.lock().unwrap();
         if state.screen_origin.is_none() {
             state.screen_origin = owner
@@ -1876,6 +2281,12 @@ impl Composite {
         }
         let changed = state.settings != settings;
         if changed {
+            if state.settings.native_output() != settings.native_output() {
+                // Invalidate an unconsumed worker reply from the previous mode.
+                // The current UI destination stays live until the new reply.
+                state.initialized = None;
+            }
+            state.settings_revision = state.settings_revision.wrapping_add(1);
             state.settings = settings;
             drop(state);
             wake(&self.worker.send, self.key, &self.shared);
@@ -1886,37 +2297,24 @@ impl Composite {
         }
         Ok(changed)
     }
-    pub(crate) fn needs_initial_picture(&self) -> bool {
-        self.initial_picture.get() && !self.is_revealed() && !self.failed.get()
-    }
-    pub(crate) fn initial_picture_scale(&self) -> f64 {
-        let state = self.shared.state.lock().unwrap();
-        f64::from(state.settings.scale / state.settings.density)
-    }
-    pub(crate) fn initial_picture(
-        &self,
-        picture: std::result::Result<super::picture::Picture, String>,
-    ) {
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            match picture {
-                Ok(picture) => state.initial_picture = Some(picture),
-                Err(error) => state.initialized = Some(Err(error)),
-            }
-        }
-        wake(&self.worker.send, self.key, &self.shared);
-    }
     pub(crate) fn surface_id(&self) -> Option<String> {
-        if self.failed.get() || self.needs_initial_picture() {
+        if self.failed.get()
+            || self
+                .presentation
+                .borrow()
+                .as_ref()
+                .is_some_and(|p| p.awaiting_capture())
+        {
             return None;
         }
-        let state = self.shared.state.lock().unwrap();
-        let id = if state.settings.native_output() {
-            state.output_surface
-        } else {
-            self.surface.get()
-        };
-        id.map(|id| id.to_string())
+        // Only the worker can publish a new producer destination: switching to
+        // native output must first relinquish EGL ownership of that queue.
+        self.shared
+            .state
+            .lock()
+            .unwrap()
+            .surface
+            .map(|id| id.to_string())
     }
     pub(crate) fn shader_slot(&self, id: NodeId, slot: u16, value: AnimationValue) {
         let _ = self.worker.send.send(Task::Slot(self.key, id, slot, value));
@@ -1927,10 +2325,11 @@ impl Composite {
             .send
             .send(Task::Transition(self.key, id, duration));
     }
-    pub(crate) fn capture(&self, key: crate::render::shader::navigation::Key) {
+    pub(crate) fn capture(&self, key: crate::render::shader::navigation::Key, before_screen: bool) {
         let _ = self.worker.send.send(Task::Capture {
             key,
             source: self.key,
+            before_screen,
         });
     }
     pub(crate) fn shader_navigation(
@@ -1980,12 +2379,30 @@ impl Composite {
             .as_ref()
             .is_some_and(super::presentation::Presentation::is_revealed)
     }
-    pub(crate) fn ready(&self) -> (bool, bool) {
-        let initialized = self.shared.state.lock().unwrap().initialized.take();
-        let first_input = self.surface.get().is_none();
-        if let Some(Ok(id)) = initialized.as_ref() {
-            self.surface.set(*id);
+    pub(crate) fn ready(&self, owner: &Node) -> (bool, bool) {
+        let (initialized, can_export, screen_effect) = {
+            let mut state = self.shared.state.lock().unwrap();
+            let initialized = state.initialized.take();
+            if let Some(Ok(id)) = initialized.as_ref() {
+                state.surface = *id;
+            }
+            (
+                initialized,
+                state.surface.is_some() && state.output_surface.is_some(),
+                state.settings.navigation.is_none()
+                    && !state.settings.capture
+                    && state
+                        .settings
+                        .shaders
+                        .iter()
+                        .any(|(_, layer)| layer.role == nsh_core::shader::ShaderRole::Screen),
+            )
+        };
+        // Keep the live native subtree visible during initial EGL and window setup.
+        if can_export && let Some(layer) = self.presentation.borrow().as_ref() {
+            layer.capture_before_export(owner, screen_effect);
         }
+        let input_changed = initialized.is_some();
         if let Some(Err(error)) = initialized {
             log::warn!("OHOS compositor initialization: {error}");
             self.failed.set(true);
@@ -1993,8 +2410,6 @@ impl Composite {
                 layer.hide();
             }
         }
-        // A window-created notification can repeat the same input surface.
-        let initialized = first_input && self.surface.get().is_some();
         self.shared.posted.store(false, Ordering::Release);
         let output = self.shared.state.lock().unwrap().output.take();
         if let Some(output) = output {
@@ -2016,14 +2431,14 @@ impl Composite {
                 match result {
                     Ok(revealed) => {
                         drop(presentation);
-                        return (initialized, revealed);
+                        return (input_changed, revealed);
                     }
                     Err(error) => log::warn!("shader frame presentation: {error}"),
                 }
-                return (initialized, false);
+                return (input_changed, false);
             }
         }
-        (initialized, false)
+        (input_changed, false)
     }
     pub(crate) fn measure(
         &self,
@@ -2124,10 +2539,21 @@ fn settings(owner: &Node, overlay: bool) -> Result<Settings> {
         insets,
         scene,
         capture: owner.navigation_capture.get(),
+        keep_gpu_input: !overlay
+            && (owner.id == nsh_core::ROOT_ID || owner.keeps_modal_shader_input()),
+        navigation: if overlay || owner.shader_layers.borrow().is_empty() {
+            None
+        } else {
+            owner.shaders.navigation_key(owner.id)
+        },
+        backdrop: owner.modal_backdrop.get(),
+        first_screen_layer: owner.backdrop_layer.get().filter(|_| !overlay),
         shaders: if overlay {
             Vec::new()
         } else {
-            owner.shader_layers.borrow().clone()
+            let mut layers = owner.shader_layers.borrow().clone();
+            layers.extend(owner.modal_screen_layers.borrow().iter().cloned());
+            layers
         },
         filters: if overlay {
             Vec::new()

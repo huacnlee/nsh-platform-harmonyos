@@ -400,9 +400,15 @@ impl Input {
         );
     }
     pub(crate) fn configure(self: &Rc<Self>, config: InputConfig) -> Result<()> {
-        if config.multiline != self.config.borrow().multiline
-            || config.secure != self.config.borrow().secure
-        {
+        let replace = {
+            let previous = self.config.borrow();
+            let cleared_custom_font = editor_font_family(previous.style.font_family).is_some()
+                && editor_font_family(config.style.font_family).is_none();
+            config.multiline != previous.multiline
+                || config.secure != previous.secure
+                || cleared_custom_font
+        };
+        if replace {
             self.retire()?;
             let Some(owner) = self.owner.upgrade() else {
                 return Ok(());
@@ -418,6 +424,35 @@ impl Input {
         }
         Ok(())
     }
+    // Use the committed NSH layout: ArkUI has not measured newly attached children
+    // during their first mount. Keep a half-viewport of editors ahead of a drag.
+    pub(crate) fn below_viewport(&self) -> bool {
+        let Some(mut node) = self.owner.upgrade() else {
+            return false;
+        };
+        let mut top = 0.0;
+        while let Some(parent) = { node.parent_node.borrow().upgrade() } {
+            if !node.style.borrow().transform.is_identity()
+                || node
+                    .live
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|live| live.changes_layout_or_transform())
+            {
+                return false;
+            }
+            top += node.frame.get().y;
+            if let Some(scroll) = parent.scroll.borrow().as_ref() {
+                let height = parent.frame.get().height;
+                return height > 0.0
+                    && scroll.scale() == 1.0
+                    && top - scroll.current_offset().1 > height * 1.5;
+            }
+            node = parent;
+        }
+        false
+    }
+
     pub(crate) fn update(&self) {
         let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
             return;
@@ -460,6 +495,7 @@ impl Input {
             .selection_color
             .unwrap_or(nsh_core::Color(0x3388ff55));
         owner.editor_update(EditorSettings {
+            below_viewport: false,
             accessibility: Some(EditorAccessibility {
                 label: accessibility.label.as_deref().unwrap_or("").to_owned(),
                 hint: accessibility.hint.as_deref().unwrap_or("").to_owned(),
@@ -477,10 +513,7 @@ impl Input {
             placeholder: config.placeholder.clone(),
             font_size: config.style.font_size.0 as f64,
             font_weight: config.style.font_weight as u32,
-            font_family: config
-                .style
-                .font_family
-                .map(|family| crate::text::fonts::families(&family.name()).join(",")),
+            font_family: editor_font_family(config.style.font_family),
             italic: config.style.italic,
             color: argb(config.style.color),
             placeholder_color: argb(config.placeholder_color.unwrap_or(config.style.color)),
@@ -781,4 +814,10 @@ fn content_type(fill: nsh_core::AutoFill) -> Option<&'static str> {
         F::CreditCardNumber => Some("credit-card"),
         _ => None,
     }
+}
+
+fn editor_font_family(family: Option<nsh_core::FontFamily>) -> Option<String> {
+    let family = family?.name();
+    let list = crate::text::fonts::families(&family);
+    (!list.is_empty()).then(|| list.join(","))
 }

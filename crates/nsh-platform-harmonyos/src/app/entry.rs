@@ -11,8 +11,8 @@ use std::{
 
 use napi_derive_ohos::napi;
 use napi_ohos::{
-    Env, Error, JsValue, Result, Status,
-    bindgen_prelude::{FromNapiValue, Function, FunctionRef, Object, Unknown},
+    Env, Error, Result,
+    bindgen_prelude::{Function, FunctionRef, Object, ObjectRef, Unknown},
 };
 use ohos_resource_manager_binding::ResourceManager;
 
@@ -68,16 +68,22 @@ pub fn get_capabilities() -> NshCapabilities {
 }
 
 thread_local! {
-    static SESSION_BINDER: RefCell<Option<FunctionRef<(), ()>>> = RefCell::default();
+    pub(crate) static ALERT_FACTORY: RefCell<Option<FunctionRef<napi_ohos::bindgen_prelude::ObjectRef, FunctionRef<(), ()>>>> = RefCell::default();
+    static SESSION_BINDER: RefCell<Option<FunctionRef<ObjectRef, u32>>> = RefCell::default();
 }
 
 #[napi]
 pub(crate) fn nsh_register_session_binder(
     sdk_api_version: i32,
-    #[napi(ts_arg_type = "(uiContext: object) => number")] binder: Function<'_, (), ()>,
+    #[napi(ts_arg_type = "(uiContext: object) => number")] binder: Function<'_, ObjectRef, u32>,
+    #[napi(ts_arg_type = "(options: object) => () => void")] alerts: Option<
+        Function<'_, napi_ohos::bindgen_prelude::ObjectRef, FunctionRef<(), ()>>,
+    >,
 ) -> Result<()> {
     set_runtime_api_version(sdk_api_version);
     crate::media::webview::register_custom_scheme();
+    let alerts = alerts.map(|factory| factory.create_ref()).transpose()?;
+    ALERT_FACTORY.with(|slot| *slot.borrow_mut() = alerts);
     let reference = binder.create_ref()?;
     SESSION_BINDER.with(|slot| {
         *slot.borrow_mut() = Some(reference);
@@ -98,26 +104,7 @@ pub(crate) fn bind_session(env: &Env, ui_context: &Object<'_>) -> Result<Arc<Ser
                 .transpose()
         })?
         .ok_or_else(|| Error::from_reason("@nsh/harmonyos session binder is not registered"))?;
-    let arg = ui_context.raw();
-    let mut raw_result = std::ptr::null_mut();
-    // SAFETY: all handles belong to this UI-thread environment and remain live
-    // for the synchronous call; raw_result receives its owned N-API value.
-    let status = unsafe {
-        napi_ohos::sys::napi_call_function(
-            env.raw(),
-            binder.raw(),
-            binder.raw(),
-            1,
-            &arg,
-            &mut raw_result,
-        )
-    };
-    if status != napi_ohos::sys::Status::napi_ok {
-        return Err(Error::from_status(Status::from(status)));
-    }
-    // SAFETY: a successful call initialized raw_result in this environment;
-    // FromNapiValue checks the binder's session ID before converting it.
-    let session_id = unsafe { u32::from_napi_value(env.raw(), raw_result) }?;
+    let session_id = binder.call(ui_context.create_ref()?)?;
     let host = crate::app::session::get(session_id)?;
     host.bind_ui_context(env, ui_context)?;
     Ok(host)
@@ -143,6 +130,10 @@ pub(crate) fn nsh_create_session(
         crate::interop::component::TabBarContext,
         napi_ohos::bindgen_prelude::ObjectRef,
     >,
+    #[napi(
+        ts_arg_type = "(callbacks: { frame(timestamp: number): boolean }) => (request: object) => void"
+    )]
+    frame_factory: crate::app::frame_source::Factory,
 ) -> Result<u32> {
     if init.sdk_api_version < crate::app::features::MIN_API as i32 {
         return Err(Error::from_reason(format!(
@@ -165,6 +156,7 @@ pub(crate) fn nsh_create_session(
         applier,
         command_tsfn,
         tab_bar.create_ref()?,
+        frame_factory,
     )
 }
 
@@ -206,6 +198,7 @@ pub(crate) fn nsh_update_config(
     time_zone: Option<String>,
     regional_locale: Option<String>,
     is_24_hour_clock: Option<bool>,
+    font_changed: Option<bool>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
         let mut environment = crate::app::session::environment_from_config(
@@ -221,6 +214,9 @@ pub(crate) fn nsh_update_config(
         );
         environment.pixel_ratio = pixel_ratio;
         host.update(environment)?;
+        if font_changed == Some(true) {
+            host.notify_fonts_changed()?;
+        }
     }
     Ok(())
 }

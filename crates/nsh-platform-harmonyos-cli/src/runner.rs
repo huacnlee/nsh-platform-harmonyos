@@ -582,14 +582,14 @@ mod tests {
     }
 
     #[test]
-    fn dev_runners_need_no_patch_against_released_crates() {
+    fn dev_runners_inherit_backend_pins_without_app_patches() {
         let dir = std::env::temp_dir().join(format!("nsh-hm-released-{}", std::process::id()));
         let app = dir.join("rust-app");
         fs::create_dir_all(&app).unwrap();
         fs::write(
             app.join("Cargo.toml"),
             "[package]\nname = \"counter-rust-app\"\nversion = \"0.0.0\"\n\n\
-             [dependencies]\nnsh-core = \"0.5\"\n",
+             [dependencies]\nnsh-core = \"0.6\"\n",
         )
         .unwrap();
         fs::write(
@@ -600,9 +600,10 @@ mod tests {
         write(&dir.join("runner-dev"), App::Rust(&app), true).unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"dev\"]"));
-        assert!(
-            !dev_manifest.contains("[patch.crates-io]"),
-            "{dev_manifest}"
+        assert_eq!(
+            workspace_patches(&dev_manifest).trim(),
+            crate::embedded::NSH_PATCH.trim(),
+            "{dev_manifest}",
         );
         fs::remove_dir_all(&dir).unwrap();
     }

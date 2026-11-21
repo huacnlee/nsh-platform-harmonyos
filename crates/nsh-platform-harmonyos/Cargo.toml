@@ -90,6 +90,7 @@ rustc-hash.workspace = true
 napi-build-ohos.workspace = true
 
 [dev-dependencies]
+rustc-hash.workspace = true
 getrandom = { workspace = true, features = ["std"] }
 log.workspace = true
 nsh-core = { workspace = true, features = ["shader"] }

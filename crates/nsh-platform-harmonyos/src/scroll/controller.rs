@@ -38,6 +38,7 @@ pub(crate) struct Scroller {
     pub(crate) content: NativeNode,
     owner: Weak<Node>,
     size: Cell<Size>,
+    has_explicit_size: Cell<bool>,
     measured_size: Cell<Size>,
     layout_pending: Cell<bool>,
     viewport_size: Cell<Size>,
@@ -48,7 +49,9 @@ pub(crate) struct Scroller {
     corrections: Cell<u32>,
     applying_offset: Cell<bool>,
     report_pending: Cell<bool>,
-    phase: Cell<i32>,
+    // The SDK's observed main/cross phases, published together when a command
+    // replaces both axes. There is no separate public phase to leave behind.
+    phases: Cell<[i32; 2]>,
     scroll_value: Cell<Option<u32>>,
     pull_value: Cell<Option<u32>>,
     pull: Cell<f32>,
@@ -71,12 +74,13 @@ pub(crate) struct Scroller {
     snap_limit: Cell<Option<f32>>,
     pinch: RefCell<Option<ohos_arkui_binding::gesture::inner_gesture::Gesture>>,
     selection_progress: RefCell<crate::text::selection::scroll::Progress>,
+    culled_nodes: RefCell<Vec<Weak<Node>>>,
 }
 
 impl Scroller {
     #[cfg(feature = "dev")]
     pub(crate) fn test_animating(&self) -> bool {
-        self.phase.get() != 0 || self.zoom_motion.get().is_some()
+        self.phases.get() != [0; 2] || self.zoom_motion.get().is_some()
     }
     pub(crate) fn mounted(&self) -> NativeNode {
         self.overlay
@@ -111,6 +115,7 @@ impl Scroller {
         if let Some(plane) = self.overlay.borrow().as_ref() {
             plane.update(owner)?;
         }
+        self.update_child_culling()?;
         Ok(())
     }
     pub(crate) fn restore_scene(&self, owner: &Node) -> Result<()> {
@@ -131,6 +136,7 @@ impl Scroller {
                 .insert_child(self.wrapper.clone(), index)?;
             self.overlay.borrow_mut().take();
         }
+        self.update_child_culling()?;
         Ok(())
     }
     pub(crate) fn new(owner: Weak<Node>) -> Result<Rc<Self>> {
@@ -164,6 +170,7 @@ impl Scroller {
             content,
             owner,
             size: Cell::new(Size::default()),
+            has_explicit_size: Cell::new(false),
             measured_size: Cell::new(Size::default()),
             layout_pending: Cell::new(false),
             viewport_size: Cell::new(Size::default()),
@@ -174,7 +181,7 @@ impl Scroller {
             corrections: Cell::new(0),
             applying_offset: Cell::new(false),
             report_pending: Cell::new(false),
-            phase: Cell::new(0),
+            phases: Cell::new([0; 2]),
             scroll_value: Cell::new(None),
             pull_value: Cell::new(None),
             pull: Cell::new(0.0),
@@ -197,6 +204,7 @@ impl Scroller {
             snap_limit: Cell::new(None),
             pinch: RefCell::default(),
             selection_progress: RefCell::default(),
+            culled_nodes: RefCell::default(),
         });
         let weak = Rc::downgrade(&scroll);
         scroll.content.borrow_mut().on_custom_measure(move |event| {
@@ -235,6 +243,15 @@ impl Scroller {
                 Ok(())
             })
         });
+        let weak = Rc::downgrade(&scroll);
+        scroll
+            .native
+            .borrow_mut()
+            .on_event(E::ScrollEventOnScrollStart, move |_| {
+                if let Some(scroll) = weak.upgrade() {
+                    scroll.command_started(0);
+                }
+            });
         let weak = Rc::downgrade(&scroll);
         scroll
             .native
@@ -318,11 +335,10 @@ impl Scroller {
                 // ArkUI OnScroll also exposes intermediate animation steps within
                 // one frame, which must not race a synchronized peer's commands.
                 callback(|| {
-                    if let Some(scroll) = weak.upgrade() {
-                        if scroll.applying_offset.get() {
-                            scroll.report()?;
-                        }
-                        scroll.invalidate_shader_input()?;
+                    if let Some(scroll) = weak.upgrade()
+                        && scroll.applying_offset.get()
+                    {
+                        scroll.report()?;
                     }
                     Ok(())
                 })
@@ -334,14 +350,7 @@ impl Scroller {
             .on_event(E::ScrollEventOnDidScroll, move |event| {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
-                        if scroll.applying_offset.get() {
-                            scroll.report()?;
-                            scroll.invalidate_shader_input()?;
-                            return Ok(());
-                        }
-                        scroll.queue_report()?;
-                        scroll.invalidate_shader_input()?;
-                        scroll.phase(event.component_i32(2).unwrap_or(0))?;
+                        scroll.did_scroll(0, event.component_i32(2).unwrap_or(0))?;
                     }
                     Ok(())
                 })
@@ -353,14 +362,7 @@ impl Scroller {
             .on_event(E::ScrollEventOnScrollStop, move |_| {
                 callback(|| {
                     if let Some(scroll) = weak.upgrade() {
-                        if scroll.applying_offset.get() {
-                            scroll.report()?;
-                            scroll.invalidate_shader_input()?;
-                            return Ok(());
-                        }
-                        scroll.queue_report()?;
-                        scroll.invalidate_shader_input()?;
-                        scroll.phase(0)?;
+                        scroll.did_scroll(0, 0)?;
                     }
                     Ok(())
                 })
@@ -416,11 +418,45 @@ impl Scroller {
                 .borrow()
                 .set_attribute(A::Translate, [center.0, center.1, 0.0].into())?;
         }
+        if let Some(owner) = self.owner.upgrade()
+            && !owner.flushing_batch.get()
+        {
+            self.update_child_culling()?;
+        }
         Ok(())
     }
     pub(crate) fn size(&self, size: Size) -> Result<()> {
+        let first_explicit = !self.has_explicit_size.replace(true);
+        self.apply_size(size, first_explicit)
+    }
+    pub(crate) fn sync_inferred_size(&self) -> Result<()> {
+        if self.has_explicit_size.get() {
+            return Ok(());
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return Ok(());
+        };
+        let frame = owner.frame.get();
+        let viewport = Size::new(frame.width, frame.height);
+        let children = owner.children.borrow();
+        let inferred = super::motion::inferred_content_size(
+            viewport,
+            children
+                .iter()
+                .filter_map(Weak::upgrade)
+                .filter(|child| !child.style.borrow().hidden)
+                .map(|child| child.frame.get()),
+        );
+        drop(children);
+        self.apply_size(inferred, false)
+    }
+    fn apply_size(&self, size: Size, force_dirty: bool) -> Result<()> {
         let previous = self.size.replace(size);
-        if previous.width != size.width || previous.height != size.height {
+        let changed = previous.width != size.width || previous.height != size.height;
+        if !changed && !force_dirty {
+            return Ok(());
+        }
+        if changed {
             *self.selection_progress.borrow_mut() = Default::default();
             self.layout_pending.set(true);
         }
@@ -437,8 +473,8 @@ impl Scroller {
         if let Some(owner) = self.owner.upgrade() {
             owner.scroll_watchers.resized(owner.id);
         }
-        if previous.width != size.width || previous.height != size.height {
-            self.invalidate_shader_input()?;
+        if changed {
+            self.invalidate_composite_geometry()?;
         }
         Ok(())
     }
@@ -466,14 +502,24 @@ impl Scroller {
         self.command_to(x + dx, y + dy, animated)
     }
     pub(crate) fn host_stop_scrolling(&self) -> Result<()> {
-        let (x, y) = self
-            .read_native_offset()?
-            .unwrap_or_else(|| self.offset.get());
-        self.to(x, y, false)?;
-        self.report()?;
-        if self.phase.get() != 0 {
-            self.phase(0)?;
+        let stopped = (|| {
+            let (x, y) = self
+                .read_native_offset()?
+                .unwrap_or_else(|| self.offset.get());
+            self.to(x, y, false)?;
+            self.report()
+        })();
+        // ArkUI can suppress OnScrollStop when an animation is aborted. Close
+        // our observed phase even if stopping or reporting the native node fails.
+        let settled = self.update_phases([0; 2]);
+        stopped.and(settled)
+    }
+    pub(crate) fn suspend(&self) -> Result<()> {
+        if self.phases.get() != [0; 2] {
+            self.host_stop_scrolling()?;
         }
+        // NSH zoom motion keeps its existing clock/lifecycle. This only stops
+        // the independently running ArkUI scroll driver.
         Ok(())
     }
     pub(crate) fn mirrored(&self) -> bool {
@@ -488,6 +534,9 @@ impl Scroller {
         keyboard_dismiss: nsh_core::KeyboardDismissMode,
         mirrored: bool,
     ) -> Result<()> {
+        if self.horizontal.get() != horizontal {
+            self.suspend()?;
+        }
         self.scroll_value.set(value);
         self.pull_value.set(pull_value.filter(|_| !horizontal));
         self.horizontal.set(horizontal);
@@ -529,6 +578,11 @@ impl Scroller {
         Ok(())
     }
     pub(crate) fn behavior(self: &Rc<Self>, behavior: &ScrollBehavior) -> Result<()> {
+        if !behavior.enabled || (self.behavior.borrow().zooms() && !behavior.zooms()) {
+            // Stop both native axes while the old topology still describes
+            // their offsets. Disabling the cross axis need not emit Stop.
+            self.suspend()?;
+        }
         let native = self.native.borrow();
         native.set_bool_attribute(
             A::ScrollEnableScrollInteraction,
@@ -635,7 +689,7 @@ impl Scroller {
         if dx != 0.0 || dy != 0.0 {
             self.pay_owed(dx, dy)?;
         }
-        self.invalidate_shader_input()?;
+        self.invalidate_composite_geometry()?;
         Ok(())
     }
     pub(crate) fn to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
@@ -644,37 +698,65 @@ impl Scroller {
                 .owner
                 .upgrade()
                 .is_some_and(|owner| !owner.platform.get().reduce_motion);
+        let previous = self.phases.get();
         let was_applying = self.applying_offset.replace(true);
-        let result = (|| -> Result<()> {
-            if let Some(cross) = self.cross.borrow().as_ref()
-                && self.behavior.borrow().zooms()
-            {
-                cross.borrow().set_number_slice_attribute(
-                    A::ScrollOffset,
-                    &[
-                        N::Float(x),
-                        N::Float(0.0),
-                        N::Int(if animated { 250 } else { 0 }),
-                    ],
-                )?;
-            }
-            self.native.borrow().set_number_slice_attribute(
+        let scale = self.owner.upgrade().map_or(1.0, |owner| owner.scale.get());
+        let zooms = self.behavior.borrow().zooms();
+        let apply = |native: &NativeNode, axis: usize, position: (f32, f32), horizontal: bool| {
+            let component = usize::from(!horizontal);
+            // Query this node's effective axis, not the merged offset: a cross
+            // getter failure must not turn the main node's zero into a no-op.
+            let current = if animated && self.phases.get()[axis] == 2 {
+                native
+                    .borrow()
+                    .f32_attribute(A::ScrollOffset, component)
+                    .ok()
+            } else {
+                None
+            };
+            native.borrow().set_number_slice_attribute(
                 A::ScrollOffset,
                 &[
-                    N::Float(if self.behavior.borrow().zooms() {
-                        0.0
-                    } else {
-                        x
-                    }),
-                    N::Float(y),
+                    N::Float(position.0),
+                    N::Float(position.1),
                     N::Int(if animated { 250 } else { 0 }),
                 ],
             )?;
-            Ok(())
+            let mut phases = self.phases.get();
+            phases[axis] = super::motion::command_phase(
+                phases[axis],
+                animated,
+                current,
+                if horizontal { position.0 } else { position.1 },
+                scale,
+            );
+            self.phases.set(phases);
+            Ok::<(), crate::render::node::Error>(())
+        };
+        let result = (|| -> Result<()> {
+            if let Some(cross) = self.cross.borrow().as_ref()
+                && zooms
+            {
+                apply(cross, 1, (x, 0.0), true)?;
+            }
+            apply(
+                &self.native,
+                0,
+                (if zooms { 0.0 } else { x }, y),
+                !zooms && self.horizontal.get(),
+            )
         })();
         self.applying_offset.set(was_applying);
-        result?;
-        self.invalidate_shader_input()
+        // Native Start is synchronous. Publish after both commands, so handing
+        // motion from one axis to the other cannot settle the shared value.
+        // A failed second command still leaves the first command's effects.
+        let phase = if was_applying {
+            Ok(())
+        } else {
+            self.publish_phases(previous)
+        };
+        let visuals = self.flush_scroll_visuals();
+        result.and(phase).and(visuals)
     }
     pub(crate) fn by(&self, dx: f32, dy: f32) -> Result<()> {
         self.corrections.set(self.corrections.get().wrapping_add(1));
@@ -721,13 +803,148 @@ impl Scroller {
             ));
         }
         self.report()?;
-        self.invalidate_shader_input()?;
+        self.flush_scroll_visuals()?;
         Ok(())
     }
-    fn invalidate_shader_input(&self) -> Result<()> {
+    pub(crate) fn update_child_culling(&self) -> Result<()> {
+        let clear_all = |culled: &RefCell<Vec<Weak<Node>>>| -> Result<()> {
+            let prev = std::mem::take(&mut *culled.borrow_mut());
+            for node in prev.into_iter().filter_map(|w| w.upgrade()) {
+                if node.active.get() {
+                    node.set_culled_by_scroll(false)?;
+                }
+            }
+            Ok(())
+        };
+        let Some(owner) = self.owner.upgrade() else {
+            return clear_all(&self.culled_nodes);
+        };
+        let viewport = self.viewport_size.get();
+        if viewport.width <= 0.0
+            || viewport.height <= 0.0
+            || self.mirrored.get()
+            || !owner.active.get()
+            || !owner.ancestors_allow_scroll_cull()
+        {
+            return clear_all(&self.culled_nodes);
+        }
+        let offset = self
+            .read_native_offset()?
+            .unwrap_or_else(|| self.offset.get());
+        self.offset.set(offset);
+        let center = self.centering.get();
+        let zoom = self.zoom.get().max(0.01);
+        let inset = self.behavior.borrow().content_inset;
+        let margin = 256.0_f32;
+        let vx0 = (offset.0 - center.0 - inset.left.0) / zoom - margin;
+        let vy0 = (offset.1 - center.1 - inset.top.0) / zoom - margin;
+        let vx1 = (offset.0 - center.0 + viewport.width + inset.right.0) / zoom + margin;
+        let vy1 = (offset.1 - center.1 + viewport.height + inset.bottom.0) / zoom + margin;
+
+        // Single-pass bottom-up traversal: every node is visited at most once,
+        // preserving exact equivalence with nested outside + can_cull_subtree walks.
+        fn visit(
+            node: &Rc<Node>,
+            window: (f32, f32, f32, f32),
+            depth: u8,
+            emit: bool,
+            need_subtree_cull: bool,
+            out: &mut Vec<Rc<Node>>,
+        ) -> bool {
+            if !emit && !need_subtree_cull {
+                return true;
+            }
+            if node.style.borrow().hidden {
+                return !need_subtree_cull || node.can_cull_subtree_inner();
+            }
+            let (vx0, vy0, vx1, vy1) = window;
+            let outside = if emit {
+                let (x0, y0, x1, y1) = node.scroll_ink_bounds();
+                x1 < vx0 || x0 > vx1 || y1 < vy0 || y0 > vy1
+            } else {
+                false
+            };
+            let self_subtree_ok = if need_subtree_cull || outside {
+                node.self_allows_scroll_cull()
+            } else {
+                true
+            };
+            let self_can_try_cull =
+                outside && self_subtree_ok && node.self_transform_allows_scroll_cull();
+            let child_need_subtree = (need_subtree_cull && self_subtree_ok) || self_can_try_cull;
+            let child_emit = emit && depth < 6 && node.allows_scroll_group_walk();
+            if !child_emit && !child_need_subtree {
+                return self_subtree_ok;
+            }
+            let out_start = out.len();
+            let f = node.frame.get();
+            let child_window = (vx0 - f.x, vy0 - f.y, vx1 - f.x, vy1 - f.y);
+            let mut children_cullable = true;
+            for child in node.children.borrow().iter().filter_map(Weak::upgrade) {
+                if !child_emit && !children_cullable {
+                    break;
+                }
+                let ok = visit(
+                    &child,
+                    child_window,
+                    depth + 1,
+                    child_emit,
+                    child_need_subtree && children_cullable,
+                    out,
+                );
+                children_cullable &= ok;
+            }
+            let subtree_cullable = self_subtree_ok && children_cullable;
+            if self_can_try_cull && subtree_cullable {
+                out.truncate(out_start);
+                out.push(node.clone());
+            }
+            subtree_cullable
+        }
+
+        let mut next = Vec::new();
+        for child in owner.children.borrow().iter().filter_map(Weak::upgrade) {
+            visit(&child, (vx0, vy0, vx1, vy1), 0, true, false, &mut next);
+        }
+        let mut outside = rustc_hash::FxHashSet::default();
+        for node in &next {
+            outside.insert(Rc::as_ptr(node));
+            node.set_culled_by_scroll(true)?;
+        }
+        let prev = std::mem::take(&mut *self.culled_nodes.borrow_mut());
+        for old in prev.into_iter().filter_map(|w| w.upgrade()) {
+            if old.active.get() && !outside.contains(&Rc::as_ptr(&old)) {
+                old.set_culled_by_scroll(false)?;
+            }
+        }
+        *self.culled_nodes.borrow_mut() = next.into_iter().map(|n| Rc::downgrade(&n)).collect();
+        Ok(())
+    }
+    fn flush_scroll_visuals(&self) -> Result<()> {
+        self.update_child_culling()?;
+        if let Some(owner) = self.owner.upgrade() {
+            // ArkUI exports the scrolled pixels; NativeImage's buffer listener
+            // wakes their shader consumer. The clipped viewport's composite
+            // settings do not change with its offset. Scene coordinates change
+            // only when this Scroll itself participates in an active Scene root.
+            owner.shaders.invalidate_visibility();
+            if owner.scene_active() {
+                owner.invalidate_scene();
+            }
+            // Keep layout's final coordinates and any scroll-bound animation
+            // updates in this native turn, before ArkUI submits its frame.
+            if !owner.flushing_batch.get() {
+                owner.flush_arkui()?;
+            }
+        }
+        Ok(())
+    }
+    fn invalidate_composite_geometry(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             owner.invalidate_composites();
-            owner.flush_arkui()?;
+            if !owner.flushing_batch.get() {
+                owner.flush_arkui()?;
+            }
         }
         Ok(())
     }
@@ -751,7 +968,10 @@ impl Scroller {
             self.offset.set(offset);
             self.pin_sticky()?;
             if let Some(owner) = self.owner.upgrade() {
-                owner.invalidate_scene();
+                owner.shaders.invalidate_visibility();
+                if owner.scene_active() {
+                    owner.invalidate_scene();
+                }
                 if let Some(value) = self.scroll_value.get() {
                     owner.animator.set(
                         value,
@@ -809,12 +1029,18 @@ impl Scroller {
         // UIKit/Android report a position change once. ArkUI also reports
         // programmatic moves later in OnDidScroll and again in OnScrollStop;
         // replaying those offsets makes synchronized scroll views feed back.
-        if !self.reported.update(reported, self.corrections.get()) {
+        if !self
+            .reported
+            .update(reported, self.zoom.get(), self.corrections.get())
+        {
             return Ok(());
         }
 
         if let Some(owner) = self.owner.upgrade() {
-            owner.invalidate_scene();
+            owner.shaders.invalidate_visibility();
+            if owner.scene_active() {
+                owner.invalidate_scene();
+            }
             let selection = owner
                 .selected_text
                 .borrow()
@@ -856,6 +1082,7 @@ impl Scroller {
         Ok(())
     }
     pub(crate) fn dispose(&self) -> Result<()> {
+        self.phases.set([0; 2]);
         self.zoom_motion.set(None);
         use ohos_arkui_binding::component::attribute::ArkUIGesture;
         if let Some(gesture) = self.pinch.borrow_mut().take()
@@ -1151,7 +1378,7 @@ impl Scroller {
                     offset: self.offset.get(),
                 },
                 to,
-                start: owner.animator.now(),
+                start: None,
             }));
             owner.animator.track_scroll(&owner);
             Ok(())
@@ -1160,8 +1387,16 @@ impl Scroller {
         }
     }
     pub(crate) fn tick(&self, now: f64) -> Result<bool> {
-        let Some(motion) = self.zoom_motion.get() else {
-            return Ok(false);
+        if self.phases.get() != [0; 2]
+            && self
+                .owner
+                .upgrade()
+                .is_none_or(|owner| !owner.paint_visible())
+        {
+            self.suspend()?;
+        }
+        let Some(mut motion) = self.zoom_motion.get() else {
+            return Ok(self.phases.get() != [0; 2]);
         };
         let (frame, running) = if self
             .owner
@@ -1172,11 +1407,11 @@ impl Scroller {
         } else {
             motion.sample(now)
         };
+        // Anchor and advance in the native frame clock's domain. Input can
+        // arrive between VSync callbacks, whose timestamps include delivery lag.
+        self.zoom_motion.set(running.then_some(motion));
         self.apply_zoom(frame)?;
-        if !running {
-            self.zoom_motion.set(None);
-        }
-        Ok(running)
+        Ok(running || self.phases.get() != [0; 2])
     }
     fn apply_zoom(&self, frame: ZoomFrame) -> Result<()> {
         let Some(owner) = self.owner.upgrade() else {
@@ -1200,16 +1435,20 @@ impl Scroller {
             self.report()?;
             return Ok(());
         }
+        self.zoom_offset
+            .set(Some((frame.offset.0, frame.offset.1, false)));
+        // Native writes may report scrolling synchronously. Publish the scale
+        // first, as didZoom does upstream, so every offset carries this scale.
+        owner.control.zoom(owner.id, frame.scale);
         let content = self.content.borrow();
         content.set_attribute(A::Scale, vec![frame.scale, frame.scale].into())?;
         content.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
         drop(content);
         let viewport = owner.frame.get();
         self.viewport(Size::new(viewport.width, viewport.height))?;
-        self.zoom_offset
-            .set(Some((frame.offset.0, frame.offset.1, false)));
-        owner.control.zoom(owner.id, frame.scale);
-        Ok(())
+        // A scale-only final sample need not cause another native offset or
+        // layout callback. Pair it with a report before the animation stops.
+        self.report()
     }
     fn configure_axes(self: &Rc<Self>) -> Result<()> {
         use ohos_arkui_binding::component::attribute::ArkUIEvent;
@@ -1227,16 +1466,33 @@ impl Scroller {
                 let weak = Rc::downgrade(self);
                 cross
                     .borrow_mut()
-                    .on_event(E::ScrollEventOnDidScroll, move |_| {
+                    .on_event(E::ScrollEventOnScrollStart, move |_| {
+                        if let Some(scroll) = weak.upgrade() {
+                            scroll.command_started(1);
+                        }
+                    });
+                let weak = Rc::downgrade(self);
+                cross
+                    .borrow_mut()
+                    .on_event(E::ScrollEventOnDidScroll, move |event| {
                         callback(|| {
-                            if let Some(scroll) = weak.upgrade() {
-                                if scroll.applying_offset.get() {
-                                    scroll.report()?;
-                                    scroll.invalidate_shader_input()?;
-                                    return Ok(());
-                                }
-                                scroll.queue_report()?;
-                                scroll.invalidate_shader_input()?;
+                            if let Some(scroll) = weak.upgrade()
+                                && scroll.behavior.borrow().zooms()
+                            {
+                                scroll.did_scroll(1, event.component_i32(2).unwrap_or(0))?;
+                            }
+                            Ok(())
+                        });
+                    });
+                let weak = Rc::downgrade(self);
+                cross
+                    .borrow_mut()
+                    .on_event(E::ScrollEventOnScrollStop, move |_| {
+                        callback(|| {
+                            if let Some(scroll) = weak.upgrade()
+                                && scroll.behavior.borrow().zooms()
+                            {
+                                scroll.did_scroll(1, 0)?;
                             }
                             Ok(())
                         });
@@ -1426,15 +1682,60 @@ impl Scroller {
         }
         Ok(())
     }
-    fn phase(&self, phase: i32) -> Result<()> {
-        let previous = self.phase.replace(phase);
+    fn command_started(&self, axis: usize) {
+        // The C event is synchronous with AnimateTo. Only that call identifies
+        // Start as programmatic animation; ordinary Start may instead be a drag
+        // and gets its phase from DidScroll. Never infer a start from success.
+        if self.applying_offset.get() {
+            let mut phases = self.phases.get();
+            if phases[axis] == 0 {
+                phases[axis] = 2;
+                self.phases.set(phases);
+            }
+        }
+    }
+    fn did_scroll(&self, axis: usize, phase: i32) -> Result<()> {
+        let applying = self.applying_offset.get();
+        let report = if applying {
+            self.report()
+        } else {
+            self.queue_report()
+        };
+        let visuals = self.flush_scroll_visuals();
+        let observed = if applying {
+            // Stop from the replaced driver must not settle between the two
+            // native commands. The caller publishes their combined result.
+            Ok(())
+        } else {
+            let mut phases = self.phases.get();
+            phases[axis] = phase;
+            self.update_phases(phases)
+        };
+        // Reporting/painting errors cannot keep a stopped native driver alive.
+        report.and(visuals).and(observed)
+    }
+    fn update_phases(&self, phases: [i32; 2]) -> Result<()> {
+        let previous = self.phases.replace(phases);
+        self.publish_phases(previous)
+    }
+    fn publish_phases(&self, previous: [i32; 2]) -> Result<()> {
+        let previous = super::motion::combined_phase(previous);
+        let phase = super::motion::combined_phase(self.phases.get());
+        if previous == 0
+            && phase != 0
+            && let Some(owner) = self.owner.upgrade()
+        {
+            // Native drag and fling are real ongoing frame consumers, even
+            // when a scroll report produces no NSH animation or next RAF.
+            owner.animator.track_scroll(&owner);
+        }
         if previous == phase {
             return Ok(());
         }
         // Flush any queued offset before emitting phase boundaries so the
         // engine sees the final scroll position before ScrollDragEnd /
         // MomentumEnd / ScrollEnd and no deferred report trails behind rest.
-        self.report()?;
+        let report = self.report();
         if let Some(owner) = self.owner.upgrade() {
             let (x, y) = self.offset.get();
             let payload = EventPayload::Scroll(Point::new(Points(x), Points(y)));
@@ -1454,9 +1755,12 @@ impl Scroller {
                 owner.emit(EventKind::MomentumStart, payload.clone());
             }
             if phase == 0 {
+                if let Some(value) = self.scroll_value.get() {
+                    owner.animator.settle(value);
+                }
                 owner.emit(EventKind::ScrollEnd, payload);
             }
         }
-        Ok(())
+        report
     }
 }

@@ -17,7 +17,7 @@ use ohos_arkui_binding::{
     api::node_content::NodeContent,
     common::{
         error::ArkUIResult,
-        node::{ArkUINode, ArkUINodeRaw},
+        node::{ArkUINode, ImportedFrameNode},
     },
     component::attribute::ArkUICommonAttribute,
 };
@@ -207,14 +207,19 @@ struct RetainedContent {
     env: Env,
     frame: Option<ObjectRef>,
     slot: Option<ObjectRef>,
+    imported: ImportedFrameNode,
 }
 
+// Importing a BuilderNode root creates a C handle and increments its UINode
+// reference count independently of the ArkTS BuilderNode and the N-API reference.
 impl RetainedContent {
     fn new(env: &Env, frame: &Object<'_>, slot: Option<&Object<'_>>) -> Result<Self> {
+        let imported = ImportedFrameNode::new(env, frame)?;
         let mut retained = Self {
             env: *env,
             frame: Some(frame.create_ref()?),
             slot: None,
+            imported,
         };
         retained.slot = slot.map(Object::create_ref).transpose()?;
         Ok(retained)
@@ -571,12 +576,9 @@ impl NativeAttachment {
             ));
         }
         let retained = RetainedContent::new(env, content, slot)?;
-        // SAFETY: conversion is scoped to this active N-API callback; `retained`
-        // keeps the FrameNode alive until after the native edge is detached.
-        let raw = unsafe { ArkUINodeRaw::from_napi_value(env.raw(), content.raw()) }?;
-        // SAFETY: the target retains the FrameNode and never disposes its borrowed native node.
+        // SAFETY: retained owns the imported handle until after the native edge is detached.
         let child = Rc::new(RefCell::new(
-            unsafe { raw.borrowed_node() }
+            unsafe { retained.imported.borrowed_node() }
                 .map_err(|error| Error::from_reason(error.to_string()))?,
         ));
         let handle = slot

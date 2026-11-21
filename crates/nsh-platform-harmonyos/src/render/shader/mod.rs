@@ -32,7 +32,7 @@ use crate::app::frame_rate::FrameRate;
 /// The shader views of a surface, on the UI thread.
 pub(crate) struct Shaders {
     effects: effects::Effects,
-    /// The surface's VSync, which paces the worker.
+    /// Shared frame-rate arbitration; the UI display pump paces the worker.
     rate: Arc<FrameRate>,
     worker: RefCell<Option<Rc<Worker>>>,
     generation: Cell<u32>,
@@ -119,8 +119,11 @@ impl Shaders {
         self.effects.hosts_retainable()
     }
 
-    pub(crate) fn has_navigation_layer(&self, target_id: NodeId) -> bool {
-        self.effects.has_navigation_layer(target_id)
+    pub(crate) fn holds_root_input(&self) -> bool {
+        self.effects.holds_root_input()
+    }
+    pub(crate) fn navigation_key(&self, target_id: NodeId) -> Option<navigation::Key> {
+        self.effects.navigation_key(target_id)
     }
     pub(crate) fn reconcile_hosts_now(&self) -> Result<()> {
         self.reconcile_hosts()
@@ -183,6 +186,7 @@ impl Shaders {
                 }
             };
             // Under the app's children, after the other platform-owned ones.
+            owner.promote_direct_paint()?;
             let index = owner.child_index(0);
             if let Err(error) = owner
                 .native
@@ -254,6 +258,13 @@ impl Shaders {
         };
         end.and(hosts)
     }
+    pub(crate) fn modal_presentation_changed(&self, owner: &Rc<Node>) -> Result<()> {
+        self.effects.modal_presentation_changed(owner)
+    }
+    pub(crate) fn modal_shown(&self, owner: &Rc<Node>, shown: bool) -> Result<()> {
+        self.effects.modal_shown(owner, shown)
+    }
+
     pub(crate) fn finish_modal_close(&self, owner: &Rc<Node>, had_shader: bool) -> Result<()> {
         let close = self.effects.finish_modal_close(owner, had_shader);
         let hosts = if !owner.flushing_batch.get() {
@@ -341,9 +352,9 @@ impl Shaders {
         }
     }
 
-    /// A display frame: tells the worker what changed of its views (in
-    /// sight, size) and gives each surface its view's box. The worker keeps
-    /// its own pace, so this never asks for another frame.
+    /// Synchronizes visibility, size and each surface's view box. The worker
+    /// receives the display pump's timestamp separately, so this never advances
+    /// animation time.
     pub(crate) fn frame(&self) -> Result<bool> {
         let effects_due = self.effects.frame()?;
         let worker = self.worker.borrow();
@@ -413,12 +424,12 @@ impl Shaders {
     }
 
     pub(crate) fn close(&self) -> Result<()> {
-        self.effects.cancel_navigation("close")?;
+        let cancelled = self.effects.cancel_navigation("close");
         let ids: Vec<_> = self.views.borrow().keys().copied().collect();
         for id in ids {
             self.remove(id);
         }
-        self.collect()
+        cancelled.and(self.collect())
     }
     pub(crate) fn collect(&self) -> Result<()> {
         let worker = self.worker.borrow();

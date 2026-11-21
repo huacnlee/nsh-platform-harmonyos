@@ -1,8 +1,8 @@
-import { PicturePixels } from "./NativeViews";
 import {
   AbilityConstant,
   AbilityLifecycleCallback,
   Configuration,
+  ConfigurationConstant,
   EnvironmentCallback,
   UIAbility,
   common,
@@ -25,8 +25,11 @@ import {
   WebEventPayload,
 } from "./NativeEditors";
 import { Batch, NshPlugin } from "./NshPlugin";
+import { NativeMobileControl } from "./NativeMobileControl";
 import { NativeTabBar, TabBarContext } from "./NativeTabBar";
+import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames";
 
+import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -46,6 +49,7 @@ interface AvoidAreaPayload {
 
 interface HostInitPayload {
   speechAvailable: boolean;
+  shareAvailable: boolean;
   sdkApiVersion: number;
   deviceType: string;
   cacheDir: string;
@@ -87,7 +91,11 @@ interface PickedDescriptor {
 }
 
 interface NshNativeModule {
-  nshRegisterSessionBinder(sdkApiVersion: number, binder: (uiContext: UIContext) => number): void;
+  nshRegisterSessionBinder(
+    sdkApiVersion: number,
+    binder: (uiContext: UIContext) => number,
+    alerts: (options: NativeAlertOptions) => () => void,
+  ): void;
   nshCreateSession(
     init: HostInitPayload,
     platformWindowId: number,
@@ -95,6 +103,7 @@ interface NshNativeModule {
     applyBatch: (batch: Batch) => void,
     onCommand: (command: HostCommandPayload) => void,
     tabBar: (context: TabBarContext) => object,
+    frames: (callbacks: FrameCallbacks) => (request: FrameRequest) => void,
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
@@ -112,6 +121,7 @@ interface NshNativeModule {
     timeZone?: string,
     regionalLocale?: string,
     is24HourClock?: boolean,
+    fontChanged?: boolean,
   ): void;
   nshUpdateAccessibility(sessionId: number, screenReader?: boolean, reduceMotion?: boolean): void;
   nshUpdateWindow(
@@ -126,7 +136,6 @@ interface NshNativeModule {
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
-  nshNativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshViewAction(action: MenuActionPayload): boolean;
@@ -219,7 +228,7 @@ function readSystemLocaleDetails(): SystemLocaleDetails {
   } catch {}
   let regionalLocale: string | undefined = undefined;
   try {
-    regionalLocale = i18n.System.getSystemLocale();
+    regionalLocale = i18n.System.getSystemLocaleInstance().toString();
   } catch {}
   let is24HourClock: boolean | undefined = undefined;
   try {
@@ -232,10 +241,19 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private readonly ui: UIContext;
   private readonly mod: NshNativeModule;
   private active: boolean = true;
+  private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
     this.mod = mod;
+  }
+
+  colorMode(): ThemeColorMode {
+    return this.themeColorMode;
+  }
+
+  setColorMode(colorMode: ThemeColorMode): void {
+    this.themeColorMode = colorMode;
   }
 
   deactivate(): void {
@@ -283,12 +301,6 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     } catch (error) {
       console.error(`[NSH] retireNativeNode(${targetId}) failed: ${String(error)}`);
       return false;
-    }
-  }
-
-  nativePicture(targetId: number, generation: number, picture?: PicturePixels, error?: string): void {
-    if (this.active) {
-      this.mod.nshNativePicture(targetId, generation, picture, error);
     }
   }
 
@@ -397,6 +409,11 @@ class HostSession {
   private readonly appContext?: common.ApplicationContext;
   private readonly windowStage?: window.WindowStage;
   private readonly mainWindow: window.Window;
+  private readonly mobileControls: Set<NativeMobileControl> = new Set();
+  private readonly tabBars: Set<NativeTabBar> = new Set();
+  private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  private systemColorMode: number = -1;
+  private fontId: string = "";
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
@@ -440,6 +457,7 @@ class HostSession {
 
   private readonly onWindowSizeChange = (_size: window.Size): void => {
     this.syncWindowMetrics();
+    this.refreshMobileControls();
   };
 
   private readonly onKeyboardWillChange = (info: window.KeyboardInfo): void => {
@@ -502,14 +520,18 @@ class HostSession {
         ? "active"
         : "inactive"
       : "background";
+    this.systemColorMode = config?.colorMode ?? -1;
+    this.fontId = config?.fontId ?? "";
     this.sessionId = mod.nshCreateSession(
       {
+        shareAvailable:
+          deviceInfo.sdkApiVersion >= 18 && canIUse("SystemCapability.Collaboration.SystemShare"),
         speechAvailable: canIUse("SystemCapability.AI.SpeechRecognizer"),
         sdkApiVersion: deviceInfo.sdkApiVersion,
         deviceType: deviceInfo.deviceType ?? "phone",
         cacheDir: abilityContext.cacheDir,
         filesDir: abilityContext.filesDir,
-        colorMode: config?.colorMode ?? -1,
+        colorMode: this.systemColorMode,
         fontSizeScale: config?.fontSizeScale ?? 1.0,
         language,
         languages: localeDetails.languages,
@@ -533,7 +555,18 @@ class HostSession {
       (command: HostCommandPayload): void => {
         this.handleHostCommand(command);
       },
-      (context: TabBarContext): object => new NativeTabBar(uiContext, context),
+      (context: TabBarContext): object =>
+        context.name === "nsh/switch" || context.name === "nsh/date-time-picker"
+          ? new NativeMobileControl(
+              uiContext,
+              context,
+              mainWindow,
+              this.mobileControls,
+              this.colorMode,
+            )
+          : new NativeTabBar(uiContext, context, this.tabBars, this.colorMode),
+      (callbacks: FrameCallbacks): ((request: FrameRequest) => void) =>
+        createFrameSource(uiContext, callbacks),
     );
 
     this.system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
@@ -608,15 +641,28 @@ class HostSession {
     }
   }
 
+  // Remeasure mounted system controls after changes to fonts, language or window size.
+  private refreshMobileControls(): void {
+    this.mobileControls.forEach((control: NativeMobileControl): void => control.refresh());
+  }
+
   onConfigurationUpdated(newConfig: Configuration): void {
     if (this.closed) {
       return;
     }
     try {
+      if (this.colorMode === ThemeColorMode.SYSTEM && newConfig.colorMode !== undefined) {
+        this.systemColorMode = newConfig.colorMode;
+      }
+      let fontChanged = false;
+      if (newConfig.fontId !== undefined && newConfig.fontId !== this.fontId) {
+        this.fontId = newConfig.fontId;
+        fontChanged = true;
+      }
       const localeDetails = readSystemLocaleDetails();
       this.mod.nshUpdateConfig(
         this.sessionId,
-        newConfig.colorMode ?? -1,
+        this.systemColorMode,
         newConfig.fontSizeScale ?? 1.0,
         newConfig.language ?? "",
         i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
@@ -626,7 +672,10 @@ class HostSession {
         localeDetails.timeZone,
         localeDetails.regionalLocale,
         localeDetails.is24HourClock,
+        fontChanged,
       );
+      this.refreshMobileControls();
+      this.tabBars.forEach((bar: NativeTabBar): void => bar.refresh());
     } catch {}
   }
 
@@ -636,6 +685,13 @@ class HostSession {
     }
     this.closed = true;
     HostSession.windows.delete(this.windowName);
+    if (this.colorMode !== ThemeColorMode.SYSTEM) {
+      try {
+        this.appContext?.setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
+      } catch {}
+    }
+    this.mobileControls.clear();
+    this.tabBars.clear();
     this.system.close();
     this.updateCursor("auto");
     this.updateSystemBars();
@@ -768,7 +824,13 @@ class HostSession {
     ];
     const keyboard = safeAvoidArea(this.mainWindow, window.AvoidAreaType.TYPE_KEYBOARD);
     try {
-      this.mod.nshUpdateWindow(this.sessionId, this.windowId, visual, keyboard, maximumRefreshRate(this.mainWindow));
+      this.mod.nshUpdateWindow(
+        this.sessionId,
+        this.windowId,
+        visual,
+        keyboard,
+        maximumRefreshRate(this.mainWindow),
+      );
     } catch {}
   }
 
@@ -913,6 +975,12 @@ class HostSession {
       return;
     }
 
+    if (command.kind === "back") {
+      // Programmatic router back resumes the host's default return without
+      // re-entering the page's onBackPress and its NSH BackHandler listeners.
+      this.runtimeContext.getUIContext().getRouter().back();
+      return;
+    }
     if (command.kind === "system") {
       this.system
         .execute(command.openId ?? 0, command.system ?? { op: "" })
@@ -933,6 +1001,42 @@ class HostSession {
     }
     if (command.kind === "video-fullscreen" || command.kind === "status-bar") {
       this.updateSystemBars(command);
+      return;
+    }
+    if (command.kind === "appearance") {
+      const mode =
+        command.text === "dark"
+          ? ThemeColorMode.DARK
+          : command.text === "light"
+            ? ThemeColorMode.LIGHT
+            : ThemeColorMode.SYSTEM;
+      if (mode !== this.colorMode) {
+        const wasSystem = this.colorMode === ThemeColorMode.SYSTEM;
+        this.colorMode = mode;
+        const appMode =
+          mode === ThemeColorMode.DARK
+            ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+            : mode === ThemeColorMode.LIGHT
+              ? ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT
+              : ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET;
+        try {
+          if (wasSystem && mode !== ThemeColorMode.SYSTEM) {
+            const currentSystem =
+              this.systemColorMode === ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+                ? ConfigurationConstant.ColorMode.COLOR_MODE_DARK
+                : ConfigurationConstant.ColorMode.COLOR_MODE_LIGHT;
+            if (currentSystem !== appMode) {
+              this.appContext?.setColorMode(currentSystem);
+            }
+          }
+          this.appContext?.setColorMode(appMode);
+        } catch {}
+        this.mobileControls.forEach((control: NativeMobileControl): void =>
+          control.setColorMode(mode),
+        );
+        this.tabBars.forEach((bar: NativeTabBar): void => bar.setColorMode(mode));
+        this.runtimeContext.setColorMode(mode);
+      }
       return;
     }
 
@@ -1075,10 +1179,15 @@ class HostSession {
 getNativeModule().nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
+  showNativeAlert,
 );
 
 function maximumRefreshRate(mainWindow: window.Window): number {
   const id = mainWindow.getWindowProperties().displayId;
-  const screen = id === undefined ? display.getDefaultDisplaySync() : display.getDisplayByIdSync(id);
-  return (screen.supportedRefreshRates ?? []).reduce((maximum: number, hz: number): number => Math.max(maximum, hz), screen.refreshRate);
+  const screen =
+    id === undefined ? display.getDefaultDisplaySync() : display.getDisplayByIdSync(id);
+  return (screen.supportedRefreshRates ?? []).reduce(
+    (maximum: number, hz: number): number => Math.max(maximum, hz),
+    screen.refreshRate,
+  );
 }

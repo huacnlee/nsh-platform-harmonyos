@@ -112,12 +112,6 @@ impl Video {
         }
         Ok(())
     }
-    pub(crate) fn tick(&self, now: f64) -> Result<bool> {
-        if self.closed.get() {
-            return Ok(false);
-        }
-        self.ui.tick(now)
-    }
     pub(crate) fn frame(&self, size: Size) -> Result<()> {
         if self.closed.get() {
             return Ok(());

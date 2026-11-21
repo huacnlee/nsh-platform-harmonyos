@@ -65,7 +65,12 @@ export class NativeNotifications {
           : "default",
     };
   }
-  async show(name: string, title: string, body: string, silent: boolean = false): Promise<NotificationReply> {
+  async show(
+    name: string,
+    title: string,
+    body: string,
+    silent: boolean = false,
+  ): Promise<NotificationReply> {
     const agent = await wantAgent.getWantAgent({
       wants: [
         {

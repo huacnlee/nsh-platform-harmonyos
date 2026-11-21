@@ -5,6 +5,7 @@ pub(crate) mod entry;
 pub(crate) mod environment;
 pub(crate) mod features;
 pub(crate) mod frame_rate;
+pub(crate) mod frame_source;
 pub(crate) mod options;
 pub(crate) mod runtime;
 pub(crate) mod session;

@@ -1270,6 +1270,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "env_filter"
+version = "2.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2316,9 +2325,9 @@ dependencies = [
 
 [[package]]
 name = "js-sys"
-version = "0.3.107"
+version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8dc09d2154098bbf4ef54eab6b117a3c24cbbffe94046b16ee6d6d4510584d3a"
+checksum = "0e0c1080212aad755ea003d18543e8768dd432c48819efd73a7bf1e39b7a5a3a"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -2760,9 +2769,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-base"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7bae08ed29b11f2595cf5b4ce406430b14493d24f07f2f4a9f068188fb35079"
+checksum = "e083cbd14b906efbd94076939c7effd43fa3d1574f1d555919d099e9e0ec3e1c"
 dependencies = [
  "chrono",
  "html5ever",
@@ -2791,9 +2800,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-bundler"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b50ea11808a4253e9a821b287b06665b23deee9d2d5da8477bcce2258753817a"
+checksum = "80ecc1a77d328a278f75365e841324db31805b8da948f54a7ceb5f3840973b15"
 dependencies = [
  "anyhow",
  "dunce",
@@ -2818,11 +2827,12 @@ dependencies = [
 
 [[package]]
 name = "nsh-core"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f93e2fa3cc4e18b393b7935d5551deba8330968f69f2a1b2ff1928cb125782a"
+checksum = "4b45a8b194c6879bcb26c6e430b804e49e97ec0fea5fad8c78d7710fd41f74a6"
 dependencies = [
  "cap-std",
+ "chrono",
  "crc32fast",
  "flate2",
  "futures-util",
@@ -2851,17 +2861,17 @@ dependencies = [
  "ttf-parser",
  "unicode-linebreak",
  "unicode-properties",
+ "ureq",
  "url",
- "webpki-roots 1.0.11",
  "windows-sys 0.61.2",
  "wuff",
 ]
 
 [[package]]
 name = "nsh-dev"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc746247e56b895185300d03794e5e0f5b2e8a9cc956f320fe97c5006725aaa6"
+checksum = "5a5a74aadf76568a5ee98a2d96e429e93c99bec736d54172bdc734a68cbe5bd0"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -2876,11 +2886,12 @@ dependencies = [
 
 [[package]]
 name = "nsh-engine"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4c0dda64a09a18ae35ba04be534f140d6f3cbcdb30a81b1926dc4718fefaefd2"
+checksum = "b4de944c36204b3f778b4fcf90373496d29507e8d38fb5e92a6e29a4cce637d7"
 dependencies = [
  "crossbeam-channel",
+ "env_filter 2.0.0",
  "libc",
  "log",
  "nsh-core",
@@ -2892,14 +2903,15 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde_json",
  "tokio",
+ "ureq",
  "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "nsh-i18n"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4570770dee21d88d2c364e091aa64a53af38480a39d75ee0feec0811a2c0dec"
+checksum = "f9cfb1cfa50808fc3d66147cfb03f5075269157ff392fbda6104eeb3c3b25ee5"
 dependencies = [
  "rust-i18n-support",
  "serde_json",
@@ -2907,9 +2919,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-js"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fda1d0dd5fff1c92ce576cae439317a0d30116a3d260c862eeeccb1dd6a3e713"
+checksum = "27702dc84976d755e24f736d0022689429c421549401b7fd3fa5f1a8cd49dc72"
 dependencies = [
  "futures-util",
  "getrandom 0.4.3",
@@ -2931,9 +2943,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-macros"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eefb6467662ffb652997c7c252919488aa4723807e3a0f17fff3a8c01c29b22f"
+checksum = "6f1b3ce01247cac072395d42177725e7972de498eb148d37443196d870cdaf2b"
 dependencies = [
  "imagesize 0.15.0",
  "proc-macro2",
@@ -2945,9 +2957,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-package"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e292d17debb97b13445c7861dbeb8d39ea424d82426a1b11f60b2703f49b261"
+checksum = "200354039215917efcfadb5d73605a3a9d611753755da3cf99c40601f0677e3b"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3026,9 +3038,9 @@ dependencies = [
 
 [[package]]
 name = "nsh-testing"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54ac8c9e9d8205b03748bf3485689b3ea3bd1f8f1b8fbc0b6f66ff19c67d655f"
+checksum = "f59bc508ad121ed0d924cfd99cff0061f78c467d5815d54eaec74c9667fb5b4d"
 dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
@@ -3045,13 +3057,14 @@ dependencies = [
  "serde_json",
  "tokio",
  "ureq",
+ "url",
 ]
 
 [[package]]
 name = "nsh-updater"
-version = "0.5.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6df81dce14aadfd08fd2aaf9d6754e922e8537d360bc69dcb28a6e478921bd"
+checksum = "c263483a4e5c6977dcade98dd1865b0bbdfbf4ff8dafbacaa3ad198e7bf1e2fe"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 2.2.0",
@@ -3163,9 +3176,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-arkui-binding"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74e1c5a8886bf97241c993cd7c4cab296f4aa3bff4f79f2b16ba270fcb778c64"
+checksum = "c4ca77cd4fcf239a53b51029e691035a8f88a373dd6d255443dc13465d2c389e"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -3201,9 +3214,9 @@ checksum = "22d658c88d3692ded92e2dc17912483950b8f3abee189c8a215a8e6e63dbdf29"
 
 [[package]]
 name = "ohos-arkui-sys"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35efa99f975fd59e27391d88a3b6057a1e28012625ec09b1ab3ca19c58b474d2"
+checksum = "6eec1dc201dc1351f7876200dffd66b380a235589b2a03b7df2bae1481a44681"
 dependencies = [
  "napi-sys-ohos",
  "ohos-arkui-input-sys",
@@ -3264,9 +3277,9 @@ checksum = "fa6cca5bbc6612f386af26a41f458913aa6b9a06b90bcff36fb8a436f6996e7c"
 
 [[package]]
 name = "ohos-drawing-binding"
-version = "0.2.8"
+version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "04b89af49880606b18401049501a57622d24dd0576aa874572775e9d1816a06c"
+checksum = "e5885e777bd6add829225ea046210d617f90481de49bedb366f4d0fe45724a79"
 dependencies = [
  "ohos-enum-derive",
  "ohos-native-drawing-sys",
@@ -3290,7 +3303,7 @@ version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dce895ad9a0dc93e065fb519d637806653d56ad29d0cc00d05f723c4ebabc83e"
 dependencies = [
- "env_filter",
+ "env_filter 0.1.4",
  "log",
  "ohos-enum-derive",
  "ohos-hilogs-sys",
@@ -3574,9 +3587,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-xcomponent-binding"
-version = "0.6.0"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c45f2877e08ab3cea8efc1dfc6b8b4877917e16547cba5c6a392708388bb43b5"
+checksum = "f3a188784b1b208b7a10966235d51dfbae26f86bad71b1c24a0e621a8536fccd"
 dependencies = [
  "napi-derive-ohos",
  "napi-ohos",
@@ -3591,9 +3604,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-xcomponent-sys"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e365f1e413612ef058a0b996c1ff4769a064761a5d5aa1e25aa5258b76f3f80b"
+checksum = "b21c83d6ca2661dee4dc2be822e318abbe5ded07ca3ba745ca8089ee24f91ece"
 dependencies = [
  "ohos-accessibility-sys",
  "ohos-arkui-input-sys",
@@ -6988,11 +7001,12 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen"
-version = "0.2.130"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a0181c14ddd6c7b8b0b0132a5f1ea2f32be0d893cd3ea97b6e3b28886b8a3d1c"
+checksum = "1b70935747edd64d89de3efa29d73789b806c15798f8e7dca4d8ac356b50ce70"
 dependencies = [
  "cfg-if",
+ "once_cell",
  "rustversion",
  "wasm-bindgen-macro",
  "wasm-bindgen-shared",
@@ -7000,9 +7014,9 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro"
-version = "0.2.130"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e931a02a39abdbf66966fc35902b5ed58344750a70885bed4ebb3d8eaf28ed9"
+checksum = "77775f8f3f7217702089053b94958f8f54061a3f663417df76e19cbdcca29bc1"
 dependencies = [
  "quote",
  "wasm-bindgen-macro-support",
@@ -7010,31 +7024,31 @@ dependencies = [
 
 [[package]]
 name = "wasm-bindgen-macro-support"
-version = "0.2.130"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ca4b54280e455bd831e33a6b8e734baf432fe63fbc35c42ac14ce67a043a53a"
+checksum = "e11d33f857dc2fb11b8bc75aee111aa9cbeb12cd9f25efd3d4c2a3dd4e235284"
 dependencies = [
  "bumpalo",
  "proc-macro2",
  "quote",
- "syn 3.0.10",
+ "syn 2.0.119",
  "wasm-bindgen-shared",
 ]
 
 [[package]]
 name = "wasm-bindgen-shared"
-version = "0.2.130"
+version = "0.2.127"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3b1f9c3798725016c6ee5f2f57869ec0831e8bbc0ab0310a86e787e97f41389e"
+checksum = "7ef64dbcc55df09c7e5a46182d181c2cfa3e925f3da937ea764728b4bbb9dcbf"
 dependencies = [
  "unicode-ident",
 ]
 
 [[package]]
 name = "web-sys"
-version = "0.3.107"
+version = "0.3.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7d179596ff5ec0f6de4db64d54011bde6289cc49603d3a6e4ce3f329207ab88"
+checksum = "c435338968042f4f59a557f690a253676d47ce13ceb55d70100e7facf6620a30"
 dependencies = [
  "js-sys",
  "wasm-bindgen",

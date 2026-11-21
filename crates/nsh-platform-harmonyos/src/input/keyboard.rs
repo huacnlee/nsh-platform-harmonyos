@@ -81,6 +81,7 @@ impl KeyboardWindow {
         &self,
         event: KeyEvent<'_>,
         route: &crate::app::runtime::Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
     ) -> bool {
         let action = match event.event_type() {
             KeyEventType::Down => 1,
@@ -106,7 +107,115 @@ impl KeyboardWindow {
                 }
             }
         }
-        held.event(action, code, |stroke, repeat| {
+        let held_before = held.keys.iter().any(|(old, _)| *old == code);
+        let modifiers = held.modifiers();
+        let stroke = key(code).map(|key| Keystroke { key, modifiers });
+        let kind = if action == 1 {
+            nsh_core::EventKind::KeyDown
+        } else {
+            nsh_core::EventKind::KeyUp
+        };
+        let focus = owner
+            .key_focus
+            .borrow()
+            .upgrade()
+            .filter(|node| node.visible_in_tree());
+        let target = focus.as_ref().unwrap_or(owner);
+        let mut ancestor = Some(target.clone());
+        let (mut observes, mut captures) = (false, false);
+        while let Some(node) = ancestor {
+            let (listens, prevents) = node.interaction.key_interest(kind, stroke.as_ref());
+            observes |= listens;
+            captures |= prevents;
+            if node.modal.borrow().is_some() {
+                break;
+            }
+            ancestor = node.parent_node.borrow().upgrade();
+        }
+        if (observes || captures) && !route.keyboard.lock().unwrap().composing {
+            let mut details = nsh_core::KeyEvent::default();
+            let text = char::from_u32(event.unicode()).filter(|ch| !ch.is_control());
+            let named = match code {
+                N::ShiftLeft | N::ShiftRight => "Shift",
+                N::AltLeft | N::AltRight => "Alt",
+                N::CtrlLeft | N::CtrlRight => "Control",
+                N::MetaLeft | N::MetaRight => "Meta",
+                N::DpadLeft => "ArrowLeft",
+                N::DpadRight => "ArrowRight",
+                N::DpadDown => "ArrowDown",
+                N::DpadUp => "ArrowUp",
+                N::MoveHome => "Home",
+                N::MoveEnd => "End",
+                N::Del => "Backspace",
+                N::ForwardDel => "Delete",
+                N::Enter => "Enter",
+                N::Escape => "Escape",
+                N::Tab => "Tab",
+                N::PageUp => "PageUp",
+                N::PageDown => "PageDown",
+                N::Insert => "Insert",
+                _ => "",
+            };
+            let logical = if !named.is_empty() {
+                named.to_owned()
+            } else if let Some(text) = text {
+                text.to_string()
+            } else {
+                let text = event.key_text();
+                if text.is_empty() {
+                    "Unidentified".into()
+                } else {
+                    text
+                }
+            };
+            details.key = logical.into();
+            // ArkUI exposes a logical key identifier but no hardware scan code.
+            details.modifiers = modifiers;
+            match code {
+                N::ShiftLeft | N::ShiftRight => {
+                    details.modifiers.shift = action == 1
+                        || held
+                            .keys
+                            .iter()
+                            .any(|(k, _)| *k != code && matches!(k, N::ShiftLeft | N::ShiftRight))
+                }
+                N::CtrlLeft | N::CtrlRight => {
+                    details.modifiers.ctrl = action == 1
+                        || held
+                            .keys
+                            .iter()
+                            .any(|(k, _)| *k != code && matches!(k, N::CtrlLeft | N::CtrlRight))
+                }
+                N::AltLeft | N::AltRight => {
+                    details.modifiers.alt = action == 1
+                        || held
+                            .keys
+                            .iter()
+                            .any(|(k, _)| *k != code && matches!(k, N::AltLeft | N::AltRight))
+                }
+                N::MetaLeft | N::MetaRight => {
+                    details.modifiers.cmd = action == 1
+                        || held
+                            .keys
+                            .iter()
+                            .any(|(k, _)| *k != code && matches!(k, N::MetaLeft | N::MetaRight))
+                }
+                _ => {}
+            }
+            details.repeat = action == 1 && held_before;
+            details.default_prevented = captures;
+            target
+                .control
+                .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
+        } else {
+            captures = false;
+        }
+        let shortcut = held.event(action, code, |stroke, repeat| {
+            // Capture is recomputed for each transition. Only shortcut
+            // consumption is retained for the matching hardware release.
+            if captures {
+                return false;
+            }
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.composing {
                 return false;
@@ -180,7 +289,8 @@ impl KeyboardWindow {
                 }
             }
             false
-        })
+        });
+        shortcut || captures
     }
 }
 
@@ -204,7 +314,7 @@ pub(crate) fn install(
         if let Some(owner) = weak.upgrade()
             && let Some(event) = event.key_event()
             && let Some(route) = owner.dispatcher.upgrade()
-            && owner.host.key_event(event, &route)
+            && owner.host.key_event(event, &route, &owner)
         {
             event.set_consumed(true);
             event.stop_propagation(true);

@@ -1,5 +1,7 @@
 //! Ordered CSS passes over premultiplied GPU pictures. Intermediate attachments
 //! belong to this pipeline; no native pixels cross to the CPU.
+use std::{cell::Cell, rc::Rc};
+
 use glow::HasContext;
 use nsh_core::Filter;
 
@@ -53,6 +55,8 @@ void main() {
         if (all(greaterThanEqual(q, vec2(0.0))) && all(lessThan(q, shadow_size))) alpha = texture(shadow, q / shadow_size).a;
         alpha *= color.a;
         result = c + vec4(color.rgb * alpha, alpha) * (1.0 - c.a);
+    } else if (mode == 4) {
+        result = c + texture(shadow, gl_FragCoord.xy / source_size) * (1.0 - c.a);
     } else { result = c; }
 }
 "#;
@@ -82,9 +86,169 @@ impl Pass {
     }
 }
 
+pub(in crate::render::composition) struct FilterProgram {
+    context: Rc<super::super::readback::Context>,
+    gl: Rc<glow::Context>,
+    program: glow::Program,
+    warmed: Cell<bool>,
+    source: Option<glow::UniformLocation>,
+    shadow: Option<glow::UniformLocation>,
+    source_size: Option<glow::UniformLocation>,
+    source_scale: Option<glow::UniformLocation>,
+    shadow_size: Option<glow::UniformLocation>,
+    offset: Option<glow::UniformLocation>,
+    shadow_offset: Option<glow::UniformLocation>,
+    direction: Option<glow::UniformLocation>,
+    sigma: Option<glow::UniformLocation>,
+    mode: Option<glow::UniformLocation>,
+    matrix: Option<glow::UniformLocation>,
+    bias: Option<glow::UniformLocation>,
+    color: Option<glow::UniformLocation>,
+}
+impl FilterProgram {
+    fn get_or_compile(gpu: &TextureContext) -> Result<Rc<Self>> {
+        if let Some(cached) = gpu.filter_program.borrow().as_ref() {
+            return Ok(cached.clone());
+        }
+        let _current = gpu.context.enter()?;
+        let gl = &gpu.gl;
+        // SAFETY: validated static sources, compiled on the owning worker context.
+        let compiled = unsafe {
+            let program = gl.create_program()?;
+            let compile = || -> Result<()> {
+                for (kind, source) in [
+                    (glow::VERTEX_SHADER, VERTEX),
+                    (glow::FRAGMENT_SHADER, FRAGMENT),
+                ] {
+                    let shader = gl.create_shader(kind)?;
+                    gl.shader_source(shader, source);
+                    gl.compile_shader(shader);
+                    if !gl.get_shader_compile_status(shader) {
+                        let error = gl.get_shader_info_log(shader);
+                        gl.delete_shader(shader);
+                        return Err(Error::Shader(error));
+                    }
+                    gl.attach_shader(program, shader);
+                    gl.delete_shader(shader);
+                }
+                gl.link_program(program);
+                if !gl.get_program_link_status(program) {
+                    return Err(Error::Shader(gl.get_program_info_log(program)));
+                }
+                Ok(())
+            };
+            if let Err(error) = compile() {
+                gl.delete_program(program);
+                return Err(error);
+            }
+            let loc = |name| gl.get_uniform_location(program, name);
+            Rc::new(Self {
+                context: gpu.context.clone(),
+                gl: gpu.gl.clone(),
+                program,
+                warmed: Cell::new(false),
+                source: loc("source"),
+                shadow: loc("shadow"),
+                source_size: loc("source_size"),
+                source_scale: loc("source_scale"),
+                shadow_size: loc("shadow_size"),
+                offset: loc("offset"),
+                shadow_offset: loc("shadow_offset"),
+                direction: loc("direction"),
+                sigma: loc("sigma"),
+                mode: loc("mode"),
+                matrix: loc("matrix"),
+                bias: loc("bias"),
+                color: loc("color"),
+            })
+        };
+        *gpu.filter_program.borrow_mut() = Some(compiled.clone());
+        Ok(compiled)
+    }
+
+    fn draw_pass(
+        &self,
+        framebuffer: glow::Framebuffer,
+        size: (u32, u32),
+        source: Picture,
+        pass: &Pass,
+        flush: bool,
+    ) -> Result<()> {
+        let gl = &self.gl;
+        // SAFETY: caller has entered `self.context`; inputs and distinct FBO belong
+        // to this worker's context and uniforms are copied before release.
+        unsafe {
+            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(framebuffer));
+            gl.viewport(0, 0, size.0 as i32, size.1 as i32);
+            gl.disable(glow::BLEND);
+            gl.disable(glow::SCISSOR_TEST);
+            gl.disable(glow::DEPTH_TEST);
+            gl.use_program(Some(self.program));
+            gl.active_texture(glow::TEXTURE0);
+            gl.bind_texture(glow::TEXTURE_2D, Some(source.0));
+            gl.uniform_1_i32(self.source.as_ref(), 0);
+            gl.uniform_2_f32(self.source_size.as_ref(), source.1 as f32, source.2 as f32);
+            gl.uniform_2_f32_slice(self.source_scale.as_ref(), &pass.source_scale);
+            gl.uniform_2_f32_slice(self.offset.as_ref(), &pass.offset);
+            gl.uniform_2_f32_slice(self.direction.as_ref(), &pass.direction);
+            gl.uniform_1_f32(self.sigma.as_ref(), pass.sigma);
+            gl.uniform_1_i32(self.mode.as_ref(), pass.mode);
+            let mut matrix = [0.0; 16];
+            let mut bias = [0.0; 4];
+            for row in 0..4 {
+                for column in 0..4 {
+                    matrix[column * 4 + row] = pass.matrix[row * 5 + column];
+                }
+                bias[row] = pass.matrix[row * 5 + 4];
+            }
+            gl.uniform_matrix_4_f32_slice(self.matrix.as_ref(), false, &matrix);
+            gl.uniform_4_f32_slice(self.bias.as_ref(), &bias);
+            let (shadow, offset, color) = pass.shadow.unwrap_or((source, [0.0; 2], [0.0; 4]));
+            gl.active_texture(glow::TEXTURE1);
+            gl.bind_texture(glow::TEXTURE_2D, Some(shadow.0));
+            gl.uniform_1_i32(self.shadow.as_ref(), 1);
+            gl.uniform_2_f32(self.shadow_size.as_ref(), shadow.1 as f32, shadow.2 as f32);
+            gl.uniform_2_f32_slice(self.shadow_offset.as_ref(), &offset);
+            gl.uniform_4_f32_slice(self.color.as_ref(), &color);
+            gl.draw_arrays(glow::TRIANGLES, 0, 3);
+            if flush {
+                gl.flush();
+            }
+            let error = gl.get_error();
+            if error != glow::NO_ERROR {
+                return Err(Error::Draw(error));
+            }
+        }
+        self.warmed.set(true);
+        Ok(())
+    }
+}
+impl Drop for FilterProgram {
+    fn drop(&mut self) {
+        if let Ok(_current) = self.context.enter() {
+            // SAFETY: deletion occurs on the creating worker and current context.
+            unsafe {
+                self.gl.delete_program(self.program);
+            }
+        }
+    }
+}
+
+pub(in crate::render::composition) fn precompile(gpu: &TextureContext) -> Result<()> {
+    let program = FilterProgram::get_or_compile(gpu)?;
+    if program.warmed.get() {
+        return Ok(());
+    }
+    let _current = gpu.context.enter()?;
+    let empty = gpu.empty_picture();
+    let mut pass = Pass::new((1, 1));
+    pass.mode = 4;
+    pass.shadow = Some((empty, [0.0; 2], [0.0; 4]));
+    program.draw_pass(gpu.warmup_fbo(), (1, 1), empty, &pass, true)
+}
+
 pub(in crate::render::composition) struct Filters {
     gpu: TextureContext,
-    program: Option<glow::Program>,
     targets: Vec<Target>,
     next: usize,
 }
@@ -92,7 +256,6 @@ impl Filters {
     pub(in crate::render::composition) fn new(gpu: &TextureContext) -> Self {
         Self {
             gpu: gpu.clone(),
-            program: None,
             targets: Vec::new(),
             next: 0,
         }
@@ -186,6 +349,19 @@ impl Filters {
         self.targets.truncate(self.next);
         Ok((picture, x, y, scale))
     }
+    // Both textures cover the same full-screen viewport, in premultiplied RGBA.
+    pub(in crate::render::composition) fn over(
+        &mut self,
+        front: Picture,
+        back: Picture,
+    ) -> Result<Picture> {
+        self.next = 0;
+        let mut pass = Pass::new((front.1, front.2));
+        pass.mode = 4;
+        pass.shadow = Some((back, [0.0; 2], [0.0; 4]));
+        self.draw(front, pass)
+    }
+
     fn blur(&mut self, mut picture: Picture, sigma: f32) -> Result<Picture> {
         if sigma <= 0.0 {
             return Ok(picture);
@@ -244,41 +420,8 @@ impl Filters {
         Ok(picture)
     }
     fn draw(&mut self, source: Picture, pass: Pass) -> Result<Picture> {
+        let program = FilterProgram::get_or_compile(&self.gpu)?;
         let _current = self.gpu.context.enter()?;
-        let gl = &self.gpu.gl;
-        if self.program.is_none() {
-            // SAFETY: validated static sources, compiled on the owning context.
-            unsafe {
-                let program = gl.create_program()?;
-                let compile = || -> Result<()> {
-                    for (kind, source) in [
-                        (glow::VERTEX_SHADER, VERTEX),
-                        (glow::FRAGMENT_SHADER, FRAGMENT),
-                    ] {
-                        let shader = gl.create_shader(kind)?;
-                        gl.shader_source(shader, source);
-                        gl.compile_shader(shader);
-                        if !gl.get_shader_compile_status(shader) {
-                            let error = gl.get_shader_info_log(shader);
-                            gl.delete_shader(shader);
-                            return Err(Error::Shader(error));
-                        }
-                        gl.attach_shader(program, shader);
-                        gl.delete_shader(shader);
-                    }
-                    gl.link_program(program);
-                    if !gl.get_program_link_status(program) {
-                        return Err(Error::Shader(gl.get_program_info_log(program)));
-                    }
-                    Ok(())
-                };
-                if let Err(error) = compile() {
-                    gl.delete_program(program);
-                    return Err(error);
-                }
-                self.program = Some(program);
-            }
-        }
         if self
             .targets
             .get(self.next)
@@ -293,69 +436,13 @@ impl Filters {
         }
         let target = &self.targets[self.next];
         self.next += 1;
-        let program = self.program.unwrap();
-        // SAFETY: inputs and the distinct attachment are live on this worker's
-        // context; uniforms are copied before their borrowed storage is released.
-        unsafe {
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(target.framebuffer));
-            gl.viewport(0, 0, target.width as i32, target.height as i32);
-            gl.disable(glow::BLEND);
-            gl.disable(glow::SCISSOR_TEST);
-            gl.disable(glow::DEPTH_TEST);
-            gl.use_program(Some(program));
-            let loc = |name| gl.get_uniform_location(program, name);
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(source.0));
-            gl.uniform_1_i32(loc("source").as_ref(), 0);
-            gl.uniform_2_f32(
-                loc("source_size").as_ref(),
-                source.1 as f32,
-                source.2 as f32,
-            );
-            gl.uniform_2_f32_slice(loc("source_scale").as_ref(), &pass.source_scale);
-            gl.uniform_2_f32_slice(loc("offset").as_ref(), &pass.offset);
-            gl.uniform_2_f32_slice(loc("direction").as_ref(), &pass.direction);
-            gl.uniform_1_f32(loc("sigma").as_ref(), pass.sigma);
-            gl.uniform_1_i32(loc("mode").as_ref(), pass.mode);
-            let mut matrix = [0.0; 16];
-            let mut bias = [0.0; 4];
-            for row in 0..4 {
-                for column in 0..4 {
-                    matrix[column * 4 + row] = pass.matrix[row * 5 + column];
-                }
-                bias[row] = pass.matrix[row * 5 + 4];
-            }
-            gl.uniform_matrix_4_f32_slice(loc("matrix").as_ref(), false, &matrix);
-            gl.uniform_4_f32_slice(loc("bias").as_ref(), &bias);
-            let (shadow, offset, color) = pass.shadow.unwrap_or((source, [0.0; 2], [0.0; 4]));
-            gl.active_texture(glow::TEXTURE1);
-            gl.bind_texture(glow::TEXTURE_2D, Some(shadow.0));
-            gl.uniform_1_i32(loc("shadow").as_ref(), 1);
-            gl.uniform_2_f32(
-                loc("shadow_size").as_ref(),
-                shadow.1 as f32,
-                shadow.2 as f32,
-            );
-            gl.uniform_2_f32_slice(loc("shadow_offset").as_ref(), &offset);
-            gl.uniform_4_f32_slice(loc("color").as_ref(), &color);
-            gl.draw_arrays(glow::TRIANGLES, 0, 3);
-            let error = gl.get_error();
-            if error != glow::NO_ERROR {
-                return Err(Error::Draw(error));
-            }
-        }
+        program.draw_pass(
+            target.framebuffer,
+            (target.width, target.height),
+            source,
+            &pass,
+            false,
+        )?;
         Ok(target.picture())
-    }
-}
-impl Drop for Filters {
-    fn drop(&mut self) {
-        if let Some(program) = self.program.take()
-            && let Ok(_current) = self.gpu.context.enter()
-        {
-            // SAFETY: deletion occurs on the creating worker and current context.
-            unsafe {
-                self.gpu.gl.delete_program(program);
-            }
-        }
     }
 }

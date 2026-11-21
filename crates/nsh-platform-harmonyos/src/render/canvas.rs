@@ -19,9 +19,10 @@ use nsh_core::{
     },
 };
 use ohos_drawing_binding::{
-    Bitmap, BlendMode, Brush, Canvas, ClipOperation, FilterMode, FontSlant, FontStyle, FontWeight,
-    FontWidth, Matrix, MipmapMode, Path, PathEffect, PathFillType, Pen, Rect, SamplingOptions,
-    ShaderEffect, ShadowLayer, TextBlob, TextStyle, TileMode, TypographyBuilder, TypographyStyle,
+    Bitmap, BlendMode, Brush, Canvas, ClipOperation, CornerPosition, FilterMode, FontSlant,
+    FontStyle, FontWeight, FontWidth, Matrix, MipmapMode, Path, PathEffect, PathFillType, Pen,
+    Point as DrawingPoint, Rect, RoundRect, SamplingOptions, ShaderEffect, ShadowLayer, TextBlob,
+    TextStyle, TileMode, TypographyBuilder, TypographyStyle,
 };
 
 use crate::{
@@ -402,19 +403,23 @@ impl Replay<'_> {
                     self.state.transform = self.state.transform.mul(Affine(v.map(|n| self.num(n))))
                 }
                 Op::SetTransform(v) => self.state.transform = Affine(v.map(|n| self.num(n))),
-                Op::BeginPath => {
-                    self.path.path.reset();
-                    self.path.current = None;
-                    self.path.start = None;
-                }
+                Op::BeginPath => self.path.reset(),
                 Op::Path(op) => self.path.append(op, self.state.transform, self.slots),
                 Op::Fill(path, rule) => {
-                    let path = self.paint_path(path.as_deref());
-                    self.paint_path_native(path, *rule, false);
+                    if let Some(shape) = self.simple_shape(path.as_deref(), false) {
+                        self.paint_shape_native(shape, false);
+                    } else {
+                        let path = self.paint_path(path.as_deref());
+                        self.paint_path_native(path, *rule, false);
+                    }
                 }
                 Op::Stroke(path) => {
-                    let path = self.paint_path(path.as_deref());
-                    self.paint_path_native(path, FillRule::NonZero, true);
+                    if let Some(shape) = self.simple_shape(path.as_deref(), true) {
+                        self.paint_shape_native(shape, true);
+                    } else {
+                        let path = self.paint_path(path.as_deref());
+                        self.paint_path_native(path, FillRule::NonZero, true);
+                    }
                 }
                 Op::Clip(path, rule) => {
                     let mut path = self.paint_path(path.as_deref());
@@ -532,14 +537,41 @@ impl Replay<'_> {
         }
         self.canvas.restore();
     }
-    fn paint_path(&self, ops: Option<&[PathOp]>) -> Path {
+    fn simple_shape(&self, ops: Option<&[PathOp]>, stroke: bool) -> Option<SimpleShape> {
+        if stroke && !self.state.dash.is_empty() {
+            return None;
+        }
+        if let Some(ops) = ops {
+            single_ops_shape(ops, self.slots)
+        } else {
+            self.path.single_for(self.state.transform)
+        }
+    }
+    fn paint_shape_native(&self, shape: SimpleShape, stroke: bool) {
+        self.save_transform();
+        if stroke {
+            let pen = self.pen();
+            self.canvas.attach_pen(&pen);
+            shape.draw(self.canvas);
+            self.canvas.detach_pen();
+        } else {
+            let brush = self.brush(&self.state.fill);
+            self.canvas.attach_brush(&brush);
+            shape.draw(self.canvas);
+            self.canvas.detach_brush();
+        }
+        self.canvas.restore();
+    }
+    fn paint_path(&mut self, ops: Option<&[PathOp]>) -> Path {
         if let Some(ops) = ops {
             let mut path = Geometry::default();
             for op in ops {
                 path.append(op, Affine::default(), self.slots);
             }
+            path.materialize();
             path.path
         } else {
+            self.path.materialize();
             let mut path = self.path.path.clone_path();
             if self.state.transform != Affine::default() {
                 if let Some(inverse) = self.state.transform.inverse() {
@@ -738,14 +770,259 @@ impl Replay<'_> {
         self.canvas.restore();
     }
 }
+#[derive(Clone, Copy)]
+enum SimpleShape {
+    Circle {
+        x: f32,
+        y: f32,
+        r: f32,
+    },
+    Oval {
+        x: f32,
+        y: f32,
+        rx: f32,
+        ry: f32,
+    },
+    Rect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+    },
+    RoundRect {
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        radii: [f32; 4],
+    },
+}
+impl SimpleShape {
+    fn draw(self, canvas: &Canvas) {
+        match self {
+            Self::Circle { x, y, r } => canvas.draw_circle(&DrawingPoint::new(x, y), r),
+            Self::Oval { x, y, rx, ry } => {
+                canvas.draw_oval(&Rect::new(x - rx, y - ry, x + rx, y + ry));
+            }
+            Self::Rect { x, y, w, h } => {
+                canvas.draw_rect(&Rect::new(
+                    x.min(x + w),
+                    y.min(y + h),
+                    x.max(x + w),
+                    y.max(y + h),
+                ));
+            }
+            Self::RoundRect {
+                x,
+                y,
+                w,
+                h,
+                radii: [tl, tr, br, bl],
+            } => {
+                let rect = Rect::new(x, y, x + w, y + h);
+                let mut round_rect = RoundRect::new(&rect, 0.0, 0.0);
+                for (corner, radius) in [
+                    CornerPosition::TopLeft,
+                    CornerPosition::TopRight,
+                    CornerPosition::BottomRight,
+                    CornerPosition::BottomLeft,
+                ]
+                .into_iter()
+                .zip([tl, tr, br, bl])
+                {
+                    round_rect.set_corner(corner, radius, radius);
+                }
+                canvas.draw_round_rect(&round_rect);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PendingSingle {
+    transform: Affine,
+    shape: SimpleShape,
+    start_angle: f32,
+    sweep_angle: f32,
+}
+
+fn single_from_op(op: &PathOp, m: Affine, slots: &[AnimationValue]) -> Option<PendingSingle> {
+    let n = |n: Num| {
+        n.get(|i| {
+            slots
+                .get(i as usize)
+                .copied()
+                .unwrap_or(AnimationValue::Number(0.0))
+                .number()
+        })
+    };
+    match op {
+        PathOp::Arc {
+            x,
+            y,
+            radius,
+            start,
+            end,
+            ccw,
+        } => {
+            let r = n(*radius);
+            let s = n(*start);
+            let sweep = canvas::arc_sweep(
+                nsh_core::geometry::Radians(s),
+                nsh_core::geometry::Radians(n(*end)),
+                *ccw,
+            )
+            .0;
+            (r >= 0.0 && (sweep.abs() - std::f32::consts::TAU).abs() <= 1e-4).then_some(
+                PendingSingle {
+                    transform: m,
+                    shape: SimpleShape::Circle {
+                        x: n(*x),
+                        y: n(*y),
+                        r,
+                    },
+                    start_angle: s,
+                    sweep_angle: sweep,
+                },
+            )
+        }
+        PathOp::Ellipse {
+            geometry,
+            start,
+            end,
+            ccw,
+        } => {
+            let [x, y, rx, ry, rotation] = geometry.map(n);
+            let s = n(*start);
+            let sweep = canvas::arc_sweep(
+                nsh_core::geometry::Radians(s),
+                nsh_core::geometry::Radians(n(*end)),
+                *ccw,
+            )
+            .0;
+            (rx >= 0.0
+                && ry >= 0.0
+                && rotation == 0.0
+                && (sweep.abs() - std::f32::consts::TAU).abs() <= 1e-4)
+                .then_some(PendingSingle {
+                    transform: m,
+                    shape: SimpleShape::Oval { x, y, rx, ry },
+                    start_angle: s,
+                    sweep_angle: sweep,
+                })
+        }
+        PathOp::Rect(v) => {
+            let [x, y, w, h] = v.map(n);
+            Some(PendingSingle {
+                transform: m,
+                shape: SimpleShape::Rect { x, y, w, h },
+                start_angle: 0.0,
+                sweep_angle: 0.0,
+            })
+        }
+        PathOp::RoundRect(v, r) => {
+            let [x, y, w, h] = v.map(n);
+            let mut r = r.map(n);
+            if w < 0.0 {
+                r.swap(0, 1);
+                r.swap(2, 3);
+            }
+            if h < 0.0 {
+                r.swap(0, 3);
+                r.swap(1, 2);
+            }
+            let [x, y, w, h] = [x.min(x + w), y.min(y + h), w.abs(), h.abs()];
+            let radii = canvas::fit_radii(
+                nsh_core::Size::new(nsh_core::Points(w), nsh_core::Points(h)),
+                nsh_core::Corners::from(r.map(nsh_core::Points)),
+            )
+            .to_array()
+            .map(|p| p.0);
+            Some(PendingSingle {
+                transform: m,
+                shape: SimpleShape::RoundRect { x, y, w, h, radii },
+                start_angle: 0.0,
+                sweep_angle: 0.0,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn single_ops_shape(ops: &[PathOp], slots: &[AnimationValue]) -> Option<SimpleShape> {
+    let ops = match ops.split_last() {
+        Some((PathOp::Close, rest)) => rest,
+        _ => ops,
+    };
+    if ops.len() != 1 {
+        return None;
+    }
+    single_from_op(&ops[0], Affine::default(), slots).map(|p| p.shape)
+}
+
 #[derive(Default)]
 struct Geometry {
     path: Path,
+    path_dirty: bool,
+    single: Option<PendingSingle>,
     current: Option<[f32; 2]>,
     start: Option<[f32; 2]>,
 }
 impl Geometry {
+    fn reset(&mut self) {
+        if self.path_dirty {
+            self.path.reset();
+            self.path_dirty = false;
+        }
+        self.single = None;
+        self.current = None;
+        self.start = None;
+    }
+    fn single_for(&self, transform: Affine) -> Option<SimpleShape> {
+        let pending = self.single?;
+        (!self.path_dirty && pending.transform == transform).then_some(pending.shape)
+    }
+    fn materialize(&mut self) {
+        let Some(pending) = self.single.take() else {
+            return;
+        };
+        let m = pending.transform;
+        match pending.shape {
+            SimpleShape::Circle { x, y, r } => {
+                self.ellipse(
+                    m,
+                    [x, y, r, r, 0.0],
+                    pending.start_angle,
+                    pending.sweep_angle,
+                );
+            }
+            SimpleShape::Oval { x, y, rx, ry } => {
+                self.ellipse(
+                    m,
+                    [x, y, rx, ry, 0.0],
+                    pending.start_angle,
+                    pending.sweep_angle,
+                );
+            }
+            SimpleShape::Rect { x, y, w, h } => self.rect([x, y, w, h], m),
+            SimpleShape::RoundRect {
+                x,
+                y,
+                w,
+                h,
+                radii: [tl, tr, br, bl],
+            } => {
+                self.move_to(m.point(x + tl, y));
+                self.arc_to(m, [x + w, y, x + w, y + h, tr]);
+                self.arc_to(m, [x + w, y + h, x, y + h, br]);
+                self.arc_to(m, [x, y + h, x, y, bl]);
+                self.arc_to(m, [x, y, x + w, y, tl]);
+                self.close();
+            }
+        }
+    }
     fn move_to(&mut self, p: [f32; 2]) {
+        self.path_dirty = true;
         self.path.move_to(p[0], p[1]);
         self.current = Some(p);
         self.start = Some(p);
@@ -754,6 +1031,7 @@ impl Geometry {
         if self.current.is_none() {
             self.move_to(p)
         } else {
+            self.path_dirty = true;
             self.path.line_to(p[0], p[1]);
             self.current = Some(p);
         }
@@ -762,11 +1040,16 @@ impl Geometry {
         if self.current.is_none() {
             self.move_to(a)
         }
+        self.path_dirty = true;
         self.path
             .bezier_curve_to(a[0], a[1], b[0], b[1], p[0], p[1]);
         self.current = Some(p);
     }
     fn close(&mut self) {
+        if self.single.is_some() && !self.path_dirty {
+            return;
+        }
+        self.path_dirty = true;
         self.path.close();
         self.current = self.start;
     }
@@ -839,6 +1122,18 @@ impl Geometry {
         self.ellipse(m, [c[0], c[1], r, r, 0.0], a, sweep);
     }
     fn append(&mut self, op: &PathOp, m: Affine, slots: &[AnimationValue]) {
+        if matches!(op, PathOp::Close) && self.single.is_some() && !self.path_dirty {
+            return;
+        }
+        if self.single.is_none()
+            && !self.path_dirty
+            && self.current.is_none()
+            && let Some(single) = single_from_op(op, m, slots)
+        {
+            self.single = Some(single);
+            return;
+        }
+        self.materialize();
         let n = |n: Num| {
             n.get(|i| {
                 slots
@@ -858,6 +1153,7 @@ impl Geometry {
                 }
                 let a = m.point(x1, y1);
                 let p = m.point(x, y);
+                self.path_dirty = true;
                 self.path.quadratic_curve_to(a[0], a[1], p[0], p[1]);
                 self.current = Some(p);
             }
@@ -1046,7 +1342,10 @@ impl ShapedText {
             },
         ));
         if let Some(family) = &font.family {
-            text_style.set_font_families(&crate::text::fonts::families(family));
+            let families = crate::text::fonts::families(family);
+            if !families.is_empty() {
+                text_style.set_font_families(&families);
+            }
         }
         for tag in font.variant.tags() {
             text_style.add_font_feature(tag, 1);

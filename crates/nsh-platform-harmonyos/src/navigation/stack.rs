@@ -26,6 +26,8 @@ use crate::{
     text::typography::argb,
 };
 
+type SettledCallback = Box<dyn FnOnce(bool)>;
+
 pub(crate) struct Screen {
     owner: Weak<Node>,
     pub(crate) config: RefCell<ScreenConfig>,
@@ -43,7 +45,9 @@ pub(crate) struct Screen {
     motion: RefCell<Option<Motion>>,
     shader: RefCell<Option<Rc<crate::render::shader::navigation::Navigation>>>,
     immediate_removal: Cell<bool>,
+    detached_for_pop: Cell<Option<usize>>,
     insets: Cell<Option<EdgeInsets>>,
+    on_settled: RefCell<Vec<SettledCallback>>,
 }
 impl Screen {
     #[cfg(feature = "dev")]
@@ -101,49 +105,55 @@ impl Screen {
             motion: RefCell::default(),
             shader: RefCell::default(),
             immediate_removal: Cell::new(false),
+            detached_for_pop: Cell::new(None),
             insets: Cell::new(None),
+            on_settled: RefCell::default(),
         });
         let weak = Rc::downgrade(&screen);
-        let paint = crate::render::paint_node::PaintNode::new(move |canvas| {
-            crate::render::node::callback(|| {
-                let Some(screen) = weak.upgrade() else {
-                    return Ok(());
-                };
-                let Some(owner) = screen.owner.upgrade() else {
-                    return Ok(());
-                };
-                use ohos_drawing_binding::{LineCap, LineJoin, Path, Pen};
-                let scale = owner.scale.get();
-                let (x, y) = (22.0 * scale, 22.0 * scale);
-                let direction = if owner.platform.get().rtl { -1.0 } else { 1.0 };
-                let mut path = Path::new();
-                path.move_to(x + 4.0 * scale * direction, y - 8.0 * scale);
-                path.line_to(x - 4.0 * scale * direction, y);
-                path.line_to(x + 4.0 * scale * direction, y + 8.0 * scale);
-                let dark = owner
-                    .appearance
-                    .get()
-                    .resolve(owner.platform.get().color_scheme)
-                    == nsh_engine::ColorScheme::Dark;
-                let color = screen
-                    .config
-                    .borrow()
-                    .tint_color
-                    .map(argb)
-                    .unwrap_or_else(|| owner.theme.borrow().color("foreground", dark));
-                let mut pen = Pen::new();
-                pen.set_anti_alias(true);
-                pen.set_color(color);
-                pen.set_width(2.0 * scale);
-                pen.set_cap(LineCap::RoundCap);
-                pen.set_join(LineJoin::RoundJoin);
-                canvas.attach_pen(&pen);
-                canvas.draw_path(&path);
-                canvas.detach_pen();
-                Ok(())
-            });
-        })?;
-        screen.back.borrow_mut().add_child(paint.native.clone())?;
+        let paint = crate::render::paint_node::PaintNode::new_attached(
+            &screen.back,
+            -1,
+            true,
+            move |canvas| {
+                crate::render::node::callback(|| {
+                    let Some(screen) = weak.upgrade() else {
+                        return Ok(());
+                    };
+                    let Some(owner) = screen.owner.upgrade() else {
+                        return Ok(());
+                    };
+                    use ohos_drawing_binding::{LineCap, LineJoin, Path, Pen};
+                    let scale = owner.scale.get();
+                    let (x, y) = (22.0 * scale, 22.0 * scale);
+                    let direction = if owner.platform.get().rtl { -1.0 } else { 1.0 };
+                    let mut path = Path::new();
+                    path.move_to(x + 4.0 * scale * direction, y - 8.0 * scale);
+                    path.line_to(x - 4.0 * scale * direction, y);
+                    path.line_to(x + 4.0 * scale * direction, y + 8.0 * scale);
+                    let dark = owner
+                        .appearance
+                        .get()
+                        .resolve(owner.platform.get().color_scheme)
+                        == nsh_engine::ColorScheme::Dark;
+                    let color = screen
+                        .config
+                        .borrow()
+                        .tint_color
+                        .map(argb)
+                        .unwrap_or_else(|| owner.theme.borrow().color("foreground", dark));
+                    let mut pen = Pen::new();
+                    pen.set_anti_alias(true);
+                    pen.set_color(color);
+                    pen.set_width(2.0 * scale);
+                    pen.set_cap(LineCap::RoundCap);
+                    pen.set_join(LineJoin::RoundJoin);
+                    canvas.attach_pen(&pen);
+                    canvas.draw_path(&path);
+                    canvas.detach_pen();
+                    Ok(())
+                });
+            },
+        )?;
         *screen.back_paint.borrow_mut() = Some(paint);
         let weak = Rc::downgrade(&screen);
         screen.back.borrow_mut().on_click(move || {
@@ -183,7 +193,25 @@ impl Screen {
         if !matches {
             return Ok(());
         }
-        if !navigation.backwards {
+        if navigation.backwards && self.popped.get() {
+            // The GPU owns the outgoing image. ArkUI's texture export can keep
+            // drawing a retained hidden child until the native child list changes.
+            if let Some(owner) = self.owner.upgrade()
+                && let Some(parent) = owner.mount_parent.borrow().upgrade()
+            {
+                let mounted = owner.mounted();
+                let index = parent
+                    .borrow()
+                    .children()
+                    .iter()
+                    .position(|c| Rc::ptr_eq(c, &mounted));
+                if let Some(index) = index {
+                    parent.borrow_mut().remove_child(index)?;
+                    self.detached_for_pop.set(Some(index));
+                    parent.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
+                }
+            }
+        } else if !navigation.backwards {
             self.progress.set(0.0);
         }
         self.show()?;
@@ -402,6 +430,32 @@ impl Screen {
     pub(crate) fn is_unanimated(&self) -> bool {
         self.motion.borrow().is_none() && self.shader.borrow().is_none()
     }
+    pub(crate) fn is_entering(&self) -> bool {
+        !self.popped.get()
+            && (self
+                .motion
+                .borrow()
+                .as_ref()
+                .is_some_and(|motion| motion.to == 0.0)
+                || self
+                    .shader
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|nav| !nav.backwards && nav.running()))
+    }
+    pub(crate) fn when_settled(&self, callback: impl FnOnce(bool) + 'static) {
+        if self.is_entering() {
+            self.on_settled.borrow_mut().push(Box::new(callback));
+        } else {
+            callback(!self.popped.get());
+        }
+    }
+    fn notify_settled(&self, entered: bool) {
+        let callbacks = std::mem::take(&mut *self.on_settled.borrow_mut());
+        for callback in callbacks {
+            callback(entered);
+        }
+    }
     fn show(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             owner.restore_style()?;
@@ -427,8 +481,15 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
-        if self.shader.borrow().is_some() {
-            owner.navigation_presentation(1.0, 0.0)?;
+        if let Some(nav) = self.shader.borrow().as_ref() {
+            // The worker already owns the departing picture. Keep the outgoing
+            // screen outside the exported viewport while ArkUI draws the peer.
+            if nav.backwards && !nav.capturing() {
+                let sign = if owner.platform.get().rtl { -1.0 } else { 1.0 };
+                owner.navigation_presentation(0.0, sign * owner.frame.get().width)?;
+            } else {
+                owner.navigation_presentation(1.0, 0.0)?;
+            }
             if let Some(peer) = self.peer.borrow().upgrade() {
                 peer.navigation_presentation(1.0, 0.0)?;
             }
@@ -505,6 +566,7 @@ impl Screen {
         Ok(())
     }
     fn pop(&self) -> Result<bool> {
+        self.notify_settled(false);
         let Some(owner) = self.owner.upgrade() else {
             return Ok(false);
         };
@@ -556,6 +618,7 @@ impl Screen {
         Ok(())
     }
     fn settle(&self) -> Result<()> {
+        self.detached_for_pop.take();
         let popped = self.popped.get();
         let shader = self.shader.borrow_mut().take();
         self.motion.borrow_mut().take();
@@ -608,6 +671,7 @@ impl Screen {
         {
             owner.shaders.end_navigation(owner.id)?;
         }
+        self.notify_settled(!popped);
         Ok(())
     }
     pub(crate) fn frame(&self, now: f64) -> Result<(bool, bool)> {
@@ -623,6 +687,16 @@ impl Screen {
             if fallback {
                 self.shader.borrow_mut().take();
                 if let Some(owner) = self.owner.upgrade() {
+                    if let Some(index) = self.detached_for_pop.take()
+                        && let Some(parent) = owner.mount_parent.borrow().upgrade()
+                    {
+                        let mounted = owner.mounted();
+                        let mut parent = parent.borrow_mut();
+                        if !parent.children().iter().any(|c| Rc::ptr_eq(c, &mounted)) {
+                            let at = index.min(parent.children().len());
+                            parent.insert_child(mounted, at)?;
+                        }
+                    }
                     owner.shaders.end_navigation(owner.id)?;
                     if !backwards && self.progress.get() == 0.0 {
                         self.progress.set(1.0);

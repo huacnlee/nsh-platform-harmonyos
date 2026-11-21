@@ -19,7 +19,7 @@ use crate::{
     render::{
         geometry::Size,
         mount::Mounter,
-        node::{Error, NativeNode, Result},
+        node::{NativeNode, Result},
     },
     text::typography::OhosTextEngine,
 };
@@ -122,6 +122,7 @@ pub(crate) enum Message {
         index: i32,
     },
     HostEnvironment(NshEnvironment),
+    HostFontsChanged,
     HostWindow(
         [crate::app::session::AvoidArea; 3],
         crate::app::session::AvoidArea,
@@ -148,9 +149,10 @@ pub(crate) enum Message {
     Batch(MountBatch),
     Error(String),
     RequestFrame,
-    Frame(Option<u64>),
-    FrameSynced(u64),
+    EngineFrameRequested,
+    EngineFrameCompleted,
     Reclaim(u64),
+    CompositeDemand,
     VideoRetired(u64),
     VideoUi(u64, crate::media::video::UiState),
     UiTask(u64, Option<Box<dyn std::any::Any + Send>>),
@@ -292,15 +294,17 @@ impl Dispatcher {
             _marker: std::marker::PhantomData,
         }
     }
-    pub(crate) fn after(this: &Weak<Self>, delay: std::time::Duration, work: Box<dyn FnOnce()>) {
+    pub(crate) fn after(
+        this: &Weak<Self>,
+        delay: std::time::Duration,
+        work: Box<dyn FnOnce()>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         let reply = Self::reply(this, move |()| work());
-        if reply.inner.is_none() {
-            return;
-        }
-        napi_ohos::bindgen_prelude::spawn(async move {
+        reply.inner.as_ref()?;
+        Some(napi_ohos::bindgen_prelude::spawn(async move {
             tokio::time::sleep(delay).await;
             reply.send(());
-        });
+        }))
     }
 }
 struct Sink(
@@ -331,7 +335,7 @@ impl MountSink for Sink {
         self.0.send(Message::Error(message.into()));
     }
     fn request_frame(&self) {
-        self.0.send(Message::RequestFrame);
+        self.0.send(Message::EngineFrameRequested);
     }
     #[cfg(feature = "dev")]
     fn hot_update_failed(&self) {
@@ -348,11 +352,14 @@ struct State {
     engine: Option<Engine>,
     mounter: Option<Mounter>,
     dispatcher: Weak<Dispatcher>,
-    vsync: Arc<Vsync>,
+    rate_driver: Option<Arc<super::frame_source::RateDriver>>,
+    phase: Option<super::frame_source::Phase>,
     frame_rate: Arc<crate::app::frame_rate::FrameRate>,
     environment: Environment,
     errors: Errors,
-    frame_pending: bool,
+    engine_wanted: bool,
+    engine_in_flight: usize,
+    native_demand: super::frame_rate::UiDemand,
     laid_out: bool,
     attached: bool,
     visible: bool,
@@ -368,6 +375,7 @@ impl State {
         if matches!(message, Message::Close | Message::HostClosed) {
             return self.close();
         }
+        // Native retirement barriers remain valid after the engine closes.
         if let Message::Reclaim(epoch) = message {
             if let Some(mounter) = &mut self.mounter {
                 mounter.reclaim(epoch);
@@ -396,7 +404,7 @@ impl State {
                 });
             }
             if let Some(mounter) = &self.mounter {
-                mounter.shaders.collect()?;
+                let collected = mounter.shaders.collect();
                 if let Some(worker) = mounter.compositor.borrow().as_ref() {
                     worker.collect();
                 }
@@ -408,6 +416,7 @@ impl State {
                 {
                     self.retiring_dispatcher.take();
                 }
+                return collected;
             }
             return Ok(());
         }
@@ -485,6 +494,11 @@ impl State {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
+            Message::HostFontsChanged => {
+                self.engine.as_ref().unwrap().control().fonts_changed();
+                self.mounter.as_ref().unwrap().invalidate_canvases()?;
+                self.request_frame()?;
+            }
             Message::HostWindow(visual, keyboard) if self.laid_out => {
                 let changes = self
                     .mounter
@@ -555,14 +569,27 @@ impl State {
                 self.report(error);
             }
             Message::RequestFrame => self.request_frame()?,
-            Message::Frame(timestamp) => {
-                self.step_frame(true, timestamp)?;
-                return Ok(());
+            Message::EngineFrameRequested => {
+                if self.laid_out
+                    && self.is_active()
+                    && self.engine_in_flight == 0
+                    && !self
+                        .phase
+                        .as_ref()
+                        .is_some_and(super::frame_source::Phase::is_running)
+                {
+                    self.dispatch_engine_frame();
+                } else {
+                    self.engine_wanted = true;
+                }
+                self.schedule_frame()?;
             }
-            Message::FrameSynced(timestamp) => {
-                self.step_frame(false, Some(timestamp))?;
-                return Ok(());
+            Message::EngineFrameCompleted => {
+                debug_assert!(self.engine_in_flight > 0);
+                self.engine_in_flight = self.engine_in_flight.saturating_sub(1);
+                self.schedule_frame()?;
             }
+            Message::CompositeDemand => self.schedule_frame()?,
             Message::Reclaim(_)
             | Message::VideoRetired(_)
             | Message::VideoUi(..)
@@ -578,20 +605,24 @@ impl State {
             && self.visible
             && self.environment.lifecycle != nsh_engine::Lifecycle::Background
     }
-    fn update_back(&self) {
+    fn update_back(&mut self) {
         let active = self.is_active();
-        if !active {
-            self.frame_rate
-                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
-        }
         if let Some(dispatcher) = self.dispatcher.upgrade() {
-            if dispatcher
+            let was_active = dispatcher
                 .active
-                .swap(active, std::sync::atomic::Ordering::AcqRel)
-                != active
-                && let Some(mounter) = &self.mounter
-            {
-                mounter.shaders.wake();
+                .swap(active, std::sync::atomic::Ordering::AcqRel);
+            if was_active != active {
+                if let Some(mounter) = &self.mounter {
+                    mounter.shaders.wake();
+                }
+                // Preserve outstanding engine requests across background and
+                // detach; native state gets one sample when it becomes visible.
+                if active {
+                    self.frame_wanted = true;
+                }
+                if let Err(error) = self.schedule_frame() {
+                    self.report(error.to_string());
+                }
             }
             dispatcher.wants_back.store(
                 active && self.mounter.as_ref().is_some_and(Mounter::wants_back),
@@ -616,113 +647,108 @@ impl State {
         }
         let lifecycle_changed = self.environment.lifecycle != environment.lifecycle;
         self.environment = environment;
-        if lifecycle_changed
-            && environment.lifecycle != nsh_engine::Lifecycle::Active
-            && let Some(mounter) = &self.mounter
-        {
-            mounter.cancel_input()?;
-        }
-        if lifecycle_changed && environment.lifecycle != nsh_engine::Lifecycle::Background {
-            self.request_frame()?;
-        }
+        let mut updated = Ok(());
         if let Some(mounter) = &self.mounter {
-            mounter.environment(environment)?;
+            if lifecycle_changed && environment.lifecycle != nsh_engine::Lifecycle::Active {
+                updated = updated.and(mounter.cancel_input());
+            }
+            // Lifecycle metadata must reach the compositor even if stopping
+            // an independent input/scroll owner failed.
+            updated = updated.and(mounter.environment(environment));
         }
-        Ok(())
+        // A failed native cleanup must not leave the old active frame vote or
+        // worker visibility in place after the lifecycle has already changed.
+        if lifecycle_changed {
+            self.update_back();
+        }
+        updated
     }
     fn report(&self, error: String) {
         self.errors.report(error);
     }
-    fn step_frame(&mut self, wake_engine: bool, timestamp: Option<u64>) -> Result<()> {
-        let _trace = crate::render::composition::trace::Scope::new(c"NSH UI frame");
-        self.frame_pending = false;
-        if !self.is_active() {
-            self.frame_wanted = true;
-            self.update_back();
-            return Ok(());
+    fn dispatch_engine_frame(&mut self) {
+        self.engine_in_flight += 1;
+        let dispatcher = self.dispatcher.clone();
+        let control = self.engine.as_ref().unwrap().control();
+        control.frame();
+        control.flush(move |_| {
+            if let Some(dispatcher) = dispatcher.upgrade() {
+                dispatcher.send(Message::EngineFrameCompleted);
+            }
+        });
+    }
+    fn step_frame(&mut self, timestamp: u64) -> Result<bool> {
+        let rate_driver = self.rate_driver.as_ref().unwrap().clone();
+        if !self.is_active() || !rate_driver.active() {
+            return Ok(false);
         }
-        if self.engine.is_none() {
-            self.update_back();
-            return Ok(());
+        if std::mem::take(&mut self.engine_wanted) {
+            self.dispatch_engine_frame();
         }
-        if wake_engine {
-            self.engine.as_ref().unwrap().control().frame();
+        self.frame_wanted = false;
+        let mounter = self.mounter.as_mut().unwrap();
+        let sampled = mounter.frame(Some(timestamp));
+        if self.frame_rate.has_shader_demand()
+            && let Some(worker) = mounter.compositor.borrow().as_ref()
+        {
+            worker.frame(timestamp);
         }
-        let mounter_wants = self.mounter.as_mut().unwrap().frame(timestamp)?;
-        if mounter_wants || self.frame_wanted {
-            let demand = if !self.frame_wanted {
-                self.mounter
-                    .as_ref()
-                    .and_then(|m| m.animator.frame_rate())
-                    .map(|hz| crate::app::frame_rate::UiDemand::Capped((hz.round() as i32).max(1)))
-                    .unwrap_or(crate::app::frame_rate::UiDemand::Uncapped)
-            } else {
-                crate::app::frame_rate::UiDemand::Uncapped
-            };
-            self.frame_rate.set_ui_demand(demand);
-            self.request_frame()?;
-        } else {
-            self.frame_rate
-                .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
-        }
-        self.retire()?;
+        self.native_demand = sampled.as_ref().copied().unwrap_or_default();
+        let retired = self.retire();
+        let scheduled = self.schedule_frame();
         self.update_back();
-        Ok(())
+        sampled?;
+        retired?;
+        scheduled?;
+        Ok(rate_driver.active())
     }
     fn request_frame(&mut self) -> Result<()> {
         self.frame_wanted = true;
-        if !self.is_active() {
-            return Ok(());
-        }
-        if !self.frame_pending {
-            self.frame_wanted = false;
-            // The rate request and the frame source must use the same VSync
-            // connection. Its callback posts UI mutations through the existing
-            // dispatcher; it never accesses ArkUI from the VSync thread.
-            self.schedule(Message::Frame(None))?;
-            self.frame_pending = true;
-        }
-        Ok(())
+        self.schedule_frame()
     }
-    fn schedule(&self, message: Message) -> Result<()> {
-        let dispatcher = self.dispatcher.upgrade();
-        let control = matches!(message, Message::Frame(_))
-            .then(|| self.engine.as_ref().map(|e| e.control()))
-            .flatten();
-        let mut message = Some(message);
-        // NativeVSync is available on API 12. Its callback may run off the UI
-        // thread, so it only posts a message and never accesses ArkUI state.
-        let status = self.vsync.request_frame_once(move |timestamp| {
-            if let (Some(dispatcher), Some(message)) = (&dispatcher, message.take()) {
-                let wake_engine = matches!(message, Message::Frame(_))
-                    && dispatcher.active.load(std::sync::atomic::Ordering::Acquire);
-                let message = if wake_engine {
-                    Message::FrameSynced(timestamp.max(0) as u64)
-                } else if matches!(message, Message::Frame(_)) {
-                    Message::Frame(Some(timestamp.max(0) as u64))
-                } else {
-                    message
-                };
-                dispatcher.send(message);
-                if wake_engine && let Some(control) = &control {
-                    control.frame();
-                }
-            }
-        });
-        if status != 0 {
-            return Err(Error::Vsync(status));
+    fn schedule_frame(&mut self) -> Result<()> {
+        use super::frame_rate::UiDemand;
+        let demand = if self.engine_wanted || self.engine_in_flight > 0 || self.frame_wanted {
+            UiDemand::Uncapped
+        } else {
+            self.native_demand
+        };
+        self.frame_rate.set_ui_demand(demand);
+        let active =
+            self.is_active() && (demand != UiDemand::Idle || self.frame_rate.has_shader_demand());
+        let rate_driver = self.rate_driver.as_ref().unwrap();
+        rate_driver.set_active(active)?;
+        if let Err(error) = self
+            .phase
+            .as_ref()
+            .unwrap()
+            .set_running(active, self.frame_rate.desired_range())
+        {
+            let _ = rate_driver.set_active(false);
+            return Err(error.into());
         }
         Ok(())
     }
     fn retire(&mut self) -> Result<()> {
-        if let Some(epoch) = self.mounter.as_mut().and_then(Mounter::freeze_retired) {
-            // Disposing within a layout/draw callback is unsafe. The frame
-            // callback posts a new UI turn, and only that turn releases nodes.
-            self.schedule(Message::Reclaim(epoch))?;
+        if let Some(mounter) = &mut self.mounter
+            && let Some(epoch) = mounter.freeze_retired()
+        {
+            self.rate_driver.as_ref().unwrap().retire(epoch)?;
         }
         Ok(())
     }
     fn close(&mut self) -> Result<()> {
+        // Stop the UI subscription first. An uncancellable Native callback may
+        // still release retired resources, but cannot sample this generation.
+        self.phase.take();
+        let stopped = self
+            .rate_driver
+            .as_ref()
+            .map_or(Ok(()), |rate_driver| rate_driver.set_active(false));
+        self.engine_wanted = false;
+        self.engine_in_flight = 0;
+        self.frame_wanted = false;
+        self.native_demand = super::frame_rate::UiDemand::Idle;
         self.frame_rate
             .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
         if let Some(dispatcher) = self.dispatcher.upgrade() {
@@ -758,13 +784,15 @@ impl State {
                 }
             });
         }
-        if let Some(mounter) = &mut self.mounter {
+        let closed = if let Some(mounter) = &mut self.mounter {
             mounter.host.system.retire(&mounter.host, &self.dispatcher);
             mounter.host.apply_selected_status();
-            mounter.close()?;
-            self.retire()?;
-        }
-        Ok(())
+            mounter.close()
+        } else {
+            Ok(())
+        };
+        let retired = self.retire();
+        stopped.and(closed).and(retired)
     }
 }
 impl Drop for State {
@@ -859,7 +887,7 @@ impl Runtime {
                 "failed to configure OHOS native VSync rate: {status}"
             )));
         }
-        // The shader thread paces itself on the surface's shared FrameRate too.
+        // UI and shader demand share this one NativeVSync rate owner.
         let shader_rate = frame_rate.clone();
         let state = Rc::new(RefCell::new(State {
             #[cfg(feature = "dev")]
@@ -870,10 +898,13 @@ impl Runtime {
             engine: None,
             mounter: None,
             dispatcher: Weak::new(),
-            vsync,
+            rate_driver: None,
+            phase: None,
             frame_rate,
             errors,
-            frame_pending: false,
+            engine_wanted: false,
+            engine_in_flight: 0,
+            native_demand: super::frame_rate::UiDemand::Idle,
             laid_out: false,
             attached: true,
             visible: true,
@@ -916,13 +947,43 @@ impl Runtime {
             live: std::sync::atomic::AtomicBool::new(true),
         });
         state.borrow_mut().dispatcher = Arc::downgrade(&dispatcher);
+        state.borrow_mut().rate_driver = Some(super::frame_source::RateDriver::new(
+            vsync,
+            shader_rate.clone(),
+            Arc::downgrade(&dispatcher),
+        ));
+        let weak = Rc::downgrade(&state);
+        let rate_driver = state.borrow().rate_driver.as_ref().unwrap().clone();
+        state.borrow_mut().phase = Some(super::frame_source::Phase::new(
+            env,
+            &config.host,
+            rate_driver,
+            move |timestamp| {
+                let Some(state) = weak.upgrade() else {
+                    return Ok(false);
+                };
+                let mut state = state.try_borrow_mut().map_err(reentry)?;
+                match state.step_frame(timestamp) {
+                    Ok(active) => Ok(active),
+                    Err(error) => {
+                        state.report(error.to_string());
+                        if let Some(rate_driver) = &state.rate_driver {
+                            let _ = rate_driver.set_active(false);
+                        }
+                        Ok(false)
+                    }
+                }
+            },
+        )?);
         let environment = Environment {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
+            clipboard_images: Some(true),
             web_input: true,
             web_evaluate: true,
             notifications: true,
             speech: config.host.speech_available,
+            share: config.host.share_available,
             file_requests: true,
             audio: true,
             pixel_ratio: scale,
@@ -960,6 +1021,7 @@ impl Runtime {
             limits: config.limits,
             ui_sets: crate::ui_sets(),
             runtime: None,
+            support_dir: None,
             data_dir: Some(config.host.data_directory()),
             cache: config.cache.clone(),
             storage: config.storage.as_ref().map(|directory| {
@@ -974,6 +1036,7 @@ impl Runtime {
             speech: None,
             audio: None,
             windows: None,
+            login_item: None,
         };
         #[cfg(feature = "dev")]
         if let Some(testing) = &app.testing {
@@ -985,7 +1048,7 @@ impl Runtime {
         }
         let host_tokens = config.host_tokens.clone();
         let host_fonts = config.fonts.clone();
-        let fonts = crate::text::fonts::Fonts::new();
+        let fonts = crate::text::fonts::Fonts::shared();
         let engine_fonts = fonts.clone();
         let scale = environment.pixel_ratio;
         let text_scale = Arc::new(std::sync::atomic::AtomicU32::new(scale.to_bits()));
@@ -1024,6 +1087,7 @@ impl Runtime {
             scene: RefCell::default(),
             compositor: std::cell::RefCell::default(),
             composite_nodes: std::cell::RefCell::default(),
+            key_focus: RefCell::default(),
             selected_text: RefCell::default(),
             accessibility_dirty: RefCell::default(),
             accessibility_focus: RefCell::default(),
@@ -1034,6 +1098,7 @@ impl Runtime {
             unreclaimed_delete_count: std::cell::Cell::new(0),
             arkui: crate::render::arkui::empty_batch(),
             arkui_views: Default::default(),
+            deferred_webs: RefCell::default(),
             host: config.host.clone(),
             dispatcher: Arc::downgrade(&dispatcher),
             env,
@@ -1136,19 +1201,17 @@ impl Runtime {
         }
         let changed = state.attached != attached;
         state.attached = attached;
+        let mut updated = Ok(());
         if let Some(mounter) = &state.mounter {
             if !attached {
-                mounter.cancel_input().map_err(napi_error)?;
+                updated = updated.and(mounter.cancel_input().map_err(napi_error));
             }
             if changed {
-                mounter.native_context(attached).map_err(napi_error)?;
+                updated = updated.and(mounter.native_context(attached).map_err(napi_error));
             }
         }
         state.update_back();
-        if state.is_active() && state.frame_wanted {
-            state.request_frame().map_err(napi_error)?;
-        }
-        Ok(())
+        updated
     }
     pub(crate) fn set_visible(&self, visible: bool) -> napi_ohos::Result<()> {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
@@ -1156,14 +1219,13 @@ impl Runtime {
             return Ok(());
         }
         state.visible = visible;
-        if !visible && let Some(mounter) = &state.mounter {
-            mounter.cancel_input().map_err(napi_error)?;
-        }
+        let updated = if !visible && let Some(mounter) = &state.mounter {
+            mounter.cancel_input().map_err(napi_error)
+        } else {
+            Ok(())
+        };
         state.update_back();
-        if state.is_active() && state.frame_wanted {
-            state.request_frame().map_err(napi_error)?;
-        }
-        Ok(())
+        updated
     }
     #[cfg(feature = "dev")]
     pub(crate) fn hot_update(&self, update: nsh_engine::HotUpdate, version: (u64, u64)) -> bool {

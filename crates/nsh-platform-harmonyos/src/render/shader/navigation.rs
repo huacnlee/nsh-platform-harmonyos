@@ -2,6 +2,7 @@
 use std::{
     cell::Cell,
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 use nsh_core::NodeId;
@@ -40,10 +41,12 @@ pub(crate) struct Navigation {
     pub(crate) backwards: bool,
     phase: Cell<Phase>,
     fallback_pending: Cell<bool>,
+    phase_started: Cell<Instant>,
+    duration: Duration,
 }
 
 impl Navigation {
-    pub(crate) fn new(owner: NodeId, backwards: bool) -> Option<Self> {
+    pub(crate) fn new(owner: NodeId, backwards: bool, duration: Duration) -> Option<Self> {
         // Queued replies can outlive an app reload on the same host dispatcher.
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let generation = NEXT
@@ -53,6 +56,8 @@ impl Navigation {
             key: Key { owner, generation },
             backwards,
             phase: Cell::new(Phase::Capturing),
+            phase_started: Cell::new(Instant::now()),
+            duration,
             fallback_pending: Cell::new(false),
         })
     }
@@ -65,10 +70,23 @@ impl Navigation {
         matches!(self.phase.get(), Phase::Capturing | Phase::Running)
     }
 
+    /// The compositor can lose its producer without receiving another buffer
+    /// callback. The UI display pump must then release the pending navigation.
+    pub(crate) fn timed_out(&self, now: Instant) -> bool {
+        let grace = Duration::from_secs(2);
+        let allowed = match self.phase.get() {
+            Phase::Capturing => grace,
+            Phase::Running => self.duration.saturating_add(grace),
+            _ => return false,
+        };
+        now.saturating_duration_since(self.phase_started.get()) >= allowed
+    }
+
     pub(crate) fn mark_running(&self, key: Key) -> bool {
         if self.key != key || self.phase.get() != Phase::Capturing {
             return false;
         }
+        self.phase_started.set(Instant::now());
         self.phase.set(Phase::Running);
         true
     }
@@ -305,9 +323,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stalled_navigation_falls_back_without_truncating_a_long_animation() {
+        let nav = Navigation::new(4, false, Duration::from_secs(7)).unwrap();
+        let start = nav.phase_started.get();
+        assert!(nav.timed_out(start + Duration::from_secs(2)));
+        assert!(nav.mark_running(nav.key));
+        let start = nav.phase_started.get();
+        assert!(!nav.timed_out(start + Duration::from_secs(8)));
+        assert!(nav.timed_out(start + Duration::from_secs(9)));
+        assert!(nav.mark_fallback(nav.key));
+        assert!(!nav.timed_out(start + Duration::from_secs(10)));
+    }
+
+    #[test]
     fn late_completion_cannot_finish_a_reused_owner() {
-        let previous = Navigation::new(7, false).unwrap();
-        let current = Navigation::new(7, true).unwrap();
+        let previous = Navigation::new(7, false, Duration::ZERO).unwrap();
+        let current = Navigation::new(7, true, Duration::ZERO).unwrap();
         assert!(current.backwards);
         assert!(!current.complete(previous.key));
         assert!(current.running());
@@ -328,7 +359,7 @@ mod tests {
     #[test]
     fn capture_lifecycle_transitions_capturing_to_running_to_complete() {
         let mut demands = CaptureDemands::default();
-        let nav = Navigation::new(12, false).unwrap();
+        let nav = Navigation::new(12, false, Duration::ZERO).unwrap();
         assert!(nav.capturing());
         assert!(nav.running());
 
@@ -366,7 +397,7 @@ mod tests {
     fn running_failure_after_capture_marks_fallback_and_stops_running() {
         // Reproduces Event::Failed arriving from Task::Navigation (missing/expired
         // snapshot) after Event::Captured already moved Navigation into Running.
-        let nav = Navigation::new(50, false).unwrap();
+        let nav = Navigation::new(50, false, Duration::ZERO).unwrap();
         assert!(nav.mark_running(nav.key));
         assert!(nav.running());
 
@@ -386,7 +417,7 @@ mod tests {
         // 1. Same-owner interruption (e.g. Modal close interrupting mid-IRIS Modal open):
         //    modal 20's layer on target 20 stays held during ROOT_ID capture, then is
         //    replaced in place by set_on without detaching modal 20's Composite.
-        let modal_close = Navigation::new(20, true).unwrap();
+        let modal_close = Navigation::new(20, true, Duration::ZERO).unwrap();
         held.hold(20, 20, modal_close.key);
         assert!(held.is_held(20));
         assert_eq!(
@@ -399,8 +430,8 @@ mod tests {
         //    followed by a third Screen 12 superseding Screen 11 before capture lands:
         //    Screen 10's layer stays held across the transfer, then detaches after Screen 12's
         //    layer is attached via set_on.
-        let screen_11 = Navigation::new(11, false).unwrap();
-        let screen_12 = Navigation::new(12, false).unwrap();
+        let screen_11 = Navigation::new(11, false, Duration::ZERO).unwrap();
+        let screen_12 = Navigation::new(12, false, Duration::ZERO).unwrap();
         held.hold(10, 1, screen_11.key);
         assert!(held.is_held(10));
         assert_eq!(
@@ -412,14 +443,14 @@ mod tests {
         assert!(!held.is_held(10));
 
         // 3. Failure / cancellation before set_on detaches even same-owner held views.
-        let retry_close = Navigation::new(20, true).unwrap();
+        let retry_close = Navigation::new(20, true, Duration::ZERO).unwrap();
         held.hold(20, 20, retry_close.key);
         assert_eq!(held.release_holder(retry_close.key, None), vec![20]);
         assert!(!held.is_held(20));
 
         // 4. Node/target removal and clear release matching entries.
-        let nav_a = Navigation::new(30, false).unwrap();
-        let nav_b = Navigation::new(31, false).unwrap();
+        let nav_a = Navigation::new(30, false, Duration::ZERO).unwrap();
+        let nav_b = Navigation::new(31, false, Duration::ZERO).unwrap();
         held.hold(30, 1, nav_a.key);
         held.hold(31, 99, nav_b.key);
         assert!(held.remove_view(30));
@@ -434,15 +465,15 @@ mod tests {
     #[test]
     fn shared_picture_root_stays_sampled_until_last_demand_releases() {
         let mut demands = CaptureDemands::default();
-        let first = Navigation::new(10, false).unwrap();
-        let second = Navigation::new(11, false).unwrap();
+        let first = Navigation::new(10, false, Duration::ZERO).unwrap();
+        let second = Navigation::new(11, false, Duration::ZERO).unwrap();
         demands.request(first.key, 1);
         demands.request(second.key, 1);
         assert_eq!(demands.len(), 2);
         assert!(demands.contains_picture(1));
 
         // Replacing owner 10's demand returns the displaced key without dropping root 1.
-        let replacement = Navigation::new(10, true).unwrap();
+        let replacement = Navigation::new(10, true, Duration::ZERO).unwrap();
         assert_eq!(demands.request(replacement.key, 1), Some(first.key));
         assert!(demands.contains_picture(1));
 
@@ -455,9 +486,9 @@ mod tests {
     #[test]
     fn node_removal_and_clear_release_matching_and_all_demands() {
         let mut demands = CaptureDemands::default();
-        let page = Navigation::new(30, false).unwrap();
-        let modal = Navigation::new(31, false).unwrap();
-        let nested = Navigation::new(32, false).unwrap();
+        let page = Navigation::new(30, false, Duration::ZERO).unwrap();
+        let modal = Navigation::new(31, false, Duration::ZERO).unwrap();
+        let nested = Navigation::new(32, false, Duration::ZERO).unwrap();
         demands.request(page.key, 1);
         demands.request(modal.key, 1);
         demands.request(nested.key, 99);
@@ -480,27 +511,27 @@ mod tests {
     #[test]
     fn screen_and_modal_hold_visibility_until_capture_lands() {
         // Screen push: hidden while capturing, visible once running.
-        let push = Navigation::new(40, false).unwrap();
+        let push = Navigation::new(40, false, Duration::ZERO).unwrap();
         assert!(!screen_paint_visible(Some(&push), true, false, false));
         assert!(push.mark_running(push.key));
         assert!(screen_paint_visible(Some(&push), true, false, false));
 
         // Screen pop: visible while capturing, hidden once running so peer shows.
-        let pop = Navigation::new(41, true).unwrap();
+        let pop = Navigation::new(41, true, Duration::ZERO).unwrap();
         assert!(screen_paint_visible(Some(&pop), false, false, false));
         assert!(pop.mark_running(pop.key));
         assert!(!screen_paint_visible(Some(&pop), false, false, false));
 
         // Modal open: transparent while capturing or before texture surface is ready;
         // modal close: stays visible throughout capture and shader close.
-        let modal_open = Navigation::new(42, false).unwrap();
+        let modal_open = Navigation::new(42, false, Duration::ZERO).unwrap();
         assert!(modal_open_waiting(&modal_open, false));
         assert!(modal_open_waiting(&modal_open, true));
         assert!(modal_open.mark_running(modal_open.key));
         assert!(modal_open_waiting(&modal_open, false));
         assert!(!modal_open_waiting(&modal_open, true));
 
-        let modal_close = Navigation::new(43, true).unwrap();
+        let modal_close = Navigation::new(43, true, Duration::ZERO).unwrap();
         assert!(!modal_open_waiting(&modal_close, false));
         assert!(modal_close.mark_running(modal_close.key));
         assert!(!modal_open_waiting(&modal_close, false));

@@ -28,9 +28,6 @@ impl Node {
         native
             .borrow()
             .set_length_metric_unit(LengthMetricUnit::Vp)?;
-        // Every engine node is a native measure boundary, including the
-        // zero-sized containers that position overflowing virtual children.
-        native.borrow().set_layout_rect([0, 0, 0, 0])?;
         let visual_ptr = Rc::as_ptr(&native) as usize;
         let node = Rc::new_cyclic(|weak| Self {
             weak: weak.clone(),
@@ -45,7 +42,11 @@ impl Node {
             pending_delete: Cell::new(false),
             scene_prepared: Cell::new(false),
             scene_root: Cell::new(false),
+            scene_ancestor_captured: Cell::new(false),
             shader_layers: RefCell::default(),
+            modal_screen_layers: RefCell::default(),
+            backdrop_layer: Cell::new(None),
+            modal_backdrop: Cell::new(None),
             navigation_capture: Cell::new(false),
             composite_dirty: Cell::new(true),
             capture_cache: Cell::new(None),
@@ -87,8 +88,8 @@ impl Node {
             decoration: crate::render::decor::Decoration::default(),
             layout_callbacks: Cell::new(false),
             drawing: RefCell::new(None),
+            drawing_bounds: Cell::new([0; 4]),
             outlined: RefCell::new(None),
-            shadow_layer: RefCell::default(),
             text_drawing: RefCell::new(None),
             selection_area: RefCell::new(None),
             raster: RefCell::new(None),
@@ -100,9 +101,16 @@ impl Node {
             presentation: Cell::new((1.0, 0.0)),
             pinned: Cell::new((0.0, 0.0)),
             input_transform: Cell::new(nsh_core::Matrix::IDENTITY),
-            applied_layout_size: Cell::new((visual_ptr, 0, 0)),
+            applied_layout_size: Cell::new((0, 0, 0)),
             applied_position: Cell::new((0, 0, 0)),
             has_text_links: Cell::new(false),
+            batch_created: Cell::new(false),
+            culled_by_scroll: Cell::new(false),
+            in_culled_subtree: Cell::new(false),
+            style_deferred: Cell::new(false),
+            bounds_deferred: Cell::new(false),
+            paint_deferred: Cell::new(false),
+            anim_deferred: Cell::new(false),
         });
         if id == nsh_core::ROOT_ID || kind == ViewKind::Modal {
             crate::input::keyboard::install(&node)?;
@@ -191,6 +199,174 @@ impl Node {
     pub(crate) fn self_ref(&self) -> Option<Rc<Self>> {
         self.weak.upgrade()
     }
+    pub(crate) fn flush_deferred_native(self: &Rc<Self>) -> Result<()> {
+        if self.style_deferred.replace(false) {
+            if (self.style.borrow().effects.is_some() || !self.shader_layers.borrow().is_empty())
+                && let Some(scene) = self.scene.borrow().as_ref()
+            {
+                scene.require(self);
+            }
+            self.ensure_wrapper()?;
+            self.restore_style()?;
+        }
+        if self.bounds_deferred.replace(false) || self.applied_layout_size.get().0 == 0 {
+            self.update_layout_bounds()?;
+        }
+        if self.paint_deferred.replace(false) {
+            if self.text_drawing.borrow().is_some() && self.drawing.borrow().is_none() {
+                self.enable_drawing()?;
+            } else {
+                self.invalidate_paint()?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn allows_scroll_group_walk(&self) -> bool {
+        if self.kind != ViewKind::View
+            || self.pinned.get() != (0.0, 0.0)
+            || self.extra.get().1 != crate::render::transition::Extra::NONE
+            || self.scene_root.get()
+            || self.scene_active()
+            || self.scene_ancestor_captured.get()
+            || self.navigation_capture.get()
+            || self.shaders.contains(self.id)
+            || self.wrapper.borrow().is_some()
+            || self.live.borrow().is_some()
+        {
+            return false;
+        }
+        let style = self.style.borrow();
+        !style.hidden
+            && style.transform.is_identity()
+            && style
+                .effects
+                .as_ref()
+                .is_none_or(|e| e.filters.is_empty() && e.backdrop_filters.is_empty())
+    }
+    pub(crate) fn sync_culled_subtree(self: &Rc<Self>, ancestor_culled: bool) -> Result<()> {
+        let effective =
+            ancestor_culled || (self.culled_by_scroll.get() && !self.navigation_capture.get());
+        let changed = self.in_culled_subtree.replace(effective) != effective;
+        if !effective
+            && changed
+            && self.anim_deferred.replace(false)
+            && !self.style_deferred.get()
+            && self.mount_parent.borrow().strong_count() > 0
+        {
+            self.restore_style()?;
+        }
+        if changed {
+            let children: Vec<Rc<Node>> = self
+                .children
+                .borrow()
+                .iter()
+                .filter_map(Weak::upgrade)
+                .collect();
+            for child in children {
+                child.sync_culled_subtree(effective)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn set_culled_by_scroll(self: &Rc<Self>, culled: bool) -> Result<()> {
+        if self.culled_by_scroll.replace(culled) != culled {
+            let ancestor_culled = self
+                .parent_node
+                .borrow()
+                .upgrade()
+                .is_some_and(|parent| parent.in_culled_subtree.get());
+            self.sync_culled_subtree(ancestor_culled)?;
+            if !self.style_deferred.get() {
+                self.apply_opacity(self.style.borrow().opacity)?;
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn self_transform_allows_scroll_cull(&self) -> bool {
+        self.pinned.get() == (0.0, 0.0)
+            && self.extra.get().1 == crate::render::transition::Extra::NONE
+            && self.live.borrow().is_none()
+            && self.style.borrow().transform.is_identity()
+    }
+    pub(crate) fn self_allows_scroll_cull(&self) -> bool {
+        self.input.borrow().is_none()
+            && self.web.borrow().is_none()
+            && self.video.borrow().is_none()
+            && self.modal.borrow().is_none()
+            && self.component.borrow().is_none()
+            && !self.shaders.contains(self.id)
+            && self.shader_layers.borrow().is_empty()
+            && self
+                .wrapper
+                .borrow()
+                .as_ref()
+                .is_none_or(|wrapper| wrapper.composite.borrow().is_none())
+            && !self.navigation_capture.get()
+            && !self.scene_root.get()
+            && !self.scene_active()
+            && !self.has_selection()
+            && !self.accessibility_state.has_live()
+    }
+    pub(crate) fn can_cull_subtree_inner(&self) -> bool {
+        if !self.self_allows_scroll_cull() {
+            return false;
+        }
+        self.children
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .all(|child| child.can_cull_subtree_inner())
+    }
+    pub(crate) fn scroll_ink_bounds(&self) -> (f32, f32, f32, f32) {
+        let f = self.frame.get();
+        let style = self.style.borrow();
+        let mut outset = self.applied.get().ink_outset;
+        if style.outline.is_visible() {
+            outset = outset.max((style.outline.width.0 + style.outline.offset.0).max(0.0));
+        }
+        if let Some(effects) = style.effects.as_ref() {
+            for shadow in &effects.box_shadows {
+                if !shadow.inset && shadow.is_visible() {
+                    let reach = shadow.offset_x.0.abs().max(shadow.offset_y.0.abs())
+                        + shadow.blur.0.max(0.0) * 1.5
+                        + shadow.spread.0.max(0.0);
+                    outset = outset.max(reach);
+                }
+            }
+        }
+        drop(style);
+        let pad = outset + 4.0;
+        let (mut x0, mut y0, mut x1, mut y1) = (
+            f.x - pad,
+            f.y - pad,
+            f.x + f.width + pad,
+            f.y + f.height + pad,
+        );
+        if let Some(ov) = self.overflow.get() {
+            x0 = x0.min(f.x + ov.x - pad);
+            y0 = y0.min(f.y + ov.y - pad);
+            x1 = x1.max(f.x + ov.x + ov.width + pad);
+            y1 = y1.max(f.y + ov.y + ov.height + pad);
+        }
+        (x0, y0, x1, y1)
+    }
+    pub(crate) fn ancestors_allow_scroll_cull(&self) -> bool {
+        let mut cur = self.self_ref();
+        while let Some(node) = cur {
+            if node.id == nsh_core::ROOT_ID {
+                break;
+            }
+            if node.scene_active()
+                || node.navigation_capture.get()
+                || node.shaders.contains(node.id)
+                || node.effects_plan().requires_texture
+            {
+                return false;
+            }
+            cur = node.parent_node.borrow().upgrade();
+        }
+        true
+    }
     pub(crate) fn deactivate(&self) {
         if !self.active.replace(false) {
             return;
@@ -198,7 +374,9 @@ impl Node {
         self.animated_opacity.set(None);
         callback(|| self.cursor.update(self, false));
         callback(|| self.selection_clear());
-        self.invalidate_scene();
+        if self.scene_active() {
+            self.invalidate_scene();
+        }
         self.accessibility_state.deactivate(self);
         #[cfg(feature = "api-23")]
         self.accessibility_provider.clear();
@@ -249,19 +427,23 @@ impl Node {
         // Retained removed nodes and platform overlays are not logical siblings.
         // Locate a real sibling instead of counting assumed native child slots.
         for child in children[index..].iter().filter_map(Weak::upgrade) {
+            let mounted = child.mounted();
             if let Some(at) = native
                 .children()
                 .iter()
-                .position(|entry| Rc::ptr_eq(entry, &child.mounted()))
+                .position(|entry| Rc::ptr_eq(entry, &mounted))
             {
                 return at;
             }
         }
         for child in children[..index].iter().rev().filter_map(Weak::upgrade) {
+            let mounted = child.mounted();
+            // Appending usually follows the final native sibling. Searching
+            // from that end avoids rescanning the growing prefix per child.
             if let Some(at) = native
                 .children()
                 .iter()
-                .position(|entry| Rc::ptr_eq(entry, &child.mounted()))
+                .rposition(|entry| Rc::ptr_eq(entry, &mounted))
             {
                 return at + 1;
             }
@@ -318,6 +500,7 @@ impl Node {
         let frame = self.frame.get();
         component.native.borrow().width(frame.width)?;
         component.native.borrow().height(frame.height)?;
+        self.promote_direct_paint()?;
         self.native
             .borrow_mut()
             .insert_child(component.native.clone(), 0)?;
@@ -361,7 +544,6 @@ impl Drop for Node {
         }
         self.drawing.borrow_mut().take();
         self.outlined.borrow_mut().take();
-        self.shadow_layer.borrow_mut().take();
         // Struct fields otherwise outlive this Drop body. Release controller
         // handles before recursively disposing their mounted native descendants.
         #[cfg(feature = "api-23")]

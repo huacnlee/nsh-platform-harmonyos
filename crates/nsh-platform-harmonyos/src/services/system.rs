@@ -133,6 +133,30 @@ impl System {
                 };
                 (EventKind::Speech, id, true, data)
             }
+            Command::Share { id, sheet } => (
+                EventKind::Share,
+                id,
+                false,
+                SystemCommand {
+                    op: "share".into(),
+                    text: sheet.text,
+                    uri: sheet.url,
+                    title: sheet.title,
+                    paths: Some(sheet.files),
+                    ..Default::default()
+                },
+            ),
+            Command::SetClipboardItem(item) => (
+                EventKind::Clipboard,
+                0,
+                false,
+                SystemCommand {
+                    op: "clipboard-write".into(),
+                    text: Some(item.text),
+                    html: item.html,
+                    ..Default::default()
+                },
+            ),
             Command::SetClipboard(text) => (
                 EventKind::Clipboard,
                 0,
@@ -627,7 +651,15 @@ impl System {
             }
             return;
         }
-        let payload = if request.kind == EventKind::FileRequest {
+        let payload = if request.kind == EventKind::Share {
+            if let Some(message) = value.error {
+                nsh_core::share::ShareError::failed(message).payload(request.id)
+            } else if value.phase.as_deref() == Some("shared") {
+                nsh_core::share::ShareOutcome::shared(value.text).payload(request.id)
+            } else {
+                nsh_core::share::ShareOutcome::dismissed().payload(request.id)
+            }
+        } else if request.kind == EventKind::FileRequest {
             match value.error {
                 Some(error) => EventPayload::file_failed(request.id, error),
                 None => EventPayload::file_answer(request.id, Vec::new()),
@@ -787,6 +819,8 @@ fn insert_request<R>(
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SystemCommand {
     pub op: String,
+    pub paths: Option<Vec<String>>,
+    pub html: Option<String>,
     pub text: Option<String>,
     pub uri: Option<String>,
     pub asset: Option<String>,

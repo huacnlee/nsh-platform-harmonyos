@@ -1,9 +1,13 @@
 //! System AlertDialog/ActionSheet, called from Rust on the owning UI thread.
 //! ArkUI owns all content, styling, input and exit animations. The queue advances
 //! only after onDidDisappear, never while a system button is on the native stack.
-use std::{cell::Cell, collections::VecDeque, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+};
 
-use napi_ohos::bindgen_prelude::{Function, JsObjectValue, Object};
+use napi_ohos::bindgen_prelude::{Function, FunctionRef, JsObjectValue, Object};
 use nsh_core::{DialogButtonStyle, EventKind, EventPayload, PayloadValue};
 
 use crate::{
@@ -14,12 +18,13 @@ use crate::{
 struct Alert {
     request: nsh_core::Dialog,
     active: Rc<Cell<bool>>,
+    close: RefCell<Option<FunctionRef<(), ()>>>,
     #[cfg(feature = "dev")]
     appeared: Rc<Cell<bool>>,
 }
 impl Drop for Alert {
     fn drop(&mut self) {
-        // System dialogs have window lifetime and no programmatic close API.
+        // Native callbacks may outlive a retiring surface.
         // Retiring a surface must not let its later callbacks reach a new engine.
         self.active.set(false);
     }
@@ -84,6 +89,7 @@ impl Dialogs {
         self.alerts.push_back(Alert {
             request,
             active: Rc::new(Cell::new(true)),
+            close: RefCell::default(),
             #[cfg(feature = "dev")]
             appeared: Rc::new(Cell::new(false)),
         });
@@ -119,6 +125,14 @@ impl Dialogs {
             }
             options.set("message", request.message.as_deref().unwrap_or(""))?;
             options.set("autoCancel", request.cancelable)?;
+            options.set(
+                "appearance",
+                match self.context.appearance.get() {
+                    nsh_core::platform::Appearance::System => "system",
+                    nsh_core::platform::Appearance::Light => "light",
+                    nsh_core::platform::Appearance::Dark => "dark",
+                },
+            )?;
             #[cfg(feature = "dev")]
             for (event, visible) in [("onDidAppear", true), ("onWillDisappear", false)] {
                 let appeared = alert.appeared.clone();
@@ -150,6 +164,18 @@ impl Dialogs {
                         "value"
                     },
                     button.text.as_str(),
+                )?;
+                option.set(
+                    "destructive",
+                    button.style == DialogButtonStyle::Destructive,
+                )?;
+                option.set(
+                    "style",
+                    match button.style {
+                        DialogButtonStyle::Cancel => "cancel",
+                        DialogButtonStyle::Default => "default",
+                        DialogButtonStyle::Destructive => "destructive",
+                    },
                 )?;
                 let selected = result.clone();
                 let active = alert.active.clone();
@@ -204,6 +230,19 @@ impl Dialogs {
                     Ok(())
                 })?,
             )?;
+            let factory = crate::app::entry::ALERT_FACTORY.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .map(|factory| factory.borrow_back(env))
+                    .transpose()
+            })?;
+            if let Some(factory) = factory {
+                options.set("ui", ui)?;
+                options.set("sheet", request.sheet)?;
+                let close = factory.call(options.create_ref()?)?;
+                alert.close.replace(Some(close));
+                return Ok(());
+            }
             let show: Function<'_, Object<'_>, ()> = ui.get_named_property(if request.sheet {
                 "showActionSheet"
             } else {
@@ -211,6 +250,20 @@ impl Dialogs {
             })?;
             show.apply(ui, options)
         })?;
+        Ok(())
+    }
+    pub(crate) fn close(&mut self, id: u32) -> Result<()> {
+        let Some(index) = self.alerts.iter().position(|alert| alert.request.id == id) else {
+            return Ok(());
+        };
+        if index != 0 {
+            self.alerts.remove(index);
+            return Ok(());
+        }
+        let front = &self.alerts[0];
+        if let Some(close) = front.close.borrow().as_ref() {
+            close.borrow_back(&self.context.env)?.call(())?;
+        }
         Ok(())
     }
     pub(crate) fn finish(&mut self, id: u32, index: i32) -> Result<()> {
@@ -237,6 +290,9 @@ impl Dialogs {
         );
     }
     pub(crate) fn clear(&mut self) {
+        if let Some(id) = self.alerts.front().map(|alert| alert.request.id) {
+            let _ = self.close(id);
+        }
         self.alerts.clear();
         self.overlay = None;
     }

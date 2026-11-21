@@ -9,9 +9,12 @@ use std::{
 use nsh_core::animation::{AnimationOp, AnimationProp, AnimationValue, Finished, Graph};
 use nsh_engine::EngineControl;
 
-use crate::render::{
-    frame_clock::Active,
-    node::{Node, Result},
+use crate::{
+    app::frame_rate::UiDemand,
+    render::{
+        frame_clock::Active,
+        node::{Node, Result},
+    },
 };
 
 type Bindings = (Weak<Node>, Vec<(AnimationProp, u32)>);
@@ -36,6 +39,7 @@ pub(crate) struct Animator {
     clock: Instant,
     frame_clock: RefCell<super::frame_clock::FrameClock>,
     frame_time: std::cell::Cell<f64>,
+    graph_clock: RefCell<super::frame_clock::GraphClock>,
 }
 
 impl Animator {
@@ -69,7 +73,22 @@ impl Animator {
             clock: Instant::now(),
             frame_clock: RefCell::default(),
             frame_time: std::cell::Cell::new(0.0),
+            graph_clock: RefCell::default(),
         })
+    }
+    pub(crate) fn hold_presented_animation(self: &Rc<Self>) -> Option<PresentedAnimation> {
+        if !self.state.borrow().graph.is_finishing() {
+            return None;
+        }
+        let elapsed = self.now();
+        let last = self.frame_time.get();
+        let anchor = if last > 0.0 && (elapsed - last).abs() < 50.0 {
+            last
+        } else {
+            self.frame_clock.borrow_mut().sample(None, elapsed)
+        };
+        self.graph_clock.borrow_mut().hold(anchor);
+        Some(PresentedAnimation(Rc::downgrade(self)))
     }
     pub(crate) fn request_frame(&self) {
         if let Some(dispatcher) = self.dispatcher.upgrade() {
@@ -161,34 +180,14 @@ impl Animator {
     pub(crate) fn value(&self, node: u32) -> f32 {
         self.state.borrow().graph.value(node).unwrap_or_default()
     }
+    pub(crate) fn settle(&self, node: u32) {
+        let started = self.state.borrow_mut().graph.settle(node);
+        if started {
+            self.request_frame();
+        }
+    }
     pub(crate) fn frame_time(&self) -> f64 {
         self.frame_time.get()
-    }
-    pub(crate) fn frame_rate(&self) -> Option<f32> {
-        use nsh_core::animation::highest_frame_rate;
-        if self.scrolls.borrow().iter().next().is_some()
-            || self.selection.borrow().strong_count() > 0
-        {
-            return None;
-        }
-        let mut rate = None;
-        let mut any = false;
-        {
-            let state = self.state.borrow();
-            if state.graph.is_animating() {
-                any = true;
-                rate = Some(state.graph.frame_rate()?);
-            }
-        }
-        for weak in self.motion.borrow().iter() {
-            let Some(owner) = weak.upgrade() else {
-                continue;
-            };
-            any = true;
-            let live_rate = owner.live.borrow().as_ref().and_then(|l| l.frame_rate())?;
-            rate = highest_frame_rate(rate, Some(live_rate));
-        }
-        if any { rate } else { None }
     }
     pub(crate) fn flush(&self) -> Result<()> {
         if self.dirty.get() {
@@ -196,24 +195,24 @@ impl Animator {
         }
         Ok(())
     }
-    pub(crate) fn tick(&self, timestamp: Option<u64>) -> Result<bool> {
-        let _trace = super::composition::trace::Scope::new(c"NSH animation tick");
+    pub(crate) fn tick(&self, timestamp: Option<u64>) -> Result<UiDemand> {
         let now = self.frame_clock.borrow_mut().sample(timestamp, self.now());
         self.frame_time.set(now);
-        let (was_animating, mut animating) = {
+        let (changed, mut demand) = {
             let mut state = self.state.borrow_mut();
             let State { graph, finished } = &mut *state;
-            let was = graph.is_animating();
-            if was || self.dirty.get() {
-                graph.tick(now / 1000.0, finished);
-            }
-            (was, graph.is_animating())
+            let changed = (graph.is_animating() || self.dirty.get())
+                && graph.tick(self.graph_clock.borrow_mut().sample(now) / 1000.0, finished);
+            (
+                changed,
+                UiDemand::from_animation(graph.is_animating(), graph.frame_rate()),
+            )
         };
         let selection_root = self.selection.borrow().upgrade();
         if let Some(root) = selection_root {
             let mut touches = root.touches.borrow_mut();
             let active = touches.selection_tick(&root, now)?;
-            animating |= active;
+            demand = demand.merge(UiDemand::from_animation(active, None));
             // Keep a weak cleanup route at an edge without scheduling idle frames.
             if !touches.selection_held() {
                 *self.selection.borrow_mut() = Weak::new();
@@ -229,7 +228,7 @@ impl Animator {
                 } else {
                     false
                 };
-                animating |= active;
+                demand = demand.merge(UiDemand::from_animation(active, None));
                 Ok(active)
             })?;
         self.motion
@@ -238,17 +237,21 @@ impl Animator {
                 let Some(owner) = weak.upgrade() else {
                     return Ok(false);
                 };
-                let (active, removed) = owner.tick_transition(now)?;
-                animating |= active;
+                let (motion_demand, removed) = owner.tick_transition(now)?;
+                demand = demand.merge(motion_demand);
                 if removed {
                     self.removals.borrow_mut().push(owner.id);
                 }
-                Ok(active)
+                Ok(motion_demand != UiDemand::Idle)
             })?;
-        if was_animating || animating || self.dirty.get() {
+        if changed || self.dirty.get() {
             self.write()?;
+        } else {
+            // A driver can finish without changing its value. Local layout,
+            // navigation and scroll motion apply their own node bindings.
+            self.report_finished();
         }
-        Ok(animating)
+        Ok(demand)
     }
     fn write(&self) -> Result<()> {
         self.dirty.set(false);
@@ -280,11 +283,14 @@ impl Animator {
                 scroll.pin_sticky()?;
             }
         }
+        self.report_finished();
+        Ok(())
+    }
+    fn report_finished(&self) {
         let finished = std::mem::take(&mut self.state.borrow_mut().finished);
         if !finished.is_empty() {
             self.control.animations_finished(finished);
         }
-        Ok(())
     }
 }
 
@@ -293,4 +299,17 @@ pub(crate) fn color(value: AnimationValue) -> nsh_core::Color {
         AnimationValue::Color(color) => color,
         other => other.number() as u32,
     })
+}
+
+// A root snapshot can outlive its presentation's SDK callback. Dropping the
+// presentation on success, failure or cancellation releases its hold.
+pub(crate) struct PresentedAnimation(Weak<Animator>);
+
+impl Drop for PresentedAnimation {
+    fn drop(&mut self) {
+        if let Some(animator) = self.0.upgrade() {
+            animator.graph_clock.borrow_mut().release();
+            animator.request_frame();
+        }
+    }
 }

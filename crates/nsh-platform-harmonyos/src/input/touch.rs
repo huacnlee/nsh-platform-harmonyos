@@ -65,6 +65,7 @@ pub(crate) struct Touches {
     fingers: Vec<Finger>,
     activated: Option<Weak<Node>>,
     timestamp: f64,
+    modifiers: nsh_core::keymap::Modifiers,
     keyboard_tap: Option<KeyboardTap>,
     suppressed_presses: Vec<nsh_core::NodeId>,
     back: Option<BackSwipe>,
@@ -138,6 +139,7 @@ impl Touches {
                 .iter_mut()
                 .map(|f| {
                     f.point.changed = true;
+                    f.point.pressure = 0.0;
                     f.point.clone()
                 })
                 .collect();
@@ -147,6 +149,7 @@ impl Touches {
                 EventPayload::Touch(Box::new(TouchEvent {
                     phase: TouchPhase::Cancel,
                     timestamp: self.timestamp,
+                    modifiers: self.modifiers,
                     points,
                     activated: None,
                 })),
@@ -170,6 +173,7 @@ impl Touches {
         };
         let count = input.pointer_count().min(32);
         if phase == TouchPhase::Start {
+            self.modifiers = root.host.modifiers();
             self.keyboard_tap = None;
             if count == 1 {
                 self.suppressed_presses.clear();
@@ -249,6 +253,9 @@ impl Touches {
                             ),
                             location: nsh_core::Point::default(),
                             changed: true,
+                            pressure: 0.5,
+                            tilt_x: 0.0,
+                            tilt_y: 0.0,
                             pointer_type: match input.tool_type {
                                 UIInputToolType::Mouse | UIInputToolType::Touchpad => {
                                     PointerType::Mouse
@@ -270,6 +277,21 @@ impl Touches {
                 self.keyboard_tap = None;
             }
             if let Some(finger) = self.fingers.iter_mut().find(|f| f.point.id == id) {
+                let down_pressure = TouchPoint::default_pressure(
+                    phase,
+                    changed == Some(id) || phase == TouchPhase::Cancel,
+                );
+                let measured = input.pointer_pressure(i);
+                finger.point.pressure =
+                    if down_pressure > 0.0 && measured.is_finite() && measured > 0.0 {
+                        measured.min(1.0)
+                    } else {
+                        down_pressure
+                    };
+                if finger.point.pointer_type == PointerType::Pen {
+                    finger.point.tilt_x = input.pointer_tilt_x(i).clamp(-90.0, 90.0);
+                    finger.point.tilt_y = input.pointer_tilt_y(i).clamp(-90.0, 90.0);
+                }
                 finger.point.page =
                     nsh_core::Point::new(nsh_core::Points(page.0), nsh_core::Points(page.1));
                 if let Some(node) = finger.node.upgrade()
@@ -333,6 +355,7 @@ impl Touches {
                 EventPayload::Touch(Box::new(TouchEvent {
                     phase,
                     timestamp: self.timestamp,
+                    modifiers: self.modifiers,
                     points: self.fingers.iter().map(|f| f.point.clone()).collect(),
                     activated,
                 })),
@@ -391,12 +414,14 @@ impl Touches {
                 EventPayload::Touch(Box::new(TouchEvent {
                     phase: TouchPhase::Cancel,
                     timestamp: self.timestamp,
+                    modifiers: self.modifiers,
                     activated: None,
                     points: self
                         .fingers
                         .drain(..)
                         .map(|mut f| {
                             f.point.changed = true;
+                            f.point.pressure = 0.0;
                             f.point
                         })
                         .collect(),
@@ -640,6 +665,7 @@ impl Touches {
                         EventPayload::Touch(Box::new(TouchEvent {
                             phase: TouchPhase::Cancel,
                             timestamp: self.timestamp,
+                            modifiers: self.modifiers,
                             activated: None,
                             points: self
                                 .fingers
@@ -647,6 +673,7 @@ impl Touches {
                                 .map(|finger| {
                                     let mut point = finger.point.clone();
                                     point.changed = true;
+                                    point.pressure = 0.0;
                                     point
                                 })
                                 .collect(),
