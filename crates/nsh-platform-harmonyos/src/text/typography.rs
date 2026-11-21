@@ -10,10 +10,13 @@ use std::{
     },
 };
 
-use nsh_core::{AttributedText, Color, Point, Points, Size, TextAlign, TextEngine, TextLayout};
+use nsh_core::{
+    AttachmentAlignments, AttributedText, Color, FontExtent, Point, Points, Size, TextAlign,
+    TextEngine, TextLayout, VerticalAlign,
+};
 use ohos_drawing_binding::{
-    Canvas, FontSlant, FontStyle, FontWeight, FontWidth, TextDirection, TextStyle, Typography,
-    TypographyBuilder, TypographyStyle,
+    Canvas, DrawingFontMetrics, FontSlant, FontStyle, FontWeight, FontWidth, TextDirection,
+    TextStyle, Typography, TypographyBuilder, TypographyStyle,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -143,6 +146,7 @@ impl EngineText {
 pub(crate) struct Prepared {
     paragraph: RefCell<Arc<Mutex<Paragraph>>>,
     source: Arc<AttributedText>,
+    alignments: AttachmentAlignments,
     single_line_ltr: bool,
     has_attachments: bool,
     text: Arc<str>,
@@ -173,7 +177,10 @@ impl Prepared {
             // Mounted layouts retain their geometry, as CTFrame/StaticLayout do.
             // Rebuild only when a later constraint really changes that geometry.
             if Arc::strong_count(&paragraph) > 1 {
-                *paragraph = engine.prepare(&self.source).paragraph.into_inner();
+                *paragraph = engine
+                    .prepare_aligned(&self.source, &self.alignments)
+                    .paragraph
+                    .into_inner();
             }
             let mut owned = paragraph.lock().expect("text paragraph");
             owned.native.layout(width);
@@ -181,6 +188,28 @@ impl Prepared {
         }
         paragraph.clone()
     }
+}
+
+fn font_extent_from_metrics(metrics: Option<DrawingFontMetrics>, font_size: f32) -> FontExtent {
+    if let Some(m) = metrics {
+        let ascent = m.ascent.abs();
+        let descent = m.descent.abs();
+        if ascent.is_finite() && descent.is_finite() && (ascent > 0.0 || descent > 0.0) {
+            let x_height = if m.x_height.is_finite() && m.x_height != 0.0 {
+                m.x_height.abs()
+            } else if ascent > 0.0 {
+                ascent * 0.5
+            } else {
+                font_size * 0.5
+            };
+            return FontExtent::new(Points(ascent), Points(descent), Points(x_height));
+        }
+    }
+    FontExtent::new(
+        Points(font_size * 0.8),
+        Points(font_size * 0.2),
+        Points(font_size * 0.5),
+    )
 }
 
 pub(crate) struct OhosTextEngine {
@@ -295,6 +324,14 @@ impl TextEngine for OhosTextEngine {
     }
 
     fn prepare(&self, text: &AttributedText) -> Prepared {
+        self.prepare_aligned(text, &AttachmentAlignments::default())
+    }
+
+    fn prepare_aligned(
+        &self,
+        text: &AttributedText,
+        alignments: &AttachmentAlignments,
+    ) -> Prepared {
         let rtl = text.writing_direction.unwrap_or(text.rtl);
         let mut style = TypographyStyle::new();
         style.set_text_align(match text.align {
@@ -326,6 +363,7 @@ impl TextEngine for OhosTextEngine {
         }
         let mut fonts = self.fonts.lock().expect("font collection");
         let mut builder = TypographyBuilder::new(&mut style, &mut fonts.collection);
+        let mut metrics_probe: Option<Typography> = None;
         // Core spans use UTF-16 offsets, including supplementary characters.
         let single_plain_span = text.spans.len() == 1 && text.attachments.is_empty();
         let is_ascii = text.text.is_ascii();
@@ -430,6 +468,7 @@ impl TextEngine for OhosTextEngine {
             }
             builder.push_text_style(&mut style);
             let mut start = span.start as usize;
+            let mut span_font_extent: Option<FontExtent> = None;
             for attachment in text
                 .attachments
                 .iter()
@@ -437,17 +476,50 @@ impl TextEngine for OhosTextEngine {
             {
                 let at = attachment.index as usize;
                 add_slice(&mut builder, start, at);
-                if let Err(error) =
-                    builder.add_placeholder(&ohos_drawing_binding::PlaceholderSpan {
+                let align = alignments.get(attachment.index);
+                let has_baseline = alignments.baseline(attachment.index).is_some();
+                let placeholder = if align == VerticalAlign::Baseline && !has_baseline {
+                    ohos_drawing_binding::PlaceholderSpan {
                         width: attachment.width.0 as f64,
                         height: attachment.height.0 as f64,
-                        // The drawing ABI's above-baseline/alphabetic alignment
-                        // preserves the existing inline attachment placement.
                         alignment: ohos_drawing_binding::PlaceholderAlignment::AboveBaseline.into(),
                         baseline: ohos_drawing_binding::PlaceholderBaseline::Alphabetic.into(),
                         baselineOffset: 0.0,
-                    })
-                {
+                    }
+                } else {
+                    let extent = if align == VerticalAlign::Baseline {
+                        FontExtent::default()
+                    } else {
+                        *span_font_extent.get_or_insert_with(|| {
+                            let probe = metrics_probe.get_or_insert_with(|| {
+                                let mut probe_style = TypographyStyle::new();
+                                let mut p =
+                                    TypographyBuilder::new(&mut probe_style, &mut fonts.collection)
+                                        .build();
+                                p.layout(1.0);
+                                p
+                            });
+                            font_extent_from_metrics(
+                                probe.font_metrics(&style),
+                                span.style.font_size.0,
+                            )
+                        })
+                    };
+                    let ascent = alignments.ascent(attachment, extent);
+                    // OH_Drawing `ALIGNMENT_OFFSET_AT_BASELINE` measures `baselineOffset`
+                    // as the upward shift of the placeholder's bottom edge from the text
+                    // baseline (`top_above_baseline = height + baselineOffset`).
+                    let baseline_offset = (ascent - attachment.height).0 as f64;
+                    ohos_drawing_binding::PlaceholderSpan {
+                        width: attachment.width.0 as f64,
+                        height: attachment.height.0 as f64,
+                        alignment: ohos_drawing_binding::PlaceholderAlignment::OffsetAtBaseline
+                            .into(),
+                        baseline: ohos_drawing_binding::PlaceholderBaseline::Alphabetic.into(),
+                        baselineOffset: baseline_offset,
+                    }
+                };
+                if let Err(error) = builder.add_placeholder(&placeholder) {
                     log::warn!("OHOS text attachment: {error}");
                 }
                 start = at + 1;
@@ -468,6 +540,7 @@ impl TextEngine for OhosTextEngine {
                 _fonts: fonts.data.clone(),
             }))),
             source: Arc::new(text.clone()),
+            alignments: alignments.clone(),
             single_line_ltr: !rtl && matches!(text.align, TextAlign::Auto | TextAlign::Left),
             has_attachments: !text.attachments.is_empty(),
             selectable: (text.selectable != Some(false)).then(|| shared_text.clone()),
@@ -478,6 +551,19 @@ impl TextEngine for OhosTextEngine {
             decorations,
             selection_color: text.selection_color,
         }
+    }
+
+    fn first_baseline(&self, prepared: &Prepared, width: Points) -> Option<Points> {
+        let target = if prepared.no_wrap {
+            1_000_000.0
+        } else {
+            width.0.max(0.0) as f64
+        };
+        let shared = prepared.layout(self, target, true);
+        let owned = shared.lock().expect("text paragraph");
+        let line = owned.native.line_metrics(0)?;
+        let baseline = (line.y + line.ascender) as f32;
+        (baseline.is_finite() && baseline >= 0.0).then_some(Points(baseline))
     }
 
     fn measure(&self, prepared: &Prepared, max_width: Option<Points>) -> Size<Points> {
