@@ -103,6 +103,7 @@ export interface EditorSettings {
   editable: boolean;
   autoCorrect: boolean;
   reportPaste: boolean;
+  editActions?: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
   align: number;
@@ -128,6 +129,7 @@ export interface HostCommand {
   assertive?: boolean;
   announcement?: string;
   elementId?: number;
+  windowId?: number;
   openId?: number;
   limit?: number;
   filters?: Array<string>;

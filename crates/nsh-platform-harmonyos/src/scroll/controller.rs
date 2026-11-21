@@ -1112,6 +1112,19 @@ impl Scroller {
             if let Some(selection) = selection {
                 selection.selection_refresh()?;
             }
+            if let Some(focused) = owner.key_focus.borrow().upgrade()
+                && let Some(input) = focused.input.borrow().as_ref()
+                && input.is_ime_cursor_sink()
+            {
+                let mut ancestor = focused.parent_node.borrow().upgrade();
+                while let Some(node) = ancestor {
+                    if node.id == owner.id {
+                        input.frame_moved();
+                        break;
+                    }
+                    ancestor = node.parent_node.borrow().upgrade();
+                }
+            }
             owner.control.scroll(
                 owner.id,
                 Point::new(Points(reported.0), Points(reported.1)),

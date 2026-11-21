@@ -81,6 +81,7 @@ interface HostCommandPayload {
   assertive?: boolean;
   announcement?: string;
   elementId?: number;
+  windowId?: number;
   openId?: number;
   limit?: number;
   filters?: string[];
@@ -253,6 +254,7 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private active: boolean = true;
   private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private focusHandler?: (componentId: string) => boolean;
+  private uiContextResolver?: (componentId: string) => UIContext | undefined;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
@@ -269,6 +271,14 @@ class ComponentRuntimeContext implements NshRuntimeContext {
 
   setFocusHandler(handler?: (componentId: string) => boolean): void {
     this.focusHandler = handler;
+  }
+
+  setUIContextResolver(resolver?: (componentId: string) => UIContext | undefined): void {
+    this.uiContextResolver = resolver;
+  }
+
+  getUIContextFor(componentId: string): UIContext {
+    return this.uiContextResolver?.(componentId) ?? this.ui;
   }
 
   requestFocus(componentId: string): boolean {
@@ -580,7 +590,7 @@ class HostSession {
       pixelRatio = display.getDisplayByIdSync(displayId).densityPixels;
     }
     if (pixelRatio > 0) {
-      pixelRatio = Math.round(pixelRatio * 100) / 100;
+      pixelRatio = Math.round(pixelRatio * 10000) / 10000;
     }
     const lifecycle = mainWindow.isWindowShowing()
       ? mainWindow.isFocused()
@@ -661,9 +671,15 @@ class HostSession {
             return false;
           }
         },
+        (): void => {
+          this.syncWindowMetrics();
+        },
       );
       this.runtimeContext.setFocusHandler((componentId: string): boolean =>
         this.desktop?.requestComponentFocus(componentId) ?? false,
+      );
+      this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
+        this.desktop?.resolveComponentUIContext(componentId),
       );
       try {
         abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
@@ -764,7 +780,7 @@ class HostSession {
         newConfig.language ?? "",
         i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
         deviceInfo.deviceType,
-        Math.round(this.runtimeContext.getUIContext().vp2px(1) * 100) / 100,
+        Math.round(this.runtimeContext.getUIContext().vp2px(1) * 10000) / 10000,
         localeDetails.languages,
         localeDetails.timeZone,
         localeDetails.regionalLocale,
@@ -1003,7 +1019,7 @@ class HostSession {
       });
   }
 
-  private updateCursor(name: string): void {
+  private updateCursor(name: string, windowId?: number): void {
     const controller = this.runtimeContext.getUIContext().getCursorController();
     if (name === "none") {
       if (this.savedPointerVisible === undefined) {
@@ -1070,12 +1086,18 @@ class HostSession {
         style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
         break;
       default:
-        controller.restoreDefault();
-        this.desktop?.updateCursor(undefined);
+        if (windowId !== undefined) {
+          this.desktop?.updateWindowCursor(windowId, undefined);
+        } else {
+          controller.restoreDefault();
+        }
         return;
     }
-    controller.setCursor(style);
-    this.desktop?.updateCursor(style);
+    if (windowId !== undefined) {
+      this.desktop?.updateWindowCursor(windowId, style);
+    } else {
+      controller.setCursor(style);
+    }
   }
 
   private handleHostCommand(command: HostCommandPayload): void {
@@ -1104,7 +1126,7 @@ class HostSession {
       return;
     }
     if (command.kind === "cursor") {
-      this.updateCursor(command.text ?? "auto");
+      this.updateCursor(command.text ?? "auto", command.windowId);
       return;
     }
     if (command.kind === "restore-bars") {

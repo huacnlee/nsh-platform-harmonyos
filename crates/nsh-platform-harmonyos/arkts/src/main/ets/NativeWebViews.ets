@@ -644,7 +644,11 @@ class WebEntry {
         intentionCode: -1,
         stopPropagation: (): void => {},
       };
-      this.context.getUIContext().dispatchKeyEvent(`nsh-web-${this.settings.targetId}`, event);
+      const id = `nsh-web-${this.settings.targetId}`;
+      const ui = this.context.getUIContextFor
+        ? this.context.getUIContextFor(id)
+        : this.context.getUIContext();
+      ui.dispatchKeyEvent(id, event);
     }
   }
 

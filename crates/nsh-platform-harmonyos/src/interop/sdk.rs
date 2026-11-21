@@ -32,6 +32,7 @@ pub(crate) struct EditorSettings {
     pub editable: bool,
     pub auto_correct: bool,
     pub report_paste: bool,
+    pub edit_actions: Option<bool>,
     pub scrollbar_visible: bool,
     pub hit_test: u32,
     pub align: u32,

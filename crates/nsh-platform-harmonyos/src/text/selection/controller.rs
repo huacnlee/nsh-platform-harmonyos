@@ -89,7 +89,7 @@ impl Node {
             .is_some_and(|a| !a.model.is_empty())
     }
     pub(crate) fn selection_refresh(&self) -> Result<()> {
-        if !self.selectable() {
+        if !(self.selectable() || self.interaction.selectable_view()) {
             return self.selection_clear();
         }
         if let Some(area) = self.selection_area.borrow_mut().as_mut() {
@@ -213,7 +213,6 @@ impl Node {
         if let Some(route) = self.dispatcher.upgrade() {
             route.keyboard.lock().unwrap().selection = Some(self.id);
         }
-        self.ensure_wrapper()?;
         self.update_wrapper()?;
         Ok(true)
     }
@@ -240,7 +239,9 @@ impl Node {
         if let Some(route) = self.dispatcher.upgrade() {
             route.keyboard.lock().unwrap().selection = Some(self.id);
         }
-        self.ensure_wrapper()?;
+        if !desktop {
+            self.ensure_wrapper()?;
+        }
         self.update_wrapper()?;
         Ok(true)
     }

@@ -26,6 +26,7 @@ export interface EditorSettings {
   editable: boolean;
   autoCorrect: boolean;
   reportPaste: boolean;
+  editActions?: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
   align: number;
@@ -117,6 +118,7 @@ export interface WebEventPayload {
 export interface NshRuntimeContext {
   isActive(): boolean;
   getUIContext(): UIContext;
+  getUIContextFor?(componentId: string): UIContext;
   requestFocus?(componentId: string): boolean;
   colorMode?(): ThemeColorMode;
   attachNativeNode(targetId: number, content: FrameNode | null): boolean;
@@ -222,6 +224,10 @@ const SINK_BYTE_LIMIT: number = 256;
 
 function isSinkSettings(s: EditorSettings): boolean {
   return s.multiline && s.reportPaste && s.hitTest === 3 && s.color === 0 && s.caretColor === 0;
+}
+
+function isImeCursorSinkSettings(s: EditorSettings): boolean {
+  return !s.secure && s.reportPaste && s.hitTest === 3 && s.color === 0 && s.caretColor === 0;
 }
 
 function utf8ByteLength(text: string): number {
@@ -452,6 +458,10 @@ function editorContent(entry: EditorEntry) {
 const quarantinedEditors: Set<EditorEntry> = new Set();
 let activeEditor: EditorEntry | undefined;
 
+export function syncActiveEditorImeCursor(): void {
+  activeEditor?.refreshImeCursor();
+}
+
 interface EditMenuParams {
   entry: EditorEntry;
   x: number;
@@ -662,6 +672,7 @@ class EditorEntry {
   private selEnd: number = 0;
   private pendingScroll?: EditorCommand;
   private editMenuContent?: ComponentContent<EditMenuParams>;
+  private editMenuUi?: UIContext;
   private menuInteracting: boolean = false;
   private imeCursorKey: string = "";
   private consumedPasteKey: boolean = false;
@@ -679,6 +690,20 @@ class EditorEntry {
   }
   isSink(): boolean {
     return isSinkSettings(this.settings);
+  }
+  isImeCursorSink(): boolean {
+    return isImeCursorSinkSettings(this.settings);
+  }
+  private editorUIContext(): UIContext {
+    const id = `nsh-editor-${this.settings.targetId}`;
+    return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.context.getUIContext();
+  }
+  refreshImeCursor(): void {
+    if (this.closed || !this.focused || !this.isImeCursorSink() || !this.context.isActive()) {
+      return;
+    }
+    this.imeCursorKey = "";
+    this.scheduleSize();
   }
   private pinSinkCaret(): void {
     const end = this.text.length;
@@ -798,7 +823,7 @@ class EditorEntry {
     if (this.keyEvent(event)) {
       return true;
     }
-    if (this.settings.reportPaste && this.canEdit()) {
+    if (this.settings.reportPaste && this.canEdit() && this.focused && this.preview.length === 0) {
       if (
         event.type === KeyType.Down &&
         event.keyCode === KeyCode.KEYCODE_V &&
@@ -817,9 +842,7 @@ class EditorEntry {
       }
     }
     try {
-      return this.context
-        .getUIContext()
-        .dispatchKeyEvent(`nsh-editor-${this.settings.targetId}`, event);
+      return this.editorUIContext().dispatchKeyEvent(`nsh-editor-${this.settings.targetId}`, event);
     } catch {
       return false;
     }
@@ -1112,7 +1135,7 @@ class EditorEntry {
     this.scheduleSize();
   }
   private applySinkDiff(deleted: number, inserted: string): void {
-    const richEditorSink = !this.settings.scrollbarVisible;
+    const richEditorSink = !this.settings.scrollbarVisible && this.settings.editActions === true;
     if (deleted > 0) {
       const rustChars = Array.from(this.rustText);
       const k = rustChars.length;
@@ -1168,7 +1191,7 @@ class EditorEntry {
       return;
     }
     this.sizePending = true;
-    this.context.getUIContext().postFrameCallback(new EditorSizeCallback(this));
+    this.editorUIContext().postFrameCallback(new EditorSizeCallback(this));
   }
   measureSize(): void {
     this.sizePending = false;
@@ -1179,7 +1202,7 @@ class EditorEntry {
       this.settings.multiline && !this.settings.secure
         ? this.area.getTextContentRect()
         : this.line.getTextContentRect();
-    const ui = this.context.getUIContext();
+    const ui = this.editorUIContext();
     const width = ui.px2vp(rect.width);
     const height = ui.px2vp(rect.height);
     if (width !== this.contentWidth || height !== this.contentHeight) {
@@ -1231,7 +1254,7 @@ class EditorEntry {
         y -= offset.yOffset;
       }
       this.revealCaret = false;
-      if (this.isSink()) {
+      if (this.isImeCursorSink()) {
         this.syncImeCursor(ui);
       }
       if (
@@ -1320,12 +1343,7 @@ class EditorEntry {
     }
     if (kind === "blur" && this.menuInteracting) {
       this.menuInteracting = false;
-      try {
-        this.context
-          .getUIContext()
-          .getFocusController()
-          .requestFocus(`nsh-editor-${this.settings.targetId}`);
-      } catch {}
+      this.requestEditorFocus();
       return;
     }
     if (kind === "focus") {
@@ -1480,7 +1498,7 @@ class EditorEntry {
         }
       }
     } else if (command.kind === "cursor") {
-      if (this.focused && this.isSink()) {
+      if (this.focused && this.isImeCursorSink()) {
         this.imeCursorKey = "";
         this.scheduleSize();
       }
@@ -1593,12 +1611,7 @@ class EditorEntry {
   chooseEditAction(action: string): void {
     this.menuInteracting = false;
     if (!this.focused) {
-      try {
-        this.context
-          .getUIContext()
-          .getFocusController()
-          .requestFocus(`nsh-editor-${this.settings.targetId}`);
-      } catch {}
+      this.requestEditorFocus();
     }
     if (this.closed || !this.context.isActive()) {
       this.closeEditMenu();
@@ -1664,7 +1677,7 @@ class EditorEntry {
     if (filtered.length === 0) {
       return;
     }
-    const ui = this.context.getUIContext();
+    const ui = this.editorUIContext();
     const content = new ComponentContent<EditMenuParams>(
       ui,
       wrapBuilder(editMenuBuilder),
@@ -1679,11 +1692,13 @@ class EditorEntry {
       { nestingBuilderSupported: true },
     );
     this.editMenuContent = content;
+    this.editMenuUi = ui;
     try {
       ui.getOverlayManager().addComponentContent(content);
     } catch {
       if (this.editMenuContent === content) {
         this.editMenuContent = undefined;
+        this.editMenuUi = undefined;
       }
       try {
         content.dispose();
@@ -1692,12 +1707,14 @@ class EditorEntry {
   }
   private closeEditMenu(): void {
     const content = this.editMenuContent;
+    const ui = this.editMenuUi ?? this.editorUIContext();
     if (!content) {
       return;
     }
     this.editMenuContent = undefined;
+    this.editMenuUi = undefined;
     try {
-      this.context.getUIContext().getOverlayManager().removeComponentContent(content);
+      ui.getOverlayManager().removeComponentContent(content);
     } catch {}
     try {
       content.dispose();

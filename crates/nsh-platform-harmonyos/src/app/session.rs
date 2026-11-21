@@ -115,6 +115,7 @@ pub(crate) struct HostCommand {
     pub assertive: Option<bool>,
     pub announcement: Option<String>,
     pub element_id: Option<i64>,
+    pub window_id: Option<u32>,
     pub open_id: Option<u32>,
     pub limit: Option<u32>,
     pub filters: Option<Vec<String>>,
@@ -632,9 +633,10 @@ impl Services {
         })
     }
 
-    pub(crate) fn cursor(&self, cursor: nsh_core::Cursor) -> Result<()> {
+    pub(crate) fn cursor(&self, window_id: Option<u32>, cursor: nsh_core::Cursor) -> Result<()> {
         self.send_host_command(HostCommand {
             kind: "cursor".into(),
+            window_id,
             text: Some(cursor.name().into()),
             ..Default::default()
         })

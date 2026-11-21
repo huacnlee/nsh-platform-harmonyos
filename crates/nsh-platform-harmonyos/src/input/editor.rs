@@ -195,8 +195,23 @@ impl Input {
         let surface = owner.key_surface_root();
         owner.host.editor_key_event(&event, &route, &surface)
     }
+    pub(crate) fn report_paste(&self) -> bool {
+        self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report
+    }
+    pub(crate) fn is_ime_cursor_sink(&self) -> bool {
+        let config = self.config.borrow();
+        !config.secure
+            && config.paste_behavior == nsh_core::PasteBehavior::Report
+            && self.hit_test.get() == i32::from(HitTestMode::None) as u32
+            && config.caret_hidden
+            && argb(config.style.color) == 0
+    }
+    pub(crate) fn select_all(&self) -> Result<()> {
+        self.command("select-all", 0, 0);
+        Ok(())
+    }
     pub(crate) fn frame_moved(&self) {
-        if !self.closed.get() && self.state.borrow().is_focused() {
+        if !self.closed.get() && self.state.borrow().is_focused() && self.is_ime_cursor_sink() {
             self.command("cursor", 0, 0);
         }
     }
@@ -553,6 +568,7 @@ impl Input {
             editable: config.editable,
             auto_correct: config.auto_correct,
             report_paste: config.paste_behavior == nsh_core::PasteBehavior::Report,
+            edit_actions: Some(owner.interaction.mask().contains(EventKind::EditAction)),
             scrollbar_visible: config.scrollbar_visible && !config.replaced,
             hit_test: self.hit_test.get(),
             align: match config.align {

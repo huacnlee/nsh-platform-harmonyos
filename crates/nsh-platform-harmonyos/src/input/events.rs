@@ -410,7 +410,7 @@ impl Interaction {
             }
         }
         let mouse = !blocked
-            && (is_surface_root
+            && ((is_surface_root && owner.platform.get().os.is_desktop())
                 || owner.selectable()
                 || events.contains(EventKind::MouseMove)
                 || events.contains(EventKind::ContextMenu));
@@ -436,19 +436,26 @@ impl Interaction {
                             match input.mouse_action() {
                                 UIMouseEventAction::Move => {
                                     if is_root {
-                                        if owner
-                                            .touches
-                                            .borrow_mut()
-                                            .move_window_resize(&owner, (dx, dy))?
-                                        {
-                                            return Ok(());
-                                        }
-                                        if owner
-                                            .touches
-                                            .borrow_mut()
-                                            .move_pending_window_drag(&owner, (wx, wy))?
-                                        {
-                                            return Ok(());
+                                        let left_pressed = pressed_mouse_button(&input)
+                                            == Some(nsh_core::MouseButton::Left);
+                                        if !left_pressed {
+                                            owner.touches.borrow_mut().end_window_resize();
+                                            owner.touches.borrow_mut().clear_pending_window_drag();
+                                        } else {
+                                            if owner
+                                                .touches
+                                                .borrow_mut()
+                                                .move_window_resize(&owner, (dx, dy))?
+                                            {
+                                                return Ok(());
+                                            }
+                                            if owner
+                                                .touches
+                                                .borrow_mut()
+                                                .move_pending_window_drag(&owner, (wx, wy))?
+                                            {
+                                                return Ok(());
+                                            }
                                         }
                                         if desktop {
                                             update_desktop_pointer_cursor(&owner, x, y)?;
@@ -502,6 +509,7 @@ impl Interaction {
                                                     (wx, wy),
                                                     clicks,
                                                 )?;
+                                                blur_desktop_focus_on_empty_press(&owner, x, y)?;
                                             }
                                         }
                                         UIMouseEventButton::Right => {
@@ -1384,6 +1392,35 @@ fn hit_window_resize_edge(
     }
 }
 
+fn inspect_hit_window_chrome(
+    hit: &Rc<Node>,
+    root_id: nsh_core::NodeId,
+) -> (bool, Option<nsh_core::desktop::ResizeEdge>) {
+    let mut cur = hit.clone();
+    let mut is_control = false;
+    let mut explicit_edge = None;
+    loop {
+        if cur.interaction.window_control().is_some() {
+            is_control = true;
+            explicit_edge = None;
+            break;
+        }
+        if explicit_edge.is_none()
+            && let Some(edge) = cur.interaction.window_resize()
+        {
+            explicit_edge = Some(edge);
+        }
+        if cur.id == root_id {
+            break;
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            break;
+        };
+        cur = parent;
+    }
+    (is_control, explicit_edge)
+}
+
 fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> {
     let modal = root
         .modal
@@ -1402,11 +1439,11 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
         },
         |modal| modal.desktop_resizable(),
     );
-    let explicit_edge = if resizable {
-        hit_window_resize_edge(root, x, y)?
-    } else {
-        None
-    };
+    let hit = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)?;
+    let (is_control, explicit_edge) = hit.as_ref().map_or((false, None), |node| {
+        inspect_hit_window_chrome(node, root.id)
+    });
+    let explicit_edge = if resizable { explicit_edge } else { None };
     let resize_edge = explicit_edge.or_else(|| {
         if let Some(modal) = modal.as_ref() {
             modal.desktop_resize_edge((x, y))
@@ -1424,7 +1461,7 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
         }
     });
     if let Some(edge) = resize_edge
-        && (explicit_edge.is_some() || !hit_is_window_control(root, x, y)?)
+        && (explicit_edge.is_some() || !is_control)
     {
         root.cursor.set_resize(
             root,
@@ -1434,31 +1471,78 @@ fn update_desktop_pointer_cursor(root: &Rc<Node>, x: f32, y: f32) -> Result<()> 
     }
     root.cursor.set_resize(root, None)?;
 
-    let auto_cursor =
-        if let Some(node) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? {
-            if node.style.borrow().cursor != nsh_core::Cursor::Auto {
-                None
-            } else {
-                let local = if node.id == root.id {
-                    Some((x, y))
-                } else {
-                    node.input_in_root(root)?
-                        .and_then(|matrix| crate::render::geometry::local_point(&matrix.0, (x, y)))
-                };
-                if let Some((lx, ly)) = local
-                    && node.text_link_at(EventKind::Press, lx, ly).is_some()
-                {
-                    Some(nsh_core::Cursor::Pointer)
-                } else if node.selectable() {
-                    Some(nsh_core::Cursor::Text)
-                } else {
-                    None
-                }
-            }
-        } else {
+    let auto_cursor = if let Some(node) = hit {
+        if node.style.borrow().cursor != nsh_core::Cursor::Auto {
             None
-        };
+        } else {
+            let local = if node.id == root.id {
+                Some((x, y))
+            } else {
+                node.input_in_root(root)?
+                    .and_then(|matrix| crate::render::geometry::local_point(&matrix.0, (x, y)))
+            };
+            if let Some((lx, ly)) = local
+                && node.text_link_at(EventKind::Press, lx, ly).is_some()
+            {
+                Some(nsh_core::Cursor::Pointer)
+            } else if node.selectable() {
+                Some(nsh_core::Cursor::Text)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
     root.cursor.set_pointer_auto(root, auto_cursor)
+}
+
+fn blur_desktop_focus_on_empty_press(root: &Rc<Node>, x: f32, y: f32) -> Result<()> {
+    let Some(focused) = root.key_focus.borrow().upgrade() else {
+        return Ok(());
+    };
+    if !focused.visible_in_tree() || focused.key_window_id() != root.key_window_id() {
+        return Ok(());
+    }
+    let Some(mut cur) = crate::input::touch::hit(root, (x, y), &nsh_core::Matrix::IDENTITY)? else {
+        return Ok(());
+    };
+    loop {
+        if cur.id == focused.id
+            || cur.kind == nsh_core::ViewKind::Input
+            || cur.interaction.wrapper_key_focusable(&cur)
+            || cur.interaction.window_control().is_some()
+            || cur.interaction.window_drag() == Some(true)
+        {
+            return Ok(());
+        }
+        let mask = cur.interaction.mask();
+        if [
+            EventKind::Press,
+            EventKind::PressDown,
+            EventKind::LongPress,
+            EventKind::Touch,
+        ]
+        .into_iter()
+        .any(|event| mask.contains(event) || cur.text_listens(event))
+        {
+            return Ok(());
+        }
+        if cur.id == root.id {
+            break;
+        }
+        let Some(parent) = cur.parent_node.borrow().upgrade() else {
+            break;
+        };
+        cur = parent;
+    }
+    if let Some(input) = focused.input.borrow().as_ref() {
+        let _ = input.focus(false);
+    }
+    if let Some(sink) = root.focus_sink.borrow().as_ref() {
+        let _ = sink.borrow().request_focus();
+    }
+    Ok(())
 }
 
 fn handle_window_resize_press(

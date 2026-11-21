@@ -65,6 +65,7 @@ interface MenuParameters {
   menu: ViewMenu;
 }
 interface MenuLease {
+  ui: UIContext;
   content: ComponentContent<MenuParameters>;
   generation: number;
   opening: Promise<void>;
@@ -159,6 +160,8 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       .enabled(!s.disabled)
       .onClick(s.clickable || keyFocusable || s.menu != null ? (): void => {} : undefined)
       .focusOnTouch(keyFocusable);
+    // Do not call `.focusable(false)` on the wrapper `Stack`: in ArkUI that
+    // disables focus for the entire descendant subtree (including child editors).
     if (keyFocusable) {
       node
         .focusable(true)
@@ -471,8 +474,15 @@ class ViewEntry {
       kind: "focus",
     });
   }
+  private viewId(): string {
+    return this.settings.testId ?? `nsh-view-${this.settings.targetId}`;
+  }
+  private viewUIContext(): UIContext {
+    const id = this.viewId();
+    return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.ui;
+  }
   private requestViewFocus(): boolean {
-    const id = this.settings.testId ?? `nsh-view-${this.settings.targetId}`;
+    const id = this.viewId();
     try {
       if (this.context.requestFocus) {
         return this.context.requestFocus(id);
@@ -496,7 +506,7 @@ class ViewEntry {
     } else {
       this.focusPending = false;
       try {
-        this.ui.getFocusController().clearFocus();
+        this.viewUIContext().getFocusController().clearFocus();
       } catch (_) {}
     }
   }
@@ -530,7 +540,7 @@ class ViewEntry {
     if (previous) {
       this.retireMenu(previous);
     }
-    const ui = this.ui;
+    const ui = this.viewUIContext();
     const frame = this.focusTargetNode() ?? this.node.getFrameNode();
     if (!frame) {
       return;
@@ -538,9 +548,7 @@ class ViewEntry {
     // C custom nodes have a disabled focus type. Their native Stack wrapper
     // owns selection focus, so keys bubble only inside this surface and the
     // menu restores that focus without taking it back from a host control.
-    ui.getFocusController().requestFocus(
-      this.settings.testId ?? `nsh-view-${this.settings.targetId}`,
-    );
+    ui.getFocusController().requestFocus(this.viewId());
     const content = new ComponentContent<MenuParameters>(
       ui,
       wrapBuilder(menuContent),
@@ -548,6 +556,7 @@ class ViewEntry {
       { nestingBuilderSupported: true },
     );
     const lease: MenuLease = {
+      ui: ui,
       content: content,
       generation: menu.generation,
       opening: Promise.resolve(),
@@ -577,7 +586,9 @@ class ViewEntry {
       lease,
       lease.opening,
       (): Promise<void> =>
-        lease.disappeared ? Promise.resolve() : this.ui.getPromptAction().closeMenu(lease.content),
+        lease.disappeared
+          ? Promise.resolve()
+          : lease.ui.getPromptAction().closeMenu(lease.content),
       (): void => lease.content.dispose(),
     );
   }

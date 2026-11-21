@@ -219,13 +219,8 @@ impl KeyboardWindow {
         let code = input.code;
         let mut held = self.held.lock().unwrap();
         if input.from_editor {
-            if input.timestamp > 0 {
-                held.last_editor_key = Some((input.timestamp, action, code));
-            }
-        } else if input.timestamp > 0
-            && held.last_editor_key == Some((input.timestamp, action, code))
-        {
-            held.last_editor_key = None;
+            held.last_editor_key = Some((input.timestamp, action, code));
+        } else if held.last_editor_key.take() == Some((input.timestamp, action, code)) {
             return false;
         }
         if action == 1
@@ -337,12 +332,7 @@ impl KeyboardWindow {
             && focus
                 .as_ref()
                 .is_none_or(|node| node.scroll.borrow().is_some());
-        let shortcut = held.event(action, code, |stroke, repeat| {
-            // Capture is recomputed for each transition. Only shortcut
-            // consumption is retained for the matching hardware release.
-            if captures {
-                return false;
-            }
+        let shortcut = held.event(action, code, captures, |stroke, repeat| {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.composing {
                 return false;
@@ -356,6 +346,7 @@ impl KeyboardWindow {
                     Key::Char('c')
                         if stroke.modifiers.ctrl
                             && !stroke.modifiers.alt
+                            && !stroke.modifiers.shift
                             && !stroke.modifiers.cmd =>
                     {
                         Some(Command::Copy)
@@ -363,6 +354,7 @@ impl KeyboardWindow {
                     Key::Char('a')
                         if stroke.modifiers.ctrl
                             && !stroke.modifiers.alt
+                            && !stroke.modifiers.shift
                             && !stroke.modifiers.cmd =>
                     {
                         Some(Command::SelectAll)
@@ -423,7 +415,8 @@ impl KeyboardWindow {
                             route.send(crate::app::runtime::Message::DismissKeyboard);
                             return true;
                         }
-                        return false;
+                        drop(snapshot);
+                        return back(route);
                     }
                     drop(snapshot);
                     return back(route);
@@ -567,16 +560,14 @@ pub(crate) fn install(
 impl Held {
     fn sync_modifiers(&mut self, code: N, modifiers: Modifiers) {
         let mut sync = |left: N, right: N, active: bool| {
-            if code == left || code == right {
-                return;
-            }
             if active {
-                if !self.has(left, right) {
+                if code != left && code != right && !self.has(left, right) {
                     self.keys.push((left, false));
                 }
             } else {
-                self.keys
-                    .retain(|(held_code, _)| *held_code != left && *held_code != right);
+                self.keys.retain(|(held_code, _)| {
+                    *held_code == code || (*held_code != left && *held_code != right)
+                });
             }
         };
         sync(N::CtrlLeft, N::CtrlRight, modifiers.ctrl);
@@ -601,7 +592,13 @@ impl Held {
             false
         }
     }
-    fn event(&mut self, action: i32, code: N, fire: impl FnOnce(Keystroke, bool) -> bool) -> bool {
+    fn event(
+        &mut self,
+        action: i32,
+        code: N,
+        captured: bool,
+        fire: impl FnOnce(Keystroke, bool) -> bool,
+    ) -> bool {
         if self.cancel(action) {
             return false;
         }
@@ -616,8 +613,8 @@ impl Held {
             return false;
         }
         let modifiers = self.modifiers();
-        let consumed =
-            key(code).is_some_and(|key| fire(Keystroke { key, modifiers }, old.is_some()));
+        let consumed = captured
+            || key(code).is_some_and(|key| fire(Keystroke { key, modifiers }, old.is_some()));
         if let Some(index) = old {
             self.keys[index].1 |= consumed;
         } else {
@@ -768,34 +765,57 @@ mod tests {
     #[test]
     fn repeat_and_consumed_release_survive_callback_borrowing() {
         let mut held = Held::default();
-        assert!(held.event(1, N::A, |_, repeat| {
+        assert!(held.event(1, N::A, false, |_, repeat| {
             assert!(!repeat);
             true
         }));
-        assert!(!held.event(1, N::A, |_, repeat| {
+        assert!(!held.event(1, N::A, false, |_, repeat| {
             assert!(repeat);
             false
         }));
-        assert!(held.event(2, N::A, |_, _| panic!("up must not dispatch")));
-        assert!(!held.event(2, N::A, |_, _| false));
+        assert!(held.event(2, N::A, false, |_, _| panic!("up must not dispatch")));
+        assert!(!held.event(2, N::A, false, |_, _| false));
+    }
+    #[test]
+    fn captured_key_down_consumes_matching_release() {
+        let mut held = Held::default();
+        assert!(held.event(1, N::Enter, true, |_, _| panic!(
+            "captured key must not run shortcut callback"
+        )));
+        assert!(held.event(2, N::Enter, false, |_, _| false));
+        assert!(!held.event(2, N::Enter, false, |_, _| false));
+    }
+    #[test]
+    fn right_modifier_release_clears_externally_synced_left_modifier() {
+        let mut held = Held::default();
+        held.sync_modifiers(
+            N::A,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(held.modifiers().shift);
+        held.sync_modifiers(N::ShiftRight, Modifiers::default());
+        assert!(!held.modifiers().shift);
     }
     #[test]
     fn cancellation_does_not_require_a_decodable_key_code() {
         let mut held = Held::default();
-        held.event(1, N::CtrlLeft, |_, _| false);
+        held.event(1, N::CtrlLeft, false, |_, _| false);
         assert!(held.cancel(0));
         assert!(held.keys.is_empty());
     }
     #[test]
     fn modifier_state_and_cancel_are_native_only() {
         let mut held = Held::default();
-        held.event(1, N::CtrlLeft, |_, _| false);
-        held.event(1, N::C, |stroke, _| {
+        held.event(1, N::CtrlLeft, false, |_, _| false);
+        held.event(1, N::C, false, |stroke, _| {
             assert!(stroke.modifiers.ctrl);
             false
         });
-        held.event(0, N::C, |_, _| false);
-        held.event(1, N::C, |stroke, _| {
+        held.event(0, N::C, false, |_, _| false);
+        held.event(1, N::C, false, |stroke, _| {
             assert!(!stroke.modifiers.ctrl);
             false
         });

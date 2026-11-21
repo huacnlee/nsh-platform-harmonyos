@@ -10,6 +10,7 @@ import { UIContext } from "@ohos.arkui.UIContext";
 import display from "@ohos.display";
 import pointer from "@ohos.multimodalInput.pointer";
 import { NativeMenuCleanup } from "./NativeMenus";
+import { syncActiveEditorImeCursor } from "./NativeEditors";
 import {
   NSH_SUBWINDOW_BRIDGE_KEY,
   NSH_SUBWINDOW_ROUTE,
@@ -362,13 +363,13 @@ function resolveScaleFactor(displayId: number | undefined, fallbackUi: UIContext
         ? display.getDisplayByIdSync(displayId)
         : display.getDefaultDisplaySync();
     if (screen.densityPixels > 0) {
-      return Math.round(screen.densityPixels * 100) / 100;
+      return Math.round(screen.densityPixels * 10000) / 10000;
     }
   } catch {}
   try {
     const vp = fallbackUi.vp2px(1);
     if (vp > 0) {
-      return Math.round(vp * 100) / 100;
+      return Math.round(vp * 10000) / 10000;
     }
   } catch {}
   return 1.0;
@@ -432,20 +433,22 @@ async function resolveTargetDisplay(
 }
 
 async function displayAvailableRectPx(screen: display.Display): Promise<PixelArea> {
+  const originX = screen.x ?? 0;
+  const originY = screen.y ?? 0;
   try {
     const area = await screen.getAvailableArea();
     if (area.width > 0 && area.height > 0) {
       return {
-        left: area.left,
-        top: area.top,
+        left: originX + area.left,
+        top: originY + area.top,
         width: area.width,
         height: area.height,
       };
     }
   } catch {}
   return {
-    left: 0,
-    top: 0,
+    left: originX,
+    top: originY,
     width: screen.width,
     height: screen.height,
   };
@@ -501,6 +504,7 @@ class SubWindowHost {
       this.userPositioned = true;
     }
     this.syncState();
+    syncActiveEditorImeCursor();
   };
 
   private readonly onStatusChange = (status: window.WindowStatusType): void => {
@@ -509,6 +513,7 @@ class SubWindowHost {
     }
     this.applyWindowStatus(status);
     this.syncState();
+    syncActiveEditorImeCursor();
   };
 
   private readonly onWindowEvent = (event: window.WindowEventType): void => {
@@ -548,6 +553,7 @@ class SubWindowHost {
         return;
     }
     this.syncState();
+    syncActiveEditorImeCursor();
   };
 
   private readonly onTitleButtonRectChange = (rect: window.TitleButtonRect): void => {
@@ -967,6 +973,9 @@ class SubWindowHost {
       } catch {}
     }
     await this.applyAttributesInternal(cmd);
+    if (this.destroyed) {
+      return;
+    }
 
     const attached = this.owner.attachSubWindow(this.windowId, content, platformWindowId);
     if (!attached || this.destroyed) {
@@ -1013,7 +1022,6 @@ class SubWindowHost {
     if (cmd.mode && cmd.mode !== "normal") {
       await this.setModeInternal(cmd.mode);
     }
-    this.updateCursor(this.owner.activeCursorStyle());
     this.syncTitleBar();
     this.syncState();
   }
@@ -1593,7 +1601,8 @@ export class NativeDesktop {
   private readonly subWindows: Map<number, SubWindowHost> = new Map();
   private closed: boolean = false;
   private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
-  private currentCursorStyle?: pointer.PointerStyle;
+  private lastDisplayId?: number;
+  private readonly onDisplayMetricsChanged?: () => void;
   private nextCascadeIndex: number = 0;
   private frameNone: boolean = false;
   private transparent: boolean = false;
@@ -1663,6 +1672,14 @@ export class NativeDesktop {
 
   private readonly onWindowRectChange = (_data: window.RectChangeOptions): void => {
     this.syncWindowState();
+    syncActiveEditorImeCursor();
+    try {
+      const displayId = this.mainWindow.getWindowProperties().displayId;
+      if (displayId !== undefined && displayId !== this.lastDisplayId) {
+        this.lastDisplayId = displayId;
+        this.onDisplayMetricsChanged?.();
+      }
+    } catch {}
   };
 
   private readonly onWindowStatusChange = (status: window.WindowStatusType): void => {
@@ -1700,14 +1717,16 @@ export class NativeDesktop {
   private readonly onWindowWillClose = (): Promise<boolean> => {
     if (!this.closed) {
       this.emit("close-press", JSON.stringify({ reason: "closeButton" }));
+      // Always defer teardown to Rust so ClosePress, child windows, Closed, and Quit run cleanly.
+      return Promise.resolve(true);
     }
-    // `resolve(true)` prevents closing; `resolve(false)` lets the window close.
-    return Promise.resolve(!this.closeOnPress);
+    return Promise.resolve(false);
   };
 
   private readonly onDisplayChange = (_id: number): void => {
     this.syncDisplays();
     this.syncWindowState();
+    this.onDisplayMetricsChanged?.();
   };
 
   constructor(
@@ -1720,12 +1739,17 @@ export class NativeDesktop {
       content: NodeContent,
       platformWindowId: number,
     ) => boolean,
+    onDisplayMetricsChanged?: () => void,
   ) {
     this.ui = ui;
     this.abilityContext = abilityContext;
     this.mainWindow = mainWindow;
     this.emit = emit;
     this.attachSubWindowCb = attachSubWindow;
+    this.onDisplayMetricsChanged = onDisplayMetricsChanged;
+    try {
+      this.lastDisplayId = mainWindow.getWindowProperties().displayId;
+    } catch {}
     try {
       this.visible = mainWindow.isWindowShowing();
       this.focused = mainWindow.isFocused();
@@ -1761,10 +1785,6 @@ export class NativeDesktop {
     return this.nextCascadeIndex++;
   }
 
-  activeCursorStyle(): pointer.PointerStyle | undefined {
-    return this.currentCursorStyle;
-  }
-
   activeColorMode(): ThemeColorMode {
     return this.colorMode;
   }
@@ -1790,11 +1810,24 @@ export class NativeDesktop {
     }
   }
 
-  updateCursor(style?: pointer.PointerStyle): void {
-    this.currentCursorStyle = style;
-    this.subWindows.forEach((sub: SubWindowHost): void => {
-      sub.updateCursor(style);
-    });
+  updateWindowCursor(windowId: number, style?: pointer.PointerStyle): void {
+    this.subWindows.get(windowId)?.updateCursor(style);
+  }
+
+  resolveComponentUIContext(componentId: string): UIContext | undefined {
+    const hosts = Array.from(this.subWindows.values());
+    for (let i = 0; i < hosts.length; i++) {
+      const ui = hosts[i].uiContext();
+      if (ui === undefined) {
+        continue;
+      }
+      try {
+        if (ui.getFrameNodeById(componentId) !== null) {
+          return ui;
+        }
+      } catch {}
+    }
+    return undefined;
   }
 
   setColorMode(mode: ThemeColorMode): void {
@@ -2608,13 +2641,13 @@ export class NativeDesktop {
             ? display.getDisplayByIdSync(props.displayId)
             : display.getDefaultDisplaySync();
         if (screen.densityPixels > 0) {
-          scale = Math.round(screen.densityPixels * 100) / 100;
+          scale = Math.round(screen.densityPixels * 10000) / 10000;
         }
         displayName = `display-${screen.id}`;
       } catch {
         const vp = this.ui.vp2px(1);
         if (vp > 0) {
-          scale = Math.round(vp * 100) / 100;
+          scale = Math.round(vp * 10000) / 10000;
         }
       }
       const bounds: WireBoundsPayload = {
@@ -2671,7 +2704,7 @@ export class NativeDesktop {
       for (let i = 0; i < screens.length; i++) {
         const screen = screens[i];
         const scale =
-          screen.densityPixels > 0 ? Math.round(screen.densityPixels * 100) / 100 : 1.0;
+          screen.densityPixels > 0 ? Math.round(screen.densityPixels * 10000) / 10000 : 1.0;
         const x = (screen.x ?? 0) / scale;
         const y = (screen.y ?? 0) / scale;
         const bounds: WireBoundsPayload = {
@@ -3010,7 +3043,8 @@ export class NativeDesktop {
     }
     this.trayClickId = cmd.click ?? 0;
 
-    const menuGroups = this.buildStatusBarMenu(generation, cmd.items ?? []);
+    const nextMenuTargets: Map<string, TrayMenuTarget> = new Map();
+    const menuGroups = this.buildStatusBarMenu(generation, cmd.items ?? [], nextMenuTargets);
     const rawTips = (cmd.tooltip ?? "").trim() || (cmd.title ?? "").trim();
     const hoverTips =
       rawTips.length > STATUS_BAR_MAX_HOVER_TIPS_CHARS
@@ -3061,7 +3095,18 @@ export class NativeDesktop {
             reject(error);
           }
         });
+        if (this.closed || generation !== this.trayGeneration) {
+          try {
+            if (deviceInfo.sdkApiVersion >= 14) {
+              kit.default.removeFromStatusBar(this.abilityContext, (): void => {});
+            } else {
+              kit.default.removeFromStatusBar(this.abilityContext);
+            }
+          } catch {}
+          return;
+        }
         this.trayAdded = true;
+        this.trayMenuTargets = nextMenuTargets;
         this.trayLastIconKey = iconKey;
         this.trayLastHoverTips = hoverTips;
       } catch (error) {
@@ -3092,6 +3137,9 @@ export class NativeDesktop {
           reject(error);
         }
       });
+      if (!this.closed && generation === this.trayGeneration) {
+        this.trayMenuTargets = nextMenuTargets;
+      }
     } catch (error) {
       console.warn(`[NSH] updateStatusBarMenu failed: ${String(error)}`);
     }
@@ -3203,8 +3251,8 @@ export class NativeDesktop {
   private buildStatusBarMenu(
     generation: number,
     items: WireMenuItem[],
+    targets: Map<string, TrayMenuTarget>,
   ): statusBarManager.StatusBarGroupMenu[] {
-    this.trayMenuTargets.clear();
     const abilityName = this.abilityContext.abilityInfo?.name ?? "EntryAbility";
     const moduleName = this.abilityContext.abilityInfo?.moduleName ?? "entry";
     const supportsItemOptions = deviceInfo.sdkApiVersion >= 24;
@@ -3213,7 +3261,7 @@ export class NativeDesktop {
 
     const makeCode = (item: WireMenuItem): string => {
       const code = `nsh-${generation}-${++seq}`;
-      this.trayMenuTargets.set(code, { id: item.id ?? 0, role: item.role });
+      targets.set(code, { id: item.id ?? 0, role: item.role });
       return code;
     };
 
@@ -3339,8 +3387,13 @@ export class NativeDesktop {
           alphaType: image.AlphaType.PREMUL,
         };
         const white = await image.createPixelMap(whiteBuf, opts);
-        const black = await image.createPixelMap(blackBuf, opts);
-        return { white, black };
+        try {
+          const black = await image.createPixelMap(blackBuf, opts);
+          return { white, black };
+        } catch (error) {
+          white.release().catch((): void => {});
+          throw error instanceof Error ? error : new Error(String(error));
+        }
       } catch (error) {
         console.warn(`[NSH] tray RGBA icon decode failed: ${String(error)}`);
       }
@@ -3355,8 +3408,13 @@ export class NativeDesktop {
             desiredPixelFormat: image.PixelMapFormat.RGBA_8888,
           };
           const white = await source.createPixelMap(opts);
-          const black = await source.createPixelMap(opts);
-          return { white, black };
+          try {
+            const black = await source.createPixelMap(opts);
+            return { white, black };
+          } catch (error) {
+            white.release().catch((): void => {});
+            throw error instanceof Error ? error : new Error(String(error));
+          }
         } finally {
           source.release().catch((): void => {});
         }
@@ -3394,7 +3452,12 @@ export class NativeDesktop {
       alphaType: image.AlphaType.PREMUL,
     };
     const white = await image.createPixelMap(whitePixels.buffer, opts);
-    const black = await image.createPixelMap(blackPixels.buffer, opts);
-    return { white, black };
+    try {
+      const black = await image.createPixelMap(blackPixels.buffer, opts);
+      return { white, black };
+    } catch (error) {
+      white.release().catch((): void => {});
+      throw error instanceof Error ? error : new Error(String(error));
+    }
   }
 }

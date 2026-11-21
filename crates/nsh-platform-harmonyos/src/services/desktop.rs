@@ -1550,6 +1550,7 @@ pub(crate) struct MainWindowState {
     pub(crate) min_size: Option<Size<Points>>,
     pub(crate) max_size: Option<Size<Points>>,
     pub(crate) size_to_content: SizeToContent,
+    pub(crate) backdrop: Backdrop,
 }
 
 impl Default for MainWindowState {
@@ -1562,6 +1563,7 @@ impl Default for MainWindowState {
             min_size: None,
             max_size: None,
             size_to_content: SizeToContent::Off,
+            backdrop: Backdrop::None,
         }
     }
 }
@@ -1589,6 +1591,9 @@ impl MainWindowState {
         }
         if let Some(size_to_content) = attrs.size_to_content {
             self.size_to_content = size_to_content;
+        }
+        if let Some(backdrop) = attrs.backdrop {
+            self.backdrop = backdrop;
         }
     }
 
@@ -1628,6 +1633,12 @@ impl DesktopState {
     pub(crate) fn next_popup_generation(&mut self) -> u32 {
         self.popup_generation = self.popup_generation.wrapping_add(1).max(1);
         self.popup_open = true;
+        self.popup_generation
+    }
+
+    pub(crate) fn next_selection_popup_generation(&mut self) -> u32 {
+        self.popup_generation = self.popup_generation.wrapping_add(1).max(1);
+        self.popup_open = false;
         self.popup_generation
     }
 }

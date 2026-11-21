@@ -300,9 +300,41 @@ impl Mounter {
         }
         result.and(self.system_appearance())
     }
+    fn apply_main_backdrop(&self) {
+        if let Ok(root) = self.node(nsh_core::ROOT_ID) {
+            use nsh_core::{desktop::Backdrop, platform::Appearance};
+            use ohos_arkui_binding::{
+                common::attribute::ArkUINodeAttributeNumber,
+                types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
+            };
+            let backdrop = self.main_window.borrow().backdrop;
+            let style = match backdrop {
+                Backdrop::None => None,
+                Backdrop::Window => Some(BlurStyle::BackgroundThick),
+                Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
+                Backdrop::Popover => Some(BlurStyle::BackgroundThin),
+                Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
+            };
+            if let Some(style) = style {
+                // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
+                let color_mode = match self.appearance.get() {
+                    Appearance::System => 0,
+                    Appearance::Light => 1,
+                    Appearance::Dark => 2,
+                };
+                let _ = root.native.borrow().set_background_blur_style([
+                    ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
+                    ArkUINodeAttributeNumber::Int(color_mode),
+                ]);
+            } else {
+                let _ = root.native.borrow().reset_attribute(A::BackgroundBlurStyle);
+            }
+        }
+    }
     fn system_appearance(&self) -> Result<()> {
         let appearance = self.appearance.get();
         self.host.set_appearance(appearance)?;
+        self.apply_main_backdrop();
         let dark =
             appearance.resolve(self.platform.get().color_scheme) == nsh_engine::ColorScheme::Dark;
         let config = self.dispatcher.upgrade().and_then(|route| {
@@ -608,28 +640,8 @@ impl Mounter {
                     self.desktop.close_on_press = close_on_press;
                 }
                 self.main_window.borrow_mut().apply_attributes(&attrs);
-                if let Some(backdrop) = attrs.backdrop
-                    && let Ok(root) = self.node(nsh_core::ROOT_ID)
-                {
-                    use nsh_core::desktop::Backdrop;
-                    use ohos_arkui_binding::types::{
-                        advanced::BlurStyle, attribute::ArkUINodeAttributeType as A,
-                    };
-                    let style = match backdrop {
-                        Backdrop::None => None,
-                        Backdrop::Window => Some(BlurStyle::BackgroundThick),
-                        Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
-                        Backdrop::Popover => Some(BlurStyle::BackgroundThin),
-                        Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
-                    };
-                    if let Some(style) = style {
-                        let _ = root
-                            .native
-                            .borrow()
-                            .set_i32_attribute(A::BackgroundBlurStyle, u32::from(style) as i32);
-                    } else {
-                        let _ = root.native.borrow().reset_attribute(A::BackgroundBlurStyle);
-                    }
+                if attrs.backdrop.is_some() {
+                    self.apply_main_backdrop();
                 }
                 self.host.desktop_command(&wire_attributes(&attrs))?;
             }
@@ -754,12 +766,14 @@ impl Mounter {
                 self.desktop_menu_action(id, role)?;
             }
             DesktopEvent::MenuClose { generation } => {
-                self.desktop.selection_menu_target = None;
-                if generation == self.desktop.popup_generation && self.desktop.popup_open {
-                    self.desktop.popup_open = false;
-                    let (kind, payload) = menu_closed_payload();
-                    self.control
-                        .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                if generation == self.desktop.popup_generation {
+                    self.desktop.selection_menu_target = None;
+                    if self.desktop.popup_open {
+                        self.desktop.popup_open = false;
+                        let (kind, payload) = menu_closed_payload();
+                        self.control
+                            .dispatch_event(nsh_core::ROOT_ID, kind, payload);
+                    }
                 }
             }
             DesktopEvent::GlobalShortcutRegistered { id, registered } => {
@@ -806,9 +820,14 @@ impl Mounter {
                 if let Ok(node) = self.node(window_id)
                     && let Some(modal) = node.modal.borrow().clone()
                 {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
                     modal.on_sub_window_close_press(reason)?;
                     if !modal.is_visible() {
+                        self.cursor.clear_window(window_id);
                         self.close_desktop_children(window_id)?;
+                        self.request_desktop_focus_for(parent_id);
                     }
                 }
             }
@@ -816,18 +835,28 @@ impl Mounter {
                 if let Ok(node) = self.node(window_id)
                     && let Some(modal) = node.modal.borrow().clone()
                 {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
                     modal.on_sub_window_blur()?;
                     if !modal.is_visible() {
+                        self.cursor.clear_window(window_id);
                         self.close_desktop_children(window_id)?;
+                        self.request_desktop_focus_for(parent_id);
                     }
                 }
             }
             DesktopEvent::SubWindowDestroyed { window_id } => {
+                self.cursor.clear_window(window_id);
                 if let Ok(node) = self.node(window_id)
                     && let Some(modal) = node.modal.borrow().clone()
                 {
+                    let parent_id = modal
+                        .desktop_parent_window_id()
+                        .unwrap_or(nsh_core::ROOT_ID);
                     modal.on_sub_window_destroyed()?;
                     self.close_desktop_children(window_id)?;
+                    self.request_desktop_focus_for(parent_id);
                 }
             }
             DesktopEvent::WindowState(_)
@@ -868,6 +897,7 @@ impl Mounter {
             EventKind, EventPayload,
             desktop::{MenuRole, WindowEvent, WindowMode, WindowRequest},
         };
+        let selection_target = self.desktop.selection_menu_target.take();
         if let Some(role) = role {
             match role {
                 MenuRole::Quit => {
@@ -933,8 +963,25 @@ impl Mounter {
                         .desktop_command(&wire_request(&WindowRequest::SetMode(next)))?;
                     return Ok(());
                 }
-                MenuRole::Copy | MenuRole::SelectAll | MenuRole::Paste => {
-                    if role != MenuRole::Paste {
+                MenuRole::Copy
+                | MenuRole::Cut
+                | MenuRole::SelectAll
+                | MenuRole::Paste
+                | MenuRole::Undo
+                | MenuRole::Redo => {
+                    if role == MenuRole::SelectAll
+                        && let Some(target_id) = selection_target
+                        && let Ok(target) = self.node(target_id)
+                    {
+                        if let Ok(window) = self.node(target.key_window_id())
+                            && let Some(sink) = window.focus_sink.borrow().as_ref()
+                        {
+                            let _ = sink.borrow().request_focus();
+                        }
+                        target.selection_select_all_target(true)?;
+                        return Ok(());
+                    }
+                    if matches!(role, MenuRole::Copy | MenuRole::SelectAll) {
                         let selected = self
                             .selected_text
                             .borrow()
@@ -951,18 +998,6 @@ impl Mounter {
                             node.selection_command(cmd)?;
                             return Ok(());
                         }
-                        if role == MenuRole::SelectAll
-                            && let Some(target_id) = self.desktop.selection_menu_target.take()
-                            && let Ok(target) = self.node(target_id)
-                        {
-                            if let Ok(window) = self.node(target.key_window_id())
-                                && let Some(sink) = window.focus_sink.borrow().as_ref()
-                            {
-                                let _ = sink.borrow().request_focus();
-                            }
-                            target.selection_select_all_target(true)?;
-                            return Ok(());
-                        }
                     }
                     let focused_input = self
                         .dispatcher
@@ -974,7 +1009,7 @@ impl Mounter {
                     {
                         match role {
                             MenuRole::SelectAll => {
-                                input.selection(0, u32::MAX)?;
+                                input.select_all()?;
                                 return Ok(());
                             }
                             MenuRole::Paste => {
@@ -982,8 +1017,27 @@ impl Mounter {
                                     &self.host,
                                     self.dispatcher.clone(),
                                     input_id,
-                                    false,
+                                    input.report_paste(),
                                 )?;
+                                return Ok(());
+                            }
+                            MenuRole::Copy | MenuRole::Cut | MenuRole::Undo | MenuRole::Redo
+                                if node.interaction.mask().contains(EventKind::EditAction) =>
+                            {
+                                let action = match role {
+                                    MenuRole::Copy => "copy",
+                                    MenuRole::Cut => "cut",
+                                    MenuRole::Undo => "undo",
+                                    MenuRole::Redo => "redo",
+                                    _ => unreachable!(),
+                                };
+                                node.emit(
+                                    EventKind::EditAction,
+                                    EventPayload::Map(vec![(
+                                        "action",
+                                        nsh_core::PayloadValue::Str(action.to_owned()),
+                                    )]),
+                                );
                                 return Ok(());
                             }
                             _ => {}
@@ -1001,23 +1055,44 @@ impl Mounter {
         Ok(())
     }
     pub(crate) fn request_desktop_focus(&self) {
+        self.request_desktop_focus_for(nsh_core::ROOT_ID);
+    }
+    pub(crate) fn request_desktop_focus_for(&self, window_id: NodeId) {
+        let mut stale_other_window_focus = false;
         let has_input_focus = self
             .dispatcher
             .upgrade()
-            .is_some_and(|route| route.keyboard.lock().unwrap().focused.is_some());
+            .and_then(|route| route.keyboard.lock().unwrap().focused)
+            .is_some_and(|focused_id| {
+                if let Ok(node) = self.node(focused_id)
+                    && node.visible_in_tree()
+                    && node.key_window_id() == window_id
+                {
+                    true
+                } else {
+                    stale_other_window_focus = true;
+                    false
+                }
+            });
         let has_child_focus = self
             .key_focus
             .borrow()
             .upgrade()
-            .is_some_and(|node| node.visible_in_tree());
+            .is_some_and(|node| node.visible_in_tree() && node.key_window_id() == window_id);
         if has_input_focus || has_child_focus {
             return;
         }
-        if let Ok(root) = self.node(nsh_core::ROOT_ID) {
-            if let Some(sink) = root.focus_sink.borrow().as_ref() {
+        if stale_other_window_focus && let Some(route) = self.dispatcher.upgrade() {
+            let mut keyboard = route.keyboard.lock().unwrap();
+            keyboard.focused = None;
+            keyboard.input = None;
+            keyboard.composing = false;
+        }
+        if let Ok(window) = self.node(window_id) {
+            if let Some(sink) = window.focus_sink.borrow().as_ref() {
                 let _ = sink.borrow().request_focus();
             } else {
-                let _ = root.native.borrow().request_focus();
+                let _ = window.native.borrow().request_focus();
             }
         }
     }
@@ -1099,7 +1174,7 @@ impl Mounter {
             }
         }
         let window_id = target.key_window_id();
-        let generation = self.desktop.next_popup_generation();
+        let generation = self.desktop.next_selection_popup_generation();
         self.host.desktop_command(&WireCommand::PopupMenu {
             window_id: (window_id != nsh_core::ROOT_ID).then_some(window_id),
             generation,
