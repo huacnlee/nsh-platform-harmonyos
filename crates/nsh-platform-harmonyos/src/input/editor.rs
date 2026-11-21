@@ -182,6 +182,24 @@ impl Input {
         self.event(event)?;
         Ok(self.state.borrow().count)
     }
+    pub(crate) fn native_key_event(&self, event: crate::interop::sdk::EditorKeyEvent) -> bool {
+        if self.closed.get() {
+            return false;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return false;
+        };
+        let Some(route) = owner.dispatcher.upgrade() else {
+            return false;
+        };
+        let surface = owner.key_surface_root();
+        owner.host.editor_key_event(&event, &route, &surface)
+    }
+    pub(crate) fn frame_moved(&self) {
+        if !self.closed.get() && self.state.borrow().is_focused() {
+            self.command("cursor", 0, 0);
+        }
+    }
     fn event(&self, event: EditorEvent) -> Result<()> {
         let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
             return Ok(());

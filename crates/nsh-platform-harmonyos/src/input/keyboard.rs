@@ -57,6 +57,18 @@ impl crate::render::node::Node {
         }
         nsh_core::ROOT_ID
     }
+    pub(crate) fn key_surface_root(self: &std::rc::Rc<Self>) -> std::rc::Rc<Self> {
+        let mut node = self.clone();
+        loop {
+            if node.id == nsh_core::ROOT_ID || node.kind == nsh_core::ViewKind::Modal {
+                return node;
+            }
+            let Some(parent) = node.parent_node.borrow().upgrade() else {
+                return node;
+            };
+            node = parent;
+        }
+    }
     fn find_input(&self, id: NodeId) -> Option<std::rc::Rc<crate::input::editor::Input>> {
         if self.id == id {
             return self.input.borrow().clone();
@@ -95,7 +107,20 @@ impl Default for Snapshot {
 #[derive(Default)]
 struct Held {
     keys: Vec<(N, bool)>,
+    last_editor_key: Option<(i64, i32, N)>,
 }
+
+struct KeyInput<'a> {
+    action: i32,
+    code: N,
+    unicode: u32,
+    key_text: &'a str,
+    pressed_keys: Option<&'a [i32]>,
+    explicit_modifiers: Option<Modifiers>,
+    timestamp: i64,
+    from_editor: bool,
+}
+
 /// Per-window modifier bookkeeping, with no window-global native registration.
 pub(crate) struct KeyboardWindow {
     id: i32,
@@ -106,7 +131,9 @@ impl KeyboardWindow {
         self.id
     }
     pub(crate) fn clear(&self) {
-        self.held.lock().unwrap().keys.clear();
+        let mut held = self.held.lock().unwrap();
+        held.keys.clear();
+        held.last_editor_key = None;
     }
     pub(crate) fn modifiers(&self) -> Modifiers {
         self.held.lock().unwrap().modifiers()
@@ -129,7 +156,78 @@ impl KeyboardWindow {
             KeyEventType::Up => 2,
             _ => return false,
         };
-        let code = event.key_code();
+        let mut pressed = [0; 64];
+        let pressed_keys = event
+            .pressed_keys(&mut pressed)
+            .ok()
+            .map(|count| &pressed[..count.min(pressed.len())]);
+        let key_text = event.key_text();
+        self.dispatch(
+            KeyInput {
+                action,
+                code: event.key_code(),
+                unicode: event.unicode(),
+                key_text: &key_text,
+                pressed_keys,
+                explicit_modifiers: None,
+                timestamp: event.event_time(),
+                from_editor: false,
+            },
+            route,
+            owner,
+        )
+    }
+
+    pub(crate) fn editor_event(
+        &self,
+        event: &crate::interop::sdk::EditorKeyEvent,
+        route: &crate::app::runtime::Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        if event.action != 1 && event.action != 2 {
+            return false;
+        }
+        let code = N::try_from_raw(event.key_code).unwrap_or(N::Unknown);
+        self.dispatch(
+            KeyInput {
+                action: event.action,
+                code,
+                unicode: event.unicode,
+                key_text: &event.key_text,
+                pressed_keys: None,
+                explicit_modifiers: Some(Modifiers {
+                    ctrl: event.ctrl,
+                    alt: event.alt,
+                    shift: event.shift,
+                    cmd: event.cmd,
+                }),
+                timestamp: event.timestamp,
+                from_editor: true,
+            },
+            route,
+            owner,
+        )
+    }
+
+    fn dispatch(
+        &self,
+        input: KeyInput<'_>,
+        route: &crate::app::runtime::Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        let action = input.action;
+        let code = input.code;
+        let mut held = self.held.lock().unwrap();
+        if input.from_editor {
+            if input.timestamp > 0 {
+                held.last_editor_key = Some((input.timestamp, action, code));
+            }
+        } else if input.timestamp > 0
+            && held.last_editor_key == Some((input.timestamp, action, code))
+        {
+            held.last_editor_key = None;
+            return false;
+        }
         if action == 1
             && !matches!(
                 code,
@@ -147,12 +245,10 @@ impl KeyboardWindow {
                 .control
                 .set_input_modality(nsh_core::platform::InputModality::Keyboard);
         }
-        let mut held = self.held.lock().unwrap();
-        // Focus may have entered while modifiers were held in the host. Read the
-        // event's pressed set instead of depending on keydowns outside our tree.
-        let mut pressed = [0; 64];
-        if let Ok(count) = event.pressed_keys(&mut pressed) {
-            let keys = &pressed[..count.min(pressed.len())];
+        // Focus may have entered while modifiers were held in the host. Sync from
+        // the event's pressed set or modifier state instead of relying solely on
+        // prior keydowns inside our tree.
+        if let Some(keys) = input.pressed_keys {
             held.keys.retain(|(key, _)| {
                 *key == code || keys.iter().any(|raw| N::try_from_raw(*raw) == Some(*key))
             });
@@ -164,6 +260,8 @@ impl KeyboardWindow {
                     held.keys.push((key, false));
                 }
             }
+        } else if let Some(modifiers) = input.explicit_modifiers {
+            held.sync_modifiers(code, modifiers);
         }
         let held_before = held.keys.iter().any(|(old, _)| *old == code);
         let modifiers = held.modifiers();
@@ -193,8 +291,7 @@ impl KeyboardWindow {
         }
         if (observes || captures) && !route.keyboard.lock().unwrap().composing {
             let mut details = nsh_core::KeyEvent::default();
-            let key_text = event.key_text();
-            details.key = logical_key(code, event.unicode(), modifiers.shift, &key_text).into();
+            details.key = logical_key(code, input.unicode, modifiers.shift, input.key_text).into();
             // ArkUI exposes a logical key identifier but no hardware scan code.
             details.modifiers = modifiers;
             match code {
@@ -417,7 +514,7 @@ pub(crate) fn install(
         // ArkUI delegates focus requested on a container to its first focusable
         // leaf descendant (e.g. a search TextInput). A childless leaf focus sink
         // inside the root absorbs surface-level focus so global shortcuts bubble
-        // to `on_key_pre_ime` without focusing an editor or clearing selections.
+        // to `on_key_event` without focusing an editor or clearing selections.
         let sink = ohos_arkui_binding::component::built_in_component::Stack::new()?.into_node();
         {
             use ohos_arkui_binding::{
@@ -450,7 +547,11 @@ pub(crate) fn install(
         *owner.focus_sink.borrow_mut() = Some(sink);
     }
     let weak = std::rc::Rc::downgrade(owner);
-    owner.native.borrow_mut().on_key_pre_ime(move |event| {
+    // Use post-IME key delivery so active IMEs (including desktop candidate
+    // windows that do not populate PreviewText) consume editing and navigation
+    // keys while composing. Focused editors route post-IME keys before ArkUI's
+    // built-in TextArea/TextInput handler via `nsh_editor_key_event`.
+    owner.native.borrow_mut().on_key_event(move |event| {
         if let Some(owner) = weak.upgrade()
             && let Some(event) = event.key_event()
             && let Some(route) = owner.dispatcher.upgrade()
@@ -458,14 +559,31 @@ pub(crate) fn install(
         {
             event.set_consumed(true);
             event.stop_propagation(true);
-            return Some(true);
         }
-        Some(false)
     });
     Ok(())
 }
 
 impl Held {
+    fn sync_modifiers(&mut self, code: N, modifiers: Modifiers) {
+        let mut sync = |left: N, right: N, active: bool| {
+            if code == left || code == right {
+                return;
+            }
+            if active {
+                if !self.has(left, right) {
+                    self.keys.push((left, false));
+                }
+            } else {
+                self.keys
+                    .retain(|(held_code, _)| *held_code != left && *held_code != right);
+            }
+        };
+        sync(N::CtrlLeft, N::CtrlRight, modifiers.ctrl);
+        sync(N::AltLeft, N::AltRight, modifiers.alt);
+        sync(N::ShiftLeft, N::ShiftRight, modifiers.shift);
+        sync(N::MetaLeft, N::MetaRight, modifiers.cmd);
+    }
     fn modifiers(&self) -> Modifiers {
         Modifiers {
             ctrl: self.has(N::CtrlLeft, N::CtrlRight),
@@ -477,6 +595,7 @@ impl Held {
     fn cancel(&mut self, action: i32) -> bool {
         if action == 0 {
             self.keys.clear();
+            self.last_editor_key = None;
             true
         } else {
             false
@@ -526,7 +645,7 @@ fn logical_key(code: N, unicode: u32, shift: bool, key_text: &str) -> String {
         N::MoveEnd => "End",
         N::Del => "Backspace",
         N::ForwardDel => "Delete",
-        N::Enter => "Enter",
+        N::Enter | N::NumpadEnter => "Enter",
         N::Escape => "Escape",
         N::Tab => "Tab",
         N::Space => " ",
@@ -613,7 +732,7 @@ fn key(code: N) -> Option<Key> {
         N::F10 => K::F(10),
         N::F11 => K::F(11),
         N::F12 => K::F(12),
-        N::Enter => K::Enter,
+        N::Enter | N::NumpadEnter => K::Enter,
         N::Escape => K::Escape,
         N::Tab => K::Tab,
         N::Space => K::Char(' '),
@@ -688,5 +807,31 @@ mod tests {
         assert_eq!(logical_key(N::A, 0, true, "KEYCODE_A"), "A");
         assert_eq!(logical_key(N::F5, 0, false, "KEYCODE_F5"), "F5");
         assert_eq!(logical_key(N::A, 'ä' as u32, false, "KEYCODE_A"), "ä");
+        assert_eq!(logical_key(N::NumpadEnter, 0, false, ""), "Enter");
+    }
+    #[test]
+    fn sync_modifiers_tracks_external_state_without_overwriting_active_modifier() {
+        let mut held = Held::default();
+        held.sync_modifiers(
+            N::B,
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(held.modifiers().ctrl);
+        assert!(held.modifiers().shift);
+        assert!(!held.modifiers().alt);
+        // Pressing Ctrl itself must not pre-populate Ctrl before held.event checks repeat.
+        let mut fresh = Held::default();
+        fresh.sync_modifiers(
+            N::CtrlLeft,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(!fresh.modifiers().ctrl);
     }
 }

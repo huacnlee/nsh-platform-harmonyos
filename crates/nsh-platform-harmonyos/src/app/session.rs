@@ -473,6 +473,21 @@ impl Services {
                 .is_some_and(|keyboard| keyboard.event(event, route, owner))
     }
 
+    pub(crate) fn editor_key_event(
+        &self,
+        event: &crate::interop::sdk::EditorKeyEvent,
+        route: &Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        self.is_foreground()
+            && self
+                .keyboard
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|keyboard| keyboard.editor_event(event, route, owner))
+    }
+
     pub(crate) fn modifiers(&self) -> nsh_core::keymap::Modifiers {
         self.keyboard
             .lock()

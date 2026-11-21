@@ -49,7 +49,6 @@ impl State {
         changed
     }
 
-    #[cfg(feature = "dev")]
     pub(crate) fn is_focused(&self) -> bool {
         self.focused
     }

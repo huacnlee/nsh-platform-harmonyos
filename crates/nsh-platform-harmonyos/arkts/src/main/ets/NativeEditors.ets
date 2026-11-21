@@ -1,8 +1,9 @@
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
+import inputMethod from "@ohos.inputMethod";
+import { KeyCode } from "@ohos.multimodalInput.keyCode";
 import pasteboard from "@ohos.pasteboard";
-import image from "@ohos.multimedia.image";
-import util from "@ohos.util";
+import { ExtractedPasteData, extractPasteData } from "./NativeClipboard";
 
 export interface EditorSettings {
   belowViewport?: boolean;
@@ -77,6 +78,17 @@ export interface EditorReceipt {
   accepted: boolean;
   count: number;
 }
+export interface EditorKeyEventPayload {
+  action: number;
+  keyCode: number;
+  keyText: string;
+  unicode: number;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  cmd: boolean;
+  timestamp: number;
+}
 export interface MenuActionPayload {
   targetId: number;
   action: string;
@@ -111,6 +123,7 @@ export interface NshRuntimeContext {
   attachNativeSubtree(targetId: number, content: FrameNode | null, slot: NodeContent): boolean;
   retireNativeNode(targetId: number): boolean;
   editorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
+  editorKeyEvent?(targetId: number, event: EditorKeyEventPayload): boolean;
   viewAction(action: MenuActionPayload): boolean;
   webControllerAttached(targetId: number, nativeTag: string): boolean;
   webNavigate(targetId: number, url: string): boolean;
@@ -366,7 +379,6 @@ function editorContent(entry: EditorEntry) {
         .id(`nsh-editor-${entry.settings.targetId}`)
         .attributeModifier(new EditorModifier(entry))
         .editMenuOptions(new EditorSystemMenu(entry))
-        .onKeyPreIme((): boolean => false)
         .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
         .onFocus(() => entry.emit("focus"))
         .onBlur(() => entry.emit("blur"))
@@ -396,32 +408,43 @@ function editorContent(entry: EditorEntry) {
     .scrollable(ScrollDirection.Vertical)
     .scrollBar(entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
     .clip(true)
+    .hitTestBehavior(entry.settings.hitTest as HitTestMode)
+    .onKeyEventDispatch((event: KeyEvent): boolean => entry.dispatchKeyEvent(event))
     .onDidScroll(() => entry.scrolled());
   } else {
-    TextInput({ text: entry.text, placeholder: entry.settings.placeholder, controller: entry.line })
-      .id(`nsh-editor-${entry.settings.targetId}`)
-      .attributeModifier(new EditorModifier(entry))
-      .editMenuOptions(new EditorSystemMenu(entry))
-      .onKeyPreIme((): boolean => false)
-      .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
-      .onFocus(() => entry.emit("focus"))
-      .onBlur(() => entry.emit("blur"))
-      .onSubmit((_key: EnterKeyType, event: SubmitEvent) => entry.submit(event))
-      .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
-      .onContentScroll(() => entry.scrolled())
-      .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
-      .onWillChange(() => entry.canEdit())
-      .onWillInsert((value: InsertValue): boolean => {
-        if (!entry.canEdit()) return false;
-        entry.editKey(value.insertValue);
-        return true;
+    Stack() {
+      TextInput({
+        text: entry.text,
+        placeholder: entry.settings.placeholder,
+        controller: entry.line,
       })
-      .onWillDelete((): boolean => {
-        if (!entry.canEdit()) return false;
-        entry.editKey("Backspace");
-        return true;
-      })
-      .onAppear(() => entry.appeared());
+        .id(`nsh-editor-${entry.settings.targetId}`)
+        .attributeModifier(new EditorModifier(entry))
+        .editMenuOptions(new EditorSystemMenu(entry))
+        .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
+        .onFocus(() => entry.emit("focus"))
+        .onBlur(() => entry.emit("blur"))
+        .onSubmit((_key: EnterKeyType, event: SubmitEvent) => entry.submit(event))
+        .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
+        .onContentScroll(() => entry.scrolled())
+        .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
+        .onWillChange(() => entry.canEdit())
+        .onWillInsert((value: InsertValue): boolean => {
+          if (!entry.canEdit()) return false;
+          entry.editKey(value.insertValue);
+          return true;
+        })
+        .onWillDelete((): boolean => {
+          if (!entry.canEdit()) return false;
+          entry.editKey("Backspace");
+          return true;
+        })
+        .onAppear(() => entry.appeared());
+    }
+    .width(entry.settings.width)
+    .height(entry.settings.height)
+    .hitTestBehavior(entry.settings.hitTest as HitTestMode)
+    .onKeyEventDispatch((event: KeyEvent): boolean => entry.dispatchKeyEvent(event));
   }
 }
 
@@ -438,53 +461,12 @@ interface EditMenuParams {
   actions: string[];
 }
 
-interface ExtractedPasteData {
-  text: string;
-  html?: string;
-  files?: string;
-  image?: string;
-}
-
-async function extractPasteData(data: pasteboard.PasteData): Promise<ExtractedPasteData> {
-  const text = data.getPrimaryText() ?? "";
-  let html: string | undefined;
+function modifierPressed(event: KeyEvent, key: string): boolean {
   try {
-    const primaryHtml = data.getPrimaryHtml();
-    if (primaryHtml && primaryHtml.length > 0) {
-      html = primaryHtml;
-    }
-  } catch {}
-  const uris: string[] = [];
-  try {
-    const count = data.getRecordCount();
-    for (let i = 0; i < count; i++) {
-      const record = data.getRecord(i);
-      if (!html && record.htmlText && record.htmlText.length > 0) {
-        html = record.htmlText;
-      }
-      if (record.uri && record.uri.startsWith("file:")) {
-        uris.push(record.uri);
-      }
-    }
-  } catch {}
-  const files = uris.length > 0 ? uris.join("\n") : undefined;
-  let imgUri: string | undefined;
-  try {
-    const pixels = data.getPrimaryPixelMap();
-    if (pixels) {
-      const packer = image.createImagePacker();
-      try {
-        const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
-        if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
-          imgUri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
-        }
-      } finally {
-        packer.release();
-        pixels.release();
-      }
-    }
-  } catch {}
-  return { text, html, files, image: imgUri };
+    return event.getModifierKeyState ? event.getModifierKeyState([key]) : false;
+  } catch {
+    return false;
+  }
 }
 
 // The system's own text selection menu labels, so every language the platform
@@ -681,6 +663,8 @@ class EditorEntry {
   private pendingScroll?: EditorCommand;
   private editMenuContent?: ComponentContent<EditMenuParams>;
   private menuInteracting: boolean = false;
+  private imeCursorKey: string = "";
+  private consumedPasteKey: boolean = false;
   private rustText: string = "";
   private rustEmptied: string = "";
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
@@ -810,8 +794,99 @@ class EditorEntry {
   colorMode(): ThemeColorMode {
     return this.context.colorMode ? this.context.colorMode() : ThemeColorMode.SYSTEM;
   }
+  dispatchKeyEvent(event: KeyEvent): boolean {
+    if (this.keyEvent(event)) {
+      return true;
+    }
+    if (this.settings.reportPaste && this.canEdit()) {
+      if (
+        event.type === KeyType.Down &&
+        event.keyCode === KeyCode.KEYCODE_V &&
+        modifierPressed(event, "Ctrl") &&
+        !modifierPressed(event, "Alt") &&
+        !modifierPressed(event, "Shift") &&
+        event.metaKey !== 1
+      ) {
+        this.consumedPasteKey = true;
+        this.pasteFromShortcut();
+        return true;
+      }
+      if (event.type === KeyType.Up && event.keyCode === KeyCode.KEYCODE_V && this.consumedPasteKey) {
+        this.consumedPasteKey = false;
+        return true;
+      }
+    }
+    try {
+      return this.context
+        .getUIContext()
+        .dispatchKeyEvent(`nsh-editor-${this.settings.targetId}`, event);
+    } catch {
+      return false;
+    }
+  }
+  private pasteFromShortcut(): void {
+    try {
+      const board = pasteboard.getSystemPasteboard();
+      if (!board.hasDataSync()) {
+        return;
+      }
+      // Consume HarmonyOS pasteboard_service's one-shot Ctrl+V read grant
+      // directly before TextArea's built-in handler reads plain text only.
+      board
+        .getData()
+        .then((data: pasteboard.PasteData): void => {
+          if (this.closed || !this.context.isActive()) {
+            return;
+          }
+          if (data.getRecordCount() === 0) {
+            this.emit("edit-action", "paste");
+            return;
+          }
+          extractPasteData(data)
+            .then((rich: ExtractedPasteData): void => {
+              if (this.closed || !this.context.isActive()) {
+                return;
+              }
+              this.emit("paste", rich.text, 0, 0, 0, 0, 0, 0, rich.html, rich.files, rich.image);
+            })
+            .catch((): void => {
+              this.emit("edit-action", "paste");
+            });
+        })
+        .catch((): void => {
+          this.emit("edit-action", "paste");
+        });
+    } catch {
+      this.emit("edit-action", "paste");
+    }
+  }
+  keyEvent(event: KeyEvent): boolean {
+    if (!this.attached || this.closed || !this.context.isActive() || !this.context.editorKeyEvent) {
+      return false;
+    }
+    const action = event.type === KeyType.Down ? 1 : event.type === KeyType.Up ? 2 : 0;
+    if (action === 0) {
+      return false;
+    }
+    const consumed = this.context.editorKeyEvent(this.settings.targetId, {
+      action,
+      keyCode: event.keyCode,
+      keyText: event.keyText ?? "",
+      unicode: event.unicode ?? 0,
+      ctrl: modifierPressed(event, "Ctrl"),
+      alt: modifierPressed(event, "Alt"),
+      shift: modifierPressed(event, "Shift"),
+      cmd: event.metaKey === 1,
+      timestamp: event.timestamp ?? 0,
+    });
+    if (consumed) {
+      event.stopPropagation();
+      return true;
+    }
+    return false;
+  }
   editorHeight(): number {
-    return this.settings.multiline && !this.settings.secure
+    return this.settings.multiline && !this.settings.secure && !this.isSink()
       ? Math.max(this.settings.height, this.contentHeight)
       : this.settings.height;
   }
@@ -878,6 +953,7 @@ class EditorEntry {
     this.selStart = Math.max(0, start);
     this.selEnd = Math.max(this.selStart, end);
     this.emit("selection", "", start, end);
+    this.imeCursorKey = "";
     this.revealCaret = true;
     this.scheduleSize();
   }
@@ -952,6 +1028,7 @@ class EditorEntry {
     if (wasComposing && composed.length === 0) {
       this.emit("composition", "", start, start);
     }
+    this.imeCursorKey = "";
     this.revealCaret = true;
     this.scheduleSize();
   }
@@ -1030,6 +1107,7 @@ class EditorEntry {
         return;
       }
     }
+    this.imeCursorKey = "";
     this.revealCaret = true;
     this.scheduleSize();
   }
@@ -1137,7 +1215,7 @@ class EditorEntry {
       let y = ui.px2vp(caret.y);
       if (this.settings.multiline && !this.settings.secure) {
         let offset = this.scroller.currentOffset();
-        if (this.revealCaret) {
+        if (!this.isSink() && this.revealCaret) {
           const top = offset.yOffset;
           const bottom = top + this.settings.height;
           if (y < top || y + lineHeight > bottom) {
@@ -1153,6 +1231,9 @@ class EditorEntry {
         y -= offset.yOffset;
       }
       this.revealCaret = false;
+      if (this.isSink()) {
+        this.syncImeCursor(ui);
+      }
       if (
         caret.index !== this.caretIndex ||
         x !== this.caretX ||
@@ -1166,6 +1247,45 @@ class EditorEntry {
         this.emit("caret", "", caret.index, caret.index, 1.5, lineHeight, x, y);
       }
     }
+  }
+  private syncImeCursor(ui: UIContext): void {
+    const frame = this.node.getFrameNode();
+    if (!frame) {
+      return;
+    }
+    let x = Number.NaN;
+    let y = Number.NaN;
+    try {
+      const pos = frame.getPositionToScreenWithTransform();
+      x = Number(pos.x);
+      y = Number(pos.y);
+    } catch {
+      try {
+        const pos = frame.getPositionToScreen();
+        x = Number(pos.x);
+        y = Number(pos.y);
+      } catch {
+        return;
+      }
+    }
+    if (!Number.isFinite(x) || !Number.isFinite(y)) {
+      return;
+    }
+    const left = Math.round(ui.vp2px(x));
+    const top = Math.round(ui.vp2px(y));
+    const width = Math.max(1, Math.round(ui.vp2px(this.settings.width)));
+    const height = Math.max(1, Math.round(ui.vp2px(this.settings.height)));
+    const key = `${left},${top},${width},${height}`;
+    if (key === this.imeCursorKey) {
+      return;
+    }
+    this.imeCursorKey = key;
+    try {
+      inputMethod
+        .getController()
+        .updateCursor({ left, top, width, height })
+        .catch((): void => {});
+    } catch {}
   }
   markMenuInteraction(): void {
     this.menuInteracting = true;
@@ -1215,6 +1335,7 @@ class EditorEntry {
       }
       activeEditor = this;
       this.focused = true;
+      this.imeCursorKey = "";
       if (this.isSink() && this.preview.length === 0) {
         this.pinSinkCaret();
       }
@@ -1225,6 +1346,8 @@ class EditorEntry {
         activeEditor = undefined;
       }
       this.focused = false;
+      this.imeCursorKey = "";
+      this.consumedPasteKey = false;
       this.closeEditMenu();
       this.caretIndex = -1;
       this.scheduleSize();
@@ -1355,6 +1478,11 @@ class EditorEntry {
         if (this.focused) {
           this.emit("blur");
         }
+      }
+    } else if (command.kind === "cursor") {
+      if (this.focused && this.isSink()) {
+        this.imeCursorKey = "";
+        this.scheduleSize();
       }
     } else if (command.kind === "open-edit-menu") {
       this.openEditMenu(command.x, command.y, command.width, command.height, command.actions ?? []);

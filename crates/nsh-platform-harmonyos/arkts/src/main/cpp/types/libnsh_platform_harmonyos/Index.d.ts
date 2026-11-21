@@ -65,6 +65,18 @@ export interface EditorEvent {
   image?: string;
 }
 
+export interface EditorKeyEvent {
+  action: number;
+  keyCode: number;
+  keyText: string;
+  unicode: number;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  cmd: boolean;
+  timestamp: number;
+}
+
 export interface EditorReceipt {
   accepted: boolean;
   count: number;
@@ -498,6 +510,11 @@ export declare function nshEditorEvent(
   targetId: number,
   event: EditorEvent,
 ): EditorReceipt;
+
+export declare function nshEditorKeyEvent(
+  targetId: number,
+  event: EditorKeyEvent,
+): boolean;
 
 export declare function nshOpenUrlResult(
   sessionId: number,

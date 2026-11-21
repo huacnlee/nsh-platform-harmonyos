@@ -15,6 +15,91 @@ export interface ClipboardReply extends SystemReply {
   tooLarge?: number;
   files?: string;
 }
+
+export interface ExtractedPasteData {
+  text: string;
+  html?: string;
+  files?: string;
+  image?: string;
+}
+
+async function readRecordMimeText(
+  record: pasteboard.PasteDataRecord,
+  mimeType: string,
+): Promise<string | undefined> {
+  try {
+    const valid = record.getValidTypes([mimeType]);
+    if (!valid.includes(mimeType)) {
+      return undefined;
+    }
+    const value = await record.getData(mimeType);
+    return typeof value === "string" && value.length > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export async function extractPasteData(data: pasteboard.PasteData): Promise<ExtractedPasteData> {
+  let text = "";
+  try {
+    text = data.getPrimaryText() ?? "";
+  } catch {}
+  let html: string | undefined;
+  try {
+    const primaryHtml = data.getPrimaryHtml();
+    if (primaryHtml && primaryHtml.length > 0) {
+      html = primaryHtml;
+    }
+  } catch {}
+  const uris: string[] = [];
+  try {
+    const count = data.getRecordCount();
+    for (let i = 0; i < count; i++) {
+      const record = data.getRecord(i);
+      if (text.length === 0) {
+        if (record.plainText && record.plainText.length > 0) {
+          text = record.plainText;
+        } else {
+          const fallbackText = await readRecordMimeText(record, pasteboard.MIMETYPE_TEXT_PLAIN);
+          if (fallbackText !== undefined) {
+            text = fallbackText;
+          }
+        }
+      }
+      if (!html) {
+        if (record.htmlText && record.htmlText.length > 0) {
+          html = record.htmlText;
+        } else {
+          // Multi-MIME records created with `pasteboard.createData(Record)` expose
+          // non-default representations (such as HTML alongside plain text) only
+          // through `PasteDataRecord.getData(mimeType)`.
+          html = await readRecordMimeText(record, pasteboard.MIMETYPE_TEXT_HTML);
+        }
+      }
+      if (record.uri && record.uri.startsWith("file:")) {
+        uris.push(record.uri);
+      }
+    }
+  } catch {}
+  const files = uris.length > 0 ? uris.join("\n") : undefined;
+  let imgUri: string | undefined;
+  try {
+    const pixels = data.getPrimaryPixelMap();
+    if (pixels) {
+      const packer = image.createImagePacker();
+      try {
+        const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
+        if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
+          imgUri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
+        }
+      } finally {
+        packer.release();
+        pixels.release();
+      }
+    }
+  } catch {}
+  return { text, html, files, image: imgUri };
+}
 class PasteRequest {
   constructor(read: () => void) {
     this.read = read;
@@ -179,44 +264,17 @@ export class NativeClipboard {
         this.reading = key;
         const data = await this.read();
         if (op === "clipboard-paste") {
-          const text = data.getPrimaryText() ?? "";
-          let html: string | undefined;
-          try {
-            const primaryHtml = data.getPrimaryHtml();
-            if (primaryHtml && primaryHtml.length > 0) {
-              html = primaryHtml;
-            }
-          } catch {}
-          const files: string[] = [];
-          for (let i = 0; i < data.getRecordCount(); i++) {
-            const rec = data.getRecord(i);
-            if (!html && rec.htmlText && rec.htmlText.length > 0) {
-              html = rec.htmlText;
-            }
-            if (rec.uri?.startsWith("file:")) {
-              files.push(rec.uri);
-            }
-          }
-          let uri: string | undefined;
-          const pixels = data.getPrimaryPixelMap();
-          if (pixels) {
-            const packer = image.createImagePacker();
-            try {
-              const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
-              if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
-                uri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
-              }
-            } finally {
-              packer.release();
-              pixels.release();
-            }
-          }
+          const rich = await extractPasteData(data);
           reply = {
-            has: text.length > 0 || html !== undefined || files.length > 0 || uri !== undefined,
-            text,
-            html,
-            files: files.length > 0 ? files.join("\n") : undefined,
-            uri,
+            has:
+              rich.text.length > 0 ||
+              rich.html !== undefined ||
+              rich.files !== undefined ||
+              rich.image !== undefined,
+            text: rich.text,
+            html: rich.html,
+            files: rich.files,
+            uri: rich.image,
           };
         } else if (op === "clipboard-read") {
           reply = { has: data.hasType(type), text: data.getPrimaryText() ?? "" };

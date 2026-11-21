@@ -19,6 +19,7 @@ import i18n from "@ohos.i18n";
 import pointer from "@ohos.multimodalInput.pointer";
 import {
   EditorEventPayload,
+  EditorKeyEventPayload,
   EditorReceipt,
   MenuActionPayload,
   NshRuntimeContext,
@@ -146,6 +147,7 @@ interface NshNativeModule {
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
+  nshEditorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean;
   nshViewAction(action: MenuActionPayload): boolean;
   nshWebControllerAttached(targetId: number, nativeTag: string): boolean;
   nshWebNavigate(targetId: number, url: string): boolean;
@@ -337,6 +339,17 @@ class ComponentRuntimeContext implements NshRuntimeContext {
       return this.mod.nshEditorEvent(targetId, event);
     } catch {
       return { accepted: false, count: 0 };
+    }
+  }
+
+  editorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean {
+    if (!this.active) {
+      return false;
+    }
+    try {
+      return this.mod.nshEditorKeyEvent(targetId, event);
+    } catch {
+      return false;
     }
   }
 

@@ -91,6 +91,20 @@ pub(crate) struct EditorEvent {
     pub image: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+#[napi(object)]
+pub(crate) struct EditorKeyEvent {
+    pub action: i32,
+    pub key_code: i32,
+    pub key_text: String,
+    pub unicode: u32,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub cmd: bool,
+    pub timestamp: i64,
+}
+
 #[napi(object)]
 pub(crate) struct EditorReceipt {
     pub accepted: bool,
@@ -376,6 +390,14 @@ pub(crate) fn nsh_editor_event(target_id: u32, event: EditorEvent) -> Result<Edi
     Ok(EditorReceipt {
         accepted: count.is_some(),
         count: count.unwrap_or(0),
+    })
+}
+
+#[napi]
+pub(crate) fn nsh_editor_key_event(target_id: u32, event: EditorKeyEvent) -> Result<bool> {
+    NativeAttachment::dispatch(target_id, || {
+        let input = EDITORS.with(|routes| routes.borrow().get(&target_id).and_then(Weak::upgrade));
+        input.is_some_and(|input| input.native_key_event(event))
     })
 }
 

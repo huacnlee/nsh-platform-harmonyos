@@ -118,6 +118,9 @@ impl Node {
         {
             scroll.sync_inferred_size()?;
         }
+        if let Some(input) = self.input.borrow().as_ref() {
+            input.frame_moved();
+        }
         self.invalidate_ink(self.applied.get().ink_outset)?;
         let size_changed = old.width != frame.width || old.height != frame.height;
         if size_changed {
