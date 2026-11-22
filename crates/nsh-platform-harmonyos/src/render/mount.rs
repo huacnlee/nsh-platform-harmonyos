@@ -2352,14 +2352,22 @@ impl Mounter {
                                 );
                             }
                         }
-                        Command::WebViewRequest(request) => self.control.dispatch_event(
-                            id,
-                            nsh_core::EventKind::WebViewReply,
-                            nsh_core::webview::reply(
-                                request.id,
-                                Err("Managed downloads are unavailable on this host".into()),
-                            ),
-                        ),
+                        Command::WebViewRequest(request) => {
+                            if let Ok(node) = self.node(id)
+                                && let Some(web) = node.web.borrow().as_ref()
+                            {
+                                web.command(Command::WebViewRequest(request))?;
+                            } else {
+                                self.control.dispatch_event(
+                                    id,
+                                    nsh_core::EventKind::WebViewReply,
+                                    nsh_core::webview::reply(
+                                        request.id,
+                                        Err("WebView is not mounted".into()),
+                                    ),
+                                );
+                            }
+                        }
                         // Mode controls the desktop FPS overlay. Collection is
                         // independent on mobile. Orientations are iOS/Android-only.
                         Command::PerfMonitorMode(_) | Command::Orientations(_) => {}

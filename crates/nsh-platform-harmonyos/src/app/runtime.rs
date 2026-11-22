@@ -1077,6 +1077,7 @@ impl Runtime {
             platform: Some(crate::PLATFORM),
             clipboard_images: Some(true),
             canvas_render: true,
+            webview_requests: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,

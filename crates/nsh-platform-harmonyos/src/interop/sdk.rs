@@ -212,6 +212,9 @@ pub(crate) struct WebCommand {
     pub script: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    pub request_id: Option<String>,
+    pub download_id: Option<String>,
+    pub path: Option<String>,
 }
 
 #[napi(object)]
@@ -235,6 +238,11 @@ pub(crate) struct WebDownload {
     pub filename: String,
     pub path: String,
     pub bytes: f64,
+    pub mime_type: Option<String>,
+    pub method: Option<String>,
+    pub request_id: Option<String>,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
 }
 
 // Only weak routes live here. Nodes, native targets and engines retain their own lifetime.

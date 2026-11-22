@@ -102,6 +102,11 @@ export interface WebDownloadPayload {
   filename: string;
   path: string;
   bytes: number;
+  mimeType?: string;
+  method?: string;
+  requestId?: string;
+  ok?: boolean;
+  errorCode?: string;
 }
 export interface WebEventPayload {
   targetId: number;

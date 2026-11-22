@@ -420,6 +420,9 @@ export interface WebCommand {
   script?: string;
   x?: number;
   y?: number;
+  requestId?: string;
+  downloadId?: string;
+  path?: string;
 }
 
 export interface WebDownload {
@@ -428,6 +431,11 @@ export interface WebDownload {
   filename: string;
   path: string;
   bytes: number;
+  mimeType?: string;
+  method?: string;
+  requestId?: string;
+  ok?: boolean;
+  errorCode?: string;
 }
 
 export interface WebEvent {

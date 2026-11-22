@@ -1,6 +1,5 @@
 import { FrameCallback } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
-import { fileIo as fs } from "@kit.CoreFileKit";
 import picker from "@ohos.file.picker";
 import webview from "@ohos.web.webview";
 import { NshRuntimeContext } from "./NativeEditors";
@@ -34,6 +33,9 @@ export interface WebCommand {
   script?: string | null;
   x?: number | null;
   y?: number | null;
+  requestId?: string | null;
+  downloadId?: string | null;
+  path?: string | null;
 }
 
 let webEngineInitialized = false;
@@ -196,6 +198,13 @@ class WebEntry {
   private inputCommands: Promise<void> = Promise.resolve();
   private fileSelectors: Set<FileSelectorResult> = new Set();
   private downloads: Map<string, webview.WebDownloadItem> = new Map();
+  private downloadGuids: Map<string, string> = new Map();
+  private startedDownloads: Set<string> = new Set();
+  private pendingCancels: Map<string, string[]> = new Map();
+  private cancelledDownloads: Set<string> = new Set();
+  private tearingDownDownloads: Set<string> = new Set();
+  private teardownReleasePending: boolean = false;
+  private nextDownloadSeq: number = 1;
   private readonly downloadDelegate: webview.WebDownloadDelegate =
     new webview.WebDownloadDelegate();
   private inputTimestamp: number = 0;
@@ -304,40 +313,89 @@ class WebEntry {
       this.downloadDelegate.onBeforeDownload((item: webview.WebDownloadItem) => {
         if (
           this.closed ||
+          !this.context.isActive() ||
           !this.context.webDownloadAllowed(this.settings.targetId, item.getUrl())
         ) {
           item.cancel();
           return;
         }
-        try {
-          const id = item.getGuid();
-          const filename =
-            item.getSuggestedFileName().replace(/[\\/\x00-\x1f]/g, "_") || "download";
-          if (!id || id.includes("/") || id.includes("\\") || id === "." || id === "..") {
-            throw new Error("Invalid ArkWeb download ID");
-          }
-          const directory = `${this.settings.downloadDirectory}/${id}`;
-          fs.mkdirSync(directory, true);
-          this.downloads.set(id, item);
-          item.start(
-            `${directory}/${filename === "." || filename === ".." ? "download" : filename}`,
-          );
-          this.download(item, "started");
-        } catch (error) {
-          this.download(item, "failed", String(error));
-          item.cancel();
+        const guid = item.getGuid();
+        const id =
+          guid.length > 0 && !this.downloads.has(guid)
+            ? guid
+            : `ohos-dl-${this.settings.targetId}-${this.nextDownloadSeq++}`;
+        this.downloads.set(id, item);
+        if (guid.length > 0) {
+          this.downloadGuids.set(guid, id);
         }
+        this.emitDownloadOffer(id, item);
+      });
+      this.downloadDelegate.onDownloadUpdated((item: webview.WebDownloadItem) => {
+        const id = this.resolveDownloadId(item);
+        if (!id || !this.startedDownloads.has(id) || this.cancelledDownloads.has(id)) {
+          return;
+        }
+        this.emitDownloadProgress(id, item.getReceivedBytes());
       });
       this.downloadDelegate.onDownloadFinish((item: webview.WebDownloadItem) => {
-        this.download(item, "finished");
-        this.downloads.delete(item.getGuid());
+        const id = this.resolveDownloadId(item);
+        if (!id) {
+          return;
+        }
+        this.forgetDownload(id, item.getGuid());
+        const wasCancelled = this.cancelledDownloads.delete(id);
+        const wasTeardown = this.tearingDownDownloads.delete(id);
+        const hadPendingCancel = this.resolvePendingCancels(id, true);
+        if (!wasCancelled && !hadPendingCancel) {
+          if (wasTeardown) {
+            this.emitDownloadEnd(
+              id,
+              "failed",
+              0,
+              "",
+              "the web view went away",
+              undefined,
+              "ERR_NSH_DOWNLOAD_TEARDOWN",
+            );
+          } else {
+            this.emitDownloadEnd(id, "finished", item.getReceivedBytes(), item.getFullPath());
+          }
+        }
+        this.maybeFinishTeardown();
       });
       this.downloadDelegate.onDownloadFailed((item: webview.WebDownloadItem) => {
-        this.download(item, "failed", String(item.getLastErrorCode()));
-        this.downloads.delete(item.getGuid());
-        try {
-          fs.unlinkSync(item.getFullPath());
-        } catch {}
+        const id = this.resolveDownloadId(item);
+        if (!id) {
+          return;
+        }
+        this.forgetDownload(id, item.getGuid());
+        const wasCancelled = this.cancelledDownloads.delete(id);
+        const wasTeardown = this.tearingDownDownloads.delete(id);
+        const hadPendingCancel = this.resolvePendingCancels(id, true);
+        if (!wasCancelled && !hadPendingCancel) {
+          if (wasTeardown) {
+            this.emitDownloadEnd(
+              id,
+              "failed",
+              0,
+              "",
+              "the web view went away",
+              undefined,
+              "ERR_NSH_DOWNLOAD_TEARDOWN",
+            );
+          } else {
+            const errorCode = item.getLastErrorCode();
+            this.emitDownloadEnd(
+              id,
+              "failed",
+              item.getReceivedBytes(),
+              "",
+              `download failed (${errorCode})`,
+              errorCode,
+            );
+          }
+        }
+        this.maybeFinishTeardown();
       });
       this.controller.setDownloadDelegate(this.downloadDelegate);
       const startInitialLoad = (): void => {
@@ -567,27 +625,180 @@ class WebEntry {
     });
   }
 
-  private download(item: webview.WebDownloadItem, state: string, message?: string): void {
-    if (this.closed || !this.context.isActive()) {
+  private resolveDownloadId(item: webview.WebDownloadItem): string | undefined {
+    const guid = item.getGuid();
+    if (guid.length > 0) {
+      const mapped = this.downloadGuids.get(guid);
+      if (mapped !== undefined) {
+        return mapped;
+      }
+      if (this.downloads.has(guid)) {
+        return guid;
+      }
+    }
+    for (const entry of this.downloads.entries()) {
+      if (entry[1] === item) {
+        return entry[0];
+      }
+    }
+    return undefined;
+  }
+
+  private forgetDownload(id: string, guid: string): void {
+    this.downloads.delete(id);
+    this.startedDownloads.delete(id);
+    if (guid.length > 0 && this.downloadGuids.get(guid) === id) {
+      this.downloadGuids.delete(guid);
+    }
+  }
+
+  private resolvePendingCancels(id: string, ok: boolean, message?: string): boolean {
+    const pending = this.pendingCancels.get(id);
+    if (!pending) {
+      return false;
+    }
+    this.pendingCancels.delete(id);
+    for (const requestId of pending) {
+      this.emitWebReply(requestId, ok, message, id, ok ? "cancel-ok" : "error");
+    }
+    return true;
+  }
+
+  private emitWebReply(
+    requestId: string,
+    ok: boolean,
+    message?: string,
+    downloadId: string = "",
+    state?: string,
+  ): void {
+    if (!requestId || !this.context.isActive()) {
       return;
     }
     this.context.webEvent({
       targetId: this.settings.targetId,
-      phase: "download",
-      url: item.getUrl(),
+      phase: "web-reply",
+      url: "",
       title: "",
       loading: false,
       canGoBack: false,
       canGoForward: false,
       message,
       download: {
-        state,
-        id: item.getGuid(),
-        filename: item.getSuggestedFileName(),
-        path: item.getFullPath(),
-        bytes: item.getReceivedBytes(),
+        state: state ?? (ok ? "ok" : "error"),
+        id: downloadId,
+        filename: "",
+        path: "",
+        bytes: 0,
+        requestId,
+        ok,
       },
     });
+  }
+
+  private emitDownloadOffer(id: string, item: webview.WebDownloadItem): void {
+    if (this.closed || !this.context.isActive()) {
+      return;
+    }
+    const mimeType = item.getMimeType();
+    const method = item.getMethod();
+    const totalBytes = item.getTotalBytes();
+    this.context.webEvent({
+      targetId: this.settings.targetId,
+      phase: "download-offer",
+      url: item.getUrl(),
+      title: "",
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      download: {
+        state: "offer",
+        id,
+        filename: item.getSuggestedFileName() || "download",
+        path: "",
+        bytes: totalBytes > 0 ? totalBytes : -1,
+        mimeType: mimeType.length > 0 ? mimeType : undefined,
+        method: method.length > 0 ? method : undefined,
+      },
+    });
+  }
+
+  private emitDownloadProgress(id: string, receivedBytes: number): void {
+    if (this.closed || !this.context.isActive()) {
+      return;
+    }
+    this.context.webEvent({
+      targetId: this.settings.targetId,
+      phase: "download-progress",
+      url: "",
+      title: "",
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      download: {
+        state: "progress",
+        id,
+        filename: "",
+        path: "",
+        bytes: receivedBytes,
+      },
+    });
+  }
+
+  private emitDownloadEnd(
+    id: string,
+    state: string,
+    bytes: number,
+    path: string,
+    message?: string,
+    code?: number,
+    errorCode?: string,
+  ): void {
+    if (!this.context.isActive()) {
+      return;
+    }
+    this.context.webEvent({
+      targetId: this.settings.targetId,
+      phase: "download-end",
+      url: "",
+      title: "",
+      loading: false,
+      canGoBack: false,
+      canGoForward: false,
+      message,
+      code,
+      download: {
+        state,
+        id,
+        filename: "",
+        path,
+        bytes,
+        errorCode,
+      },
+    });
+  }
+
+  private isDownloadTerminal(item: webview.WebDownloadItem): boolean {
+    try {
+      const state = item.getState();
+      return (
+        state === webview.WebDownloadState.CANCELED ||
+        state === webview.WebDownloadState.INTERRUPTED ||
+        state === webview.WebDownloadState.COMPLETED
+      );
+    } catch {
+      return true;
+    }
+  }
+
+  private maybeFinishTeardown(): void {
+    if (this.teardownReleasePending && this.downloads.size === 0 && !this.disposed && !this.sdkBusy) {
+      this.teardownReleasePending = false;
+      try {
+        this.release();
+      } catch (error) {
+        console.warn(`[NSH] deferred WebView teardown release failed: ${String(error)}`);
+      }
+    }
   }
   private click(x: number, y: number): void {
     this.context
@@ -657,7 +868,13 @@ class WebEntry {
   }
 
   command(command: WebCommand): void {
-    if (this.closed || !this.context.isActive()) {
+    if (!this.context.isActive()) {
+      return;
+    }
+    if (this.closed) {
+      if (command.requestId) {
+        this.emitWebReply(command.requestId, false, "WebView is closed");
+      }
       return;
     }
     if (!this.controllerReady) {
@@ -665,7 +882,53 @@ class WebEntry {
       return;
     }
     try {
-      if (command.kind.startsWith("input-")) {
+      if (command.kind === "download-start") {
+        const requestId = command.requestId ?? "";
+        const downloadId = command.downloadId ?? "";
+        const targetPath = command.path ?? "";
+        const item = this.downloads.get(downloadId);
+        if (!item || !targetPath) {
+          this.emitWebReply(requestId, false, `no download with id ${downloadId}`);
+          return;
+        }
+        if (this.startedDownloads.has(downloadId)) {
+          this.emitWebReply(requestId, false, `download ${downloadId} is already started`);
+          return;
+        }
+        try {
+          item.start(targetPath);
+          this.startedDownloads.add(downloadId);
+          this.emitWebReply(requestId, true, undefined, downloadId);
+        } catch (error) {
+          // Leave the held offer for nsh-core's follow-up CancelDownload so
+          // staging cleanup waits on an explicit stop confirmation.
+          this.emitWebReply(requestId, false, String(error), downloadId);
+        }
+      } else if (command.kind === "download-cancel") {
+        const requestId = command.requestId ?? "";
+        const downloadId = command.downloadId ?? "";
+        const item = this.downloads.get(downloadId);
+        if (!item) {
+          this.emitWebReply(requestId, false, `no download with id ${downloadId}`);
+          return;
+        }
+        this.cancelledDownloads.add(downloadId);
+        const wasStarted = this.startedDownloads.has(downloadId);
+        try {
+          item.cancel();
+        } catch {}
+        const terminal = !wasStarted || this.isDownloadTerminal(item);
+        if (terminal) {
+          this.forgetDownload(downloadId, item.getGuid());
+          this.cancelledDownloads.delete(downloadId);
+          this.resolvePendingCancels(downloadId, true);
+          this.emitWebReply(requestId, true, undefined, downloadId, "cancel-ok");
+        } else {
+          const list = this.pendingCancels.get(downloadId) ?? [];
+          list.push(requestId);
+          this.pendingCancels.set(downloadId, list);
+        }
+      } else if (command.kind.startsWith("input-")) {
         // Serialize the asynchronous ArkWeb editor operation with native keys.
         // execCommand enters the browser editor (selection, undo and trusted
         // input); assigning a DOM value or dispatching a JS event would not.
@@ -754,14 +1017,38 @@ class WebEntry {
       return;
     }
     this.closed = true;
-    for (const item of this.downloads.values()) {
+    for (const pair of Array.from(this.downloads.entries())) {
+      const id = pair[0];
+      const item = pair[1];
+      const wasStarted = this.startedDownloads.has(id);
       try {
         item.cancel();
-        fs.unlinkSync(item.getFullPath());
       } catch {}
+      if (!wasStarted || this.isDownloadTerminal(item)) {
+        this.forgetDownload(id, item.getGuid());
+        const wasCancelled = this.cancelledDownloads.delete(id);
+        const hadPendingCancel = this.resolvePendingCancels(id, true);
+        if (!wasCancelled && !hadPendingCancel) {
+          this.emitDownloadEnd(
+            id,
+            "failed",
+            0,
+            "",
+            "the web view went away",
+            undefined,
+            "ERR_NSH_DOWNLOAD_TEARDOWN",
+          );
+        }
+      } else {
+        this.tearingDownDownloads.add(id);
+      }
     }
-    this.downloads.clear();
     this.epoch++;
+    for (const pending of this.pendingCommands) {
+      if (pending.requestId) {
+        this.emitWebReply(pending.requestId, false, "WebView disposed");
+      }
+    }
     this.pendingCommands = [];
     try {
       if (!this.retired) {
@@ -772,6 +1059,11 @@ class WebEntry {
       }
       if (this.sdkBusy) {
         this.disposePending = true;
+      } else if (this.downloads.size > 0) {
+        // Keep the delegate alive until ArkWeb confirms active writers stopped,
+        // so nsh-core receives teardown stop confirmation before cleaning staging.
+        this.teardownReleasePending = true;
+        quarantinedWebs.add(this);
       } else {
         this.release();
       }
