@@ -1170,6 +1170,7 @@ class HostSession {
         );
         this.tabBars.forEach((bar: NativeTabBar): void => bar.setColorMode(mode));
         this.desktop?.setColorMode(mode);
+        this.system.setColorMode(mode);
         this.runtimeContext.setColorMode(mode);
       }
       return;

@@ -133,6 +133,73 @@ impl System {
                 };
                 (EventKind::Speech, id, true, data)
             }
+            Command::AuthSession { id, page } => {
+                // One auth session runs at a time per route; drop any prior pending entry.
+                let previous: Vec<u32> = {
+                    let mut requests = self.requests.lock().unwrap();
+                    let keys: Vec<u32> = requests
+                        .iter()
+                        .filter_map(|(&key, r)| {
+                            (r.kind == EventKind::AuthSession && Weak::ptr_eq(&r.route, &route))
+                                .then_some(key)
+                        })
+                        .collect();
+                    for key in &keys {
+                        requests.remove(key);
+                    }
+                    keys
+                };
+                for key in previous {
+                    let _ = host.send_host_command(HostCommand {
+                        kind: "system".into(),
+                        open_id: Some(key),
+                        system: Some(SystemCommand {
+                            op: "auth-session-close".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                }
+                (
+                    EventKind::AuthSession,
+                    id,
+                    false,
+                    SystemCommand {
+                        op: "auth-session-open".into(),
+                        uri: Some(page.url),
+                        name: Some(page.callback_scheme),
+                        ephemeral: Some(page.ephemeral),
+                        ..Default::default()
+                    },
+                )
+            }
+            Command::CloseAuthSession(id) => {
+                let key = {
+                    let mut requests = self.requests.lock().unwrap();
+                    let key = requests.iter().find_map(|(&key, r)| {
+                        (r.kind == EventKind::AuthSession
+                            && r.id == id
+                            && Weak::ptr_eq(&r.route, &route))
+                        .then_some(key)
+                    });
+                    if let Some(key) = key {
+                        requests.remove(&key);
+                    }
+                    key
+                };
+                if let Some(key) = key {
+                    host.send_host_command(HostCommand {
+                        kind: "system".into(),
+                        open_id: Some(key),
+                        system: Some(SystemCommand {
+                            op: "auth-session-close".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })?;
+                }
+                return Ok(());
+            }
             Command::Share { id, sheet } => (
                 EventKind::Share,
                 id,
@@ -737,7 +804,9 @@ impl System {
             }
             return;
         }
-        let payload = if request.kind == EventKind::Share {
+        let payload = if request.kind == EventKind::AuthSession {
+            auth_session_payload(request.id, value)
+        } else if request.kind == EventKind::Share {
             if let Some(message) = value.error {
                 nsh_core::share::ShareError::failed(message).payload(request.id)
             } else if value.phase.as_deref() == Some("shared") {
@@ -927,6 +996,7 @@ pub(crate) struct SystemCommand {
     pub looped: Option<bool>,
     pub position_ms: Option<f64>,
     pub duration_ms: Option<f64>,
+    pub ephemeral: Option<bool>,
 }
 impl SystemCommand {
     fn notification_listener(command: nsh_core::notifications::NotificationCommand) -> Self {
@@ -1179,6 +1249,23 @@ fn parse_file_request_paths(files: Option<&str>) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// Converts a `NativeAuthSession` reply into the `EventKind::AuthSession` payload.
+#[allow(dead_code)]
+fn auth_session_payload(id: u32, value: SystemEvent) -> nsh_core::EventPayload {
+    use nsh_core::auth_session::{AuthSessionError, AuthSessionOutcome};
+    if let Some(message) = value.error.filter(|s| !s.is_empty()) {
+        let mut error = AuthSessionError::failed(message);
+        error.code = value.code.filter(|s| !s.is_empty());
+        return error.payload(id);
+    }
+    if value.phase.as_deref() == Some("completed")
+        && let Some(url) = value.uri.filter(|s| !s.is_empty())
+    {
+        return AuthSessionOutcome::Completed(url).payload(id);
+    }
+    AuthSessionOutcome::Cancelled.payload(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1356,5 +1443,69 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn auth_session_payload_maps_completed_cancelled_and_error_outcomes() {
+        use nsh_core::{EventPayload, PayloadValue};
+
+        let completed = auth_session_payload(
+            7,
+            SystemEvent {
+                phase: Some("completed".into()),
+                uri: Some("myapp://callback?code=abc".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = completed else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(7.0))));
+        assert!(fields.contains(&("url", PayloadValue::Str("myapp://callback?code=abc".into()))));
+
+        let cancelled = auth_session_payload(
+            8,
+            SystemEvent {
+                phase: Some("cancelled".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = cancelled else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(8.0))));
+        assert!(fields.contains(&("action", PayloadValue::Str("cancelled".into()))));
+
+        let failed = auth_session_payload(
+            9,
+            SystemEvent {
+                error: Some("dialog failed".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = failed else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(9.0))));
+        assert!(fields.contains(&("error", PayloadValue::Str("dialog failed".into()))));
+        assert!(!fields.iter().any(|(key, _)| *key == "code"));
+
+        let unavailable = auth_session_payload(
+            10,
+            SystemEvent {
+                error: Some("no browser".into()),
+                code: Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = unavailable else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(10.0))));
+        assert!(fields.contains(&("error", PayloadValue::Str("no browser".into()))));
+        assert!(fields.contains(&(
+            "code",
+            PayloadValue::Str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into())
+        )));
     }
 }

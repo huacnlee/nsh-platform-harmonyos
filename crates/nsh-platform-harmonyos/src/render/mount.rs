@@ -2311,17 +2311,6 @@ impl Mounter {
                             }
                         }
                         Command::CloseDialog(id) => self.dialogs.close(id)?,
-                        // These are capability-gated in the engine. Resolve a request
-                        // explicitly if a Rust app issues a raw command.
-                        Command::AuthSession { id, .. } => self.control.dispatch_event(
-                            nsh_core::ROOT_ID,
-                            nsh_core::EventKind::AuthSession,
-                            nsh_core::auth_session::AuthSessionError::unavailable(
-                                "Web authentication is unavailable on this host",
-                            )
-                            .payload(id),
-                        ),
-                        Command::CloseAuthSession(_) => {}
                         Command::RenderCanvas {
                             id,
                             drawing,
@@ -2395,7 +2384,9 @@ impl Mounter {
                                 );
                             }
                         }
-                        command @ (Command::Share { .. }
+                        command @ (Command::AuthSession { .. }
+                        | Command::CloseAuthSession(_)
+                        | Command::Share { .. }
                         | Command::SetClipboardItem(_)
                         | Command::SetClipboardImage(_)
                         | Command::ReadClipboardImage { .. }

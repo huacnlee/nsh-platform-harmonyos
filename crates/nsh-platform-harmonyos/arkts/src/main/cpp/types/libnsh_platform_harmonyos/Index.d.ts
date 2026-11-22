@@ -354,6 +354,7 @@ export interface SystemCommand {
   looped?: boolean;
   positionMs?: number;
   durationMs?: number;
+  ephemeral?: boolean;
 }
 
 /** Typed completion shared by clipboard, notification and speech services. */

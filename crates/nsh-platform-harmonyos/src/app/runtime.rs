@@ -1078,6 +1078,7 @@ impl Runtime {
             clipboard_images: Some(true),
             canvas_render: true,
             webview_requests: true,
+            auth_session: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,

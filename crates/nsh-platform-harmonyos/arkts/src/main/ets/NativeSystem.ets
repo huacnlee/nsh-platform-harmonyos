@@ -3,6 +3,7 @@ import { common, wantConstant } from "@kit.AbilityKit";
 import { fileUri, picker } from "@kit.CoreFileKit";
 import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAudio } from "./NativeAudio";
+import { NativeAuthSession } from "./NativeAuthSession";
 import { NativeClipboard } from "./NativeClipboard";
 import { NativeNotifications } from "./NativeNotifications";
 import { NativeSpeech, SpeechReply } from "./NativeSpeech";
@@ -52,9 +53,11 @@ export interface SystemRequest {
   looped?: boolean;
   positionMs?: number;
   durationMs?: number;
+  ephemeral?: boolean;
 }
 export class NativeSystem {
   private readonly context: common.UIAbilityContext;
+  private readonly authSession: NativeAuthSession;
   private readonly clipboard: NativeClipboard;
   private readonly notifications: NativeNotifications;
   private readonly speech: NativeSpeech;
@@ -70,11 +73,15 @@ export class NativeSystem {
     reply: (key: number, event: SystemReply) => void,
   ) {
     this.context = context;
+    this.authSession = new NativeAuthSession(ui);
     this.clipboard = new NativeClipboard(ui);
     this.notifications = new NativeNotifications(context);
     this.speech = new NativeSpeech(context);
     this.audio = new NativeAudio(context);
     this.reply = reply;
+  }
+  setColorMode(mode: ThemeColorMode): void {
+    this.authSession.setColorMode(mode);
   }
   async execute(key: number, request: SystemRequest): Promise<void> {
     if (this.closed) {
@@ -98,6 +105,22 @@ export class NativeSystem {
             request.html,
           ),
         );
+      } else if (request.op === "auth-session-open") {
+        this.authSession.open(
+          key,
+          request.uri ?? "",
+          request.name ?? "",
+          request.ephemeral ?? false,
+          (event: SystemReply) => {
+            reply(event);
+            this.active.delete(key);
+          },
+        );
+        return;
+      } else if (request.op === "auth-session-close") {
+        this.authSession.close(key);
+        this.active.delete(key);
+        return;
       } else if (request.op === "share") {
         reply(
           await this.share.show(
@@ -302,6 +325,7 @@ export class NativeSystem {
     this.active.delete(key);
   }
   cancel(key: number): void {
+    this.authSession.cancel(key);
     this.share.cancel(key);
     this.active.delete(key);
     this.clipboard.cancel(key);
@@ -317,6 +341,7 @@ export class NativeSystem {
   close(): void {
     this.closed = true;
     this.active.clear();
+    this.authSession.closeAll();
     this.clipboard.close();
     this.notifications.close();
     this.speech.close();
