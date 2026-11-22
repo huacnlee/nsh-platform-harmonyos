@@ -614,7 +614,7 @@ impl State {
                     .unwrap()
                     .accessibility_event(id, event)?;
             }
-            Message::Image(ready) => self.mounter.as_ref().unwrap().image_ready(ready)?,
+            Message::Image(ready) => self.mounter.as_mut().unwrap().image_ready(ready)?,
             Message::ImageProgress(progress) => {
                 self.mounter.as_ref().unwrap().image_progress(progress)
             }
@@ -1076,6 +1076,7 @@ impl Runtime {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
             clipboard_images: Some(true),
+            canvas_render: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,

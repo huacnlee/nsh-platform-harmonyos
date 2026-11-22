@@ -172,6 +172,7 @@ pub(crate) struct Mounter {
     uncreated_scroll_content: rustc_hash::FxHashMap<NodeId, Size>,
     dialogs: crate::services::dialogs::Dialogs,
     desktop: crate::services::desktop::DesktopState,
+    offscreen_renders: crate::render::canvas_render::OffscreenRenders,
 }
 
 impl std::ops::Deref for Mounter {
@@ -1469,6 +1470,7 @@ impl Mounter {
         Ok(Self {
             dialogs: crate::services::dialogs::Dialogs::new(context.clone()),
             desktop: Default::default(),
+            offscreen_renders: Default::default(),
             context,
             mount,
             nodes: BTreeMap::from([(nsh_core::ROOT_ID, root)]),
@@ -2320,17 +2322,35 @@ impl Mounter {
                             .payload(id),
                         ),
                         Command::CloseAuthSession(_) => {}
-                        Command::RenderCanvas { id, .. } => {
-                            self.control.dispatch_event(
-                                nsh_core::ROOT_ID,
-                                nsh_core::EventKind::CanvasImage,
-                                nsh_core::EventPayload::CanvasImage {
-                                    id,
-                                    result: Err(
-                                        "Offscreen encoding is unavailable on this host".into()
-                                    ),
-                                },
-                            )
+                        Command::RenderCanvas {
+                            id,
+                            drawing,
+                            width,
+                            height,
+                            scale,
+                            format,
+                        } => {
+                            if let Err(failure) = self.offscreen_renders.start(
+                                id,
+                                drawing,
+                                width,
+                                height,
+                                scale,
+                                format,
+                                self.context.platform.get().rtl,
+                                &self.context.images,
+                                &self.context.fonts,
+                                &self.context.dispatcher,
+                            ) {
+                                self.control.dispatch_event(
+                                    nsh_core::ROOT_ID,
+                                    nsh_core::EventKind::CanvasImage,
+                                    nsh_core::EventPayload::CanvasImage {
+                                        id,
+                                        result: Err(failure),
+                                    },
+                                );
+                            }
                         }
                         Command::WebViewRequest(request) => self.control.dispatch_event(
                             id,
@@ -2667,7 +2687,7 @@ impl Mounter {
         Ok(())
     }
 
-    pub(crate) fn image_ready(&self, ready: crate::media::image::Ready) -> Result<()> {
+    pub(crate) fn image_ready(&mut self, ready: crate::media::image::Ready) -> Result<()> {
         match ready.target {
             crate::media::image::Target::Canvas {
                 id,
@@ -2679,6 +2699,15 @@ impl Mounter {
                 {
                     canvas.ready(generation, index, ready.data)?;
                 }
+            }
+            crate::media::image::Target::OffscreenCanvas { id, index } => {
+                self.offscreen_renders.image_ready(
+                    id,
+                    index,
+                    ready.data,
+                    &self.context.fonts,
+                    &self.context.dispatcher,
+                );
             }
             crate::media::image::Target::Info(id) => {
                 crate::media::image::info(&self.control, id, ready.data)
@@ -2838,6 +2867,7 @@ impl Mounter {
     pub(crate) fn close(&mut self) -> Result<()> {
         self.scroll_watchers.clear_nodes();
         self.dialogs.clear();
+        self.offscreen_renders.close();
         if self.desktop.popup_open {
             self.desktop.popup_open = false;
             let _ = self

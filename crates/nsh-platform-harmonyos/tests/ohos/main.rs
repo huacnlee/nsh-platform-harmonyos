@@ -91,3 +91,6 @@ mod desktop;
 
 #[path = "../../src/text/family.rs"]
 mod text_family;
+
+#[path = "../../src/render/canvas_render/spec.rs"]
+mod canvas_render;

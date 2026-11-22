@@ -53,6 +53,10 @@ pub(crate) enum Target {
         generation: u64,
         index: usize,
     },
+    OffscreenCanvas {
+        id: u32,
+        index: usize,
+    },
 }
 pub(crate) struct Ready {
     pub(crate) target: Target,
