@@ -31,10 +31,8 @@ fn backend(dev: bool) -> String {
     let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
         .map(PathBuf::from)
         .or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .parent()
-                .and_then(Path::parent)
-                .map(Path::to_path_buf)
+            // This repository: the nshm's directory `nsh` builds it in.
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         })
         .filter(|dir| join_all(dir, ["crates", "nsh-platform-harmonyos", "Cargo.toml"]).is_file());
     match checkout {

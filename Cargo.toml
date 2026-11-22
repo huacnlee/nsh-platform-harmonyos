@@ -1,3 +1,31 @@
+[package]
+name = "nsh-harmonyos"
+description = "The `harmonyos` target of Native Shell, as a platform nshm: `nsh add github:huacnlee/nsh-platform-harmonyos`, then `nsh run --target harmonyos`."
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nsh-platform-harmonyos"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+quick-xml.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+nsh-core.workspace = true
+nsh-engine = { workspace = true, features = ["js"] }
+nsh-base.workspace = true
+nsh-dev = { workspace = true, features = ["server"] }
+nsh-testing = { workspace = true, features = ["bundle", "agent"] }
+image.workspace = true
+ctrlc.workspace = true
+
 [workspace]
 resolver = "3"
 members = ["crates/*"]
@@ -13,12 +41,12 @@ missing_docs = "warn"
 unreachable_pub = "deny"
 
 [workspace.dependencies]
-nsh-core = "0.6.1"
-nsh-engine = { version = "0.6.1", default-features = false }
-nsh-base = { version = "0.6.1", default-features = false }
-nsh-package = "0.6.1"
-nsh-dev = "0.6.1"
-nsh-testing = { version = "0.6.1", default-features = false }
+nsh-core = "0.6"
+nsh-engine = { version = "0.6", default-features = false }
+nsh-base = { version = "0.6", default-features = false }
+nsh-package = "0.6"
+nsh-dev = "0.6"
+nsh-testing = { version = "0.6", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
@@ -58,11 +86,25 @@ ohos-image-native-binding = { version = "0.0.8", default-features = false }
 ohos-pasteboard-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-udmf-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-avplayer-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-xcomponent-binding = { version = "0.6.1", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
+ohos-xcomponent-binding = { version = "0.6", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
 ohos-native-window-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
 ohos-vibrator-binding = { version = "0.2.4", default-features = false, features = ["api-20"] }
+
+# NSH nightly: its crates from longbridge/nsh `main`, which `nsh update nightly`
+# installs the CLI of. Cargo.lock pins the commit; `cargo update -p nsh-core`
+# moves to the latest night. The runner of a TSX app takes this section too.
+[patch.crates-io]
+nsh-macros = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-core = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-base = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-package = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-js = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-engine = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-testing = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-bundler = { git = "https://github.com/longbridge/nsh", branch = "main" }
+nsh-dev = { git = "https://github.com/longbridge/nsh", branch = "main" }
 
 [profile.release]
 opt-level = 3

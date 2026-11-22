@@ -51,7 +51,7 @@ fn join_relative(base: &Path, relative: &str) -> PathBuf {
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let repo = manifest.parent().unwrap().parent().unwrap();
+    let repo = manifest.as_path();
     let mut code = String::new();
     for (name, dir) in [
         ("TEMPLATE", repo.join("template")),

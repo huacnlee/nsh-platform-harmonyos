@@ -8,7 +8,7 @@ one QuickJS VM. How apps use it: [the README](../README.md), [embedding.md](embe
 
 The backend builds for `aarch64-unknown-linux-ohos` with the OpenHarmony NDK (API 20+); off `target_env = "ohos"` the
 crate is empty. The environment cargo needs (the NDK's clang as `CC` and linker, its sysroot for bindgen, its
-libclang) is the one `nsh-platform-harmonyos-cli`'s `sdk.rs` sets:
+libclang) is the one the `nsh-platform-harmonyos` program's `src/sdk.rs` sets:
 
 ```sh
 OHOS_NDK_HOME=… nsh package examples/counter --target harmonyos -v   # the whole path: runner, library, project
@@ -56,7 +56,7 @@ Features:
   explicit UI caps resume when the last GPU vote ends. The native range setter performs synchronous RS IPC;
   a dedicated worker applies the latest demand without holding the arbitration lock. UI/GPU callbacks only
   enqueue a bounded wake. Successful IPC completion updates the applied range, then rechecks current demand.
-- **Device tests** (`nsh-platform-harmonyos-cli/src/test/`, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
+- **Device tests** (`src/test/` of the program, `src/app/testing.rs`, `src/render/mount/testing.rs`): the
   CLI runs NSH's public `TestRun` and `Agent`, with a `RemoteScene` over the dev protocol. The device's `Model`
   observes mount batches and provides selectors, storage, network mocks and the manual clock. ArkUI answers native
   geometry queries on its UI thread; the CLI injects system input through hdc (`uitest` / `uinput`) and captures the

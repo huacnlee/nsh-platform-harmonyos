@@ -21,15 +21,23 @@ NSH 的 Gallery 运行在 OpenHarmony 7.0（API 26）模拟器上。
 
 ## 使用
 
-```sh
-cargo install --git https://github.com/huacnlee/nsh-platform-harmonyos nsh-platform-harmonyos-cli
-rustup target add aarch64-unknown-linux-ohos
+这个平台是一个提供 `harmonyos` target 的 [nshm](https://nsh.dev/docs/nshm#platform-nshm)。它跟随 NSH 的 `main`，所以要用
+[nightly](https://nsh.dev/docs/installation#installing-the-nightly-build) 版的 `nsh`（`nsh update nightly`）。在应用目录里执行：
 
-nsh package my-app --target harmonyos              # 生成 DevEco Studio 工程；装有 DevEco 工具时同时构建 HAP
-nsh run my-app --target harmonyos                  # 构建 HAP，安装到 hdc 连接的设备上并启动
+```sh
+nsh add github:huacnlee/nsh-platform-harmonyos
 ```
 
-`--target harmonyos` 时，`nsh` 会从 `PATH` 里找 `nsh-platform-harmonyos` 来执行。需要准备：
+它会把 `"nsh-harmonyos"` 加进应用 `nsh.json` 的 `"dependencies"`，并在 `nsh.lock` 里锁定版本。之后
+`nsh package --target harmonyos` 生成 DevEco Studio 工程（装有 DevEco 工具时同时构建 HAP），
+`nsh run --target harmonyos` 构建 HAP，安装到 hdc 连接的设备上并启动：
+
+```sh
+nsh run --target harmonyos
+```
+
+第一次使用时，`nsh` 会在应用的 `.nsh/platforms/harmonyos` 里编译这个平台的 `nsh-platform-harmonyos` 程序。需要 Rust 的 OHOS
+target（`rustup target add aarch64-unknown-linux-ohos`），以及：
 
 - **OpenHarmony NDK，API 20 或以上**：可以用 DevEco Studio 自带的，也可以把 `OHOS_NDK_HOME` 设成某个 SDK 的
   `openharmony` 目录（里面有 `native/`）。它用来编译 native 库。
@@ -101,7 +109,7 @@ nsh-platform-harmonyos     ArkUI 后端，基于 N-API 的 Rust 库：
   navigation/ media/       导航栈、模态、视频（AVPlayer）、网页（ArkWeb）、图片
   accessibility/           ArkUI 无障碍 provider（api-23、api-26）
   arkts/                   @nsh/harmonyos：NshHost，以及编辑器、菜单、网页的 ArkTS 部分
-nsh-platform-harmonyos-cli
+nsh-harmonyos（src/）
   package / run            `$NSH build <app>`；用 NDK 把 cdylib runner（后端 + NSH 生成的 `nsh_rust_app`）编译成
                            libnsh_platform_harmonyos.so；从 template/ 生成 DevEco 工程；调用 hvigor、hdc
 ```
@@ -125,14 +133,15 @@ CLI 写出的是标准的 Stage 模型应用：`EntryAbility` 加载 `pages/Inde
 
 ## 跟进 NSH
 
-这个平台针对 crates.io 上的 NSH `0.5` 构建（如需针对未发版的 revision 或本地仓库测试，可在 `Cargo.toml` 里加 `[patch.crates-io]`）。mount item、文本引擎和事件都是
+这个平台针对 NSH nightly 构建：`Cargo.toml` 的 `[patch.crates-io]` 从 longbridge/nsh 的 `main` 取 NSH 的 crate，`Cargo.lock`
+锁定具体 commit（`cargo update -p nsh-core` 更新到最新；要测试本地仓库，把 patch 指向它）。mount item、文本引擎和事件都是
 NSH 的协议，会随版本增长；新版 NSH 可能加入这个后端还没处理的 mount item，在处理之前会被跳过（`render/mount.rs`）。
 
 ## 开发
 
 ```sh
 cargo test --workspace                                   # CLI，以及后端中与平台无关的部分
-OHOS_NDK_HOME=… cargo run -p nsh-platform-harmonyos-cli -- typedefs   # 重新生成 @nsh/harmonyos 的 Index.d.ts
+OHOS_NDK_HOME=… cargo run -- typedefs                    # 重新生成 @nsh/harmonyos 的 Index.d.ts
 
 # 为设备构建后端（CLI 会给 cargo 设置同样的环境）
 OHOS_NDK_HOME=… nsh package examples/counter --target harmonyos -v

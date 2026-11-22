@@ -18,11 +18,17 @@ This guide covers developing [Native Shell](https://github.com/longbridge/nsh) (
    # rustup target add armv7-unknown-linux-ohos x86_64-unknown-linux-ohos
    ```
 
-2. **`nsh` CLI and the HarmonyOS target CLI**:
-   Make sure `nsh` (`0.5` or later) is on your `PATH`, then install `nsh-platform-harmonyos`:
+2. **The nightly `nsh` CLI and the HarmonyOS platform nshm**:
+   The platform follows NSH's `main`, so install the nightly `nsh` (or run `nsh update nightly`):
    ```sh
-   cargo install --git https://github.com/huacnlee/nsh-platform-harmonyos nsh-platform-harmonyos-cli
+   curl -fsSL https://nsh.dev/install.sh | sh -s -- --nightly
    ```
+   Then, in your app's directory, add the platform to its `nsh.json` `"dependencies"`:
+   ```sh
+   nsh add github:huacnlee/nsh-platform-harmonyos
+   ```
+   `nsh` builds the platform's program in the app's `.nsh/platforms/harmonyos` the first time a command uses
+   `--target harmonyos`. The `nsh.json` examples below show the dependency `nsh add` writes.
 
 3. **OpenHarmony NDK (API 20 or later)**:
    - Automatically detected if **DevEco Studio** is installed in its default location (`/Applications/DevEco-Studio.app` on macOS, `C:\Program Files\Huawei\DevEco Studio` on Windows), or via `DEVECO_STUDIO_HOME`.
@@ -55,7 +61,10 @@ my-app/
   "name": "My App",
   "id": "com.example.myapp",
   "version": "1.0.0",
-  "build": 1
+  "build": 1,
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 
@@ -110,7 +119,10 @@ my-rust-app/
   "version": "1.0.0",
   "build": 1,
   "rust": ".",
-  "root": "App"
+  "root": "App",
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 
@@ -174,7 +186,10 @@ If your app is written in TSX but includes custom Rust components, modules, or c
   "id": "com.example.myhybridapp",
   "version": "1.0.0",
   "build": 1,
-  "rust": ["./crates/native"]
+  "rust": ["./crates/native"],
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 
