@@ -2345,7 +2345,9 @@ impl Mounter {
                         Command::PerfMonitorMode(_) | Command::Orientations(_) => {}
                         Command::Back => self.back_fallback()?,
                         Command::ExitApp => {
-                            log::warn!("OHOS ExitApp: the embedding host owns Ability lifetime")
+                            if let Some(dispatcher) = self.dispatcher.upgrade() {
+                                dispatcher.request_exit_app();
+                            }
                         }
                         Command::ImageInfo { id, uri } => {
                             self.images

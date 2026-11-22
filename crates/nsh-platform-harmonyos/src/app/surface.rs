@@ -86,11 +86,22 @@ pub(crate) enum Message {
     Visible(bool),
     HostCall(nsh_engine::HostCall),
     OpenUrl(nsh_engine::OpenUrlRequest),
+    ExitApp,
     Dispose,
 }
 
 type HostHandler = FunctionRef<FnArgs<(serde_json::Value, NshHostReply)>, ()>;
 type OpenUrlHandler = FunctionRef<String, bool>;
+type ExitAppHandler = FunctionRef<(), ()>;
+
+#[derive(Clone)]
+enum ReloadTarget {
+    Resource {
+        name: String,
+        source_map: Option<String>,
+    },
+    LinkedApp,
+}
 
 /// Reply handle for a `host.call(...)` or `host.post(...)` from the app (`nsh/host`).
 #[napi]
@@ -166,6 +177,8 @@ struct State {
     scroll_watchers: crate::scroll::watch::ScrollWatchers,
     host_handlers: FxHashMap<String, Rc<HostHandler>>,
     open_url_handler: Option<Rc<OpenUrlHandler>>,
+    exit_app_handler: Option<Rc<ExitAppHandler>>,
+    last_load: Option<ReloadTarget>,
     pending_urls: Vec<String>,
     errors: Errors,
     phase: SurfacePhase,
@@ -230,6 +243,7 @@ impl State {
         overlay.hide();
         overlay.resize(size)?;
         self.errors.overlay(Some(overlay));
+        self.last_load = None;
         self.next_load()?;
         self.dev = Some(session);
         self.dev_generation = token;
@@ -588,7 +602,10 @@ impl State {
         Ok(Size::new(width, height))
     }
     fn dispatch(state: &RefCell<Self>, env: Env, message: Message) -> Result<()> {
-        if matches!(message, Message::HostCall(_) | Message::OpenUrl(_)) {
+        if matches!(
+            message,
+            Message::HostCall(_) | Message::OpenUrl(_) | Message::ExitApp
+        ) {
             let state = state.borrow();
             if state.disposed.get()
                 || matches!(state.phase, SurfacePhase::Closing(_) | SurfacePhase::Closed)
@@ -635,6 +652,20 @@ impl State {
                     false
                 };
                 request.answer(handled);
+                Ok(())
+            }
+            Message::ExitApp => {
+                let handler = state.borrow().exit_app_handler.clone();
+                if let Some(handler) = handler {
+                    let callback = handler.borrow_back(&env)?;
+                    if let Err(error) = callback.call(()) {
+                        log::error!("OHOS exitApp handler: {error}");
+                    }
+                } else {
+                    log::warn!(
+                        "OHOS ExitApp: the embedding host owns Ability lifetime; register setExitAppHandler to opt in"
+                    );
+                }
                 Ok(())
             }
             message => state.borrow_mut().receive(env, message),
@@ -720,7 +751,7 @@ impl State {
                 // like an iOS UIView. Only stop/dispose/Ability destruction ends it.
                 self.start(env)
             }
-            Message::HostCall(_) | Message::OpenUrl(_) => unreachable!(),
+            Message::HostCall(_) | Message::OpenUrl(_) | Message::ExitApp => unreachable!(),
             Message::Dispose => unreachable!(),
         }
     }
@@ -780,6 +811,8 @@ impl State {
         self.scroll_watchers.close();
         self.host_handlers.clear();
         self.open_url_handler = None;
+        self.exit_app_handler = None;
+        self.last_load = None;
         self.pending_urls.clear();
         self.errors.dispose();
         let content = self.content.as_mut().expect("live surface content");
@@ -864,6 +897,8 @@ impl NshSurface {
             scroll_watchers: crate::scroll::watch::ScrollWatchers::default(),
             host_handlers: FxHashMap::default(),
             open_url_handler: None,
+            exit_app_handler: None,
+            last_load: None,
             pending_urls: Vec::new(),
             errors: errors.clone(),
             phase: SurfacePhase::Empty,
@@ -1040,6 +1075,7 @@ impl NshSurface {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
         #[cfg(feature = "dev")]
         state.disconnect_dev();
+        state.last_load = None;
         state.next_load()?;
         let result = state.accept(env, source, source_map, None);
         if let Err(error) = &result {
@@ -1062,6 +1098,7 @@ impl NshSurface {
         let prepared = package.take()?;
         #[cfg(feature = "dev")]
         state.disconnect_dev();
+        state.last_load = None;
         let result = state.accept_app(
             env,
             App::new(
@@ -1104,6 +1141,10 @@ impl NshSurface {
                 (config.policy.granted.clone(), config.has_custom_assets)
             };
             let token = state.next_load()?;
+            state.last_load = Some(ReloadTarget::Resource {
+                name: name.clone(),
+                source_map: source_map.clone(),
+            });
             state.phase = SurfacePhase::Loading { token };
             (token, state.generation.clone(), granted, has_custom_assets)
         };
@@ -1218,7 +1259,34 @@ impl NshSurface {
         let root = crate::linked::root().ok_or_else(|| {
             Error::from_reason("this binary was not built with a linked Rust app")
         })?;
+        self.state.try_borrow_mut().map_err(reentry)?.last_load = Some(ReloadTarget::LinkedApp);
         self.load_root(env, root)
+    }
+
+    /// Reloads the last `loadResource()` or `runApp()` target in place.
+    /// For resource bundles, re-checks `nsh_engine::updates::package_to_run` so a
+    /// downloaded `.nshpkg` update takes effect without a process cold start.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn reload<'env>(&self, env: &'env Env) -> Result<PromiseRaw<'env, ()>> {
+        self.check()?;
+        let target = self
+            .state
+            .try_borrow()
+            .map_err(reentry)?
+            .last_load
+            .clone()
+            .ok_or_else(|| {
+                Error::from_reason("nothing to reload: call loadResource() or runApp() first")
+            })?;
+        match target {
+            ReloadTarget::Resource { name, source_map } => {
+                self.load_resource(env, name, source_map)
+            }
+            ReloadTarget::LinkedApp => {
+                self.run_app(*env)?;
+                env.spawn_future(async { Ok(()) })
+            }
+        }
     }
 
     /// Whether this binary was built with a linked Rust app (`runApp()`).
@@ -1406,6 +1474,19 @@ impl NshSurface {
             state.config()?.channel.remove_open_url_handler();
             state.open_url_handler = None;
         }
+        Ok(())
+    }
+
+    /// Handles `BackHandler.exitApp()` requests from the running app on the UI thread.
+    /// Pass `null` or `undefined` to restore the default embedded behavior (ignore and warn).
+    #[napi]
+    pub fn set_exit_app_handler(
+        &self,
+        #[napi(ts_arg_type = "(() => void) | null | undefined")] handler: Option<ExitAppHandler>,
+    ) -> Result<()> {
+        self.check()?;
+        let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        state.exit_app_handler = handler.map(Rc::new);
         Ok(())
     }
 

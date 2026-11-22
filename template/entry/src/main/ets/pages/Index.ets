@@ -18,6 +18,11 @@ struct Index {
     const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
     host?.eventHub.on("nsh.openUrl", this.onOpenUrl);
     host?.eventHub.on("nsh.devUrl", this.onDevUrl);
+    this.surface.setExitAppHandler((): void => {
+      host?.terminateSelf().catch((error: Error): void => {
+        console.error(`NSH exitApp: ${String(error)}`);
+      });
+    });
     const launchUrl = AppStorage.get<string>("nsh.launchUrl");
     if (typeof launchUrl === "string" && launchUrl.length > 0) {
       AppStorage.delete("nsh.launchUrl");
