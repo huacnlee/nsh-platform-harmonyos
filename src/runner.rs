@@ -16,7 +16,7 @@ use anyhow::{Context as _, bail};
 
 use crate::{
     paths::join_all,
-    sdk::{Arch, Ndk},
+    sdk::{ApiLevel, Arch, Ndk},
 };
 
 /// The library's name: the backend's N-API module is registered under its
@@ -26,8 +26,23 @@ pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 /// The backend this CLI was built with: `NSH_HARMONYOS_SOURCE` (a checkout)
 /// when set, else the checkout it was built in when it is still there, else
 /// this version's tag of the repository.
-fn backend(dev: bool) -> String {
-    let features = if dev { ", features = [\"dev\"]" } else { "" };
+fn backend(dev: bool, api: ApiLevel) -> String {
+    let mut enabled = Vec::new();
+    if dev {
+        enabled.push("\"dev\"");
+    }
+    if let Some(feature) = api.backend_feature() {
+        enabled.push(match feature {
+            "api-23" => "\"api-23\"",
+            "api-26" => "\"api-26\"",
+            _ => unreachable!(),
+        });
+    }
+    let features = if enabled.is_empty() {
+        String::new()
+    } else {
+        format!(", features = [{}]", enabled.join(", "))
+    };
     let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
         .map(PathBuf::from)
         .or_else(|| {
@@ -122,7 +137,7 @@ fn patches_of(workspace: &Path) -> String {
 }
 
 /// Writes the runner crate in `dir` for `app`.
-pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
+pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyhow::Result<()> {
     let (app_dependency, patch, lib) = match app {
         App::Rust(rust_app) => {
             let manifest = fs::read_to_string(rust_app.join("Cargo.toml"))
@@ -206,7 +221,7 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool) -> anyhow::Result<()> {
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\
              {patch}\n[workspace]\n",
-            backend(dev),
+            backend(dev, api),
         ),
     )?;
     fs::write(
@@ -471,17 +486,23 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        write(&dir.join("runner"), App::Rust(&app), false).unwrap();
+        write(&dir.join("runner"), App::Rust(&app), false, ApiLevel::Api20).unwrap();
         let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
         assert!(manifest.contains("nsh_rust_app = { package = \"counter-rust-app\", path = "));
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
         assert!(manifest.contains("crate-type = [\"cdylib\"]"));
         assert!(manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"));
-        assert!(!manifest.contains("features = [\"dev\"]"));
+        assert!(!manifest.contains("features ="));
         let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
 
-        write(&dir.join("runner-dev"), App::Rust(&app), true).unwrap();
+        write(
+            &dir.join("runner-dev"),
+            App::Rust(&app),
+            true,
+            ApiLevel::Api20,
+        )
+        .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"dev\"]"));
         let expected_testing = format!(
@@ -490,11 +511,15 @@ mod tests {
         );
         assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
 
-        write(&dir.join("tsx"), App::Tsx, true).unwrap();
+        write(&dir.join("tsx"), App::Tsx, true, ApiLevel::Api23).unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
-        assert!(tsx_manifest.contains("features = [\"dev\"]"));
+        assert!(tsx_manifest.contains("features = [\"dev\", \"api-23\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
+
+        write(&dir.join("tsx-api26"), App::Tsx, false, ApiLevel::Api26).unwrap();
+        let api26_manifest = fs::read_to_string(dir.join("tsx-api26").join("Cargo.toml")).unwrap();
+        assert!(api26_manifest.contains("features = [\"api-26\"]"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -532,6 +557,7 @@ mod tests {
                 workspace: &ws,
             },
             false,
+            ApiLevel::Api20,
         )
         .unwrap();
         let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
@@ -567,6 +593,7 @@ mod tests {
                 workspace: &ws,
             },
             true,
+            ApiLevel::Api20,
         )
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
@@ -595,7 +622,13 @@ mod tests {
             "[workspace]\nmembers = [\"rust-app\"]\n",
         )
         .unwrap();
-        write(&dir.join("runner-dev"), App::Rust(&app), true).unwrap();
+        write(
+            &dir.join("runner-dev"),
+            App::Rust(&app),
+            true,
+            ApiLevel::Api20,
+        )
+        .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"dev\"]"));
         assert_eq!(

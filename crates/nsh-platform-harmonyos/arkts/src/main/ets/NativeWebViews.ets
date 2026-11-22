@@ -154,9 +154,13 @@ struct WebViewHost {
   }
 }
 
+interface WebContentParams {
+  entry: WebEntry;
+}
+
 @Builder
-function webContent(entry: WebEntry) {
-  WebViewHost({ entry: entry, state: entry.viewState });
+function webContent(params: WebContentParams) {
+  WebViewHost({ entry: params.entry, state: params.entry.viewState });
 }
 
 const quarantinedWebs: Set<WebEntry> = new Set();
@@ -176,7 +180,7 @@ class WebMountFrame extends FrameCallback {
 class WebEntry {
   readonly nativeTag: string = `nsh.web.${nextWebNativeTagId++}`;
   readonly controller: webview.WebviewController = new webview.WebviewController(this.nativeTag);
-  readonly node: BuilderNode<[WebEntry]>;
+  readonly node: BuilderNode<[WebContentParams]>;
   readonly viewState: WebViewState = new WebViewState();
   settings: WebSettings;
   private context: NshRuntimeContext;
@@ -206,7 +210,7 @@ class WebEntry {
   constructor(settings: WebSettings, context: NshRuntimeContext) {
     this.settings = settings;
     this.context = context;
-    this.node = new BuilderNode<[WebEntry]>(context.getUIContext());
+    this.node = new BuilderNode<[WebContentParams]>(context.getUIContext());
   }
 
   create(): void {
@@ -230,7 +234,7 @@ class WebEntry {
     try {
       this.wasWarmMount = webComponentMounted;
       ensureWebEngineInitialized();
-      this.node.build(wrapBuilder(webContent), this, { nestingBuilderSupported: true });
+      this.node.build(wrapBuilder(webContent), { entry: this }, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("WebView creation was cancelled");
       }

@@ -373,84 +373,88 @@ class EditorSystemMenu implements EditMenuOptions {
   }
 }
 
+interface EditorContentParams {
+  entry: EditorEntry;
+}
+
 @Builder
-function editorContent(entry: EditorEntry) {
-  if (entry.settings.multiline && !entry.settings.secure) {
-    Scroll(entry.scroller) {
+function editorContent(params: EditorContentParams) {
+  if (params.entry.settings.multiline && !params.entry.settings.secure) {
+    Scroll(params.entry.scroller) {
       TextArea({
-        text: entry.text,
-        placeholder: entry.settings.placeholder,
-        controller: entry.area,
+        text: params.entry.text,
+        placeholder: params.entry.settings.placeholder,
+        controller: params.entry.area,
       })
-        .id(`nsh-editor-${entry.settings.targetId}`)
-        .attributeModifier(new EditorModifier(entry))
-        .editMenuOptions(new EditorSystemMenu(entry))
-        .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
-        .onFocus(() => entry.emit("focus"))
-        .onBlur(() => entry.emit("blur"))
-        .onSubmit((_key: EnterKeyType, event?: SubmitEvent) => entry.submit(event))
-        .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
-        .onContentScroll(() => entry.scrolled())
-        .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
-        .onWillChange(() => entry.canEdit())
+        .id(`nsh-editor-${params.entry.settings.targetId}`)
+        .attributeModifier(new EditorModifier(params.entry))
+        .editMenuOptions(new EditorSystemMenu(params.entry))
+        .onChange((text: string, preview?: PreviewText) => params.entry.change(text, preview))
+        .onFocus(() => params.entry.emit("focus"))
+        .onBlur(() => params.entry.emit("blur"))
+        .onSubmit((_key: EnterKeyType, event?: SubmitEvent) => params.entry.submit(event))
+        .onTextSelectionChange((start: number, end: number) => params.entry.selection(start, end))
+        .onContentScroll(() => params.entry.scrolled())
+        .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
+        .onWillChange(() => params.entry.canEdit())
         .onWillInsert((value: InsertValue): boolean => {
-          if (!entry.canEdit()) return false;
-          if (!entry.isSink()) {
-            entry.editKey(value.insertValue);
+          if (!params.entry.canEdit()) return false;
+          if (!params.entry.isSink()) {
+            params.entry.editKey(value.insertValue);
           }
           return true;
         })
         .onWillDelete((): boolean => {
-          if (!entry.canEdit()) return false;
-          if (!entry.isSink() || entry.text.length === 0) {
-            entry.editKey("Backspace");
+          if (!params.entry.canEdit()) return false;
+          if (!params.entry.isSink() || params.entry.text.length === 0) {
+            params.entry.editKey("Backspace");
           }
           return true;
         })
-        .onAppear(() => entry.appeared())
+        .onAppear(() => params.entry.appeared())
     }
-    .width(entry.settings.width)
-    .height(entry.settings.height)
+    .width(params.entry.settings.width)
+    .height(params.entry.settings.height)
     .scrollable(ScrollDirection.Vertical)
-    .scrollBar(entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
+    .scrollBar(params.entry.settings.scrollbarVisible ? BarState.Auto : BarState.Off)
     .clip(true)
-    .hitTestBehavior(entry.settings.hitTest as HitTestMode)
-    .onKeyEventDispatch((event: KeyEvent): boolean => entry.dispatchKeyEvent(event))
-    .onDidScroll(() => entry.scrolled());
+    .hitTestBehavior(params.entry.settings.hitTest as HitTestMode)
+    .onKeyEventDispatch((event: KeyEvent): boolean => params.entry.dispatchKeyEvent(event))
+    .onDidScroll(() => params.entry.scrolled());
   } else {
     Stack() {
       TextInput({
-        text: entry.text,
-        placeholder: entry.settings.placeholder,
-        controller: entry.line,
+        text: params.entry.text,
+        placeholder: params.entry.settings.placeholder,
+        controller: params.entry.line,
       })
-        .id(`nsh-editor-${entry.settings.targetId}`)
-        .attributeModifier(new EditorModifier(entry))
-        .editMenuOptions(new EditorSystemMenu(entry))
-        .onChange((text: string, preview?: PreviewText) => entry.change(text, preview))
-        .onFocus(() => entry.emit("focus"))
-        .onBlur(() => entry.emit("blur"))
-        .onSubmit((_key: EnterKeyType, event: SubmitEvent) => entry.submit(event))
-        .onTextSelectionChange((start: number, end: number) => entry.selection(start, end))
-        .onContentScroll(() => entry.scrolled())
-        .onPaste((text: string, event: PasteEvent) => entry.paste(text, event))
-        .onWillChange(() => entry.canEdit())
+        .id(`nsh-editor-${params.entry.settings.targetId}`)
+        .attributeModifier(new EditorModifier(params.entry))
+        .editMenuOptions(new EditorSystemMenu(params.entry))
+        .onChange((text: string, preview?: PreviewText) => params.entry.change(text, preview))
+        .onFocus(() => params.entry.emit("focus"))
+        .onBlur(() => params.entry.emit("blur"))
+        .onSubmit((_key: EnterKeyType, event: SubmitEvent) => params.entry.submit(event))
+        .onTextSelectionChange((start: number, end: number) => params.entry.selection(start, end))
+        .onContentScroll(() => params.entry.scrolled())
+        .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
+        .onWillChange(() => params.entry.canEdit())
         .onWillInsert((value: InsertValue): boolean => {
-          if (!entry.canEdit()) return false;
-          entry.editKey(value.insertValue);
+          if (!params.entry.canEdit()) return false;
+          params.entry.editKey(value.insertValue);
           return true;
         })
         .onWillDelete((): boolean => {
-          if (!entry.canEdit()) return false;
-          entry.editKey("Backspace");
+          if (!params.entry.canEdit()) return false;
+          params.entry.editKey("Backspace");
           return true;
         })
-        .onAppear(() => entry.appeared());
+        .onAppear(() => params.entry.appeared());
     }
-    .width(entry.settings.width)
-    .height(entry.settings.height)
-    .hitTestBehavior(entry.settings.hitTest as HitTestMode)
-    .onKeyEventDispatch((event: KeyEvent): boolean => entry.dispatchKeyEvent(event));
+    .width(params.entry.settings.width)
+    .height(params.entry.settings.height)
+    .hitTestBehavior(params.entry.settings.hitTest as HitTestMode)
+    .onKeyEventDispatch((event: KeyEvent): boolean => params.entry.dispatchKeyEvent(event));
   }
 }
 
@@ -639,7 +643,7 @@ class EditorSizeCallback extends FrameCallback {
   }
 }
 class EditorEntry {
-  readonly node: BuilderNode<[EditorEntry]>;
+  readonly node: BuilderNode<[EditorContentParams]>;
   readonly scroller: Scroller = new Scroller();
   readonly line: TextInputController = new TextInputController();
   readonly area: TextAreaController = new TextAreaController();
@@ -686,7 +690,7 @@ class EditorEntry {
     this.count = settings.count;
     this.selStart = this.text.length;
     this.selEnd = this.text.length;
-    this.node = new BuilderNode<[EditorEntry]>(context.getUIContext());
+    this.node = new BuilderNode<[EditorContentParams]>(context.getUIContext());
   }
   isSink(): boolean {
     return isSinkSettings(this.settings);
@@ -717,7 +721,7 @@ class EditorEntry {
     this.updating = true;
     this.sdkBusy = true;
     try {
-      this.node.build(wrapBuilder(editorContent), this);
+      this.node.build(wrapBuilder(editorContent), { entry: this });
       if (this.closed || !this.context.isActive()) {
         throw new Error("Editor creation was cancelled");
       }
@@ -789,7 +793,7 @@ class EditorEntry {
     this.updating = true;
     this.sdkBusy = true;
     try {
-      this.node.update(this);
+      this.node.update({ entry: this });
       if (this.isSink() && this.focused && this.preview.length === 0) {
         this.pinSinkCaret();
       }
