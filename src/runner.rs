@@ -603,6 +603,18 @@ mod tests {
             crate::embedded::NSH_PATCH.trim(),
             "{dev_manifest}",
         );
+        if crate::embedded::NSH_PATCH.contains("git = \"https://github.com/longbridge/nsh\"") {
+            assert!(
+                crate::embedded::NSH_PATCH.contains("rev = \""),
+                "expected locked rev in NSH_PATCH:\n{}",
+                crate::embedded::NSH_PATCH
+            );
+            assert!(
+                !crate::embedded::NSH_PATCH.contains("branch = \"main\""),
+                "unpinned branch in NSH_PATCH:\n{}",
+                crate::embedded::NSH_PATCH
+            );
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 

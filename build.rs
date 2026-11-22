@@ -49,6 +49,46 @@ fn join_relative(base: &Path, relative: &str) -> PathBuf {
         .fold(base.to_path_buf(), |path, part| path.join(part))
 }
 
+fn locked_git_rev(lockfile: &str, url: &str, branch: &str) -> Option<String> {
+    let prefix = format!("source = \"git+{url}?branch={branch}#");
+    for line in lockfile.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix(&prefix)
+            && let Some(rev) = rest.strip_suffix('"')
+            && !rev.is_empty()
+        {
+            return Some(rev.to_owned());
+        }
+    }
+    None
+}
+
+fn pin_git_branch(line: &str, lockfile: &str) -> String {
+    if line.contains("rev = \"") {
+        return line.to_owned();
+    }
+    let Some((_, git_rest)) = line.split_once("git = \"") else {
+        return line.to_owned();
+    };
+    let Some((url, _)) = git_rest.split_once('"') else {
+        return line.to_owned();
+    };
+    let Some((_, branch_rest)) = line.split_once("branch = \"") else {
+        return line.to_owned();
+    };
+    let Some((branch, _)) = branch_rest.split_once('"') else {
+        return line.to_owned();
+    };
+    let Some(rev) = locked_git_rev(lockfile, url, branch) else {
+        return line.to_owned();
+    };
+    line.replacen(
+        &format!("branch = \"{branch}\""),
+        &format!("rev = \"{rev}\""),
+        1,
+    )
+}
+
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.as_path();
@@ -78,9 +118,14 @@ fn main() {
     // NSH's crates as this repository pins them: the runner of a TSX app,
     // which has no generated workspace of NSH's, takes them from here.
     let workspace = fs::read_to_string(repo.join("Cargo.toml")).unwrap();
+    let lockfile = fs::read_to_string(repo.join("Cargo.lock")).unwrap_or_default();
     println!(
         "cargo:rerun-if-changed={}",
         repo.join("Cargo.toml").display()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        repo.join("Cargo.lock").display()
     );
     let mut patch = String::new();
     let mut inside = false;
@@ -97,7 +142,7 @@ fn main() {
                     let path = path.canonicalize().unwrap_or(path);
                     format!("{head}path = {:?}{tail}", path.display().to_string())
                 }
-                None => line.to_owned(),
+                None => pin_git_branch(line, &lockfile),
             };
             patch.push_str(&line);
             patch.push('\n');
