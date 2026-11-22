@@ -671,7 +671,10 @@ pub(crate) fn wire_main_window_launch(
     options: &MainWindowOptions,
     kept: Option<WindowPlacement>,
 ) -> Option<WireCommand> {
-    let visible = (!options.visible_at_launch()).then_some(false);
+    // HarmonyOS EntryAbility renders directly in its main window rather than a
+    // hidden host window, so only minimize when the app explicitly requests
+    // `defaultVisible: false`.
+    let visible = (options.default_visible == Some(false)).then_some(false);
     let title_bar_hidden = options.attributes.frame == Some(WindowFrameStyle::None)
         || options
             .attributes
@@ -722,6 +725,17 @@ pub(crate) fn wire_main_window_launch(
         mode,
         visible,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn wire_open_main_window_launch(open: &OpenWindow) -> Option<WireCommand> {
+    let mut main = MainWindowOptions::default();
+    main.default_size = open.options.default_size;
+    main.default_position = open.options.default_position;
+    main.display = open.options.display;
+    main.default_mode = open.options.default_mode;
+    main.attributes = open.options.attributes.clone();
+    wire_main_window_launch(&main, open.placement)
 }
 
 pub(crate) fn wire_request(request: &WindowRequest) -> WireCommand {
@@ -1612,6 +1626,10 @@ pub(crate) struct DesktopState {
     pub(crate) popup_open: bool,
     pub(crate) close_on_press: bool,
     pub(crate) selection_menu_target: Option<nsh_core::NodeId>,
+    /// Primary desktop window node hosted in-place inside EntryAbility's main window
+    /// under NSH window model v2 (plain TSX implicit `"main"` or primary `<Window>`).
+    pub(crate) hosted_main_window: Option<nsh_core::NodeId>,
+    pub(crate) main_window_launch_applied: bool,
 }
 
 #[cfg(target_env = "ohos")]
@@ -1624,6 +1642,8 @@ impl Default for DesktopState {
             popup_open: false,
             close_on_press: true,
             selection_menu_target: None,
+            hosted_main_window: None,
+            main_window_launch_applied: false,
         }
     }
 }
@@ -2129,6 +2149,19 @@ mod tests {
         assert_eq!(kept_json["height"], 640.0);
         assert_eq!(kept_json["contentSized"], false);
         assert_eq!(kept_json["mode"], "maximized");
+
+        // Primary window model v2 OpenWindow converts into main-window launch overrides only when set.
+        let mut implicit_open = OpenWindow::default();
+        implicit_open.implicit = true;
+        assert_eq!(wire_open_main_window_launch(&implicit_open), None);
+        implicit_open.options.default_size = Some(Size::new(Points(960.0), Points(640.0)));
+        implicit_open.options.default_position = Some(WindowPosition::Center);
+        let open_main_json =
+            serde_json::to_value(wire_open_main_window_launch(&implicit_open).unwrap()).unwrap();
+        assert_eq!(open_main_json["op"], "applyMainWindowLaunch");
+        assert_eq!(open_main_json["width"], 960.0);
+        assert_eq!(open_main_json["height"], 640.0);
+        assert_eq!(open_main_json["position"], "center");
 
         // Subwindow clamping respects explicit min/max without imposing a 120x80 floor.
         let mut small_attrs = WindowAttributes::default();

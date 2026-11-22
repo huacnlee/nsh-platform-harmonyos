@@ -279,7 +279,12 @@ impl KeyboardWindow {
             let (listens, prevents) = node.interaction.key_interest(kind, stroke.as_ref());
             observes |= listens;
             captures |= prevents;
-            if node.modal.borrow().is_some() {
+            if node
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| !modal.is_main_window_host())
+            {
                 break;
             }
             ancestor = node.parent_node.borrow().upgrade();

@@ -465,6 +465,7 @@ impl State {
                 capabilities,
                 app_id,
                 window,
+                application,
                 ..
             } => {
                 let bundle = crate::app::dev::Session::bundle(
@@ -474,6 +475,7 @@ impl State {
                     capabilities,
                     app_id,
                     window,
+                    application,
                 )?;
                 let dev = self.dev.as_mut().unwrap();
                 dev.latest = Some(((session, version), bundle.clone()));

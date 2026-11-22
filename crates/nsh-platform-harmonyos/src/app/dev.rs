@@ -100,6 +100,7 @@ impl Session {
         capabilities: Option<String>,
         app_id: Option<String>,
         window: Option<String>,
+        application: Option<String>,
     ) -> Result<Bundle> {
         let mut bundle = match format {
             // SAFETY: DevClient negotiated this engine's bytecode version with
@@ -114,6 +115,11 @@ impl Session {
             let value: serde_json::Value = serde_json::from_str(window).map_err(error)?;
             bundle.main_window =
                 Some(nsh_core::desktop::MainWindowOptions::from_json(&value).map_err(error)?);
+        }
+        if let Some(application) = application.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(application).map_err(error)?;
+            bundle.application =
+                Some(nsh_core::desktop::ApplicationOptions::from_json(&value).map_err(error)?);
         }
         bundle
             .with_capabilities_json(capabilities.as_deref())

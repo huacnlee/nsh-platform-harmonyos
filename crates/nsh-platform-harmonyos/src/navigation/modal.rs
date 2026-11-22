@@ -109,6 +109,8 @@ pub(crate) struct Modal {
     sub_window: RefCell<Option<SubWindowMount>>,
     config: RefCell<ModalConfig>,
     desktop: RefCell<Option<DesktopWindow>>,
+    hosted_in_main: Cell<bool>,
+    has_modal_config: Cell<bool>,
     pending_present: Cell<bool>,
     shown: Cell<bool>,
     show_emitted: Cell<bool>,
@@ -141,6 +143,8 @@ impl Modal {
             sub_window: RefCell::default(),
             config: RefCell::new(ModalConfig::default()),
             desktop: RefCell::new(None),
+            hosted_in_main: Cell::new(false),
+            has_modal_config: Cell::new(false),
             pending_present: Cell::new(false),
             shown: Cell::new(false),
             show_emitted: Cell::new(false),
@@ -183,6 +187,78 @@ impl Modal {
     }
     pub(crate) fn is_desktop_window(&self) -> bool {
         self.desktop.borrow().is_some()
+    }
+    pub(crate) fn is_main_window_host(&self) -> bool {
+        self.hosted_in_main.get()
+    }
+    pub(crate) fn has_modal_config(&self) -> bool {
+        self.has_modal_config.get()
+    }
+    pub(crate) fn cancel_pending_present(&self) {
+        self.pending_present.set(false);
+    }
+    pub(crate) fn open_in_main_window(&self, host_root: &Rc<Node>) -> Result<()> {
+        let Some(owner) = self.owner.upgrade() else {
+            return Ok(());
+        };
+        self.pending_present.set(false);
+        self.hosted_in_main.set(true);
+        self.config.borrow_mut().animation = ModalAnimation::None;
+        self.shown.set(true);
+        self.closing.set(false);
+        self.show_emitted.set(true);
+        host_root.enable_layout();
+        if host_root.scroll.borrow().is_none() {
+            host_root.promote_direct_paint()?;
+        }
+        if !owner.batch_created.get() {
+            owner.flush_deferred_native()?;
+        }
+        if owner.mount_parent.borrow().upgrade().is_none() {
+            let container = host_root.child_container();
+            let index = container.borrow().children().len();
+            container
+                .borrow_mut()
+                .insert_child(owner.mounted(), index)?;
+            *owner.mount_parent.borrow_mut() = Rc::downgrade(&container);
+        }
+        let size: Size = owner.platform.get().window.into();
+        self.available.set(Some(size));
+        owner.invalidate_mounted_geometry();
+        if size.width > 0.0 && size.height > 0.0 {
+            self.report_metrics(&owner, size);
+            owner.set_frame(crate::render::geometry::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: size.width,
+                height: size.height,
+            })?;
+            owner.update_layout_bounds()?;
+        }
+        owner.restore_style()?;
+        owner.update_wrapper()?;
+        Ok(())
+    }
+    fn close_main_window_host(&self) -> Result<()> {
+        self.pending_present.set(false);
+        self.hosted_in_main.set(false);
+        self.shown.set(false);
+        self.closing.set(false);
+        self.available.set(None);
+        if let Some(owner) = self.owner.upgrade()
+            && let Some(parent) = std::mem::take(&mut *owner.mount_parent.borrow_mut()).upgrade()
+        {
+            let mounted = owner.mounted();
+            let index = parent
+                .borrow()
+                .children()
+                .iter()
+                .position(|child| Rc::ptr_eq(child, &mounted));
+            if let Some(index) = index {
+                let _ = parent.borrow_mut().remove_child(index);
+            }
+        }
+        Ok(())
     }
     pub(crate) fn is_desktop_focused(&self) -> bool {
         self.shown.get()
@@ -851,10 +927,11 @@ impl Modal {
         Ok(())
     }
     pub(crate) fn configure(&self, config: ModalConfig) -> Result<()> {
+        self.has_modal_config.set(true);
         if self.closing.get() {
             return Ok(());
         }
-        if self.is_desktop_window() {
+        if self.is_desktop_window() || self.hosted_in_main.get() {
             self.config.replace(config);
             return Ok(());
         }
@@ -904,7 +981,7 @@ impl Modal {
         Ok(())
     }
     fn theme(&self) -> Result<()> {
-        if self.is_desktop_window() {
+        if self.is_desktop_window() || self.hosted_in_main.get() {
             return Ok(());
         }
         let config = self.config.borrow();
@@ -939,6 +1016,12 @@ impl Modal {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
+        if self.hosted_in_main.get() {
+            self.shown.set(true);
+            self.closing.set(false);
+            self.refresh_metrics();
+            return Ok(());
+        }
         if self.is_desktop_window() {
             self.shown.set(true);
             self.closing.set(false);
@@ -982,7 +1065,7 @@ impl Modal {
         self.on_dismiss_attempt(0)
     }
     fn on_dismiss_attempt(&self, reason: i32) -> Result<()> {
-        if self.closing.get() {
+        if self.closing.get() || self.hosted_in_main.get() {
             return Ok(());
         }
         if self.is_desktop_window() {
@@ -1060,6 +1143,9 @@ impl Modal {
         }
     }
     pub(crate) fn close(&self, animated: bool) -> Result<()> {
+        if self.hosted_in_main.get() {
+            return self.close_main_window_host();
+        }
         if self.is_desktop_window() {
             return self.close_sub_window(false);
         }
@@ -1268,7 +1354,7 @@ impl Modal {
         self.closing.get() && self.shown.get()
     }
     fn size_for_bounds(&self, owner: &Node, width: f32, height: f32) -> Size {
-        if self.is_desktop_window() {
+        if self.is_desktop_window() || self.hosted_in_main.get() {
             return Size::new(width, height);
         }
         match self.config.borrow().presentation {
@@ -1347,6 +1433,8 @@ impl Modal {
     fn report_metrics(&self, owner: &Node, size: Size) {
         let insets = if self.is_desktop_window() {
             EdgeInsets::default()
+        } else if self.hosted_in_main.get() {
+            owner.platform.get().safe_area
         } else {
             // The dialog is rooted in the window, independently of the embedding
             // surface. Only the avoid areas intersecting its own bounds are insets.
@@ -1409,6 +1497,21 @@ impl Modal {
     }
     pub(crate) fn refresh_metrics(&self) -> Option<Size> {
         let owner = self.owner.upgrade()?;
+        if self.hosted_in_main.get() {
+            let size: Size = owner.platform.get().window.into();
+            self.available.set(Some(size));
+            if size.width > 0.0 && size.height > 0.0 {
+                self.report_metrics(&owner, size);
+                let _ = owner.set_frame(crate::render::geometry::Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: size.width,
+                    height: size.height,
+                });
+                return Some(size);
+            }
+            return None;
+        }
         if self.is_desktop_window() {
             let size = self
                 .sub_window_drawable_size(&owner)
@@ -1421,6 +1524,15 @@ impl Modal {
     }
     pub(crate) fn sync_metrics(&self) -> Option<Size> {
         let owner = self.owner.upgrade()?;
+        if self.hosted_in_main.get() {
+            let size: Size = owner.platform.get().window.into();
+            if size.width <= 0.0 || size.height <= 0.0 {
+                return None;
+            }
+            self.available.set(Some(size));
+            self.report_metrics(&owner, size);
+            return Some(size);
+        }
         if self.is_desktop_window() {
             let size = self
                 .available
@@ -1449,6 +1561,14 @@ impl Modal {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(Size::default());
         };
+        if self.hosted_in_main.get() {
+            let size: Size = owner.platform.get().window.into();
+            self.available.set(Some(size));
+            if size.width > 0.0 && size.height > 0.0 {
+                self.report_metrics(&owner, size);
+            }
+            return Ok(size);
+        }
         if self.is_desktop_window() {
             let fallback = self
                 .desktop

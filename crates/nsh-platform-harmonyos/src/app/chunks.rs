@@ -150,6 +150,12 @@ fn preload(
                     .map_err(|e| format!("app.json: {e}"))?,
             );
         }
+        if let Some(application) = manifest.get("application") {
+            bundle.application = Some(
+                nsh_core::desktop::ApplicationOptions::from_json(application)
+                    .map_err(|e| format!("app.json: {e}"))?,
+            );
+        }
         if let Some(value) = manifest.get("entryChunks") {
             let names: Vec<String> = serde_json::from_value(value.clone())
                 .map_err(|e| format!("app.json entryChunks: {e}"))?;

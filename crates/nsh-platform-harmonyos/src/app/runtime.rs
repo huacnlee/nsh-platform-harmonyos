@@ -540,10 +540,9 @@ impl State {
                                     .unwrap()
                                     .control()
                                     .set_environment(self.environment);
-                                self.mounter
-                                    .as_ref()
-                                    .unwrap()
-                                    .environment(self.environment)?;
+                                let mounter = self.mounter.as_ref().unwrap();
+                                mounter.environment(self.environment)?;
+                                mounter.on_main_window_state(state);
                             }
                             if became_focused
                                 && self.laid_out
@@ -561,10 +560,9 @@ impl State {
                                 .unwrap()
                                 .control()
                                 .set_environment(self.environment);
-                            self.mounter
-                                .as_ref()
-                                .unwrap()
-                                .environment(self.environment)?;
+                            let mounter = self.mounter.as_ref().unwrap();
+                            mounter.environment(self.environment)?;
+                            mounter.on_main_window_title_bar(edges);
                         }
                     }
                     DesktopEvent::Displays(displays) => {
@@ -1247,8 +1245,9 @@ impl Runtime {
             main_window: RefCell::new(initial_main_window),
             appearance: Cell::new(nsh_core::platform::Appearance::System),
         });
-        let mounter = Mounter::new(parent, size, context).map_err(napi_error)?;
+        let mut mounter = Mounter::new(parent, size, context).map_err(napi_error)?;
         if let Some(launch) = main_window_launch {
+            mounter.note_main_window_launch_applied();
             config.host.desktop_command(&launch)?;
         }
         state.borrow_mut().mounter = Some(mounter);

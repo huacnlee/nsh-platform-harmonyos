@@ -1126,7 +1126,14 @@ pub(crate) fn hit(
                 .iter()
                 .rev()
                 .filter_map(Weak::upgrade)
-                .filter(|child| child.kind != nsh_core::ViewKind::Modal)
+                .filter(|child| {
+                    child.kind != nsh_core::ViewKind::Modal
+                        || child
+                            .modal
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|modal| modal.is_main_window_host())
+                })
             {
                 if child.input_priority() == priority {
                     let matrix = child.input_in_plane(&plane)?.mul(world);

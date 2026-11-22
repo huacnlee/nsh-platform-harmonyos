@@ -38,7 +38,9 @@ impl Node {
                 ViewKind::Scroll | ViewKind::Image | ViewKind::Stack | ViewKind::Input
             )
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                if modal.is_desktop_window() {
+                if modal.is_main_window_host() {
+                    false
+                } else if modal.is_desktop_window() {
                     !modal.desktop_transparent()
                 } else {
                     modal.presentation() != nsh_core::ModalPresentation::FullScreen
@@ -443,7 +445,9 @@ impl Node {
         let (color, _) = crate::render::shadow_geometry::effective_background(base_color, style);
         let default_surface_bg = self.kind == ViewKind::Screen
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                if modal.is_desktop_window() {
+                if modal.is_main_window_host() {
+                    false
+                } else if modal.is_desktop_window() {
                     !modal.desktop_transparent()
                         && !modal.desktop_frame_none()
                         && !modal.desktop_backdrop()
@@ -482,8 +486,8 @@ impl Node {
         if let Some(modal) = self.modal.borrow().as_ref()
             && radius == [0.0; 4]
         {
-            if modal.is_desktop_window() {
-                // SubWindows own their OS window chrome and corner radius natively.
+            if modal.is_desktop_window() || modal.is_main_window_host() {
+                // Desktop windows own their OS window chrome and corner radius natively.
                 radius = [0.0; 4];
             } else {
                 radius = match modal.presentation() {

@@ -1577,7 +1577,12 @@ fn handle_window_resize_press(
         )?;
         return Ok(true);
     }
-    if owner.id != nsh_core::ROOT_ID {
+    let is_main_window_host = owner
+        .modal
+        .borrow()
+        .as_ref()
+        .is_some_and(|modal| modal.is_main_window_host());
+    if owner.id != nsh_core::ROOT_ID && !is_main_window_host {
         return Ok(false);
     }
     let Some(state) = owner.platform.get().window_state else {
@@ -1697,7 +1702,13 @@ fn handle_window_drag_press(
         }
         return Ok(());
     }
-    if owner.id == nsh_core::ROOT_ID {
+    if owner.id == nsh_core::ROOT_ID
+        || owner
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| modal.is_main_window_host())
+    {
         let (movable, maximizable) = {
             let main = owner.main_window.borrow();
             (main.movable, main.maximizable)
