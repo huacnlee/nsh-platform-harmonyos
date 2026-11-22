@@ -83,6 +83,8 @@ impl crate::render::node::Node {
 pub(crate) struct Snapshot {
     pub(crate) map: Arc<Keymap>,
     pub(crate) menu: Option<Arc<[nsh_core::desktop::MenuItem]>>,
+    pub(crate) menu_bar_mode: nsh_core::desktop::MenuBarMode,
+    pub(crate) menu_bar_revealed: bool,
     pub(crate) quit_on_request: bool,
     pub(crate) desktop: bool,
     pub(crate) focused: Option<NodeId>,
@@ -95,6 +97,8 @@ impl Default for Snapshot {
         Self {
             map: Default::default(),
             menu: None,
+            menu_bar_mode: nsh_core::desktop::MenuBarMode::Shown,
+            menu_bar_revealed: false,
             quit_on_request: true,
             desktop: false,
             focused: None,
@@ -108,6 +112,7 @@ impl Default for Snapshot {
 struct Held {
     keys: Vec<(N, bool)>,
     last_editor_key: Option<(i64, i32, N)>,
+    alt_armed: bool,
 }
 
 struct KeyInput<'a> {
@@ -134,6 +139,7 @@ impl KeyboardWindow {
         let mut held = self.held.lock().unwrap();
         held.keys.clear();
         held.last_editor_key = None;
+        held.alt_armed = false;
     }
     pub(crate) fn modifiers(&self) -> Modifiers {
         self.held.lock().unwrap().modifiers()
@@ -333,6 +339,7 @@ impl KeyboardWindow {
         } else {
             captures = false;
         }
+        let alt_released_alone = held.track_alt_alone(action, code, held_before);
         let allow_key_scroll = !observes
             && focus
                 .as_ref()
@@ -341,6 +348,31 @@ impl KeyboardWindow {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.composing {
                 return false;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && stroke.key == Key::Escape
+                && stroke.modifiers == Modifiers::default()
+                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                && snapshot.menu_bar_revealed
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::Hide,
+                ));
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && stroke.key == Key::F(10)
+                && stroke.modifiers == Modifiers::default()
+                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::ToggleF10,
+                ));
+                return true;
             }
             if snapshot.focused.is_none()
                 && let Some(id) = snapshot.selection
@@ -396,6 +428,25 @@ impl KeyboardWindow {
                     id: action.id,
                     role: action.role,
                 });
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && snapshot.focused.is_none()
+                && stroke.modifiers
+                    == (Modifiers {
+                        alt: true,
+                        ..Modifiers::default()
+                    })
+                && let Key::Char(ch) = stroke.key
+                && ch.is_ascii_alphabetic()
+                && let Some(menu) = snapshot.menu.as_deref()
+                && crate::services::desktop::menu_bar_has_initial(menu, ch)
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::OpenInitial(ch),
+                ));
                 return true;
             }
             if !repeat
@@ -489,6 +540,19 @@ impl KeyboardWindow {
             }
             false
         });
+        if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
+            let snapshot = route.keyboard.lock().unwrap();
+            if snapshot.desktop
+                && !snapshot.composing
+                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::ToggleAlt,
+                ));
+                return true;
+            }
+        }
         shortcut || captures
     }
 }
@@ -592,9 +656,46 @@ impl Held {
         if action == 0 {
             self.keys.clear();
             self.last_editor_key = None;
+            self.alt_armed = false;
             true
         } else {
             false
+        }
+    }
+    fn track_alt_alone(&mut self, action: i32, code: N, held_before: bool) -> bool {
+        let is_alt = matches!(code, N::AltLeft | N::AltRight);
+        match action {
+            1 => {
+                if is_alt {
+                    let modifiers = self.modifiers();
+                    let others = modifiers.ctrl || modifiers.shift || modifiers.cmd;
+                    if !held_before && !others && self.keys.is_empty() {
+                        self.alt_armed = true;
+                    } else if others {
+                        self.alt_armed = false;
+                    }
+                } else {
+                    self.alt_armed = false;
+                }
+                false
+            }
+            2 => {
+                if is_alt {
+                    let armed = std::mem::replace(&mut self.alt_armed, false);
+                    let modifiers = self.modifiers();
+                    let other_alt = self
+                        .keys
+                        .iter()
+                        .any(|(k, _)| *k != code && matches!(k, N::AltLeft | N::AltRight));
+                    armed && !other_alt && !modifiers.ctrl && !modifiers.shift && !modifiers.cmd
+                } else {
+                    false
+                }
+            }
+            _ => {
+                self.alt_armed = false;
+                false
+            }
         }
     }
     fn event(

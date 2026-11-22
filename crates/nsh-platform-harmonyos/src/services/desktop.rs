@@ -5,16 +5,103 @@ use nsh_core::{
     Bounds, Edges, EventKind, EventPayload, PayloadValue, Point, Points, Size,
     desktop::{
         Backdrop, CloseReason, DesktopCommand, Display, DisplayId, Key as DesktopKey,
-        MainWindowOptions, MenuItem, MenuLabels, MenuRole, OpenWindow, ResizeEdge, Shortcut,
-        SizeToContent, TitleBarStyle, WindowAttributes, WindowFrameStyle, WindowKind, WindowLevel,
-        WindowMode, WindowPlacement, WindowPointerEvents, WindowPosition, WindowRequest,
-        WindowState,
+        MainWindowOptions, MenuBarMode, MenuItem, MenuLabels, MenuRole, OpenWindow, ResizeEdge,
+        Shortcut, SizeToContent, TitleBarStyle, WindowAttributes, WindowFrameStyle, WindowKind,
+        WindowLevel, WindowMode, WindowPlacement, WindowPointerEvents, WindowPosition,
+        WindowRequest, WindowState,
     },
     keymap::{Key as KeymapKey, Keystroke},
     platform::{Idiom, Os},
     single_instance::SecondInstance,
 };
 use serde::{Deserialize, Serialize};
+
+/// Height in vp reserved at the top of the main desktop window when the
+/// application menu bar is shown.
+pub(crate) const MENU_BAR_HEIGHT: f32 = 32.0;
+
+/// Keyboard-driven transitions for the main window's application menu bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuBarKeyAction {
+    /// Alt pressed and released alone toggles an auto-hidden bar.
+    ToggleAlt,
+    /// F10 opens the bar's first menu (or closes an auto-hidden bar).
+    ToggleF10,
+    /// Alt + initial opens the matching top-level menu item.
+    OpenInitial(char),
+    /// Escape dismisses a revealed auto-hidden bar.
+    Hide,
+}
+
+/// Resolves whether the application menu bar should be shown on the main window.
+/// Matches NSH's Linux/Windows rules: only on desktop, with non-empty menu items,
+/// when the system title bar is visible and not in full screen, and when
+/// `MenuBarMode::Shown` or revealed via Alt/F10 in `MenuBarMode::AutoHide`.
+pub(crate) fn menu_bar_visible(
+    os: Os,
+    has_menu: bool,
+    title_bar_hidden: bool,
+    frame_none: bool,
+    full_screen: bool,
+    mode: MenuBarMode,
+    alt_shown: bool,
+) -> bool {
+    os.is_desktop()
+        && has_menu
+        && !title_bar_hidden
+        && !frame_none
+        && !full_screen
+        && match mode {
+            MenuBarMode::Shown => true,
+            MenuBarMode::AutoHide => alt_shown,
+        }
+}
+
+/// Index of the first enabled top-level serialized menu bar entry (for F10).
+pub(crate) fn menu_bar_first_index(items: &[WireMenuItem]) -> Option<usize> {
+    items
+        .iter()
+        .position(|item| item.kind != "separator" && item.enabled)
+}
+
+/// Index of the first enabled top-level serialized menu bar entry whose label
+/// starts with `initial` (ASCII case-insensitive), for Alt + mnemonic activation.
+pub(crate) fn menu_bar_initial_index(items: &[WireMenuItem], initial: char) -> Option<usize> {
+    let target = initial.to_ascii_lowercase();
+    items.iter().position(|item| {
+        item.kind != "separator"
+            && item.enabled
+            && item
+                .label
+                .trim_start()
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.to_ascii_lowercase() == target)
+    })
+}
+
+/// Whether `items` (after inline expansion) has an enabled top-level menu bar
+/// entry whose label starts with `initial` (ASCII case-insensitive).
+pub(crate) fn menu_bar_has_initial(items: &[MenuItem], initial: char) -> bool {
+    let target = initial.to_ascii_lowercase();
+    let expanded = MenuItem::with_inline_expanded(items);
+    expanded.iter().any(|item| {
+        let label = match item {
+            MenuItem::Submenu {
+                label,
+                enabled: true,
+                ..
+            } => label.as_str(),
+            MenuItem::Action(action) if action.enabled => action.label.as_str(),
+            _ => return false,
+        };
+        label
+            .trim_start()
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.to_ascii_lowercase() == target)
+    })
+}
 
 /// Resolves the reported NSH OS for an OHOS device idiom.
 /// Phone and tablet stay on `Os::Android`; `2in1`/PC desktop reports `Os::Linux`.
@@ -392,6 +479,16 @@ pub(crate) enum WireCommand {
         items: Vec<WireMenuItem>,
     },
     ClosePopupMenu,
+    #[serde(rename_all = "camelCase")]
+    SetMenuBar {
+        visible: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        target_id: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        open_index: Option<u32>,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        items: Vec<WireMenuItem>,
+    },
     #[serde(rename_all = "camelCase")]
     SetTray {
         #[serde(skip_serializing_if = "String::is_empty")]
@@ -1561,6 +1658,7 @@ pub(crate) struct MainWindowState {
     pub(crate) maximizable: bool,
     pub(crate) resizable: bool,
     pub(crate) frame_none: bool,
+    pub(crate) title_bar_hidden: bool,
     pub(crate) min_size: Option<Size<Points>>,
     pub(crate) max_size: Option<Size<Points>>,
     pub(crate) size_to_content: SizeToContent,
@@ -1574,6 +1672,7 @@ impl Default for MainWindowState {
             maximizable: true,
             resizable: true,
             frame_none: false,
+            title_bar_hidden: false,
             min_size: None,
             max_size: None,
             size_to_content: SizeToContent::Off,
@@ -1596,6 +1695,9 @@ impl MainWindowState {
         }
         if let Some(frame) = attrs.frame {
             self.frame_none = frame == WindowFrameStyle::None;
+        }
+        if let Some(title_bar) = attrs.title_bar {
+            self.title_bar_hidden = title_bar.style == TitleBarStyle::Hidden;
         }
         if let Some(min_size) = attrs.min_size {
             self.min_size = min_size;
@@ -1621,6 +1723,14 @@ impl MainWindowState {
 #[cfg(target_env = "ohos")]
 pub(crate) struct DesktopState {
     pub(crate) labels: MenuLabels,
+    pub(crate) menu: Option<std::sync::Arc<[MenuItem]>>,
+    pub(crate) menu_bar_mode: MenuBarMode,
+    pub(crate) menu_bar_alt_shown: bool,
+    pub(crate) menu_bar_inset: std::cell::Cell<f32>,
+    pub(crate) menu_bar_host: Option<(
+        crate::render::node::NativeNode,
+        crate::interop::attachment::NativeAttachment,
+    )>,
     pub(crate) quit_on_request: bool,
     pub(crate) popup_generation: u32,
     pub(crate) popup_open: bool,
@@ -1637,6 +1747,11 @@ impl Default for DesktopState {
     fn default() -> Self {
         Self {
             labels: MenuLabels::default(),
+            menu: None,
+            menu_bar_mode: MenuBarMode::Shown,
+            menu_bar_alt_shown: false,
+            menu_bar_inset: std::cell::Cell::new(0.0),
+            menu_bar_host: None,
             quit_on_request: true,
             popup_generation: 0,
             popup_open: false,
@@ -1683,6 +1798,176 @@ mod tests {
             header_heights_for_os(Os::Android),
             (Points(52.0), Points(52.0))
         );
+    }
+
+    #[test]
+    fn menu_bar_visibility_respects_os_mode_and_title_bar_state() {
+        assert!(menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            false,
+            false,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Android,
+            true,
+            false,
+            false,
+            false,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            false,
+            false,
+            false,
+            false,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            true,
+            true,
+            false,
+            false,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            true,
+            false,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            false,
+            true,
+            MenuBarMode::Shown,
+            false,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            false,
+            true,
+            MenuBarMode::AutoHide,
+            true,
+        ));
+        assert!(!menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            false,
+            false,
+            MenuBarMode::AutoHide,
+            false,
+        ));
+        assert!(menu_bar_visible(
+            Os::Linux,
+            true,
+            false,
+            false,
+            false,
+            MenuBarMode::AutoHide,
+            true,
+        ));
+
+        let mut main = MainWindowState::default();
+        assert!(!main.title_bar_hidden);
+        let mut hidden_tb = TitleBarOptions::default();
+        hidden_tb.style = TitleBarStyle::Hidden;
+        let mut attrs = WindowAttributes::default();
+        attrs.title_bar = Some(hidden_tb);
+        main.apply_attributes(&attrs);
+        assert!(main.title_bar_hidden);
+
+        // Changing frame without title_bar preserves explicit title_bar_hidden.
+        let mut frame_attrs = WindowAttributes::default();
+        frame_attrs.frame = Some(WindowFrameStyle::None);
+        main.apply_attributes(&frame_attrs);
+        assert!(main.frame_none && main.title_bar_hidden);
+
+        frame_attrs.frame = Some(WindowFrameStyle::Default);
+        main.apply_attributes(&frame_attrs);
+        assert!(!main.frame_none && main.title_bar_hidden);
+
+        let mut default_tb = TitleBarOptions::default();
+        default_tb.style = TitleBarStyle::Default;
+        let mut attrs = WindowAttributes::default();
+        attrs.title_bar = Some(default_tb);
+        main.apply_attributes(&attrs);
+        assert!(!main.title_bar_hidden);
+
+        let top_items = vec![
+            MenuItem::Separator,
+            MenuItem::Submenu {
+                label: "File".into(),
+                enabled: true,
+                icon: None,
+                symbol: None,
+                inline: false,
+                items: Vec::new(),
+            },
+            MenuItem::Submenu {
+                label: "Edit".into(),
+                enabled: false,
+                icon: None,
+                symbol: None,
+                inline: false,
+                items: Vec::new(),
+            },
+            MenuItem::Submenu {
+                label: "View".into(),
+                enabled: true,
+                icon: None,
+                symbol: None,
+                inline: false,
+                items: Vec::new(),
+            },
+        ];
+        let wire_items = serialize_menu_items(&top_items, &MenuLabels::default());
+        assert_eq!(menu_bar_first_index(&wire_items), Some(1));
+        assert_eq!(menu_bar_initial_index(&wire_items, 'f'), Some(1));
+        assert_eq!(menu_bar_initial_index(&wire_items, 'e'), None);
+        assert_eq!(menu_bar_initial_index(&wire_items, 'V'), Some(3));
+        assert!(menu_bar_has_initial(&top_items, 'f'));
+        assert!(!menu_bar_has_initial(&top_items, 'e'));
+        assert!(menu_bar_has_initial(&top_items, 'V'));
+
+        let wire = serde_json::to_value(&WireCommand::SetMenuBar {
+            visible: true,
+            target_id: Some(7),
+            open_index: Some(1),
+            items: vec![WireMenuItem {
+                kind: "submenu".into(),
+                id: 0,
+                label: "File".into(),
+                enabled: true,
+                checked: None,
+                shortcut: None,
+                role: None,
+                destructive: false,
+                items: Vec::new(),
+            }],
+        })
+        .unwrap();
+        assert_eq!(wire["op"], "setMenuBar");
+        assert_eq!(wire["visible"], true);
+        assert_eq!(wire["targetId"], 7);
+        assert_eq!(wire["openIndex"], 1);
+        assert_eq!(wire["items"][0]["label"], "File");
     }
 
     #[test]

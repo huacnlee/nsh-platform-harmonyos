@@ -173,6 +173,7 @@ pub(crate) struct Mounter {
     dialogs: crate::services::dialogs::Dialogs,
     desktop: crate::services::desktop::DesktopState,
     offscreen_renders: crate::render::canvas_render::OffscreenRenders,
+    surface_size: std::cell::Cell<Size>,
 }
 
 impl std::ops::Deref for Mounter {
@@ -639,6 +640,15 @@ impl Mounter {
             );
         }
     }
+    pub(crate) fn on_main_window_chrome_change(
+        &mut self,
+        state: nsh_core::desktop::WindowState,
+    ) -> Result<()> {
+        if !state.focused || state.mode == nsh_core::desktop::WindowMode::FullScreen {
+            self.desktop.menu_bar_alt_shown = false;
+        }
+        self.sync_menu_bar()
+    }
     pub(crate) fn on_main_window_title_bar(&self, edges: nsh_core::Edges<nsh_core::Points>) {
         if let Some(id) = self.desktop.hosted_main_window {
             self.control.dispatch_event(
@@ -657,12 +667,16 @@ impl Mounter {
         if let Some(close_on_press) = attrs.close_on_press {
             self.desktop.close_on_press = close_on_press;
         }
+        let title_or_frame_changed = attrs.title_bar.is_some() || attrs.frame.is_some();
         self.main_window.borrow_mut().apply_attributes(attrs);
         if attrs.backdrop.is_some() {
             self.apply_main_backdrop();
         }
         self.host
             .desktop_command(&crate::services::desktop::wire_attributes(attrs))?;
+        if title_or_frame_changed {
+            self.sync_menu_bar()?;
+        }
         Ok(())
     }
     fn open_hosted_main_window(
@@ -726,8 +740,9 @@ impl Mounter {
                     DesktopCommand::PopupMenu { items, at } => {
                         let generation = self.desktop.next_popup_generation();
                         let wire_items = serialize_menu_items(&items, &self.desktop.labels);
+                        let inset = self.desktop.menu_bar_inset.get();
                         let pos = at
-                            .map(|p| (p.x.0, p.y.0))
+                            .map(|p| (p.x.0, p.y.0 + inset))
                             .or_else(|| self.touches.borrow().last_pointer());
                         self.host.desktop_command(&WireCommand::PopupMenu {
                             window_id: None,
@@ -814,18 +829,28 @@ impl Mounter {
                 }
             }
             DesktopCommand::SetMenu(menu) => {
+                self.desktop.menu = menu.clone();
                 if let Some(route) = self.dispatcher.upgrade() {
                     route.keyboard.lock().unwrap().menu = menu;
                 }
+                self.sync_menu_bar()?;
+            }
+            DesktopCommand::SetMenuBar(mode) => {
+                self.desktop.menu_bar_mode = mode;
+                self.desktop.menu_bar_alt_shown = false;
+                self.sync_menu_bar()?;
             }
             DesktopCommand::SetMenuLabels(labels) => {
                 self.desktop.labels = *labels;
+                if self.desktop.menu.is_some() {
+                    self.sync_menu_bar()?;
+                }
             }
             DesktopCommand::PopupMenu { items, at } => {
                 let generation = self.desktop.next_popup_generation();
                 let wire_items = serialize_menu_items(&items, &self.desktop.labels);
                 let pos = at
-                    .map(|p| (p.x.0, p.y.0))
+                    .map(|p| (p.x.0, p.y.0 + self.desktop.menu_bar_inset.get()))
                     .or_else(|| self.touches.borrow().last_pointer());
                 self.host.desktop_command(&WireCommand::PopupMenu {
                     window_id: None,
@@ -870,8 +895,195 @@ impl Mounter {
             DesktopCommand::OpenWindow(_)
             | DesktopCommand::SetQuitMode(_)
             | DesktopCommand::SetQuitRequestOptions(_)
-            | DesktopCommand::CancelQuitRequest
-            | DesktopCommand::SetMenuBar(_) => {}
+            | DesktopCommand::CancelQuitRequest => {}
+        }
+        Ok(())
+    }
+    fn ensure_menu_bar_host(&mut self) -> Result<u32> {
+        if let Some((_, attachment)) = &self.desktop.menu_bar_host {
+            return Ok(attachment.id());
+        }
+        use ohos_arkui_binding::{
+            component::built_in_component::Stack,
+            types::{advanced::LengthMetricUnit, attribute::ArkUINodeAttributeType as A},
+        };
+        let host = Stack::new()?.into_node();
+        {
+            let borrowed = host.borrow();
+            borrowed.set_length_metric_unit(LengthMetricUnit::Vp)?;
+            borrowed.width(self.surface_size.get().width.max(0.0))?;
+            borrowed.height(crate::services::desktop::MENU_BAR_HEIGHT)?;
+            borrowed.set_i32_attribute(A::StackAlignContent, 0)?;
+        }
+        let attachment = crate::interop::attachment::NativeAttachment::new(&host)?;
+        if let Some(parent) = self.mount.parent.upgrade() {
+            let idx = parent.borrow().children().len();
+            parent.borrow_mut().insert_child(host.clone(), idx)?;
+        }
+        let target_id = attachment.id();
+        self.desktop.menu_bar_host = Some((host, attachment));
+        Ok(target_id)
+    }
+
+    fn sync_menu_bar(&mut self) -> Result<()> {
+        self.sync_menu_bar_with_open(None)
+    }
+
+    fn menu_bar_available(&self) -> bool {
+        let os = self.platform.get().os;
+        let has_menu = self
+            .desktop
+            .menu
+            .as_ref()
+            .is_some_and(|items| !items.is_empty());
+        let main = self.main_window.borrow();
+        let full_screen = self
+            .platform
+            .get()
+            .window_state
+            .is_some_and(|state| state.mode == nsh_core::desktop::WindowMode::FullScreen);
+        crate::services::desktop::menu_bar_visible(
+            os,
+            has_menu,
+            main.title_bar_hidden,
+            main.frame_none,
+            full_screen,
+            nsh_core::desktop::MenuBarMode::Shown,
+            false,
+        )
+    }
+
+    pub(crate) fn desktop_menu_bar_key(
+        &mut self,
+        action: crate::services::desktop::MenuBarKeyAction,
+    ) -> Result<()> {
+        use crate::services::desktop::MenuBarKeyAction;
+        use nsh_core::desktop::MenuBarMode;
+        if !self.menu_bar_available() {
+            return Ok(());
+        }
+        match action {
+            MenuBarKeyAction::ToggleAlt => {
+                if self.desktop.menu_bar_mode == MenuBarMode::AutoHide {
+                    self.desktop.menu_bar_alt_shown = !self.desktop.menu_bar_alt_shown;
+                    self.sync_menu_bar()?;
+                }
+            }
+            MenuBarKeyAction::Hide => {
+                if self.desktop.menu_bar_mode == MenuBarMode::AutoHide
+                    && self.desktop.menu_bar_alt_shown
+                {
+                    self.desktop.menu_bar_alt_shown = false;
+                    self.sync_menu_bar()?;
+                }
+            }
+            MenuBarKeyAction::ToggleF10 => {
+                if self.desktop.menu_bar_mode == MenuBarMode::AutoHide
+                    && self.desktop.menu_bar_alt_shown
+                {
+                    self.desktop.menu_bar_alt_shown = false;
+                    self.sync_menu_bar()?;
+                } else {
+                    if self.desktop.menu_bar_mode == MenuBarMode::AutoHide {
+                        self.desktop.menu_bar_alt_shown = true;
+                    }
+                    self.sync_menu_bar_with_open(Some(None))?;
+                }
+            }
+            MenuBarKeyAction::OpenInitial(initial) => {
+                if self.desktop.menu_bar_mode == MenuBarMode::AutoHide {
+                    self.desktop.menu_bar_alt_shown = true;
+                }
+                self.sync_menu_bar_with_open(Some(Some(initial)))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_menu_bar_with_open(&mut self, open: Option<Option<char>>) -> Result<()> {
+        use crate::services::desktop::{
+            MENU_BAR_HEIGHT, WireCommand, menu_bar_first_index, menu_bar_initial_index,
+            menu_bar_visible, serialize_menu_items,
+        };
+        use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
+        let os = self.platform.get().os;
+        if !os.is_desktop() {
+            return Ok(());
+        }
+        let has_menu = self
+            .desktop
+            .menu
+            .as_ref()
+            .is_some_and(|items| !items.is_empty());
+        let main = self.main_window.borrow();
+        let full_screen = self
+            .platform
+            .get()
+            .window_state
+            .is_some_and(|state| state.mode == nsh_core::desktop::WindowMode::FullScreen);
+        let visible = menu_bar_visible(
+            os,
+            has_menu,
+            main.title_bar_hidden,
+            main.frame_none,
+            full_screen,
+            self.desktop.menu_bar_mode,
+            self.desktop.menu_bar_alt_shown,
+        );
+        drop(main);
+        if let Some(route) = self.dispatcher.upgrade() {
+            let mut keyboard = route.keyboard.lock().unwrap();
+            keyboard.menu_bar_mode = self.desktop.menu_bar_mode;
+            keyboard.menu_bar_revealed =
+                visible && self.desktop.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide;
+        }
+        let target_id = if visible {
+            let id = self.ensure_menu_bar_host()?;
+            if let Some((host, _)) = &self.desktop.menu_bar_host {
+                let borrowed = host.borrow();
+                borrowed.width(self.surface_size.get().width.max(0.0))?;
+                borrowed.height(MENU_BAR_HEIGHT)?;
+                borrowed.set_i32_attribute(A::Visibility, 0)?;
+            }
+            Some(id)
+        } else {
+            if let Some((host, _)) = &self.desktop.menu_bar_host {
+                let borrowed = host.borrow();
+                borrowed.height(0.0)?;
+                borrowed.set_i32_attribute(A::Visibility, 2)?;
+            }
+            self.desktop
+                .menu_bar_host
+                .as_ref()
+                .map(|(_, attachment)| attachment.id())
+        };
+        let items = if visible {
+            self.desktop
+                .menu
+                .as_deref()
+                .map(|items| serialize_menu_items(items, &self.desktop.labels))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let open_index = visible
+            .then_some(open)
+            .flatten()
+            .and_then(|which| match which {
+                Some(ch) => menu_bar_initial_index(&items, ch),
+                None => menu_bar_first_index(&items),
+            })
+            .and_then(|idx| u32::try_from(idx).ok());
+        self.host.desktop_command(&WireCommand::SetMenuBar {
+            visible,
+            target_id,
+            open_index,
+            items,
+        })?;
+        let inset = if visible { MENU_BAR_HEIGHT } else { 0.0 };
+        if (inset - self.desktop.menu_bar_inset.get()).abs() > f32::EPSILON {
+            self.desktop.menu_bar_inset.set(inset);
+            self.apply_surface_size(self.surface_size.get())?;
         }
         Ok(())
     }
@@ -932,6 +1144,12 @@ impl Mounter {
             } => {
                 if generation != 0 && generation == self.desktop.popup_generation {
                     self.desktop.popup_open = false;
+                } else if generation == 0
+                    && self.desktop.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                    && self.desktop.menu_bar_alt_shown
+                {
+                    self.desktop.menu_bar_alt_shown = false;
+                    self.sync_menu_bar()?;
                 }
                 self.desktop_menu_action(id, role)?;
             }
@@ -1471,6 +1689,7 @@ impl Mounter {
             dialogs: crate::services::dialogs::Dialogs::new(context.clone()),
             desktop: Default::default(),
             offscreen_renders: Default::default(),
+            surface_size: std::cell::Cell::new(size),
             context,
             mount,
             nodes: BTreeMap::from([(nsh_core::ROOT_ID, root)]),
@@ -2063,8 +2282,12 @@ impl Mounter {
                     }
                     MountItem::Frame { id, frame } => {
                         if motion.is_created_in_batch(id) || !self.frozen(id) {
+                            let mut rect: Rect = frame.into();
+                            if id == nsh_core::ROOT_ID {
+                                rect.y += self.desktop.menu_bar_inset.get();
+                            }
                             self.node(id)?
-                                .animated_frame(frame.into(), motion.frame_animation(id))?;
+                                .animated_frame(rect, motion.frame_animation(id))?;
                         }
                     }
                     MountItem::LayoutAnimation(animation) => motion.set_layout(animation),
@@ -2818,9 +3041,23 @@ impl Mounter {
         result.and(self.flush_arkui()).map(|()| demand)
     }
 
+    pub(crate) fn menu_bar_inset(&self) -> f32 {
+        self.desktop.menu_bar_inset.get()
+    }
+
     pub(crate) fn resize(&self, size: Size) -> Result<()> {
+        self.surface_size.set(size);
+        self.apply_surface_size(size)
+    }
+
+    fn apply_surface_size(&self, size: Size) -> Result<()> {
+        let inset = self.desktop.menu_bar_inset.get();
+        let content_size = Size {
+            width: size.width,
+            height: (size.height - inset).max(0.0),
+        };
         let mut platform = self.platform.get();
-        platform.window = size.into();
+        platform.window = content_size.into();
         self.platform.set(platform);
         for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
             modal.refresh_metrics();
@@ -2831,18 +3068,24 @@ impl Mounter {
                     .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
             }
         }
+        if let Some((host, _)) = &self.desktop.menu_bar_host {
+            let borrowed = host.borrow();
+            borrowed.width(size.width.max(0.0))?;
+            borrowed.height(inset)?;
+        }
         self.node(1)?.set_frame(Rect {
             x: 0.0,
-            y: 0.0,
-            width: size.width,
-            height: size.height,
+            y: inset,
+            width: content_size.width,
+            height: content_size.height,
         })?;
         if let Some(owner) = self.fullscreen_video.borrow().upgrade()
             && let Some(video) = owner.video.borrow().as_ref()
         {
             video.fullscreen_frame(size)?;
         }
-        self.control.resize(size.into());
+        self.control.set_environment(platform);
+        self.control.resize(content_size.into());
         Ok(())
     }
 
@@ -2872,6 +3115,33 @@ impl Mounter {
             let _ = self
                 .host
                 .desktop_command(&crate::services::desktop::WireCommand::ClosePopupMenu);
+        }
+        if self.desktop.menu.take().is_some()
+            || self.desktop.menu_bar_inset.get() > 0.0
+            || self.desktop.menu_bar_host.is_some()
+        {
+            self.desktop.menu_bar_inset.set(0.0);
+            let _ = self
+                .host
+                .desktop_command(&crate::services::desktop::WireCommand::SetMenuBar {
+                    visible: false,
+                    target_id: None,
+                    open_index: None,
+                    items: Vec::new(),
+                });
+            if let Some((host, attachment)) = self.desktop.menu_bar_host.take() {
+                drop(attachment);
+                if let Some(parent) = self.mount.parent.upgrade() {
+                    let index = parent
+                        .borrow()
+                        .children()
+                        .iter()
+                        .position(|child| Rc::ptr_eq(child, &host));
+                    if let Some(index) = index {
+                        let _ = parent.borrow_mut().remove_child(index);
+                    }
+                }
+            }
         }
         let mut result = self.mount.unmount();
         if result.is_ok()

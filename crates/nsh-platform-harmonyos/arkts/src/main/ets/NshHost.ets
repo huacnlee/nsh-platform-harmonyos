@@ -674,6 +674,9 @@ class HostSession {
         (): void => {
           this.syncWindowMetrics();
         },
+        (targetId: number, content: FrameNode | null): boolean =>
+          this.runtimeContext.attachNativeNode(targetId, content),
+        (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
       );
       this.runtimeContext.setFocusHandler((componentId: string): boolean =>
         this.desktop?.requestComponentFocus(componentId) ?? false,

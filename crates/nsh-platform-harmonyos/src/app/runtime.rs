@@ -128,6 +128,7 @@ pub(crate) enum Message {
         crate::app::session::AvoidArea,
     ),
     HostDesktop(crate::services::desktop::DesktopEvent),
+    DesktopMenuBar(crate::services::desktop::MenuBarKeyAction),
     DesktopMenuAction {
         id: u32,
         role: Option<nsh_core::desktop::MenuRole>,
@@ -528,21 +529,26 @@ impl State {
                 match event {
                     DesktopEvent::WindowState(state) => {
                         if self.environment.os.is_desktop() {
-                            let became_focused = state.focused
-                                && !self
-                                    .environment
-                                    .window_state
-                                    .is_some_and(|prev| prev.focused);
-                            if self.environment.window_state != Some(state) {
+                            let prev_state = self.environment.window_state;
+                            let became_focused =
+                                state.focused && !prev_state.is_some_and(|prev| prev.focused);
+                            let lost_focus =
+                                !state.focused && prev_state.is_some_and(|prev| prev.focused);
+                            let mode_changed = prev_state.map(|prev| prev.mode) != Some(state.mode);
+                            if prev_state != Some(state) {
                                 self.environment.window_state = Some(state);
+                                let effective = self.effective_environment(self.environment);
                                 self.engine
                                     .as_ref()
                                     .unwrap()
                                     .control()
-                                    .set_environment(self.environment);
-                                let mounter = self.mounter.as_ref().unwrap();
-                                mounter.environment(self.environment)?;
+                                    .set_environment(effective);
+                                let mounter = self.mounter.as_mut().unwrap();
+                                mounter.environment(effective)?;
                                 mounter.on_main_window_state(state);
+                                if mode_changed || lost_focus {
+                                    mounter.on_main_window_chrome_change(state)?;
+                                }
                             }
                             if became_focused
                                 && self.laid_out
@@ -555,13 +561,14 @@ impl State {
                     DesktopEvent::TitleBar(edges) => {
                         if self.environment.os.is_desktop() && self.environment.title_bar != edges {
                             self.environment.title_bar = edges;
+                            let effective = self.effective_environment(self.environment);
                             self.engine
                                 .as_ref()
                                 .unwrap()
                                 .control()
-                                .set_environment(self.environment);
+                                .set_environment(effective);
                             let mounter = self.mounter.as_ref().unwrap();
-                            mounter.environment(self.environment)?;
+                            mounter.environment(effective)?;
                             mounter.on_main_window_title_bar(edges);
                         }
                     }
@@ -578,6 +585,12 @@ impl State {
                         self.mounter.as_mut().unwrap().desktop_event(other)?;
                     }
                 }
+            }
+            Message::DesktopMenuBar(action) => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_menu_bar_key(action)?;
             }
             Message::DesktopMenuAction { id, role } => {
                 self.mounter
@@ -727,20 +740,33 @@ impl State {
             );
         }
     }
+    fn effective_environment(
+        &self,
+        mut env: nsh_core::platform::Environment,
+    ) -> nsh_core::platform::Environment {
+        if let Some(mounter) = &self.mounter {
+            let inset = mounter.menu_bar_inset();
+            if inset > 0.0 {
+                env.window.height = nsh_core::Points((env.window.height.0 - inset).max(0.0));
+            }
+        }
+        env
+    }
     fn update_environment(&mut self, changes: NshEnvironment) -> Result<()> {
         let environment = changes.apply(self.environment)?;
         if environment == self.environment {
             return Ok(());
         }
+        let effective = self.effective_environment(environment);
         if let Some(mounter) = &self.mounter {
             // Publish density before the engine records text for this environment.
             mounter.text_scale.store(
-                environment.pixel_ratio.to_bits(),
+                effective.pixel_ratio.to_bits(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
         if let Some(engine) = &self.engine {
-            engine.control().set_environment(environment);
+            engine.control().set_environment(effective);
         }
         let lifecycle_changed = self.environment.lifecycle != environment.lifecycle;
         self.environment = environment;
@@ -751,7 +777,7 @@ impl State {
             }
             // Lifecycle metadata must reach the compositor even if stopping
             // an independent input/scroll owner failed.
-            updated = updated.and(mounter.environment(environment));
+            updated = updated.and(mounter.environment(effective));
         }
         // A failed native cleanup must not leave the old active frame vote or
         // worker visibility in place after the lifecycle has already changed.
@@ -1326,7 +1352,8 @@ impl Runtime {
             // `Message::Resize` only relayouts the viewport; reactive
             // environment signals (`windowSize()`, `window()`, `md:`/`lg:`
             // classes) read `Environment::window`.
-            engine.control().set_environment(state.environment);
+            let effective = state.effective_environment(state.environment);
+            engine.control().set_environment(effective);
         }
         Ok(())
     }

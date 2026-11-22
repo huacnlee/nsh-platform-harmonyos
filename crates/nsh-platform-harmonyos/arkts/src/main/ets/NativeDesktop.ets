@@ -5,7 +5,7 @@ import { deviceInfo, emitter } from "@kit.BasicServicesKit";
 import type statusBarManager from "@hms.pcService.statusBarManager";
 import { image } from "@kit.ImageKit";
 import { inputConsumer } from "@kit.InputKit";
-import { ComponentContent, NodeContent } from "@ohos.arkui.node";
+import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import display from "@ohos.display";
 import pointer from "@ohos.multimodalInput.pointer";
@@ -82,6 +82,8 @@ interface WireCommand {
   display?: string;
   critical?: boolean;
   generation?: number;
+  targetId?: number;
+  openIndex?: number;
   items?: WireMenuItem[];
   tooltip?: string;
   click?: number;
@@ -142,6 +144,25 @@ interface PopupMenuContentParams {
   generation: number;
   items: WireMenuItem[];
   colorMode: ThemeColorMode;
+}
+
+@Observed
+class MenuBarState {
+  items: WireMenuItem[] = [];
+  colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  revision: number = 0;
+}
+
+interface MenuBarContentParams {
+  owner: NativeDesktop;
+  state: MenuBarState;
+}
+
+interface MenuBarDropdownLease {
+  menuContent: ComponentContent<PopupMenuContentParams>;
+  opening: Promise<void>;
+  retired: boolean;
+  disappeared: boolean;
 }
 
 interface PopupMenuAnchorParams {
@@ -240,7 +261,7 @@ struct DesktopSubmenuView {
                     .enabled(item.enabled !== false)
                     .contentFontColor($r("sys.color.warning"))
                     .onClick((): void => {
-                      this.owner?.selectPopupMenuItem(this.generation, item.id ?? 0, item.role);
+                      this.owner?.selectMenuItem(this.generation, item.id ?? 0, item.role);
                     });
                 } else {
                   MenuItem({
@@ -251,7 +272,7 @@ struct DesktopSubmenuView {
                     .selectIcon(item.checked !== undefined)
                     .enabled(item.enabled !== false)
                     .onClick((): void => {
-                      this.owner?.selectPopupMenuItem(this.generation, item.id ?? 0, item.role);
+                      this.owner?.selectMenuItem(this.generation, item.id ?? 0, item.role);
                     });
                 }
               },
@@ -274,6 +295,115 @@ function desktopPopupMenuBuilder(params: PopupMenuContentParams) {
       items: params.items,
     });
   };
+}
+
+@Component
+struct DesktopMenuBarTrigger {
+  owner?: NativeDesktop;
+  item: WireMenuItem = { kind: "action" };
+  triggerIndex: number = 0;
+  @State hovered: boolean = false;
+
+  private anchorId(): string {
+    return `nsh-menubar-item-${this.triggerIndex}`;
+  }
+
+  private hasSubmenu(): boolean {
+    return (
+      this.item.kind === "submenu" &&
+      this.item.enabled !== false &&
+      (this.item.items?.length ?? 0) > 0
+    );
+  }
+
+  build() {
+    Row() {
+      Text(this.item.label ?? "")
+        .fontSize($r("sys.float.Body_S"))
+        .fontColor(
+          this.item.enabled === false
+            ? $r("sys.color.font_tertiary")
+            : $r("sys.color.font_primary"),
+        )
+        .maxLines(1);
+    }
+    .id(this.anchorId())
+    .height(26)
+    .padding({ left: 10, right: 10 })
+    .borderRadius(6)
+    .alignItems(VerticalAlign.Center)
+    .enabled(this.item.enabled !== false)
+    .backgroundColor(
+      this.hovered && this.item.enabled !== false
+        ? $r("sys.color.interactive_hover")
+        : Color.Transparent,
+    )
+    .onHover((isHover: boolean): void => {
+      this.hovered = isHover;
+    })
+    .onClick((): void => {
+      if (this.item.enabled === false) {
+        return;
+      }
+      if (this.hasSubmenu()) {
+        this.owner?.openMenuBarDropdown(this.anchorId(), this.item.items ?? []);
+      } else if (this.item.kind !== "submenu") {
+        this.owner?.selectMenuItem(0, this.item.id ?? 0, this.item.role);
+      }
+    });
+  }
+}
+
+@Component
+struct DesktopMenuBarView {
+  owner?: NativeDesktop;
+  @ObjectLink state!: MenuBarState;
+
+  build() {
+    WithTheme({ colorMode: this.state.colorMode }) {
+      Column() {
+        Scroll() {
+          Row({ space: 2 }) {
+            ForEach(
+              this.state.items,
+              (item: WireMenuItem, index: number): void => {
+                if (item.kind !== "separator") {
+                  DesktopMenuBarTrigger({
+                    owner: this.owner,
+                    item,
+                    triggerIndex: index,
+                  });
+                }
+              },
+              (item: WireMenuItem, index: number): string =>
+                `${this.state.revision}:${this.state.colorMode}:${menuItemKey(item, index)}`,
+            );
+          }
+          .height(31)
+          .padding({ left: 8, right: 8 })
+          .alignItems(VerticalAlign.Center);
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .align(Alignment.Start)
+        .width("100%")
+        .height(31);
+
+        Divider().color($r("sys.color.comp_divider")).strokeWidth("1px");
+      }
+      .width("100%")
+      .height(32)
+      .backgroundColor($r("sys.color.background_secondary"));
+    };
+  }
+}
+
+@Builder
+function desktopMenuBarBuilder(params: MenuBarContentParams) {
+  DesktopMenuBarView({
+    owner: params.owner,
+    state: params.state,
+  });
 }
 
 @Component
@@ -1334,6 +1464,10 @@ class SubWindowHost {
       case "center":
         await this.centerInternal(false, undefined, undefined, cmd.display);
         break;
+      case "requestAttention":
+        // HarmonyOS public API 26 exposes no non-activating taskbar-flash or
+        // dock-bounce API; RequestAttention must never restore, raise, or steal focus.
+        break;
     }
   }
 
@@ -1628,6 +1762,12 @@ export class NativeDesktop {
   private readonly popupMenus: NativeMenuCleanup = new NativeMenuCleanup();
   private popupLease?: PopupMenuLease;
   private popupGeneration: number = 0;
+  private readonly menuBarState: MenuBarState = new MenuBarState();
+  private menuBarNode?: BuilderNode<[MenuBarContentParams]>;
+  private menuBarTargetId?: number;
+  private menuBarDropdown?: MenuBarDropdownLease;
+  private readonly attachNativeNodeCb?: (targetId: number, content: FrameNode | null) => boolean;
+  private readonly retireNativeNodeCb?: (targetId: number) => boolean;
   private trayAdded: boolean = false;
   private traySubscribed: boolean = false;
   private trayGeneration: number = 0;
@@ -1740,6 +1880,8 @@ export class NativeDesktop {
       platformWindowId: number,
     ) => boolean,
     onDisplayMetricsChanged?: () => void,
+    attachNativeNode?: (targetId: number, content: FrameNode | null) => boolean,
+    retireNativeNode?: (targetId: number) => boolean,
   ) {
     this.ui = ui;
     this.abilityContext = abilityContext;
@@ -1747,6 +1889,8 @@ export class NativeDesktop {
     this.emit = emit;
     this.attachSubWindowCb = attachSubWindow;
     this.onDisplayMetricsChanged = onDisplayMetricsChanged;
+    this.attachNativeNodeCb = attachNativeNode;
+    this.retireNativeNodeCb = retireNativeNode;
     try {
       this.lastDisplayId = mainWindow.getWindowProperties().displayId;
     } catch {}
@@ -1832,6 +1976,7 @@ export class NativeDesktop {
 
   setColorMode(mode: ThemeColorMode): void {
     this.colorMode = mode;
+    this.menuBarState.colorMode = mode;
     if (this.backgroundOverridden && !this.transparent && this.backdrop === "none" && !this.frameNone) {
       this.applyOpaqueBackground();
     }
@@ -1925,6 +2070,9 @@ export class NativeDesktop {
       case "closePopupMenu":
         this.closePopupMenuOnly();
         break;
+      case "setMenuBar":
+        this.updateMenuBar(cmd.visible === true, cmd.targetId, cmd.items ?? [], cmd.openIndex);
+        break;
       case "setTray":
         this.enqueueSetTray(cmd);
         break;
@@ -1959,6 +2107,7 @@ export class NativeDesktop {
         });
         break;
       case "quit":
+        this.removeMenuBar();
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
@@ -1966,6 +2115,7 @@ export class NativeDesktop {
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "restart":
+        this.removeMenuBar();
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
@@ -2007,6 +2157,106 @@ export class NativeDesktop {
     }
   }
 
+  selectMenuItem(generation: number, id: number, role?: string): void {
+    if (this.closed) {
+      return;
+    }
+    if (generation === 0) {
+      this.closeMenuBarDropdown();
+      this.emit("menu-select", JSON.stringify({ generation: 0, id, role }));
+      return;
+    }
+    this.selectPopupMenuItem(generation, id, role);
+  }
+
+  openMenuBarDropdown(anchorId: string, items: WireMenuItem[]): void {
+    this.closeMenuBarDropdown();
+    if (this.closed || items.length === 0) {
+      return;
+    }
+    let anchorUniqueId = 0;
+    try {
+      const frame = this.ui.getFrameNodeById(anchorId);
+      if (frame === null) {
+        return;
+      }
+      anchorUniqueId = frame.getUniqueId();
+    } catch {
+      return;
+    }
+    const menuContent = new ComponentContent<PopupMenuContentParams>(
+      this.ui,
+      wrapBuilder(desktopPopupMenuBuilder),
+      {
+        owner: this,
+        generation: 0,
+        items,
+        colorMode: this.colorMode,
+      },
+      { nestingBuilderSupported: true },
+    );
+    const lease: MenuBarDropdownLease = {
+      menuContent,
+      opening: Promise.resolve(),
+      retired: false,
+      disappeared: false,
+    };
+    this.menuBarDropdown = lease;
+    const options: MenuOptions = {
+      placement: Placement.BottomLeft,
+      showInSubWindow: true,
+      backgroundBlurStyle: BlurStyle.COMPONENT_ULTRA_THICK,
+      backgroundBlurStyleOptions: { colorMode: this.colorMode },
+      onDisappear: (): void => {
+        lease.disappeared = true;
+        this.retireMenuBarDropdown(lease);
+      },
+    };
+    lease.opening = this.ui
+      .getPromptAction()
+      .openMenu(menuContent, { id: anchorUniqueId }, options);
+    lease.opening.catch((error: Error): void => {
+      lease.disappeared = true;
+      console.error(`[NSH] desktop menu bar dropdown failed: ${String(error)}`);
+      this.retireMenuBarDropdown(lease);
+    });
+  }
+
+  private closeMenuBarDropdown(): void {
+    const lease = this.menuBarDropdown;
+    if (lease === undefined) {
+      return;
+    }
+    this.menuBarDropdown = undefined;
+    this.retireMenuBarDropdown(lease);
+  }
+
+  private retireMenuBarDropdown(lease: MenuBarDropdownLease): void {
+    if (this.menuBarDropdown === lease) {
+      this.menuBarDropdown = undefined;
+    }
+    if (lease.retired) {
+      return;
+    }
+    lease.retired = true;
+    this.popupMenus.retire(
+      lease,
+      lease.opening,
+      (): Promise<void> =>
+        lease.disappeared
+          ? Promise.resolve()
+          : this.ui
+              .getPromptAction()
+              .closeMenu(lease.menuContent)
+              .catch((): void => {}),
+      (): void => {
+        try {
+          lease.menuContent.dispose();
+        } catch {}
+      },
+    );
+  }
+
   selectPopupMenuItem(generation: number, id: number, role?: string): void {
     if (this.closed || generation !== this.popupGeneration) {
       return;
@@ -2034,6 +2284,7 @@ export class NativeDesktop {
       return;
     }
     this.closed = true;
+    this.removeMenuBar();
     this.closePopupMenuOnly();
     void this.popupMenus.settled();
     this.closeAllSubWindows();
@@ -2354,6 +2605,7 @@ export class NativeDesktop {
         });
         break;
       case "close":
+        this.removeMenuBar();
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
@@ -2382,6 +2634,10 @@ export class NativeDesktop {
         this.enqueueMain(async (): Promise<void> => {
           await this.centerWindow(cmd.display);
         });
+        break;
+      case "requestAttention":
+        // HarmonyOS public API 26 exposes no non-activating taskbar-flash or
+        // dock-bounce API; RequestAttention must never restore, raise, or steal focus.
         break;
     }
   }
@@ -2755,6 +3011,108 @@ export class NativeDesktop {
           void buildPayload([screen]);
         } catch {}
       });
+  }
+
+  private openMenuBarByIndex(index: number): void {
+    if (this.closed || index < 0 || index >= this.menuBarState.items.length) {
+      return;
+    }
+    const item = this.menuBarState.items[index];
+    if (item.kind === "separator" || item.enabled === false) {
+      return;
+    }
+    if (item.kind === "submenu") {
+      if ((item.items?.length ?? 0) > 0) {
+        this.openMenuBarDropdown(`nsh-menubar-item-${index}`, item.items ?? []);
+      }
+    } else {
+      this.selectMenuItem(0, item.id ?? 0, item.role);
+    }
+  }
+
+  private updateMenuBar(
+    visible: boolean,
+    targetId: number | undefined,
+    items: WireMenuItem[],
+    openIndex?: number,
+  ): void {
+    if (!visible || items.length === 0 || targetId === undefined) {
+      if (targetId === undefined) {
+        this.removeMenuBar();
+      } else {
+        this.closeMenuBarDropdown();
+        this.menuBarState.items = [];
+        this.menuBarState.revision++;
+      }
+      return;
+    }
+    this.menuBarState.colorMode = this.colorMode;
+    this.menuBarState.items = items;
+    this.menuBarState.revision++;
+    const scheduleOpen = (): void => {
+      if (openIndex === undefined) {
+        return;
+      }
+      const revision = this.menuBarState.revision;
+      setTimeout((): void => {
+        if (!this.closed && this.menuBarState.revision === revision) {
+          this.openMenuBarByIndex(openIndex);
+        }
+      }, 0);
+    };
+    if (this.menuBarNode !== undefined && this.menuBarTargetId === targetId) {
+      scheduleOpen();
+      return;
+    }
+    this.removeMenuBar();
+    if (this.attachNativeNodeCb === undefined) {
+      return;
+    }
+    const node = new BuilderNode<[MenuBarContentParams]>(this.ui);
+    try {
+      node.build(
+        wrapBuilder(desktopMenuBarBuilder),
+        {
+          owner: this,
+          state: this.menuBarState,
+        },
+        { nestingBuilderSupported: true },
+      );
+      const accepted = this.attachNativeNodeCb(targetId, node.getFrameNode());
+      if (!accepted || this.closed) {
+        this.retireNativeNodeCb?.(targetId);
+        try {
+          node.dispose();
+        } catch {}
+        return;
+      }
+      this.menuBarNode = node;
+      this.menuBarTargetId = targetId;
+      scheduleOpen();
+    } catch (error) {
+      console.warn(`[NSH] desktop menu bar mount failed: ${String(error)}`);
+      try {
+        node.dispose();
+      } catch {}
+    }
+  }
+
+  private removeMenuBar(): void {
+    this.closeMenuBarDropdown();
+    const node = this.menuBarNode;
+    const targetId = this.menuBarTargetId;
+    this.menuBarNode = undefined;
+    this.menuBarTargetId = undefined;
+    this.menuBarState.items = [];
+    if (node === undefined) {
+      return;
+    }
+    if (targetId !== undefined) {
+      this.retireNativeNodeCb?.(targetId);
+    }
+    try {
+      node.dispose();
+    } catch {}
   }
 
   private openPopupMenu(
