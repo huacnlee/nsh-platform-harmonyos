@@ -52,7 +52,7 @@ Commit subjects and pull request titles name the area first, then say what chang
 
 - The area is the part of the backend the change is about, in lower case: a module of `nsh-platform-harmonyos`
   (`text`, `scroll`, `render`, `input`, `navigation`, `media`, `accessibility`, `services`, `interop`, `app`), `cli`
-  for `nsh-platform-harmonyos-cli`, `template` for the DevEco project template, or `examples`, `docs`, `ci`. Name one
+  for the `nsh-platform-harmonyos` program (`src/`), `template` for the DevEco project template, or `examples`, `docs`, `ci`. Name one
   area only, never several separated by commas: when a change spans several, name the part it is mostly about.
 - The sentence starts with a capital letter, uses the imperative mood, has no trailing period and fits in about 72
   characters with its area. It says what the change does for a user, not which files moved:
@@ -98,9 +98,14 @@ cargo clippy -p nsh-platform-harmonyos --target aarch64-unknown-linux-ohos --fea
 
 ### Run on a device or emulator
 
+The examples use the platform installed on `PATH` (an app's nshm comes first, `PATH` serves every app):
+
 ```sh
-cargo install --path crates/nsh-platform-harmonyos-cli
-nsh run examples/counter --target harmonyos      # builds, installs and starts it on the device hdc sees
+cargo install --path .
+```
+
+```sh
+nsh run examples/counter --target harmonyos
 ```
 
 If you change visible behavior, run the related NSH gallery demo and attach before / after screenshots to the PR.

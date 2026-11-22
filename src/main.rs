@@ -755,11 +755,7 @@ fn dev(
 /// Builds the backend once with N-API's type definitions on and writes
 /// them as the ArkTS package's `Index.d.ts`.
 fn typedefs(verbose: bool) -> anyhow::Result<()> {
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .context("this repository")?
-        .to_path_buf();
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let ndk = sdk::Ndk::find()?;
     let folder = join_all(&repo, ["target", "harmonyos-typedefs"]);
     if folder.exists() {

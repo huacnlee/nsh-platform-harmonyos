@@ -23,15 +23,24 @@ NSH's gallery on OpenHarmony 7.0 (API 26), in an emulator.
 
 ## Usage
 
-```sh
-cargo install --git https://github.com/huacnlee/nsh-platform-harmonyos nsh-platform-harmonyos-cli
-rustup target add aarch64-unknown-linux-ohos
+The platform is an [nshm](https://nsh.dev/docs/nshm#platform-nshm) that provides the `harmonyos` target. It follows
+NSH's `main`, so use the [nightly](https://nsh.dev/docs/installation#installing-the-nightly-build) `nsh`
+(`nsh update nightly`). In the app's directory:
 
-nsh package my-app --target harmonyos              # a DevEco Studio project, and its HAP with DevEco's tools
-nsh run my-app --target harmonyos                  # builds, installs and starts it on the device hdc sees
+```sh
+nsh add github:huacnlee/nsh-platform-harmonyos
 ```
 
-`nsh` runs `nsh-platform-harmonyos` from your `PATH` for `--target harmonyos`. It needs:
+That adds `"nsh-harmonyos"` to the app's `nsh.json` `"dependencies"` and pins it in `nsh.lock`. Then
+`nsh package --target harmonyos` writes a DevEco Studio project (and its HAP, with DevEco's tools), and
+`nsh run --target harmonyos` builds, installs and starts the app on the device `hdc` sees:
+
+```sh
+nsh run --target harmonyos
+```
+
+`nsh` builds the platform's `nsh-platform-harmonyos` program in the app's `.nsh/platforms/harmonyos` the first time.
+It needs Rust's OHOS target (`rustup target add aarch64-unknown-linux-ohos`) and:
 
 - **The OpenHarmony NDK, API 20 or later**, found in DevEco Studio, or `OHOS_NDK_HOME` set to an SDK's `openharmony`
   directory (the one with `native/`). It builds the native library.
@@ -119,7 +128,7 @@ nsh-platform-harmonyos     the ArkUI backend, a Rust library on N-API:
   navigation/ media/       stacks, modals, video (AVPlayer), web views (ArkWeb), images
   accessibility/           ArkUI's accessibility providers (api-23, api-26)
   arkts/                   @nsh/harmonyos: NshHost and the ArkTS side of editors, menus, web views
-nsh-platform-harmonyos-cli
+nsh-harmonyos (src/)
   package / run            `$NSH build <app>`, a cdylib runner (the backend + NSH's generated `nsh_rust_app`) built
                            with the NDK into libnsh_platform_harmonyos.so, a DevEco project from template/, hvigor, hdc
 ```
@@ -147,15 +156,16 @@ existing HarmonyOS project; [docs/architecture.md](docs/architecture.md) describ
 
 ## Following NSH
 
-The platform is built against NSH `0.5` on crates.io (to test against an unreleased revision or a local checkout of
-NSH, add `[patch.crates-io]` in `Cargo.toml`). Mount items, the text engine and events are NSH's protocol and grow with
+The platform is built against NSH nightly: `Cargo.toml`'s `[patch.crates-io]` takes NSH's crates from
+longbridge/nsh `main`, and `Cargo.lock` pins the commit (`cargo update -p nsh-core` moves to the latest; point the
+patch at a local checkout to test one). Mount items, the text engine and events are NSH's protocol and grow with
 each release; a new NSH may add mount items this backend skips until it handles them (`render/mount.rs`).
 
 ## Development
 
 ```sh
 cargo test --workspace                                   # the CLI, and the backend's platform-independent parts
-OHOS_NDK_HOME=… cargo run -p nsh-platform-harmonyos-cli -- typedefs   # regenerate @nsh/harmonyos's Index.d.ts
+OHOS_NDK_HOME=… cargo run -- typedefs                    # regenerate @nsh/harmonyos's Index.d.ts
 
 # the backend for the device (the CLI sets the same environment for cargo)
 OHOS_NDK_HOME=… nsh package examples/counter --target harmonyos -v

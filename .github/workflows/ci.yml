@@ -61,3 +61,13 @@ jobs:
           for features in "" dev api-23 api-26; do
             cargo clippy -p nsh-platform-harmonyos --target aarch64-unknown-linux-ohos --features "$features" -- -D warnings
           done
+      - name: The nightly nsh CLI
+        run: |
+          curl -fsSL https://nsh.dev/install.sh | sh -s -- --nightly
+          echo "$HOME/.nsh/bin" >> "$GITHUB_PATH"
+      - name: The platform packages a TSX app with the nightly nsh
+        run: |
+          export OHOS_NDK_HOME=~/ohos-sdk/openharmony
+          cargo install --path . --locked
+          nsh -V
+          nsh package examples/counter-tsx --target harmonyos --no-hap

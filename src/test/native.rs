@@ -242,7 +242,13 @@ impl Native for HdcNative {
         }
         self.track(result);
     }
-    fn drag(&self, from: Point<Points>, to: Point<Points>) {
+    fn drag(
+        &self,
+        from: Point<Points>,
+        to: Point<Points>,
+        options: nsh_testing::DragOptions,
+    ) -> Result<(), String> {
+        nsh_testing::agent::refuse_custom_drag("drag", options)?;
         let (x, y) = self.geometry().point(from);
         let (end_x, end_y) = self.geometry().point(to);
         let result = self.shell(&[
@@ -261,6 +267,7 @@ impl Native for HdcNative {
             self.device.release_touch(end_x, end_y);
         }
         self.track(result);
+        Ok(())
     }
     fn type_text(&self, text: &str) {
         self.track(

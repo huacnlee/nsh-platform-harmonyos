@@ -18,11 +18,17 @@
    # rustup target add armv7-unknown-linux-ohos x86_64-unknown-linux-ohos
    ```
 
-2. **安装 `nsh` CLI 与鸿蒙平台插件**：
-   确保 `PATH` 中已安装 `nsh`（`0.5` 或以上版本），然后安装 `nsh-platform-harmonyos`：
+2. **安装 nightly 版 `nsh` CLI，添加鸿蒙平台 nshm**：
+   这个平台跟随 NSH 的 `main`，所以要安装 nightly 版 `nsh`（或执行 `nsh update nightly`）：
    ```sh
-   cargo install --git https://github.com/huacnlee/nsh-platform-harmonyos nsh-platform-harmonyos-cli
+   curl -fsSL https://nsh.dev/install.sh | sh -s -- --nightly
    ```
+   然后在应用目录里把平台加进 `nsh.json` 的 `"dependencies"`：
+   ```sh
+   nsh add github:huacnlee/nsh-platform-harmonyos
+   ```
+   第一次使用 `--target harmonyos` 时，`nsh` 会在应用的 `.nsh/platforms/harmonyos` 里编译平台程序。下面 `nsh.json` 示例里的依赖就是
+   `nsh add` 写入的内容。
 
 3. **准备 OpenHarmony NDK（API 20 或以上）**：
    - 若已安装 **DevEco Studio**（默认路径如 macOS `/Applications/DevEco-Studio.app` 或通过 `DEVECO_STUDIO_HOME` 指定），CLI 会自动探测其内置 NDK。
@@ -55,7 +61,10 @@ my-app/
   "name": "My App",
   "id": "com.example.myapp",
   "version": "1.0.0",
-  "build": 1
+  "build": 1,
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 
@@ -110,7 +119,10 @@ my-rust-app/
   "version": "1.0.0",
   "build": 1,
   "rust": ".",
-  "root": "App"
+  "root": "App",
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 
@@ -174,7 +186,10 @@ pub fn App() -> impl IntoElement {
   "id": "com.example.myhybridapp",
   "version": "1.0.0",
   "build": 1,
-  "rust": ["./crates/native"]
+  "rust": ["./crates/native"],
+  "dependencies": {
+    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+  }
 }
 ```
 

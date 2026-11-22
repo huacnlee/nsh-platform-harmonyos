@@ -194,6 +194,7 @@ impl Hosts {
                     capabilities: built.capabilities.clone(),
                     id: built.id.clone(),
                     window: built.window.clone(),
+                    application: built.application.clone(),
                 },
                 None,
                 built.ui_sets.clone(),
@@ -242,6 +243,7 @@ impl Hosts {
             capabilities: Build::optional_text(&out.join("capabilities.json"))?,
             id: metadata["id"].as_str().map(str::to_owned),
             window: metadata.get("window").map(ToString::to_string),
+            application: metadata.get("application").map(ToString::to_string),
             ui_sets,
             assets: Assets::collect(&out.join("assets"))?,
         });
@@ -256,6 +258,7 @@ struct Build {
     capabilities: Option<String>,
     id: Option<String>,
     window: Option<String>,
+    application: Option<String>,
     ui_sets: Vec<String>,
     assets: Vec<(String, PathBuf)>,
 }

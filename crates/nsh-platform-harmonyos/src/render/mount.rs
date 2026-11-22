@@ -1636,7 +1636,8 @@ impl Mounter {
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
-                        | Command::CancelPress => {}
+                        | Command::CancelPress
+                        | Command::ClearSelection => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
                         }
