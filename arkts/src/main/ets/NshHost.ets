@@ -143,7 +143,13 @@ interface NshNativeModule {
   ): void;
   nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void;
   nshPickImagesResult(sessionId: number, pickId: number, files: PickedDescriptor[]): void;
-  nshRunUiTask(sessionId: number, taskId: number, uiContext: UIContext, bundleName: string): void;
+  nshRunUiTask(
+    sessionId: number,
+    taskId: number,
+    uiContext: UIContext,
+    bundleName: string,
+    moduleName?: string,
+  ): void;
   nshAbilityResult(
     sessionId: number,
     requestId: number,
@@ -1005,6 +1011,11 @@ class HostSession {
     );
   }
 
+  private moduleName(): string {
+    const name = this.abilityContext.abilityInfo?.moduleName;
+    return typeof name === "string" && name.length > 0 ? name : "entry";
+  }
+
   private updateSystemBars(command?: HostCommandPayload): void {
     if (this.isDesktop) {
       return;
@@ -1163,6 +1174,7 @@ class HostSession {
         command.openId ?? 0,
         this.runtimeContext.getUIContext(),
         this.bundleName(),
+        this.moduleName(),
       );
       return;
     }

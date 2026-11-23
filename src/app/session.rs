@@ -136,8 +136,9 @@ pub(crate) fn get(session_id: u32) -> Result<Arc<Services>> {
 
 /// Resolves an active host session for platform extension points.
 ///
-/// Prefers the most recently created foreground session; when
-/// `require_foreground` is `false`, falls back to any active session.
+/// Prefers the most recently created focused (`lifecycle == "active"`) window,
+/// then any visible foreground (`lifecycle != "background"`) window; when
+/// `require_foreground` is `false`, falls back to any live session.
 /// Returns `Err(false)` if no session has ever been created (`NotStarted`),
 /// or `Err(true)` if sessions existed but none currently match.
 pub(crate) fn any_active_session(
@@ -158,6 +159,13 @@ pub(crate) fn any_active_session(
             })
             .collect()
     };
+    if let Some((_, host)) = live
+        .iter()
+        .filter(|(_, host)| host.is_active_window())
+        .max_by_key(|(id, _)| *id)
+    {
+        return Ok(host.clone());
+    }
     if let Some((_, host)) = live
         .iter()
         .filter(|(_, host)| host.is_foreground())
@@ -471,6 +479,10 @@ impl Services {
             _ => {}
         }
         self.broadcast(|| Message::HostDesktop(event.clone()));
+    }
+
+    pub(crate) fn is_active_window(&self) -> bool {
+        self.environment.lock().unwrap().lifecycle.as_deref() == Some("active")
     }
 
     pub(crate) fn is_foreground(&self) -> bool {

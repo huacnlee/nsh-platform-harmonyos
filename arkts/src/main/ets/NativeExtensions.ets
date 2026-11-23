@@ -1,6 +1,6 @@
 import { common, Want } from "@kit.AbilityKit";
 
-type WantKind = "create" | "new-want";
+export type WantKind = "create" | "new-want";
 
 interface QueuedWant {
   kind: WantKind;
@@ -12,8 +12,11 @@ const queuedWants: QueuedWant[] = [];
 let wantSink: ((kind: WantKind, payload: string) => void) | undefined = undefined;
 
 function sanitizeJsonValue(value: ESObject, depth: number): ESObject {
-  if (depth > 8 || value === null || value === undefined) {
+  if (depth > 8 || value === undefined) {
     return undefined;
+  }
+  if (value === null) {
+    return null;
   }
   const kind = typeof value;
   if (kind === "string" || kind === "boolean") {
@@ -24,7 +27,7 @@ function sanitizeJsonValue(value: ESObject, depth: number): ESObject {
   }
   if (Array.isArray(value)) {
     const out: Array<ESObject> = [];
-    const items = value as Array<ESObject>;
+    const items: Array<ESObject> = value as Array<ESObject>;
     for (let i = 0; i < items.length && i < 256; i++) {
       const sanitized: ESObject = sanitizeJsonValue(items[i], depth + 1);
       if (sanitized !== undefined) {
@@ -71,6 +74,9 @@ export function sanitizeWant(want?: Want): Record<string, ESObject> {
   if (typeof want.type === "string") {
     out["type"] = want.type;
   }
+  if (typeof want.flags === "number" && Number.isFinite(want.flags) && want.flags >= 0) {
+    out["flags"] = Math.trunc(want.flags);
+  }
   if (Array.isArray(want.entities)) {
     const entities: string[] = [];
     for (let i = 0; i < want.entities.length; i++) {
@@ -89,6 +95,18 @@ export function sanitizeWant(want?: Want): Record<string, ESObject> {
     }
   }
   return out;
+}
+
+function reportBusinessError(
+  error: ESObject,
+  complete: (ok: boolean, payload?: string, code?: number, message?: string) => void,
+): void {
+  const rawCode: ESObject = error?.code;
+  const code = typeof rawCode === "number" && Number.isFinite(rawCode) ? rawCode : undefined;
+  const rawMessage: ESObject = error?.message;
+  const message =
+    typeof rawMessage === "string" && rawMessage.length > 0 ? rawMessage : String(error);
+  complete(false, undefined, code, message);
 }
 
 export function setAbilityWantSink(sink: (kind: WantKind, payload: string) => void): void {
@@ -153,14 +171,9 @@ export function startAbilityForResult(
         complete(true, payload, undefined, undefined);
       })
       .catch((error: ESObject): void => {
-        const rawCode: ESObject = error?.code;
-        const code = typeof rawCode === "number" && Number.isFinite(rawCode) ? rawCode : undefined;
-        const rawMessage: ESObject = error?.message;
-        const message =
-          typeof rawMessage === "string" && rawMessage.length > 0 ? rawMessage : String(error);
-        complete(false, undefined, code, message);
+        reportBusinessError(error, complete);
       });
   } catch (error) {
-    complete(false, undefined, undefined, String(error));
+    reportBusinessError(error as ESObject, complete);
   }
 }

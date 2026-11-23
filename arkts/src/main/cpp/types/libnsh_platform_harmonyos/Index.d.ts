@@ -502,7 +502,7 @@ export declare function nshReportHostError(sessionId: number, message: string): 
 
 export declare function nshRetireNativeNode(targetId: number): void
 
-export declare function nshRunUiTask(sessionId: number, taskId: number, uiContext: import('@ohos.arkui.UIContext').UIContext, bundleName: string): void
+export declare function nshRunUiTask(sessionId: number, taskId: number, uiContext: import('@ohos.arkui.UIContext').UIContext, bundleName: string, moduleName?: string | undefined | null): void
 
 export declare function nshServiceEvent(sessionId: number, key: number, value: SystemEvent): void
 

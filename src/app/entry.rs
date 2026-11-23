@@ -346,11 +346,16 @@ pub(crate) fn nsh_run_ui_task(
     task_id: u32,
     #[napi(ts_arg_type = "import('@ohos.arkui.UIContext').UIContext")] ui_context: Object<'_>,
     bundle_name: String,
+    module_name: Option<String>,
 ) {
     if crate::app::session::get(session_id).is_err() {
         return;
     }
-    crate::extensions::run_ui_task(&env, task_id, ui_context, &bundle_name);
+    let module_name = module_name
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("entry");
+    crate::extensions::run_ui_task(&env, task_id, ui_context, &bundle_name, module_name);
 }
 
 #[napi]

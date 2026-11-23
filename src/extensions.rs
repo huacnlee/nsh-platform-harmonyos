@@ -14,14 +14,17 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use nsh_core::picker::{PickFormat, PickRequest};
+use nsh_core::{
+    geometry::{DevicePixels, Size},
+    picker::{Encoding, PickRequest},
+};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 const MAX_IMAGE_BYTES: usize = 64 << 20;
+const MAX_IMAGE_PIXELS: u64 = 64_000_000;
 const MAX_PENDING_WANTS: usize = 16;
-const DEFAULT_JPEG_QUALITY: u32 = 85;
 
 /// Why a HarmonyOS UI-thread extension call could not run or failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +72,9 @@ pub struct Want {
     /// MIME type (`Want.type`).
     #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
     pub mime_type: Option<String>,
+    /// Ability launch flags (`Want.flags`, e.g. `wantConstant.Flags`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<u32>,
     /// Target entities (`Want.entities`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<String>,
@@ -156,11 +162,66 @@ pub struct AbilityWantEvent {
 
 type WantObserver = Arc<dyn Fn(&AbilityWantEvent) + Send + Sync>;
 
+struct ObserverSlot {
+    id: u64,
+    callback: WantObserver,
+    /// Pending events (buffered replay followed by live deliveries) drained in
+    /// strict FIFO order by one thread at a time so live wants never overtake
+    /// replayed buffered wants.
+    queue: Mutex<(VecDeque<AbilityWantEvent>, bool)>,
+}
+
+struct DrainReset<'a>(&'a Mutex<(VecDeque<AbilityWantEvent>, bool)>);
+
+impl Drop for DrainReset<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).1 = false;
+    }
+}
+
+impl ObserverSlot {
+    fn new(id: u64, callback: WantObserver, initial: VecDeque<AbilityWantEvent>) -> Self {
+        Self {
+            id,
+            callback,
+            queue: Mutex::new((initial, false)),
+        }
+    }
+
+    fn enqueue(&self, event: AbilityWantEvent) {
+        self.queue
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .0
+            .push_back(event);
+        self.drain();
+    }
+
+    fn drain(&self) {
+        loop {
+            let next = {
+                let mut state = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if state.1 {
+                    return;
+                }
+                let Some(event) = state.0.pop_front() else {
+                    return;
+                };
+                state.1 = true;
+                event
+            };
+            let reset = DrainReset(&self.queue);
+            (self.callback)(&next);
+            drop(reset);
+        }
+    }
+}
+
 struct WantHubInner {
     next_id: u64,
     launch: Option<Want>,
     pending_new_wants: VecDeque<AbilityWantEvent>,
-    observers: Vec<(u64, WantObserver)>,
+    observers: Vec<Arc<ObserverSlot>>,
 }
 
 struct WantHub(Mutex<WantHubInner>);
@@ -185,7 +246,7 @@ impl WantHub {
 
     fn deliver(&self, kind: AbilityWantKind, want: Want) {
         let event = AbilityWantEvent { kind, want };
-        let observers: Vec<WantObserver> = {
+        let slots: Vec<Arc<ObserverSlot>> = {
             let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
             if kind == AbilityWantKind::Create {
                 inner.launch = Some(event.want.clone());
@@ -199,24 +260,29 @@ impl WantHub {
                 }
                 return;
             }
-            inner.observers.iter().map(|(_, cb)| cb.clone()).collect()
+            inner.observers.clone()
         };
-        for observer in observers {
-            observer(&event);
+        for slot in slots {
+            slot.enqueue(event.clone());
         }
     }
 
-    fn subscribe(&self, observer: WantObserver) -> (u64, Vec<AbilityWantEvent>) {
-        let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        let replay = if inner.observers.is_empty() {
-            inner.pending_new_wants.drain(..).collect()
-        } else {
-            Vec::new()
+    fn subscribe(&self, observer: WantObserver) -> u64 {
+        let slot = {
+            let mut inner = self.0.lock().unwrap_or_else(|e| e.into_inner());
+            let replay = if inner.observers.is_empty() {
+                std::mem::take(&mut inner.pending_new_wants)
+            } else {
+                VecDeque::new()
+            };
+            let id = inner.next_id;
+            inner.next_id = inner.next_id.wrapping_add(1).max(1);
+            let slot = Arc::new(ObserverSlot::new(id, observer, replay));
+            inner.observers.push(slot.clone());
+            slot
         };
-        let id = inner.next_id;
-        inner.next_id = inner.next_id.wrapping_add(1).max(1);
-        inner.observers.push((id, observer));
-        (id, replay)
+        slot.drain();
+        slot.id
     }
 
     fn unsubscribe(&self, id: u64) {
@@ -224,7 +290,7 @@ impl WantHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .observers
-            .retain(|(entry_id, _)| *entry_id != id);
+            .retain(|slot| slot.id != id);
     }
 }
 
@@ -401,38 +467,189 @@ impl<T> PendingTable<T> {
     }
 }
 
-fn target_dimensions(width: u32, height: u32, max_dimension: Option<i32>) -> Option<(u32, u32)> {
-    let limit = max_dimension.filter(|&d| d > 0)? as u32;
-    let longest = width.max(height);
-    if width == 0 || height == 0 || longest <= limit {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ExifOrientation {
+    #[default]
+    Normal,
+    FlipHorizontal,
+    Rotate180,
+    FlipVertical,
+    Transpose,
+    Rotate90,
+    Transverse,
+    Rotate270,
+}
+
+impl ExifOrientation {
+    fn from_tag(tag: u16) -> Option<Self> {
+        Some(match tag {
+            1 => Self::Normal,
+            2 => Self::FlipHorizontal,
+            3 => Self::Rotate180,
+            4 => Self::FlipVertical,
+            5 => Self::Transpose,
+            6 => Self::Rotate90,
+            7 => Self::Transverse,
+            8 => Self::Rotate270,
+            _ => return None,
+        })
+    }
+
+    fn parse_property(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        if let Ok(tag) = trimmed.parse::<u16>() {
+            return Self::from_tag(tag);
+        }
+        match trimmed.to_ascii_lowercase().as_str() {
+            "top-left" | "horizontal" | "normal" => Some(Self::Normal),
+            "top-right" | "mirror horizontal" => Some(Self::FlipHorizontal),
+            "bottom-right" | "rotate 180" => Some(Self::Rotate180),
+            "bottom-left" | "mirror vertical" => Some(Self::FlipVertical),
+            "left-top" | "mirror horizontal and rotate 270 cw" => Some(Self::Transpose),
+            "right-top" | "rotate 90 cw" => Some(Self::Rotate90),
+            "right-bottom" | "mirror horizontal and rotate 90 cw" => Some(Self::Transverse),
+            "left-bottom" | "rotate 270 cw" => Some(Self::Rotate270),
+            _ => None,
+        }
+    }
+
+    fn swaps_axes(self) -> bool {
+        matches!(
+            self,
+            Self::Transpose | Self::Rotate90 | Self::Transverse | Self::Rotate270
+        )
+    }
+
+    fn display_dimensions(self, raw_width: u32, raw_height: u32) -> (u32, u32) {
+        if self.swaps_axes() {
+            (raw_height, raw_width)
+        } else {
+            (raw_width, raw_height)
+        }
+    }
+}
+
+/// Parses EXIF Orientation (TIFF IFD0 tag `0x0112`) from a JPEG APP1 segment.
+/// Used as a fallback when `ImageSource::get_image_property("Orientation")`
+/// does not report a value.
+fn parse_jpeg_exif_orientation(bytes: &[u8]) -> Option<ExifOrientation> {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
         return None;
     }
-    let scale = f64::from(limit) / f64::from(longest);
-    Some((
-        ((f64::from(width) * scale).round() as u32).clamp(1, limit),
-        ((f64::from(height) * scale).round() as u32).clamp(1, limit),
-    ))
-}
-
-fn image_needs_encode(source_mime: &str, width: u32, height: u32, request: &PickRequest) -> bool {
-    target_dimensions(width, height, request.max_dimension.map(|d| d.0)).is_some()
-        || request.quality.is_some()
-        || (matches!(request.format, PickFormat::Compatible)
-            && !matches!(
-                source_mime,
-                "image/jpeg" | "image/png" | "image/gif" | "image/webp"
-            ))
-}
-
-fn encode_mime_and_quality(source_mime: &str, request: &PickRequest) -> (&'static str, u32) {
-    if source_mime == "image/png" && request.quality.is_none() {
-        return ("image/png", 100);
+    let mut pos = 2usize;
+    while pos + 1 < bytes.len() {
+        while pos < bytes.len() && bytes[pos] == 0xFF {
+            pos += 1;
+        }
+        if pos >= bytes.len() {
+            break;
+        }
+        let marker = bytes[pos];
+        pos += 1;
+        // SOS or EOI terminates metadata headers.
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+        // Standalone markers carry no length field.
+        if marker == 0x01 || (0xD0..=0xD7).contains(&marker) {
+            continue;
+        }
+        if pos + 2 > bytes.len() {
+            break;
+        }
+        let seg_len = u16::from_be_bytes([bytes[pos], bytes[pos + 1]]) as usize;
+        if seg_len < 2 || pos + seg_len > bytes.len() {
+            break;
+        }
+        let payload = &bytes[pos + 2..pos + seg_len];
+        pos += seg_len;
+        if marker != 0xE1 || !payload.starts_with(b"Exif\0\0") {
+            continue;
+        }
+        let tiff = &payload[6..];
+        if tiff.len() < 8 {
+            continue;
+        }
+        let little_endian = match &tiff[0..2] {
+            b"II" => true,
+            b"MM" => false,
+            _ => continue,
+        };
+        let read_u16 = |off: usize| -> Option<u16> {
+            let slice: [u8; 2] = tiff.get(off..off + 2)?.try_into().ok()?;
+            Some(if little_endian {
+                u16::from_le_bytes(slice)
+            } else {
+                u16::from_be_bytes(slice)
+            })
+        };
+        let read_u32 = |off: usize| -> Option<u32> {
+            let slice: [u8; 4] = tiff.get(off..off + 4)?.try_into().ok()?;
+            Some(if little_endian {
+                u32::from_le_bytes(slice)
+            } else {
+                u32::from_be_bytes(slice)
+            })
+        };
+        if read_u16(2)? != 0x002A {
+            continue;
+        }
+        let ifd0 = read_u32(4)? as usize;
+        let count = read_u16(ifd0)? as usize;
+        let entries_start = ifd0.checked_add(2)?;
+        for i in 0..count.min(256) {
+            let entry = entries_start.checked_add(i.checked_mul(12)?)?;
+            if entry.checked_add(12)? > tiff.len() {
+                break;
+            }
+            let tag = read_u16(entry)?;
+            let field_type = read_u16(entry + 2)?;
+            let num_values = read_u32(entry + 4)?;
+            if tag == 0x0112 && field_type == 3 && num_values >= 1 {
+                let value = read_u16(entry + 8)?;
+                return ExifOrientation::from_tag(value);
+            }
+        }
     }
-    let quality = request
-        .quality
-        .map(|q| ((q.0.clamp(0.0, 1.0) * 100.0).round() as u32).clamp(1, 100))
-        .unwrap_or(DEFAULT_JPEG_QUALITY);
-    ("image/jpeg", quality)
+    None
+}
+
+fn decode_target_dimensions(
+    raw_width: u32,
+    raw_height: u32,
+    orientation: ExifOrientation,
+    request: &PickRequest,
+) -> Option<(u32, u32)> {
+    let (display_w, display_h) = orientation.display_dimensions(raw_width, raw_height);
+    let display = Size::new(
+        DevicePixels(i32::try_from(display_w).ok()?),
+        DevicePixels(i32::try_from(display_h).ok()?),
+    );
+    let scaled = request.scaled_size(display);
+    if scaled == display {
+        return None;
+    }
+    let scaled_w = u32::try_from(scaled.width.0).ok()?;
+    let scaled_h = u32::try_from(scaled.height.0).ok()?;
+    if orientation.swaps_axes() {
+        Some((scaled_h, scaled_w))
+    } else {
+        Some((scaled_w, scaled_h))
+    }
+}
+
+fn encode_mime_and_quality(
+    encoding: Encoding,
+    request: &PickRequest,
+) -> Option<(&'static str, u32)> {
+    match encoding {
+        Encoding::Keep => None,
+        Encoding::Png => Some(("image/png", 100)),
+        Encoding::Jpeg => {
+            let quality = ((request.jpeg_quality().0 * 100.0).round() as u32).clamp(1, 100);
+            Some(("image/jpeg", quality))
+        }
+    }
 }
 
 #[cfg(target_env = "ohos")]
@@ -441,13 +658,14 @@ mod ohos {
         fs::File,
         future::Future,
         io::Read as _,
+        panic::{AssertUnwindSafe, catch_unwind},
         path::{Path, PathBuf},
         sync::{Arc, LazyLock, Mutex},
     };
 
     use napi_ohos::{
-        Env,
-        bindgen_prelude::{Function, JsObjectValue as _, Object},
+        Env, JsValue as _, ValueType,
+        bindgen_prelude::{Function, JsObjectValue as _, Object, Unknown},
         module::Module,
     };
     use nsh_core::{
@@ -456,15 +674,20 @@ mod ohos {
         picker::{PickRequest, PickedFile, file_name, sniff},
     };
     use ohos_image_native_binding::{
-        DecodingOptions, ImagePacker, ImageSource, ImageString, PackingOptions, types::ImageSize,
+        DecodingOptions, ImagePacker, ImageSource, ImageString, PackingOptions, PixelMap,
+        types::{ImageSize, PixelFormat},
     };
 
     use super::{
-        AbilityError, AbilityResult, AbilityWantEvent, AbilityWantKind, ExtensionError,
-        MAX_IMAGE_BYTES, OnceFuture, OnceSender, PendingTable, Want, WantHub, WantObserverGuard,
-        encode_mime_and_quality, image_needs_encode, target_dimensions,
+        AbilityError, AbilityResult, AbilityWantEvent, AbilityWantKind, ExifOrientation,
+        ExtensionError, MAX_IMAGE_BYTES, MAX_IMAGE_PIXELS, OnceFuture, OnceSender, PendingTable,
+        Want, WantHub, WantObserverGuard, decode_target_dimensions, encode_mime_and_quality,
+        parse_jpeg_exif_orientation,
     };
     use crate::app::session::{self, HostCommand};
+
+    /// `IMAGE_DYNAMIC_RANGE_SDR` from `<multimedia/image_framework/image/image_source_native.h>`.
+    const IMAGE_DYNAMIC_RANGE_SDR: i32 = 1;
 
     type UiTask = Box<dyn FnOnce(&UiThread<'_>) + Send + 'static>;
     type AbilitySender = OnceSender<Result<AbilityResult, AbilityError>>;
@@ -474,12 +697,120 @@ mod ohos {
         LazyLock::new(Mutex::default);
     static WANT_HUB: LazyLock<WantHub> = LazyLock::new(WantHub::new);
 
+    fn take_pending_exception(env: &Env) -> Option<String> {
+        let raw_env = env.raw();
+        let mut pending = false;
+        let check = unsafe { napi_ohos::sys::napi_is_exception_pending(raw_env, &mut pending) };
+        if check != napi_ohos::sys::Status::napi_ok || !pending {
+            return None;
+        }
+        let mut exc = std::ptr::null_mut();
+        let cleared =
+            unsafe { napi_ohos::sys::napi_get_and_clear_last_exception(raw_env, &mut exc) };
+        if cleared != napi_ohos::sys::Status::napi_ok || exc.is_null() {
+            return Some("pending JS exception".into());
+        }
+        let mut str_val = std::ptr::null_mut();
+        let coerced = unsafe { napi_ohos::sys::napi_coerce_to_string(raw_env, exc, &mut str_val) };
+        if coerced == napi_ohos::sys::Status::napi_ok && !str_val.is_null() {
+            let mut len = 0usize;
+            if unsafe {
+                napi_ohos::sys::napi_get_value_string_utf8(
+                    raw_env,
+                    str_val,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut len,
+                )
+            } == napi_ohos::sys::Status::napi_ok
+                && len > 0
+            {
+                let mut buf = vec![0u8; len + 1];
+                let mut copied = 0usize;
+                if unsafe {
+                    napi_ohos::sys::napi_get_value_string_utf8(
+                        raw_env,
+                        str_val,
+                        buf.as_mut_ptr().cast(),
+                        buf.len(),
+                        &mut copied,
+                    )
+                } == napi_ohos::sys::Status::napi_ok
+                {
+                    buf.truncate(copied);
+                    if let Ok(text) = String::from_utf8(buf) {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        // Clear any secondary exception that string coercion might have raised.
+        let mut secondary = false;
+        if unsafe { napi_ohos::sys::napi_is_exception_pending(raw_env, &mut secondary) }
+            == napi_ohos::sys::Status::napi_ok
+            && secondary
+        {
+            let mut ignored = std::ptr::null_mut();
+            let _ =
+                unsafe { napi_ohos::sys::napi_get_and_clear_last_exception(raw_env, &mut ignored) };
+        }
+        Some("pending JS exception".into())
+    }
+
+    fn read_exif_orientation(source: &ImageSource, bytes: &[u8]) -> ExifOrientation {
+        if let Ok(mut key) = ImageString::from_str("Orientation")
+            && let Ok(prop) = source.get_image_property(&mut key)
+            && let Some(raw) = prop.to_string_lossy()
+            && let Some(orientation) = ExifOrientation::parse_property(&raw)
+        {
+            return orientation;
+        }
+        parse_jpeg_exif_orientation(bytes).unwrap_or(ExifOrientation::Normal)
+    }
+
+    fn apply_orientation(
+        pixelmap: &mut PixelMap,
+        orientation: ExifOrientation,
+        raw_width: u32,
+        raw_height: u32,
+        decoded_width: u32,
+        decoded_height: u32,
+    ) -> Result<(), ohos_image_native_binding::ImageNativeError> {
+        if orientation == ExifOrientation::Normal {
+            return Ok(());
+        }
+        // Guard against any decoder that already applied axis-swapping EXIF orientation.
+        if orientation.swaps_axes()
+            && raw_width != raw_height
+            && (raw_width > raw_height) != (decoded_width > decoded_height)
+        {
+            return Ok(());
+        }
+        match orientation {
+            ExifOrientation::Normal => Ok(()),
+            ExifOrientation::FlipHorizontal => pixelmap.flip(true, false),
+            ExifOrientation::Rotate180 => pixelmap.rotate(180.0),
+            ExifOrientation::FlipVertical => pixelmap.flip(false, true),
+            ExifOrientation::Transpose => {
+                pixelmap.flip(true, false)?;
+                pixelmap.rotate(270.0)
+            }
+            ExifOrientation::Rotate90 => pixelmap.rotate(90.0),
+            ExifOrientation::Transverse => {
+                pixelmap.flip(true, false)?;
+                pixelmap.rotate(90.0)
+            }
+            ExifOrientation::Rotate270 => pixelmap.rotate(270.0),
+        }
+    }
+
     /// Access to the active HarmonyOS ArkTS UI thread passed to closures scheduled
     /// with [`run_on_ui_thread`].
     pub struct UiThread<'env> {
         env: &'env Env,
         ui_context: Object<'env>,
         bundle_name: &'env str,
+        module_name: &'env str,
     }
 
     impl<'env> UiThread<'env> {
@@ -495,9 +826,15 @@ mod ohos {
 
         /// Returns the `UIAbilityContext` owning this window (`uiContext.getHostContext()`).
         pub fn ability_context(&self) -> napi_ohos::Result<Object<'env>> {
-            let getter: Function<'_, (), Object<'_>> =
+            let getter: Function<'_, (), Unknown<'_>> =
                 self.ui_context.get_named_property("getHostContext")?;
-            getter.apply(self.ui_context, ())
+            let raw = getter.apply(self.ui_context, ())?;
+            if raw.get_type()? != ValueType::Object {
+                return Err(napi_ohos::Error::from_reason(
+                    "uiContext.getHostContext() did not return an object",
+                ));
+            }
+            raw.coerce_to_object()
         }
 
         /// Returns the host application's bundle name (e.g. `"com.example.app"`).
@@ -505,24 +842,41 @@ mod ohos {
             self.bundle_name
         }
 
-        /// Returns the `<bundleName>/entry` module-info string expected by
+        /// Returns the host HAP module name (e.g. `"entry"`).
+        pub fn module_name(&self) -> &str {
+            self.module_name
+        }
+
+        /// Returns the `<bundleName>/<moduleName>` module-info string expected by
         /// `napi_load_module_with_info` for packages declared under
-        /// `entry/build-profile.json5` `arkOptions.runtimeOnly.packages`.
+        /// `build-profile.json5` `arkOptions.runtimeOnly.packages`.
         pub fn module_info(&self) -> String {
             if self.bundle_name.is_empty() {
                 String::new()
             } else {
-                format!("{}/entry", self.bundle_name)
+                format!("{}/{}", self.bundle_name, self.module_name)
             }
         }
 
-        /// Loads an ArkTS system module (`@kit.*`, `@ohos.*`), ohpm HAR dependency,
+        /// Loads an ArkTS system module (`@ohos.*`), ohpm HAR dependency,
         /// or native `.so` module on the UI thread.
+        ///
+        /// ArkTS `@kit.*` aliases are compile-time only and cannot be resolved
+        /// dynamically by N-API; pass the underlying `@ohos.*` module or an ohpm
+        /// HAR instead.
         pub fn load_module(&self, specifier: &str) -> napi_ohos::Result<Module> {
-            if self.bundle_name.is_empty()
-                || specifier.starts_with("@kit.")
-                || specifier.starts_with("@ohos.")
-            {
+            if specifier.is_empty() {
+                return Err(napi_ohos::Error::from_reason(
+                    "module specifier must not be empty",
+                ));
+            }
+            if specifier.starts_with("@kit.") {
+                return Err(napi_ohos::Error::from_reason(format!(
+                    "cannot dynamically load ArkTS kit alias {specifier:?} at runtime; \
+                     load the underlying `@ohos.*` module or an ohpm HAR instead"
+                )));
+            }
+            if self.bundle_name.is_empty() || specifier.starts_with("@ohos.") {
                 self.env.load(specifier)
             } else {
                 let info = self.module_info();
@@ -532,7 +886,11 @@ mod ohos {
     }
 
     /// Runs `f` on the ArkTS UI thread of the active host session (preferring the
-    /// foreground window) and resolves with its return value.
+    /// focused foreground window) and resolves with its return value.
+    ///
+    /// The returned `Future` dispatches `f` through the ArkTS UI event loop;
+    /// `.await` it asynchronously and never block the ArkTS UI thread waiting on
+    /// it synchronously.
     pub fn run_on_ui_thread<F, R>(
         f: F,
     ) -> impl Future<Output = Result<R, ExtensionError>> + Send + 'static
@@ -555,7 +913,30 @@ mod ohos {
             ))
         });
         let task: UiTask = Box::new(move |ui| {
-            sender.send(f(ui).map_err(|e| ExtensionError::Failed(e.to_string())));
+            let outcome = catch_unwind(AssertUnwindSafe(|| f(ui)));
+            let pending_exc = take_pending_exception(ui.env());
+            let result = match outcome {
+                Ok(Ok(value)) => match pending_exc {
+                    Some(exc) => Err(ExtensionError::Failed(exc)),
+                    None => Ok(value),
+                },
+                Ok(Err(err)) => {
+                    let message = match pending_exc {
+                        Some(exc) if !err.reason.contains(&exc) => format!("{err}: {exc}"),
+                        _ => err.to_string(),
+                    };
+                    Err(ExtensionError::Failed(message))
+                }
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_owned())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "UI task panicked".to_owned());
+                    Err(ExtensionError::Failed(format!("UI task panicked: {msg}")))
+                }
+            };
+            sender.send(result);
         });
         let Some(task_id) = UI_TASKS.lock().unwrap().insert(host.session_id(), task) else {
             return OnceFuture::ready(Err(ExtensionError::Failed(
@@ -579,6 +960,7 @@ mod ohos {
         session::any_active_session(false)
             .ok()
             .map(|h| h.raw_cache_dir().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
     }
 
     /// Returns the active Ability's sandboxed files directory (`abilityContext.filesDir`),
@@ -587,6 +969,7 @@ mod ohos {
         session::any_active_session(false)
             .ok()
             .map(|h| h.raw_files_dir().to_path_buf())
+            .filter(|p| !p.as_os_str().is_empty())
     }
 
     /// Returns the `Want` that launched the host `UIAbility` (`onCreate`), if any.
@@ -598,11 +981,7 @@ mod ohos {
     pub fn on_ability_want(
         observer: impl Fn(&AbilityWantEvent) + Send + Sync + 'static,
     ) -> WantObserverGuard {
-        let observer = Arc::new(observer);
-        let (id, replay) = WANT_HUB.subscribe(observer.clone());
-        for event in &replay {
-            observer(event);
-        }
+        let id = WANT_HUB.subscribe(Arc::new(observer));
         WantObserverGuard::new(move || WANT_HUB.unsubscribe(id))
     }
 
@@ -711,38 +1090,70 @@ mod ohos {
         }
         let source = ImageSource::create_from_data(bytes).ok()?;
         let info = source.image_info(0).ok()?;
-        let (width, height) = (info.width().ok()?, info.height().ok()?);
-        if width == 0 || height == 0 {
+        let (raw_w, raw_h) = (info.width().ok()?, info.height().ok()?);
+        if raw_w == 0 || raw_h == 0 {
             return None;
         }
+        let orientation = read_exif_orientation(&source, bytes);
+        let (display_w, display_h) = orientation.display_dimensions(raw_w, raw_h);
+        let display_size = Size::new(
+            DevicePixels(i32::try_from(display_w).ok()?),
+            DevicePixels(i32::try_from(display_h).ok()?),
+        );
         let source_mime = sniff(bytes).unwrap_or("application/octet-stream");
-        if !image_needs_encode(source_mime, width, height, request) {
+        let encoding = request.needs_encoding(source_mime, display_size);
+        let Some((out_mime, quality)) = encode_mime_and_quality(encoding, request) else {
             let mut picked = PickedFile::new(name, source_mime, ImageData::from(bytes.to_vec()));
-            picked.size = Size::new(DevicePixels(width as i32), DevicePixels(height as i32));
+            picked.size = display_size;
             return Some(picked);
-        }
+        };
 
+        if u64::from(raw_w).saturating_mul(u64::from(raw_h)) > MAX_IMAGE_PIXELS {
+            return None;
+        }
         let mut decode_opts = DecodingOptions::new().ok()?;
-        if let Some((width, height)) =
-            target_dimensions(width, height, request.max_dimension.map(|d| d.0))
+        let _ = decode_opts.set_pixel_format(PixelFormat::Rgba8888);
+        let _ = decode_opts.set_desired_dynamic_range(IMAGE_DYNAMIC_RANGE_SDR);
+        if let Some((width, height)) = decode_target_dimensions(raw_w, raw_h, orientation, request)
         {
             decode_opts
                 .set_desired_size(ImageSize { width, height })
                 .ok()?;
         }
-        let pixelmap = source.create_pixelmap(&mut decode_opts).ok()?;
+        let mut pixelmap = source.create_pixelmap(&mut decode_opts).ok()?;
+        let decoded_info = pixelmap.image_info().ok()?;
+        let (decoded_w, decoded_h) = (decoded_info.width().ok()?, decoded_info.height().ok()?);
+        if decoded_w == 0 || decoded_h == 0 {
+            return None;
+        }
+        if decoded_info.dynamic_range().unwrap_or(false) {
+            let _ = pixelmap.to_sdr();
+        }
+        apply_orientation(
+            &mut pixelmap,
+            orientation,
+            raw_w,
+            raw_h,
+            decoded_w,
+            decoded_h,
+        )
+        .ok()?;
         let pm_info = pixelmap.image_info().ok()?;
         let (out_w, out_h) = (pm_info.width().ok()?, pm_info.height().ok()?);
         if out_w == 0 || out_h == 0 {
             return None;
         }
+        let out_size = Size::new(
+            DevicePixels(i32::try_from(out_w).ok()?),
+            DevicePixels(i32::try_from(out_h).ok()?),
+        );
 
-        let (out_mime, quality) = encode_mime_and_quality(source_mime, request);
         let mut pack_opts = PackingOptions::new().ok()?;
         let mut mime_str = ImageString::from_str(out_mime).ok()?;
         pack_opts.set_mime_type(&mut mime_str).ok()?;
         pack_opts.set_quality(quality).ok()?;
         pack_opts.set_needs_pack_properties(false).ok()?;
+        let _ = pack_opts.set_desired_dynamic_range(IMAGE_DYNAMIC_RANGE_SDR);
 
         let mut packer = ImagePacker::new().ok()?;
         let initial_cap =
@@ -751,7 +1162,7 @@ mod ohos {
         let written =
             match packer.pack_to_data_from_pixelmap(&mut pack_opts, &pixelmap, &mut encoded) {
                 Ok(size) => size,
-                Err(_) => {
+                Err(err) if matches!(err.code, 7600103 | 7600301 | 7800301) => {
                     let max_cap = (out_w as usize)
                         .saturating_mul(out_h as usize)
                         .saturating_mul(4)
@@ -765,6 +1176,7 @@ mod ohos {
                         .pack_to_data_from_pixelmap(&mut pack_opts, &pixelmap, &mut encoded)
                         .ok()?
                 }
+                Err(_) => return None,
             };
         encoded.truncate(written);
         if encoded.is_empty() || encoded.len() > MAX_IMAGE_BYTES {
@@ -776,17 +1188,25 @@ mod ohos {
             out_mime,
             ImageData::from(encoded),
         );
-        picked.size = Size::new(DevicePixels(out_w as i32), DevicePixels(out_h as i32));
+        picked.size = out_size;
         Some(picked)
     }
 
-    pub(crate) fn run_ui_task(env: &Env, task_id: u32, ui_context: Object<'_>, bundle_name: &str) {
+    pub(crate) fn run_ui_task(
+        env: &Env,
+        task_id: u32,
+        ui_context: Object<'_>,
+        bundle_name: &str,
+        module_name: &str,
+    ) {
         if let Some(task) = UI_TASKS.lock().unwrap().take(task_id) {
             task(&UiThread {
                 env,
                 ui_context,
                 bundle_name,
+                module_name,
             });
+            let _ = take_pending_exception(env);
         }
     }
 
@@ -924,11 +1344,8 @@ mod tests {
                 .unwrap()
                 .push(event.want.uri.clone().unwrap_or_default());
         });
-        let (id_a, replay) = hub.subscribe(obs_a.clone());
-        for ev in &replay {
-            obs_a(ev);
-        }
-        assert_eq!(replay.len(), MAX_PENDING_WANTS);
+        let id_a = hub.subscribe(obs_a);
+        assert_eq!(seen.lock().unwrap().len(), MAX_PENDING_WANTS);
         assert_eq!(
             seen.lock().unwrap().first().map(String::as_str),
             Some("myapp://item/4")
@@ -940,13 +1357,13 @@ mod tests {
 
         let seen_b = Arc::new(Mutex::new(Vec::<String>::new()));
         let seen_b_cb = seen_b.clone();
-        let (id_b, replay_b) = hub.subscribe(Arc::new(move |event| {
+        let id_b = hub.subscribe(Arc::new(move |event| {
             seen_b_cb
                 .lock()
                 .unwrap()
                 .push(event.want.uri.clone().unwrap_or_default());
         }));
-        assert!(replay_b.is_empty());
+        assert!(seen_b.lock().unwrap().is_empty());
 
         hub.deliver(
             AbilityWantKind::NewWant,
@@ -1013,6 +1430,7 @@ mod tests {
             bundle_name: Some("com.example.cam".into()),
             ability_name: Some("EntryAbility".into()),
             action: Some("ohos.want.action.imageCapture".into()),
+            flags: Some(0x1000_0001),
             ..Default::default()
         };
         want.parameters
@@ -1022,6 +1440,7 @@ mod tests {
         assert_eq!(serialized["bundleName"], "com.example.cam");
         assert_eq!(serialized["abilityName"], "EntryAbility");
         assert_eq!(serialized["action"], "ohos.want.action.imageCapture");
+        assert_eq!(serialized["flags"], 0x1000_0001u32);
         assert_eq!(serialized["parameters"]["supportMultiMode"], false);
         assert!(serialized.get("uri").is_none());
 
@@ -1029,12 +1448,14 @@ mod tests {
             "resultCode": 0,
             "want": {
                 "uri": "file://media/Photo/1/IMG_001.jpg",
+                "flags": 1,
                 "parameters": { "resourceUri": "file://media/Photo/1/IMG_001.jpg" }
             }
         }))
         .unwrap();
         assert_eq!(result.result_code, 0);
         let returned = result.want.unwrap();
+        assert_eq!(returned.flags, Some(1));
         assert_eq!(
             returned.uri.as_deref(),
             Some("file://media/Photo/1/IMG_001.jpg")
@@ -1046,38 +1467,168 @@ mod tests {
     }
 
     #[test]
-    fn image_preparation_sizing_and_encoding_decisions() {
-        assert_eq!(
-            target_dimensions(4000, 3000, Some(2000)),
-            Some((2000, 1500))
+    fn want_hub_preserves_fifo_order_when_live_want_arrives_during_replay() {
+        let hub = Arc::new(WantHub::new());
+        hub.deliver(
+            AbilityWantKind::NewWant,
+            Want {
+                uri: Some("myapp://buffered/1".into()),
+                ..Default::default()
+            },
         );
-        assert_eq!(target_dimensions(1500, 3000, Some(1500)), Some((750, 1500)));
-        assert_eq!(target_dimensions(800, 600, Some(1024)), None);
-        assert_eq!(target_dimensions(4000, 3000, None), None);
-        assert_eq!(target_dimensions(4000, 1, Some(100)), Some((100, 1)));
+        hub.deliver(
+            AbilityWantKind::NewWant,
+            Want {
+                uri: Some("myapp://buffered/2".into()),
+                ..Default::default()
+            },
+        );
+
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen_cb = seen.clone();
+        let hub_cb = hub.clone();
+        let injected = Arc::new(AtomicUsize::new(0));
+        let id = hub.subscribe(Arc::new(move |event| {
+            let uri = event.want.uri.clone().unwrap_or_default();
+            seen_cb.lock().unwrap().push(uri);
+            if injected.fetch_add(1, Ordering::SeqCst) == 0 {
+                // Live want arriving mid-replay must queue behind buffered/2.
+                hub_cb.deliver(
+                    AbilityWantKind::NewWant,
+                    Want {
+                        uri: Some("myapp://live/3".into()),
+                        ..Default::default()
+                    },
+                );
+            }
+        }));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                "myapp://buffered/1".to_owned(),
+                "myapp://buffered/2".to_owned(),
+                "myapp://live/3".to_owned(),
+            ]
+        );
+        hub.unsubscribe(id);
+    }
+
+    #[test]
+    fn exif_orientation_parsing_and_jpeg_app1_extraction() {
+        assert_eq!(
+            ExifOrientation::parse_property("Right-top"),
+            Some(ExifOrientation::Rotate90)
+        );
+        assert_eq!(
+            ExifOrientation::parse_property("6"),
+            Some(ExifOrientation::Rotate90)
+        );
+        assert_eq!(
+            ExifOrientation::parse_property("Left-bottom"),
+            Some(ExifOrientation::Rotate270)
+        );
+        assert_eq!(
+            ExifOrientation::parse_property("Top-left"),
+            Some(ExifOrientation::Normal)
+        );
+        assert_eq!(ExifOrientation::parse_property("default_exif_value"), None);
+        assert_eq!(
+            ExifOrientation::Rotate90.display_dimensions(40, 20),
+            (20, 40)
+        );
+        assert_eq!(
+            ExifOrientation::Rotate180.display_dimensions(40, 20),
+            (40, 20)
+        );
+
+        // Minimal JPEG with big-endian (MM) APP1 EXIF Orientation = 6.
+        let mut jpeg_mm = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x22];
+        jpeg_mm.extend_from_slice(b"Exif\0\0");
+        jpeg_mm.extend_from_slice(b"MM");
+        jpeg_mm.extend_from_slice(&0x002Au16.to_be_bytes());
+        jpeg_mm.extend_from_slice(&8u32.to_be_bytes());
+        jpeg_mm.extend_from_slice(&1u16.to_be_bytes());
+        jpeg_mm.extend_from_slice(&0x0112u16.to_be_bytes());
+        jpeg_mm.extend_from_slice(&3u16.to_be_bytes());
+        jpeg_mm.extend_from_slice(&1u32.to_be_bytes());
+        jpeg_mm.extend_from_slice(&6u16.to_be_bytes());
+        jpeg_mm.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        jpeg_mm.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(
+            parse_jpeg_exif_orientation(&jpeg_mm),
+            Some(ExifOrientation::Rotate90)
+        );
+
+        // Minimal JPEG with little-endian (II) APP1 EXIF Orientation = 8.
+        let mut jpeg_ii = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x22];
+        jpeg_ii.extend_from_slice(b"Exif\0\0");
+        jpeg_ii.extend_from_slice(b"II");
+        jpeg_ii.extend_from_slice(&0x002Au16.to_le_bytes());
+        jpeg_ii.extend_from_slice(&8u32.to_le_bytes());
+        jpeg_ii.extend_from_slice(&1u16.to_le_bytes());
+        jpeg_ii.extend_from_slice(&0x0112u16.to_le_bytes());
+        jpeg_ii.extend_from_slice(&3u16.to_le_bytes());
+        jpeg_ii.extend_from_slice(&1u32.to_le_bytes());
+        jpeg_ii.extend_from_slice(&8u16.to_le_bytes());
+        jpeg_ii.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        jpeg_ii.extend_from_slice(&[0xFF, 0xD9]);
+        assert_eq!(
+            parse_jpeg_exif_orientation(&jpeg_ii),
+            Some(ExifOrientation::Rotate270)
+        );
+    }
+
+    #[test]
+    fn image_preparation_sizing_and_encoding_decisions() {
+        use nsh_core::picker::PickFormat;
 
         let mut req = PickRequest::new(false, 1);
-        assert!(!image_needs_encode("image/jpeg", 800, 600, &req));
-        assert!(image_needs_encode("image/heic", 800, 600, &req));
+        let s_800x600 = Size::new(DevicePixels(800), DevicePixels(600));
+        assert_eq!(req.needs_encoding("image/jpeg", s_800x600), Encoding::Keep);
+        assert_eq!(req.needs_encoding("image/heic", s_800x600), Encoding::Jpeg);
+        // Default JPEG quality matches nsh_core::picker::DEFAULT_QUALITY (90).
+        assert_eq!(
+            encode_mime_and_quality(Encoding::Jpeg, &req),
+            Some(("image/jpeg", 90))
+        );
 
-        req.format = PickFormat::Current;
-        assert!(!image_needs_encode("image/heic", 800, 600, &req));
+        // Quality set on a PNG does NOT force lossy JPEG conversion.
+        req.quality = Some(Percentage(0.7));
+        assert_eq!(req.needs_encoding("image/png", s_800x600), Encoding::Keep);
+        assert_eq!(req.needs_encoding("image/jpeg", s_800x600), Encoding::Jpeg);
+        assert_eq!(
+            encode_mime_and_quality(Encoding::Jpeg, &req),
+            Some(("image/jpeg", 70))
+        );
 
+        // Resized PNG stays PNG even when quality is set.
         req.max_dimension = Some(DevicePixels(512));
-        assert!(image_needs_encode("image/png", 800, 600, &req));
+        assert_eq!(req.needs_encoding("image/png", s_800x600), Encoding::Png);
         assert_eq!(
-            encode_mime_and_quality("image/png", &req),
-            ("image/png", 100)
+            encode_mime_and_quality(Encoding::Png, &req),
+            Some(("image/png", 100))
         );
 
-        req.quality = Some(Percentage(0.75));
+        // EXIF Rotate90 40x20 raw -> 20x40 display -> scaled to max 32 -> 16x32 display -> 32x16 raw decode.
+        let mut scale_req = PickRequest::new(false, 1);
+        scale_req.max_dimension = Some(DevicePixels(32));
         assert_eq!(
-            encode_mime_and_quality("image/png", &req),
-            ("image/jpeg", 75)
+            decode_target_dimensions(40, 20, ExifOrientation::Rotate90, &scale_req),
+            Some((32, 16))
         );
         assert_eq!(
-            encode_mime_and_quality("image/heic", &req),
-            ("image/jpeg", 75)
+            decode_target_dimensions(40, 20, ExifOrientation::Normal, &scale_req),
+            Some((32, 16))
         );
+        scale_req.max_dimension = Some(DevicePixels(100));
+        assert_eq!(
+            decode_target_dimensions(40, 20, ExifOrientation::Rotate90, &scale_req),
+            None
+        );
+
+        // Current format leaves HEIC untouched when not scaled.
+        let mut cur = PickRequest::new(false, 1);
+        cur.format = PickFormat::Current;
+        assert_eq!(cur.needs_encoding("image/heic", s_800x600), Encoding::Keep);
     }
 }
