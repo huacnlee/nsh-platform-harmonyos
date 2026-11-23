@@ -100,6 +100,9 @@ pub(crate) struct HarmonyMeta {
     pub(crate) dependencies: BTreeMap<String, OhpmDep>,
     /// Extra `entry/src/main/resources/base/element/string.json` entries.
     pub(crate) strings: BTreeMap<String, String>,
+    /// Ability / extensionAbility `.ets` source files to stage into
+    /// `entry/src/main/<rel_path>` (keyed by normalized `ets/...` path).
+    pub(crate) ability_sources: BTreeMap<String, PathBuf>,
 }
 
 impl HarmonyMeta {
@@ -120,6 +123,9 @@ impl HarmonyMeta {
         )?;
         for warning in warnings {
             eprintln!("warning: {warning}");
+        }
+        if let Some(clash) = collector.clashes.first() {
+            bail!("{clash}");
         }
         Ok(collector.meta)
     }
@@ -250,7 +256,10 @@ impl ModuleMeta {
     pub(crate) fn apply(&self, app: &mut HarmonyMeta) -> anyhow::Result<()> {
         for clash in &self.clashes {
             let settled = match clash.kind {
-                "harmonyos.permissions" => app.permissions.iter().any(|p| p.name == clash.key),
+                "harmonyos.permissions" => app
+                    .permissions
+                    .iter()
+                    .any(|p| p.name == clash.key && (p.reason.is_some() || p.used_scene.is_some())),
                 "harmonyos.metadata" => app.metadata.iter().any(|m| m.name == clash.key),
                 "harmonyos.abilities" => app
                     .abilities
@@ -322,6 +331,17 @@ impl ModuleMeta {
                 .entry(key.clone())
                 .or_insert_with(|| value.clone());
         }
+        for (dest, src) in &self.meta.ability_sources {
+            app.ability_sources
+                .entry(dest.clone())
+                .or_insert_with(|| src.clone());
+        }
+        if app.query_schemes.len() > 50 {
+            bail!(
+                "harmonyos.querySchemes has {} entries (HarmonyOS allows at most 50)",
+                app.query_schemes.len()
+            );
+        }
         Ok(())
     }
 
@@ -342,9 +362,9 @@ impl ModuleMeta {
                 "permissions" => self.merge_permissions(owner, at, value, warnings)?,
                 "querySchemes" => self.merge_query_schemes(owner, at, value)?,
                 "metadata" => self.merge_metadata(owner, at, value)?,
-                "abilities" => self.merge_abilities(owner, at, value, false)?,
-                "extensionAbilities" => self.merge_abilities(owner, at, value, true)?,
-                "dependencies" => self.merge_dependencies(owner, dir, at, value)?,
+                "abilities" => self.merge_abilities(owner, dir, at, value, false, is_app)?,
+                "extensionAbilities" => self.merge_abilities(owner, dir, at, value, true, is_app)?,
+                "dependencies" => self.merge_dependencies(owner, dir, at, value, is_app)?,
                 "strings" => self.merge_strings(owner, at, value, is_app)?,
                 _ => warnings.push(format!(
                     "{owner}: {at} `harmonyos.{key}` is not something this nsh-platform-harmonyos reads: left out"
@@ -415,6 +435,11 @@ impl ModuleMeta {
             if !self.meta.query_schemes.contains(&scheme) {
                 self.meta.query_schemes.push(scheme);
             }
+            if self.meta.query_schemes.len() > 50 {
+                bail!(
+                    "{owner}: {at} `harmonyos.querySchemes` exceeds HarmonyOS limit of 50 schemes"
+                );
+            }
         }
         Ok(())
     }
@@ -430,9 +455,10 @@ impl ModuleMeta {
             let name = obj
                 .get("name")
                 .and_then(Value::as_str)
-                .filter(|s| !s.trim().is_empty())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && s.len() <= 255 && !s.contains('\0'))
                 .with_context(|| {
-                    format!("{owner}: {at} `harmonyos.metadata` entry requires a non-empty `name`")
+                    format!("{owner}: {at} `harmonyos.metadata` entry requires a valid non-empty `name` (<= 255 chars)")
                 })?
                 .to_owned();
             let val = match obj.get("value") {
@@ -496,9 +522,11 @@ impl ModuleMeta {
     fn merge_abilities(
         &mut self,
         owner: &str,
+        dir: Option<&Path>,
         at: &str,
         value: &Value,
         extension: bool,
+        is_app: bool,
     ) -> anyhow::Result<()> {
         let kind = if extension {
             "harmonyos.extensionAbilities"
@@ -534,9 +562,59 @@ impl ModuleMeta {
                 .with_context(|| {
                     format!("{owner}: {at} `{kind}` `{name}` requires a non-empty `srcEntry`")
                 })?;
-            if src_entry.contains('\0') {
-                bail!("{owner}: {at} `{kind}` `{name}`: invalid `srcEntry`");
+            let dest_rel = normalize_ets_entry(src_entry).with_context(|| {
+                format!("{owner}: {at} `{kind}` `{name}`: invalid `srcEntry` {src_entry:?}")
+            })?;
+            if extension {
+                let ext_type = obj
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .with_context(|| {
+                        format!("{owner}: {at} `{kind}` `{name}` requires a non-empty `type`")
+                    })?;
+                if ext_type == "dataShare"
+                    && obj
+                        .get("uri")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .is_none()
+                {
+                    bail!(
+                        "{owner}: {at} `{kind}` `{name}`: `dataShare` extensionAbility requires a non-empty `uri`"
+                    );
+                }
             }
+            let mut cleaned = obj.clone();
+            let staged_src = if let Some(raw_file) = cleaned.remove("srcFile") {
+                let rel = raw_file
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "{owner}: {at} `{kind}` `{name}`: `srcFile` must be a non-empty path string"
+                        )
+                    })?;
+                Some(resolve_local_file(
+                    owner, at, kind, name, "srcFile", rel, dir, is_app,
+                )?)
+            } else {
+                dir.and_then(|d| {
+                    let direct = d.join(&dest_rel);
+                    if direct.is_file() {
+                        return Some(direct.canonicalize().unwrap_or(direct));
+                    }
+                    let under_ohos = d.join("ohos").join(&dest_rel);
+                    if under_ohos.is_file() {
+                        return Some(under_ohos.canonicalize().unwrap_or(under_ohos));
+                    }
+                    None
+                })
+            };
+
             let owner_key = format!("{kind}.{name}");
             match target
                 .iter()
@@ -544,9 +622,19 @@ impl ModuleMeta {
             {
                 None => {
                     self.owners.insert(owner_key, owner.to_owned());
-                    target.push(obj.clone());
+                    target.push(cleaned);
+                    if let Some(src_path) = staged_src {
+                        self.meta.ability_sources.insert(dest_rel, src_path);
+                    }
                 }
-                Some(existing) if existing == obj => {}
+                Some(existing) if existing == &cleaned => {
+                    if let Some(src_path) = staged_src {
+                        self.meta
+                            .ability_sources
+                            .entry(dest_rel)
+                            .or_insert(src_path);
+                    }
+                }
                 Some(_) => {
                     let first = self
                         .owners
@@ -571,6 +659,7 @@ impl ModuleMeta {
         dir: Option<&Path>,
         at: &str,
         value: &Value,
+        is_app: bool,
     ) -> anyhow::Result<()> {
         let table = value.as_object().with_context(|| {
             format!(
@@ -595,7 +684,7 @@ impl ModuleMeta {
                         "{owner}: {at} `harmonyos.dependencies.{pkg}` must be a non-empty string"
                     )
                 })?;
-            let dep = parse_ohpm_dep(owner, at, pkg, spec, dir)?;
+            let dep = parse_ohpm_dep(owner, at, pkg, spec, dir, is_app)?;
             let owner_key = format!("harmonyos.dependencies.{pkg}");
             match self.meta.dependencies.get(pkg) {
                 None => {
@@ -634,7 +723,9 @@ impl ModuleMeta {
         for (key, text) in table {
             validate_resource_name(key)
                 .with_context(|| format!("{owner}: {at} `harmonyos.strings`"))?;
-            if key == "app_name" || (!is_app && key == "nsh_microphone_reason") {
+            if key == "app_name"
+                || (!is_app && (key == "nsh_microphone_reason" || key.starts_with("nsh_perm_")))
+            {
                 bail!("{owner}: {at} `harmonyos.strings.{key}` is a key NSH sets itself");
             }
             let text = text.as_str().with_context(|| {
@@ -771,6 +862,11 @@ fn parse_used_scene(
             when: "inuse".to_owned(),
         }));
     }
+    if !has_reason {
+        bail!(
+            "{owner}: {at} `harmonyos.permissions` `{name}`: `usedScene` / `abilities` / `when` requires a `reason`"
+        );
+    }
 
     if let Some(s) = scene_obj {
         for k in s.keys() {
@@ -782,7 +878,7 @@ fn parse_used_scene(
         }
     }
 
-    let abilities = match abilities_val {
+    let raw_abilities = match abilities_val {
         None => vec!["EntryAbility".to_owned()],
         Some(v) => v
             .as_array()
@@ -801,6 +897,12 @@ fn parse_used_scene(
                 format!("{owner}: {at} `harmonyos.permissions` `{name}`: `abilities` must be a non-empty list of strings")
             })?,
     };
+    let mut abilities = Vec::with_capacity(raw_abilities.len());
+    for ability in raw_abilities {
+        if !abilities.contains(&ability) {
+            abilities.push(ability);
+        }
+    }
     let when = match when_val {
         None => "inuse".to_owned(),
         Some(v) => {
@@ -849,6 +951,9 @@ fn normalize_permission_name(
 
 fn normalize_query_scheme(raw: &str) -> anyhow::Result<String> {
     let trimmed = raw.trim();
+    if trimmed.len() > 128 {
+        bail!("scheme exceeds 128 characters");
+    }
     let mut chars = trimmed.chars();
     let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
         && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
@@ -860,8 +965,16 @@ fn normalize_query_scheme(raw: &str) -> anyhow::Result<String> {
     Ok(trimmed.to_ascii_lowercase())
 }
 
+fn valid_ohpm_segment(seg: &str) -> bool {
+    let mut bytes = seg.bytes();
+    bytes.next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        && !seg.contains("..")
+}
+
 fn validate_ohpm_package_name(name: &str) -> anyhow::Result<()> {
     if name.is_empty()
+        || name.len() > 214
         || name.contains('\0')
         || name.contains('\\')
         || name.contains("..")
@@ -871,18 +984,105 @@ fn validate_ohpm_package_name(name: &str) -> anyhow::Result<()> {
         bail!("invalid ohpm package name {name:?}");
     }
     let slashes = name.matches('/').count();
-    if name.starts_with('@') {
+    if let Some(rest) = name.strip_prefix('@') {
         if slashes != 1 {
             bail!("scoped ohpm package name {name:?} must be `@scope/name`");
         }
-        let (scope, pkg) = name.split_once('/').unwrap();
-        if scope.len() <= 1 || pkg.is_empty() {
+        let (scope, pkg) = rest.split_once('/').unwrap();
+        if !valid_ohpm_segment(scope) || !valid_ohpm_segment(pkg) {
             bail!("invalid scoped ohpm package name {name:?}");
         }
-    } else if slashes > 0 {
-        bail!("unscoped ohpm package name {name:?} must not contain `/`");
+    } else if slashes > 0 || !valid_ohpm_segment(name) {
+        bail!("invalid ohpm package name {name:?}");
     }
     Ok(())
+}
+
+fn normalize_ets_entry(src_entry: &str) -> anyhow::Result<String> {
+    let trimmed = src_entry.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') || trimmed.contains('\\') {
+        bail!("must be a clean `./ets/.../*.ets` path");
+    }
+    let rel = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    if !rel.starts_with("ets/") || !rel.ends_with(".ets") {
+        bail!("must point to an `.ets` file under `./ets/`");
+    }
+    let path = Path::new(rel);
+    if path.is_absolute()
+        || path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!("must not escape `entry/src/main/ets/`");
+    }
+    Ok(rel.to_owned())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_local_file(
+    owner: &str,
+    at: &str,
+    kind: &str,
+    name: &str,
+    field: &str,
+    rel: &str,
+    base_dir: Option<&Path>,
+    is_app: bool,
+) -> anyhow::Result<PathBuf> {
+    if rel.contains('\0') {
+        bail!("{owner}: {at} `{kind}` `{name}`: invalid `{field}`");
+    }
+    let rel_path = Path::new(rel);
+    if !is_app
+        && (rel_path.is_absolute()
+            || rel_path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }))
+    {
+        bail!(
+            "{owner}: {at} `{kind}` `{name}`: `{field}` ({rel:?}) must be a relative path inside the crate directory"
+        );
+    }
+    let path = if rel_path.is_absolute() {
+        rel_path.to_path_buf()
+    } else {
+        let dir = base_dir.with_context(|| {
+            format!("{owner}: {at} `{kind}` `{name}`: no base directory for `{field}` {rel:?}")
+        })?;
+        dir.join(rel_path)
+    };
+    if let Some(dir) = base_dir
+        && dir.exists()
+    {
+        if !path.is_file() {
+            bail!(
+                "{owner}: {at} `{kind}` `{name}`: `{field}` not found at {}",
+                path.display()
+            );
+        }
+        let resolved = path.canonicalize().unwrap_or(path);
+        if !is_app {
+            let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+            if !resolved.starts_with(&root) {
+                bail!(
+                    "{owner}: {at} `{kind}` `{name}`: `{field}` resolves outside {}",
+                    root.display()
+                );
+            }
+        }
+        return Ok(resolved);
+    }
+    Ok(path.canonicalize().unwrap_or(path))
 }
 
 fn validate_resource_name(name: &str) -> anyhow::Result<()> {
@@ -903,6 +1103,7 @@ fn parse_ohpm_dep(
     pkg: &str,
     spec: &str,
     base_dir: Option<&Path>,
+    is_app: bool,
 ) -> anyhow::Result<OhpmDep> {
     let local_rel = if let Some(rest) = spec.strip_prefix("file:") {
         Some(rest)
@@ -916,17 +1117,54 @@ fn parse_ohpm_dep(
         None
     };
     if let Some(rel) = local_rel {
-        if rel.is_empty() {
+        if rel.is_empty() || rel.contains('\0') {
             bail!("{owner}: {at} `harmonyos.dependencies.{pkg}`: empty file path");
         }
-        let path = if Path::new(rel).is_absolute() {
+        let rel_path = Path::new(rel);
+        if !is_app
+            && (rel_path.is_absolute()
+                || rel_path.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                }))
+        {
+            bail!(
+                "{owner}: {at} `harmonyos.dependencies.{pkg}`: local path {rel:?} must stay inside the crate directory"
+            );
+        }
+        let path = if rel_path.is_absolute() {
             PathBuf::from(rel)
         } else {
             let dir = base_dir.with_context(|| {
                 format!("{owner}: {at} `harmonyos.dependencies.{pkg}`: no base directory for local path {rel:?}")
             })?;
-            dir.join(rel)
+            dir.join(rel_path)
         };
+        if let Some(dir) = base_dir
+            && dir.exists()
+        {
+            if !path.exists() {
+                bail!(
+                    "{owner}: {at} `harmonyos.dependencies.{pkg}`: local package not found at {}",
+                    path.display()
+                );
+            }
+            let resolved = path.canonicalize().unwrap_or(path);
+            if !is_app {
+                let root = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+                if !resolved.starts_with(&root) {
+                    bail!(
+                        "{owner}: {at} `harmonyos.dependencies.{pkg}`: local path resolves outside {}",
+                        root.display()
+                    );
+                }
+            }
+            return Ok(OhpmDep::LocalPath(resolved));
+        }
         let resolved = path.canonicalize().unwrap_or(path);
         Ok(OhpmDep::LocalPath(resolved))
     } else {
@@ -936,6 +1174,8 @@ fn parse_ohpm_dep(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use serde_json::json;
 
     use super::*;
@@ -1100,5 +1340,82 @@ mod tests {
         let (ok, warnings) = run(json!({ "permissions": ["camera"], "futureKey": true })).unwrap();
         assert_eq!(ok.meta.permissions[0].name, "ohos.permission.camera");
         assert_eq!(warnings.len(), 2, "{warnings:?}");
+    }
+
+    #[test]
+    fn validates_strict_metadata_rules_and_stages_ability_sources() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-meta-strict-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let echo_ets = dir.join("EchoAbility.ets");
+        fs::write(&echo_ets, "export default class EchoAbility {}").unwrap();
+
+        let run = |hm: Value| {
+            ModuleMeta::from_metadata(&metadata(&[(
+                "bad",
+                "/work/bad/Cargo.toml",
+                json!({ "nsh": { "harmonyos": hm } }),
+                &[],
+            )]))
+        };
+        // usedScene without reason is rejected by HarmonyOS.
+        assert!(run(json!({ "permissions": [{ "name": "CAMERA", "when": "inuse" }] })).is_err());
+        // Crates cannot hijack generated nsh_perm_* string keys.
+        assert!(run(json!({ "strings": { "nsh_perm_camera": "hijack" } })).is_err());
+        // extensionAbilities require type, and dataShare requires uri.
+        assert!(
+            run(json!({ "extensionAbilities": [{ "name": "ExtA", "srcEntry": "./ets/a/ExtA.ets" }] }))
+                .is_err()
+        );
+        assert!(
+            run(json!({ "extensionAbilities": [{ "name": "DsA", "srcEntry": "./ets/a/DsA.ets", "type": "dataShare" }] }))
+                .is_err()
+        );
+        // srcEntry must stay under ./ets/*.ets.
+        assert!(
+            run(json!({ "abilities": [{ "name": "BadAb", "srcEntry": "./ets/../escape.ets" }] }))
+                .is_err()
+        );
+        // Crate dependencies cannot traverse outside the crate.
+        assert!(run(json!({ "dependencies": { "@acme/x": "file:../outside" } })).is_err());
+        // querySchemes limit (>50).
+        let too_many: Vec<String> = (0..51).map(|i| format!("scheme{i}")).collect();
+        assert!(run(json!({ "querySchemes": too_many })).is_err());
+        // Intra-nsh.json permission clash fails.
+        assert!(
+            HarmonyMeta::from_app_json(
+                &dir,
+                &json!({
+                    "harmonyos": {
+                        "permissions": [
+                            { "name": "CAMERA", "reason": "One" },
+                            { "name": "CAMERA", "reason": "Two" }
+                        ]
+                    }
+                })
+            )
+            .is_err()
+        );
+        // srcFile on app ability is resolved and recorded in ability_sources.
+        let app = HarmonyMeta::from_app_json(
+            &dir,
+            &json!({
+                "harmonyos": {
+                    "abilities": [{
+                        "name": "EchoAbility",
+                        "srcEntry": "./ets/echo/EchoAbility.ets",
+                        "srcFile": "EchoAbility.ets"
+                    }]
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            app.ability_sources.get("ets/echo/EchoAbility.ets"),
+            Some(&echo_ets.canonicalize().unwrap())
+        );
+        assert!(app.abilities[0].get("srcFile").is_none());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

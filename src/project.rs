@@ -299,8 +299,10 @@ fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (Stri
         match permissions.iter_mut().find(|p| p.name == extra.name) {
             None => permissions.push(extra.clone()),
             Some(existing) => {
-                if extra.reason.is_some() || extra.used_scene.is_some() {
+                if extra.reason.is_some() {
                     existing.reason = extra.reason.clone();
+                }
+                if extra.used_scene.is_some() {
                     existing.used_scene = extra.used_scene.clone();
                 }
             }
@@ -383,7 +385,16 @@ fn build_abilities(schemes: &[String], extra: &[Map<String, Value>]) -> String {
         "skills": ability_skills_value(schemes),
     })];
     for ability in extra {
-        abilities.push(Value::Object(ability.clone()));
+        let mut obj = ability.clone();
+        obj.entry("icon".to_owned())
+            .or_insert_with(|| Value::String("$media:app_icon".to_owned()));
+        obj.entry("label".to_owned())
+            .or_insert_with(|| Value::String("$string:app_name".to_owned()));
+        obj.entry("startWindowIcon".to_owned())
+            .or_insert_with(|| Value::String("$media:app_icon".to_owned()));
+        obj.entry("startWindowBackground".to_owned())
+            .or_insert_with(|| Value::String("$color:start_window_background".to_owned()));
+        abilities.push(Value::Object(obj));
     }
     indent_json(&Value::Array(abilities), 4)
 }
@@ -446,6 +457,15 @@ fn sanitize_dep_dir(name: &str) -> String {
         .collect()
 }
 
+fn fnv1a_32(input: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for b in input.bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
 fn copy_ohpm_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from)? {
@@ -453,21 +473,61 @@ fn copy_ohpm_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
         let name = entry.file_name();
         if matches!(
             name.to_str(),
-            Some("oh_modules" | "node_modules" | "build" | ".hvigor" | ".git")
+            Some("oh_modules" | "node_modules" | "build" | ".hvigor" | ".git" | ".nsh" | "target")
         ) {
             continue;
         }
+        let path = entry.path();
         let target = to.join(&name);
-        if entry.file_type()?.is_dir() {
-            copy_ohpm_dir(&entry.path(), &target)?;
+        if path.is_dir() {
+            copy_ohpm_dir(&path, &target)?;
         } else {
-            fs::copy(entry.path(), target)?;
+            fs::copy(&path, target)?;
         }
     }
     Ok(())
 }
 
-fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Result<String> {
+fn existing_har_module_name(module_json: &Path) -> Option<String> {
+    let text = fs::read_to_string(module_json).ok()?;
+    let value: Value = serde_json::from_str(&text).ok()?;
+    let name = value.get("module")?.get("name")?.as_str()?.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
+fn ensure_har_module_files(dest_root: &Path, default_name: &str) -> anyhow::Result<String> {
+    let build_profile = dest_root.join("build-profile.json5");
+    if !build_profile.exists() {
+        write_file(
+            &build_profile,
+            b"{ \"apiType\": \"stageMode\", \"buildOption\": {}, \"targets\": [{ \"name\": \"default\" }] }\n",
+        )?;
+    }
+    let hvigorfile = dest_root.join("hvigorfile.ts");
+    if !hvigorfile.exists() {
+        write_file(
+            &hvigorfile,
+            b"import { harTasks } from \"@ohos/hvigor-ohos-plugin\";\nexport default { system: harTasks, plugins: [] };\n",
+        )?;
+    }
+    let module_json = join_all(dest_root, ["src", "main", "module.json5"]);
+    if let Some(existing) = existing_har_module_name(&module_json) {
+        return Ok(existing);
+    }
+    if !module_json.exists() {
+        let content = format!(
+            "{{ \"module\": {{ \"name\": \"{}\", \"type\": \"har\", \"deviceTypes\": [\"default\", \"tablet\", \"2in1\"] }} }}\n",
+            json_text(default_name),
+        );
+        write_file(&module_json, content.as_bytes())?;
+    }
+    Ok(default_name.to_owned())
+}
+
+fn stage_ohpm_dependencies(
+    out: &Path,
+    harmonyos: &HarmonyMeta,
+) -> anyhow::Result<(String, String)> {
     let mut deps = Map::new();
     deps.insert(
         "libnsh_platform_harmonyos.so".to_owned(),
@@ -477,7 +537,9 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
         "@nsh/harmonyos".to_owned(),
         Value::String("file:../nsh".to_owned()),
     );
-    for (index, (pkg, dep)) in harmonyos.dependencies.iter().enumerate() {
+    let mut extra_modules = String::new();
+    let mut seen_module_names = vec!["entry".to_owned(), "nsh_harmonyos".to_owned()];
+    for (pkg, dep) in &harmonyos.dependencies {
         let spec = match dep {
             OhpmDep::Version(version) => version.clone(),
             OhpmDep::LocalPath(src) => {
@@ -487,8 +549,13 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
                         src.display()
                     );
                 }
-                let folder = format!("{index}-{}", sanitize_dep_dir(pkg));
-                let dest_root = join_all(out, ["entry", "nshm-deps", &folder]);
+                // Stage outside `entry/` (at project root `nshm-deps/`, parallel to `nsh/`)
+                // and register directory HARs as project modules in root `build-profile.json5`
+                // so Hvigor compiles them under their declared package name with
+                // `useNormalizedOHMUrl: true`.
+                let hash = fnv1a_32(pkg);
+                let folder = format!("{}-{hash:08x}", sanitize_dep_dir(pkg));
+                let dest_root = join_all(out, ["nshm-deps", &folder]);
                 if src.is_file() {
                     let file_name = src
                         .file_name()
@@ -502,7 +569,7 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
                             src.display()
                         )
                     })?;
-                    format!("file:./nshm-deps/{folder}/{file_name}")
+                    format!("file:../nshm-deps/{folder}/{file_name}")
                 } else if src.is_dir() {
                     copy_ohpm_dir(src, &dest_root).with_context(|| {
                         format!(
@@ -510,7 +577,20 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
                             src.display()
                         )
                     })?;
-                    format!("file:./nshm-deps/{folder}")
+                    let default_mod_name = format!("nshm_{hash:08x}");
+                    let mod_name = ensure_har_module_files(&dest_root, &default_mod_name)?;
+                    if seen_module_names.iter().any(|seen| seen == &mod_name) {
+                        bail!(
+                            "harmonyos.dependencies.{pkg}: HAR module name `{mod_name}` collides with another module in build-profile.json5"
+                        );
+                    }
+                    seen_module_names.push(mod_name.clone());
+                    extra_modules.push_str(&format!(
+                        "\n    {{\n      \"name\": \"{}\",\n      \"srcPath\": \"./nshm-deps/{}\"\n    }},",
+                        json_text(&mod_name),
+                        json_text(&folder),
+                    ));
+                    format!("file:../nshm-deps/{folder}")
                 } else {
                     bail!(
                         "harmonyos.dependencies.{pkg}: {} is neither a file nor a directory",
@@ -521,7 +601,7 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
         };
         deps.insert(pkg.clone(), Value::String(spec));
     }
-    Ok(indent_json(&Value::Object(deps), 2))
+    Ok((indent_json(&Value::Object(deps), 2), extra_modules))
 }
 
 fn build_entry_build_option(harmonyos: &HarmonyMeta) -> String {
@@ -568,6 +648,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
     // What a previous package wrote and this one replaces as a whole.
     for stale in [
         &["nsh"][..],
+        &["nshm-deps"],
         &["entry", "libs"],
         &["entry", "nshm-deps"],
         &["entry", "src", "main", "resources", "rawfile"],
@@ -583,7 +664,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         build_permissions_and_strings(config.speech, &config.harmonyos);
     let abilities = build_abilities(&config.schemes, &config.harmonyos.abilities);
     let module_extras = build_module_extras(&config.harmonyos);
-    let entry_dependencies = stage_ohpm_dependencies(out, &config.harmonyos)?;
+    let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
 
     let substitutions = [
@@ -596,6 +677,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         ("{{runtimeOS}}", runtime_os.to_owned()),
         ("{{signingConfigs}}", signing),
         ("{{productSigning}}", product_signing),
+        ("{{extraModules}}", extra_modules),
         ("{{requestPermissions}}", request_permissions),
         ("{{usesWebView}}", config.webview.to_string()),
         ("{{abilities}}", abilities),
@@ -611,16 +693,16 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         }
         let target = join_relative(out, path);
         let bytes = match std::str::from_utf8(bytes) {
-            Ok(text) if text.contains("{{") => {
-                let mut text = text.to_owned();
-                for (key, value) in &substitutions {
-                    text = text.replace(key, value);
-                }
-                text.into_bytes()
-            }
+            Ok(text) if text.contains("{{") => render_template(text, &substitutions).into_bytes(),
             _ => bytes.to_vec(),
         };
         write_file(&target, &bytes)?;
+    }
+    for (dest_rel, src_file) in &config.harmonyos.ability_sources {
+        let dest = join_relative(join_all(out, ["entry", "src", "main"]), dest_rel);
+        let bytes = fs::read(src_file)
+            .with_context(|| format!("reading ability source {}", src_file.display()))?;
+        write_file(&dest, &bytes)?;
     }
     if let Some(icon) = &config.icon {
         let target = join_all(
@@ -670,6 +752,29 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         copy_dir(&assets, &rawfile.join("assets"))?;
     }
     Ok(())
+}
+
+fn render_template(template: &str, substitutions: &[(&str, String)]) -> String {
+    let mut out = String::with_capacity(template.len() + 256);
+    let mut rest = template;
+    while let Some(open) = rest.find("{{") {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open..];
+        if let Some(close) = after_open.find("}}") {
+            let token = &after_open[..close + 2];
+            if let Some((_, value)) = substitutions.iter().find(|(k, _)| *k == token) {
+                out.push_str(value);
+            } else {
+                out.push_str(token);
+            }
+            rest = &after_open[close + 2..];
+        } else {
+            out.push_str(after_open);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
@@ -1130,7 +1235,7 @@ mod tests {
         assert_eq!(deps["@ohos/lottie"], "^2.0.0");
         let scanner_rel = deps["@acme/scanner"].as_str().unwrap();
         assert!(
-            scanner_rel.starts_with("file:./nshm-deps/") && scanner_rel.ends_with("/scanner.har"),
+            scanner_rel.starts_with("file:../nshm-deps/") && scanner_rel.ends_with("/scanner.har"),
             "{scanner_rel}"
         );
         assert!(
@@ -1141,11 +1246,21 @@ mod tests {
             .is_file()
         );
         let kit_rel = deps["@acme/local-kit"].as_str().unwrap();
-        assert!(kit_rel.starts_with("file:./nshm-deps/"), "{kit_rel}");
+        assert!(kit_rel.starts_with("file:../nshm-deps/"), "{kit_rel}");
+        let kit_staged = join_relative(out.join("entry"), kit_rel.strip_prefix("file:").unwrap());
+        assert!(kit_staged.join("oh-package.json5").is_file());
+        assert!(kit_staged.join("build-profile.json5").is_file());
+        assert!(kit_staged.join("hvigorfile.ts").is_file());
+        assert!(join_all(&kit_staged, ["src", "main", "module.json5"]).is_file());
+        let root_profile: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("build-profile.json5")).unwrap())
+                .unwrap();
+        let modules = root_profile["modules"].as_array().unwrap();
         assert!(
-            join_relative(out.join("entry"), kit_rel.strip_prefix("file:").unwrap())
-                .join("oh-package.json5")
-                .is_file()
+            modules.iter().any(|m| m["srcPath"]
+                .as_str()
+                .is_some_and(|p| p.starts_with("./nshm-deps/"))),
+            "{root_profile}"
         );
         let entry_profile: Value = serde_json::from_str(
             &fs::read_to_string(join_all(&out, ["entry", "build-profile.json5"])).unwrap(),
@@ -1155,6 +1270,102 @@ mod tests {
             entry_profile["buildOption"]["arkOptions"]["runtimeOnly"]["packages"],
             json!(["@acme/local-kit", "@acme/scanner", "@ohos/lottie"])
         );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn preserves_microphone_reason_injects_ability_defaults_and_avoids_template_injection() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-hardening-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        let build = dir.join("build");
+        fs::create_dir_all(&app_dir).unwrap();
+        fs::create_dir_all(&build).unwrap();
+        fs::write(
+            app_dir.join("EchoAbility.ets"),
+            "export default class EchoAbility {}",
+        )
+        .unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+
+        let config = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "name": "Demo {{abilities}}",
+                "id": "com.example.hardening",
+                "capabilities": { "speech": true },
+                "harmonyos": {
+                    "permissions": [
+                        { "name": "MICROPHONE", "reason": "Custom mic reason", "when": "always" }
+                    ],
+                    "abilities": [
+                        {
+                            "name": "EchoAbility",
+                            "srcEntry": "./ets/echo/EchoAbility.ets",
+                            "srcFile": "EchoAbility.ets"
+                        }
+                    ]
+                }
+            }),
+        )
+        .unwrap();
+
+        let out = dir.join("project");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+        write(&out, &config, &contents).unwrap();
+
+        // Single-pass render_template must not expand {{abilities}} inside appName.
+        let app_strings = fs::read_to_string(join_all(
+            &out,
+            ["AppScope", "resources", "base", "element", "string.json"],
+        ))
+        .unwrap();
+        assert!(app_strings.contains("Demo {{abilities}}"), "{app_strings}");
+
+        // Extra ability gets mandatory defaults and its .ets source is staged.
+        let module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap(),
+        )
+        .unwrap();
+        let echo = module["module"]["abilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "EchoAbility")
+            .unwrap();
+        assert_eq!(echo["icon"], "$media:app_icon");
+        assert_eq!(echo["label"], "$string:app_name");
+        assert_eq!(echo["startWindowIcon"], "$media:app_icon");
+        assert_eq!(
+            echo["startWindowBackground"],
+            "$color:start_window_background"
+        );
+        assert!(
+            join_all(
+                &out,
+                ["entry", "src", "main", "ets", "echo", "EchoAbility.ets"]
+            )
+            .is_file()
+        );
+
+        // MICROPHONE merges cleanly and preserves custom reason + when="always".
+        let mic = module["module"]["requestPermissions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["name"] == "ohos.permission.MICROPHONE")
+            .unwrap();
+        assert_eq!(mic["reason"], "$string:nsh_perm_microphone");
+        assert_eq!(mic["usedScene"]["when"], "always");
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -53,8 +53,8 @@ fn backend(dev: bool, api: ApiLevel) -> String {
         .filter(|dir| join_all(dir, ["crates", "nsh-platform-harmonyos", "Cargo.toml"]).is_file());
     match checkout {
         Some(dir) => format!(
-            "{{ package = \"nsh-platform-harmonyos\", path = {:?}{features} }}",
-            join_all(&dir, ["crates", "nsh-platform-harmonyos"]).to_string_lossy()
+            "{{ package = \"nsh-platform-harmonyos\", path = {}{features} }}",
+            toml_string(&join_all(&dir, ["crates", "nsh-platform-harmonyos"]).to_string_lossy())
         ),
         None => format!(
             "{{ package = \"nsh-platform-harmonyos\", git = \"https://github.com/huacnlee/nsh-platform-harmonyos\", tag = \"v{}\"{features} }}",
@@ -130,52 +130,52 @@ fn workspace_patches(workspace_manifest: &str) -> String {
     out
 }
 
-/// The `[patch]` sections of the generated workspace in `workspace`, or the
-/// backend's own revision of NSH when it has none.
-fn patches_of(workspace: &Path) -> String {
-    fs::read_to_string(workspace.join("Cargo.toml"))
-        .ok()
-        .map(|m| workspace_patches(&m))
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned())
+/// Formats `s` as a valid TOML basic string (JSON string escaping is a subset of TOML).
+pub(crate) fn toml_string(s: &str) -> String {
+    serde_json::to_string(s).expect("serializing TOML string")
 }
 
-/// Merges `[patch]` entries from `nsh.lock` into `base` without duplicating
-/// existing table headers or already-patched packages.
-fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
-    if entries.is_empty() {
-        return base.to_owned();
+/// Formats `key` as a TOML bare key when safe, otherwise a quoted basic string.
+fn toml_key(key: &str) -> String {
+    if !key.is_empty()
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        key.to_owned()
+    } else {
+        toml_string(key)
     }
+}
+
+fn unquote_toml_key(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2 {
+        serde_json::from_str::<String>(trimmed).unwrap_or_else(|_| trimmed.to_owned())
+    } else if trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2 {
+        trimmed[1..trimmed.len() - 1].to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// Parses `[patch.*]` sections from TOML text into ordered `(header, lines)` pairs.
+fn parse_patch_sections(text: &str) -> Vec<(String, Vec<String>)> {
     let mut sections: Vec<(String, Vec<String>)> = Vec::new();
-    for line in base.lines() {
+    for line in text.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with('[') {
             sections.push((trimmed.to_owned(), Vec::new()));
-        } else if let Some((_, lines)) = sections.last_mut() {
+        } else if !trimmed.is_empty()
+            && let Some((_, lines)) = sections.last_mut()
+        {
             lines.push(line.to_owned());
         }
     }
-    for entry in entries {
-        let header = entry.table.header();
-        let line = format!(
-            "{} = {{ path = {:?} }}",
-            entry.package,
-            entry.path.to_string_lossy()
-        );
-        if let Some((_, lines)) = sections.iter_mut().find(|(h, _)| *h == header) {
-            let already = lines.iter().any(|existing| {
-                existing
-                    .trim()
-                    .split_once('=')
-                    .is_some_and(|(k, _)| k.trim() == entry.package)
-            });
-            if !already {
-                lines.push(line);
-            }
-        } else {
-            sections.push((header, vec![line]));
-        }
-    }
+    sections
+}
+
+fn format_patch_sections(sections: Vec<(String, Vec<String>)>) -> String {
     let mut out = String::new();
     for (header, lines) in sections {
         out.push_str(&header);
@@ -186,6 +186,88 @@ fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
         }
     }
     out
+}
+
+fn insert_patch_line(
+    sections: &mut Vec<(String, Vec<String>)>,
+    header: &str,
+    pkg_key: &str,
+    line: String,
+) {
+    if let Some((_, lines)) = sections.iter_mut().find(|(h, _)| h == header) {
+        let already = lines.iter().any(|existing| {
+            existing
+                .trim()
+                .split_once('=')
+                .is_some_and(|(k, _)| unquote_toml_key(k) == pkg_key)
+        });
+        if !already {
+            lines.push(line);
+        }
+    } else {
+        sections.push((header.to_owned(), vec![line]));
+    }
+}
+
+fn has_patch_package(sections: &[(String, Vec<String>)], header: &str, pkg_key: &str) -> bool {
+    sections
+        .iter()
+        .find(|(h, _)| h == header)
+        .is_some_and(|(_, lines)| {
+            lines.iter().any(|existing| {
+                existing
+                    .trim()
+                    .split_once('=')
+                    .is_some_and(|(k, _)| unquote_toml_key(k) == pkg_key)
+            })
+        })
+}
+
+/// The `[patch]` sections of the generated workspace in `workspace`, merged with
+/// the backend's own `NSH_PATCH` defaults whenever the workspace does not
+/// already own the `nsh-core` patch (so non-NSH `[patch]` tables in
+/// `.nsh/rust/Cargo.toml` never drop the backend's NSH crate pins, while local
+/// NSH checkouts are never mixed with `NSH_PATCH`'s git rev).
+fn patches_of(workspace: &Path) -> String {
+    let ws_raw = fs::read_to_string(workspace.join("Cargo.toml"))
+        .ok()
+        .map(|m| workspace_patches(&m))
+        .unwrap_or_default();
+    if ws_raw.trim().is_empty() {
+        return crate::embedded::NSH_PATCH.to_owned();
+    }
+    let mut sections = parse_patch_sections(&ws_raw);
+    if has_patch_package(&sections, "[patch.crates-io]", "nsh-core") {
+        return ws_raw;
+    }
+    for (header, lines) in parse_patch_sections(crate::embedded::NSH_PATCH) {
+        for line in lines {
+            if let Some((k, _)) = line.trim().split_once('=') {
+                let key = unquote_toml_key(k);
+                insert_patch_line(&mut sections, &header, &key, line);
+            }
+        }
+    }
+    format_patch_sections(sections)
+}
+
+/// Merges `[patch]` entries from `nsh.lock` into `base` without duplicating
+/// existing table headers or already-patched packages.
+fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
+    if entries.is_empty() {
+        return base.to_owned();
+    }
+    let mut sections = parse_patch_sections(base);
+    for entry in entries {
+        let header = entry.table.header();
+        let line = format!(
+            "{} = {{ path = {} }}",
+            toml_key(&entry.package),
+            toml_string(&entry.path.to_string_lossy()),
+        );
+        insert_patch_line(&mut sections, &header, &entry.package, line);
+    }
+    format_patch_sections(sections)
 }
 
 /// Writes the runner crate in `dir` for `app`.
@@ -207,8 +289,9 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyho
             };
             (
                 format!(
-                    "nsh_rust_app = {{ package = {package:?}, path = {:?} }}\n",
-                    rust_app.to_string_lossy()
+                    "nsh_rust_app = {{ package = {}, path = {} }}\n",
+                    toml_string(package),
+                    toml_string(&rust_app.to_string_lossy()),
                 ),
                 patches,
                 "// An app written in Rust: its UI sets (`nsh/base`'s, then its crates')\n\
@@ -773,5 +856,32 @@ sys.exit(101)
         assert!(err.contains("error[E0425]"), "{err}");
         assert!(err.contains("src/lib.rs:42:9"), "{err}");
         assert!(err.len() <= STDERR_TAIL_LIMIT + 512, "len={}", err.len());
+    }
+
+    #[test]
+    fn preserves_backend_nsh_pins_when_workspace_only_patches_third_party_crates() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-patch-merge-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let ws = dir.join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(
+            ws.join("Cargo.toml"),
+            "[workspace]\n[patch.\"https://github.com/acme/kit\"]\nacme-kit = { path = \"/tmp/kit\" }\n",
+        )
+        .unwrap();
+        let merged = patches_of(&ws);
+        assert!(
+            merged.contains("[patch.\"https://github.com/acme/kit\"]"),
+            "{merged}"
+        );
+        assert!(
+            merged.contains("acme-kit = { path = \"/tmp/kit\" }"),
+            "{merged}"
+        );
+        if crate::embedded::NSH_PATCH.contains("nsh-core =") {
+            assert!(merged.contains("nsh-core ="), "{merged}");
+        }
+        assert_eq!(toml_string("/tmp/项目/a\"b"), r#""/tmp/项目/a\"b""#);
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

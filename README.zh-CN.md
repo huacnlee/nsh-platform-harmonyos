@@ -109,7 +109,7 @@ value = "123456"
 "@acme/kit" = "file:ohos/kit.har"
 ```
 
-支持字段：`permissions`（写入 `module.json5` 的 `requestPermissions`，纯文本 `reason` 自动写入 `string.json`）、`querySchemes`、`metadata`、`abilities`、`extensionAbilities`、`dependencies`（写入 `entry/oh-package.json5` 及 `entry/build-profile.json5` 的 `arkOptions.runtimeOnly.packages` 供 N-API 动态加载，本地 `.har`/目录自动复制到 `entry/nshm-deps/`）与 `strings`。应用 `nsh.json` 中的 `"harmonyos"` 优先级最高，可覆盖 crate 声明并解决多 crate 冲突。
+支持字段：`permissions`（写入 `module.json5` 的 `requestPermissions`，纯文本 `reason` 自动写入 `string.json`）、`querySchemes`、`metadata`、`abilities`（支持可选 `srcFile` 自动复制 `.ets` 源码，并自动补齐 HarmonyOS 必填的图标/标签默认字段）、`extensionAbilities`、`dependencies`（写入 `entry/oh-package.json5` 及 `entry/build-profile.json5` 的 `arkOptions.runtimeOnly.packages` 供 N-API 动态加载，本地 `.har`/目录自动复制到项目根目录 `nshm-deps/`，本地目录 HAR 同时注册到根 `build-profile.json5` 的 `modules`）与 `strings`。应用 `nsh.json` 中的 `"harmonyos"` 优先级最高，可覆盖 crate 声明并解决多 crate 冲突。
 
 ## 发布到鸿蒙手机
 
