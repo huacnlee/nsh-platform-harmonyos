@@ -98,6 +98,33 @@ session's reverse forward. Desktop window sizing, mouse and paste operations are
 not supported. An unqualified `nsh test` still runs headless; this command runs
 TypeScript tests, while Rust unit tests remain `cargo test` on the computer.
 
+## Using nshm & HarmonyOS package metadata
+
+TSX apps and Rust apps can install third-party or HarmonyOS-specific [nshm](https://nsh.dev/docs/nshm) packages with `nsh add`:
+
+- **Rust nshms in TSX apps**: `nsh package` / `run` / `dev` / `test` automatically link Rust nshms locked in `nsh.lock` (entries with `"module"`, honoring `nsh.json` `"dependencies.<name>.features"`), as well as transitive Cargo nshms depended on by the app's own `"rust"` crates.
+- **HarmonyOS packaging metadata**: Any crate in the runner's resolved OHOS dependency graph can declare HarmonyOS entries under `[package.metadata.nsh.harmonyos]` or feature-gated `[package.metadata.nsh.features.<feature>.harmonyos]`, and apps can configure or override them in `nsh.json` under `"harmonyos"`:
+
+```toml
+[package.metadata.nsh.features.camera.harmonyos]
+querySchemes = ["weixin"]
+
+[[package.metadata.nsh.features.camera.harmonyos.permissions]]
+name = "ohos.permission.CAMERA" # or bare "CAMERA"
+reason = "Take photos with the camera."
+when = "inuse" # "inuse" (default) or "always"
+
+[[package.metadata.nsh.features.camera.harmonyos.metadata]]
+name = "client_id"
+value = "123456"
+
+[package.metadata.nsh.features.camera.harmonyos.dependencies]
+"@ohos/lottie" = "^2.0.0"
+"@acme/kit" = "file:ohos/kit.har"
+```
+
+Supported keys: `permissions` (merged into `module.json5` `requestPermissions`, with plain-text `reason` auto-added to `string.json`), `querySchemes`, `metadata`, `abilities`, `extensionAbilities`, `dependencies` (merged into `entry/oh-package.json5`, with local `.har`/directory paths copied into `entry/nshm-deps/`), and `strings`. The app's `nsh.json` `"harmonyos"` wins over crate entries and resolves clashes between crates.
+
 ## Publishing to HarmonyOS phones
 
 HarmonyOS NEXT (5.0 and later) is built on OpenHarmony: ArkUI's C API, N-API, the NDK and the

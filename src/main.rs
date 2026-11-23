@@ -21,6 +21,8 @@
 mod embedded {
     include!(concat!(env!("OUT_DIR"), "/embedded.rs"));
 }
+mod module_meta;
+mod nshm;
 mod paths;
 mod project;
 mod runner;
@@ -381,7 +383,7 @@ fn package(
     dev: bool,
     options: &Options,
 ) -> anyhow::Result<Packaged> {
-    let config = project::AppConfig::read(app)?;
+    let mut config = project::AppConfig::read(app)?;
     let ndk = sdk::Ndk::find()?;
     ndk.check_api(options.api)?;
     let base_sdk = sdk::BaseSdk::find();
@@ -414,22 +416,29 @@ fn package(
     }
     let workspace = join_all(app, [".nsh", "rust"]);
     let rust_app = workspace.join("rust-app");
-    let crates;
+    let tsx;
     let linked = if is_rust_app(app) && rust_app.join("Cargo.toml").is_file() {
         runner::App::Rust(&rust_app)
     } else {
-        crates = app_crates(app)?;
-        if crates.is_empty() {
+        tsx = nshm::resolve_tsx_crates(app)?;
+        if tsx.crates.is_empty() {
             runner::App::Tsx
         } else {
             runner::App::TsxWithCrates {
-                crates: &crates,
+                crates: &tsx.crates,
+                patches: &tsx.patches,
                 workspace: &workspace,
             }
         }
     };
     let runner = work.join("runner");
     runner::write(&runner, linked, dev, options.api)?;
+    // Merge `[package.metadata.nsh.harmonyos]` (and active feature sections)
+    // from every resolved crate before compiling the native library so clashes
+    // and invalid declarations fail fast.
+    let crate_meta =
+        module_meta::ModuleMeta::of_manifest(&runner.join("Cargo.toml"), arch.triple())?;
+    crate_meta.apply(&mut config.harmonyos)?;
     let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
     project::write(
         out,
@@ -459,36 +468,6 @@ pub(crate) fn is_rust_app(app: &Path) -> bool {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
         .is_some_and(|json| json["root"].is_string())
-}
-
-/// The app's Rust crates (`nsh.json` `"rust"`: a directory or a list of
-/// them, relative to the app), for a TSX app whose crates export UI sets.
-fn app_crates(app: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let text = fs::read_to_string(app.join("nsh.json")).context("reading nsh.json")?;
-    let json: serde_json::Value = serde_json::from_str(&text).context("nsh.json")?;
-    crates_of(app, &json["rust"])
-}
-
-fn crates_of(app: &Path, rust: &serde_json::Value) -> anyhow::Result<Vec<PathBuf>> {
-    let dirs: Vec<&str> = match rust {
-        serde_json::Value::Null => Vec::new(),
-        serde_json::Value::String(dir) => vec![dir],
-        serde_json::Value::Array(dirs) => dirs
-            .iter()
-            .map(|d| {
-                d.as_str()
-                    .context("nsh.json \"rust\" entries must be crate directory paths")
-            })
-            .collect::<anyhow::Result<_>>()?,
-        _ => bail!("nsh.json \"rust\" must be a crate directory or an array of them"),
-    };
-    dirs.into_iter()
-        .map(|dir| {
-            let path = app.join(dir);
-            path.canonicalize()
-                .with_context(|| format!("nsh.json \"rust\": no crate at {}", path.display()))
-        })
-        .collect()
 }
 
 fn no_deveco(out: &Path) {
@@ -611,7 +590,7 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
             "libnsh_platform_harmonyos",
         ],
     );
-    for (link, target) in [
+    let mut links = vec![
         (
             join_all(project, ["entry", "oh_modules", "@nsh", "harmonyos"]),
             project.join("nsh"),
@@ -630,7 +609,32 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
             ),
             types,
         ),
-    ] {
+    ];
+    if let Ok(text) = fs::read_to_string(join_all(project, ["entry", "oh-package.json5"]))
+        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(deps) = json.get("dependencies").and_then(|v| v.as_object())
+    {
+        for (pkg, spec) in deps {
+            if matches!(
+                pkg.as_str(),
+                "@nsh/harmonyos" | "libnsh_platform_harmonyos.so"
+            ) {
+                continue;
+            }
+            let Some(rel) = spec.as_str().and_then(|s| s.strip_prefix("file:")) else {
+                continue;
+            };
+            let target = crate::paths::join_relative(project.join("entry"), rel);
+            if target.is_dir() {
+                let mut link = join_all(project, ["entry", "oh_modules"]);
+                for seg in pkg.split('/') {
+                    link.push(seg);
+                }
+                links.push((link, target));
+            }
+        }
+    }
+    for (link, target) in links {
         if let Some(parent) = link.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -957,21 +961,25 @@ mod tests {
         let app = app.canonicalize().unwrap();
         let json = |text: &str| serde_json::from_str::<serde_json::Value>(text).unwrap();
         assert_eq!(
-            crates_of(&app, &json(r#"{"rust": "."}"#)["rust"]).unwrap(),
+            nshm::crates_of(&app, &json(r#"{"rust": "."}"#)["rust"]).unwrap(),
             vec![app.clone()]
         );
         assert_eq!(
-            crates_of(
+            nshm::crates_of(
                 &app,
                 &json(r#"{"rust": ["native", "native/charts"]}"#)["rust"]
             )
             .unwrap(),
             vec![app.join("native"), join_all(&app, ["native", "charts"])]
         );
-        assert!(crates_of(&app, &json("{}")["rust"]).unwrap().is_empty());
-        assert!(crates_of(&app, &json(r#"{"rust": "missing"}"#)["rust"]).is_err());
-        assert!(crates_of(&app, &json(r#"{"rust": 123}"#)["rust"]).is_err());
-        assert!(crates_of(&app, &json(r#"{"rust": [1]}"#)["rust"]).is_err());
+        assert!(
+            nshm::crates_of(&app, &json("{}")["rust"])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(nshm::crates_of(&app, &json(r#"{"rust": "missing"}"#)["rust"]).is_err());
+        assert!(nshm::crates_of(&app, &json(r#"{"rust": 123}"#)["rust"]).is_err());
+        assert!(nshm::crates_of(&app, &json(r#"{"rust": [1]}"#)["rust"]).is_err());
         fs::remove_dir_all(&app).unwrap();
     }
 
@@ -1080,10 +1088,34 @@ mod tests {
         fs::create_dir_all(&types).unwrap();
         fs::write(types.join("Index.d.ts"), "export {};\n").unwrap();
         fs::write(project.join("nsh").join("index.ets"), "export {};\n").unwrap();
+        let extra_dep = join_all(&project, ["entry", "nshm-deps", "0-_acme_kit"]);
+        fs::create_dir_all(&extra_dep).unwrap();
+        fs::write(extra_dep.join("index.ets"), "export const ok = 1;\n").unwrap();
+        fs::write(
+            join_all(&project, ["entry", "oh-package.json5"]),
+            r#"{
+              "name": "entry",
+              "version": "1.0.0",
+              "dependencies": {
+                "@nsh/harmonyos": "file:../nsh",
+                "libnsh_platform_harmonyos.so": "file:../nsh/src/main/cpp/types/libnsh_platform_harmonyos",
+                "@acme/kit": "file:./nshm-deps/0-_acme_kit"
+              }
+            }"#,
+        )
+        .unwrap();
 
         link_packages(&project).unwrap();
         // Calling a second time replaces existing links/copies cleanly.
         link_packages(&project).unwrap();
+
+        assert!(
+            join_all(
+                &project,
+                ["entry", "oh_modules", "@acme", "kit", "index.ets"]
+            )
+            .is_file()
+        );
 
         assert!(
             join_all(

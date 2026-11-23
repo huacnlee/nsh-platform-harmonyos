@@ -1,8 +1,5 @@
 {
   "name": "entry",
   "version": "{{versionName}}",
-  "dependencies": {
-    "libnsh_platform_harmonyos.so": "file:../nsh/src/main/cpp/types/libnsh_platform_harmonyos",
-    "@nsh/harmonyos": "file:../nsh"
-  }
+  "dependencies": {{entryDependencies}}
 }

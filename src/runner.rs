@@ -15,6 +15,7 @@ use std::{
 use anyhow::{Context as _, bail};
 
 use crate::{
+    nshm::{LinkedCrate, PatchEntry},
     paths::join_all,
     sdk::{ApiLevel, Arch, Ndk},
 };
@@ -71,7 +72,7 @@ fn value<'a>(manifest: &'a str, line_start: &str, key: &str) -> Option<&'a str> 
 }
 
 /// The `[package] name` of a `Cargo.toml` manifest.
-fn package_name(manifest: &str) -> Option<&str> {
+pub(crate) fn package_name(manifest: &str) -> Option<&str> {
     let mut in_package = false;
     for line in manifest.lines() {
         let line = line.trim();
@@ -98,12 +99,15 @@ pub(crate) enum App<'a> {
     /// `rust-app` (`nsh_rust_app`), with its UI sets and root.
     Rust(&'a Path),
     /// A TSX app with Rust crates of its own (`nsh.json` `"rust"` without
-    /// `"root"`): the bundle is a raw file of the HAP, and the crates'
-    /// UI sets (each crate's `#[native_module]` `registry()`) are served
-    /// after `nsh/base`'s for it to import. `workspace` is NSH's generated
-    /// workspace (`.nsh/rust`), whose `[patch]` sections the runner takes.
+    /// `"root"`) and/or Rust nshms (`nsh.lock` `"module"`): the bundle is a
+    /// raw file of the HAP, and the crates' UI sets (each crate's
+    /// `#[native_module]` `registry()`) are served after `nsh/base`'s for it
+    /// to import. `workspace` is NSH's generated workspace (`.nsh/rust`),
+    /// whose `[patch]` sections the runner takes, augmented with `patches`
+    /// from `nsh.lock` when `.nsh/rust` is absent.
     TsxWithCrates {
-        crates: &'a [PathBuf],
+        crates: &'a [LinkedCrate],
+        patches: &'a [PatchEntry],
         workspace: &'a Path,
     },
 }
@@ -136,6 +140,54 @@ fn patches_of(workspace: &Path) -> String {
         .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned())
 }
 
+/// Merges `[patch]` entries from `nsh.lock` into `base` without duplicating
+/// existing table headers or already-patched packages.
+fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
+    if entries.is_empty() {
+        return base.to_owned();
+    }
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
+    for line in base.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            sections.push((trimmed.to_owned(), Vec::new()));
+        } else if let Some((_, lines)) = sections.last_mut() {
+            lines.push(line.to_owned());
+        }
+    }
+    for entry in entries {
+        let header = entry.table.header();
+        let line = format!(
+            "{} = {{ path = {:?} }}",
+            entry.package,
+            entry.path.to_string_lossy()
+        );
+        if let Some((_, lines)) = sections.iter_mut().find(|(h, _)| *h == header) {
+            let already = lines.iter().any(|existing| {
+                existing
+                    .trim()
+                    .split_once('=')
+                    .is_some_and(|(k, _)| k.trim() == entry.package)
+            });
+            if !already {
+                lines.push(line);
+            }
+        } else {
+            sections.push((header, vec![line]));
+        }
+    }
+    let mut out = String::new();
+    for (header, lines) in sections {
+        out.push_str(&header);
+        out.push('\n');
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Writes the runner crate in `dir` for `app`.
 pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyhow::Result<()> {
     let (app_dependency, patch, lib) = match app {
@@ -165,25 +217,21 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyho
                     .to_owned(),
             )
         }
-        App::TsxWithCrates { crates, workspace } => {
+        App::TsxWithCrates {
+            crates,
+            patches: lock_patches,
+            workspace,
+        } => {
             let mut dependencies = String::new();
             let mut sets = Vec::new();
             for (i, krate) in crates.iter().enumerate() {
-                let manifest_path = krate.join("Cargo.toml");
-                let manifest = fs::read_to_string(&manifest_path)
-                    .with_context(|| format!("reading {}", manifest_path.display()))?;
-                let package = package_name(&manifest).with_context(|| {
-                    format!("{} has no [package] name", manifest_path.display())
-                })?;
                 // Renamed, so the runner names each crate without knowing its
                 // library's name.
-                dependencies.push_str(&format!(
-                    "app_{i} = {{ package = {package:?}, path = {:?} }}\n",
-                    krate.to_string_lossy()
-                ));
-                sets.push(format!("app_{i}::registry"));
+                let alias = format!("app_{i}");
+                dependencies.push_str(&krate.dependency_line(&alias));
+                sets.push(format!("{alias}::registry"));
             }
-            let patches = patches_of(workspace);
+            let patches = merge_patch_entries(&patches_of(workspace), lock_patches);
             let patches = if dev {
                 testing_patches(&patches, None)
             } else {
@@ -549,11 +597,29 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        let crates = [one.clone(), two.clone()];
+        let mut two_linked = LinkedCrate::path("app-charts".into(), two.clone());
+        two_linked.features = vec!["camera".into()];
+        let crates = [
+            LinkedCrate::path("app-native".into(), one.clone()),
+            two_linked,
+        ];
+        let lock_patches = [
+            PatchEntry {
+                table: crate::nshm::PatchTable::CratesIo,
+                package: "app-charts".into(),
+                path: two.clone(),
+            },
+            PatchEntry {
+                table: crate::nshm::PatchTable::Git("https://github.com/acme/ui".into()),
+                package: "acme-ui".into(),
+                path: one.clone(),
+            },
+        ];
         write(
             &dir.join("runner"),
             App::TsxWithCrates {
                 crates: &crates,
+                patches: &lock_patches,
                 workspace: &ws,
             },
             false,
@@ -570,13 +636,30 @@ mod tests {
         );
         assert!(
             manifest.contains(&format!(
-                "app_1 = {{ package = \"app-charts\", path = {:?} }}",
+                "app_1 = {{ package = \"app-charts\", path = {:?}, features = [\"camera\"] }}",
                 two.to_string_lossy()
             )),
             "{manifest}"
         );
         assert!(
             manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"),
+            "{manifest}"
+        );
+        // Existing [patch.crates-io] is extended in place without duplicating the header.
+        assert_eq!(
+            manifest.matches("[patch.crates-io]").count(),
+            1,
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains(&format!(
+                "app-charts = {{ path = {:?} }}",
+                two.to_string_lossy()
+            )),
+            "{manifest}"
+        );
+        assert!(
+            manifest.contains("[patch.\"https://github.com/acme/ui\"]"),
             "{manifest}"
         );
         assert!(!manifest.contains("features = [\"dev\"]"));
@@ -590,6 +673,7 @@ mod tests {
             &dir.join("runner-dev"),
             App::TsxWithCrates {
                 crates: &crates,
+                patches: &lock_patches,
                 workspace: &ws,
             },
             true,
