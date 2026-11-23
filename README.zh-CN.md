@@ -84,6 +84,33 @@ UITest 提供根视图屏幕位置和截图，输入坐标会换算密度及窗�
 中断时停止宿主并移除本次端口转发。桌面窗口尺寸、鼠标及粘贴操作暂不支持。
 不带 `--target` 的 `nsh test` 仍运行无界面测试；设备命令执行 TypeScript 用例，Rust 单测继续在电脑上运行 `cargo test`。
 
+## 使用 nshm 与 HarmonyOS 打包元数据
+
+TSX 应用与 Rust 应用均可通过 `nsh add` 安装通用或 HarmonyOS 专属的 [nshm](https://nsh.dev/docs/nshm) 模块：
+
+- **TSX 应用自动链接 Rust nshm**：`nsh package` / `run` / `dev` / `test` 会自动读取 `nsh.lock` 中带 `"module"` 的 Rust nshm（支持 `nsh.json` `"dependencies.<name>.features"`），以及应用自身 `"rust"` crate 通过 Cargo 传递依赖的 Rust nshm，并链接进 HarmonyOS runner。
+- **HarmonyOS 打包元数据合并**：runner 依赖图中的任意 crate 可在 `Cargo.toml` 的 `[package.metadata.nsh.harmonyos]` 或按特性开关的 `[package.metadata.nsh.features.<feature>.harmonyos]` 中声明鸿蒙打包配置，应用也可在 `nsh.json` 的 `"harmonyos"` 段中直接配置或覆盖：
+
+```toml
+[package.metadata.nsh.features.camera.harmonyos]
+querySchemes = ["weixin"]
+
+[[package.metadata.nsh.features.camera.harmonyos.permissions]]
+name = "ohos.permission.CAMERA" # 或简写 "CAMERA"
+reason = "Take photos with the camera."
+when = "inuse" # "inuse"（默认）或 "always"
+
+[[package.metadata.nsh.features.camera.harmonyos.metadata]]
+name = "client_id"
+value = "123456"
+
+[package.metadata.nsh.features.camera.harmonyos.dependencies]
+"@ohos/lottie" = "^2.0.0"
+"@acme/kit" = "file:ohos/kit.har"
+```
+
+支持字段：`permissions`（写入 `module.json5` 的 `requestPermissions`，纯文本 `reason` 自动写入 `string.json`）、`querySchemes`、`metadata`、`abilities`、`extensionAbilities`、`dependencies`（写入 `entry/oh-package.json5`，本地 `.har`/目录自动复制到 `entry/nshm-deps/`）与 `strings`。应用 `nsh.json` 中的 `"harmonyos"` 优先级最高，可覆盖 crate 声明并解决多 crate 冲突。
+
 ## 发布到鸿蒙手机
 
 HarmonyOS NEXT（5.0 起）建立在 OpenHarmony 之上，两者的 ArkUI C API、N-API、NDK 和 `aarch64-unknown-linux-ohos` ABI 都一样。所以用
