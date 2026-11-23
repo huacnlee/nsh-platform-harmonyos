@@ -28,7 +28,7 @@
     {
       "name": "nsh_harmonyos",
       "srcPath": "./nsh"
-    },
+    },{{extraModules}}
     {
       "name": "entry",
       "srcPath": "./entry",

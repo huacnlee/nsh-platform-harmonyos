@@ -420,7 +420,7 @@ fn package(
     let linked = if is_rust_app(app) && rust_app.join("Cargo.toml").is_file() {
         runner::App::Rust(&rust_app)
     } else {
-        tsx = nshm::resolve_tsx_crates(app)?;
+        tsx = nshm::resolve_tsx_crates(app, arch.triple())?;
         if tsx.crates.is_empty() {
             runner::App::Tsx
         } else {
@@ -610,6 +610,11 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
             types,
         ),
     ];
+    let entry_modules = join_all(project, ["entry", "oh_modules"]);
+    if entry_modules.exists() {
+        fs::remove_dir_all(&entry_modules)
+            .with_context(|| format!("clearing {}", entry_modules.display()))?;
+    }
     if let Ok(text) = fs::read_to_string(join_all(project, ["entry", "oh-package.json5"]))
         && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
         && let Some(deps) = json.get("dependencies").and_then(|v| v.as_object())
@@ -621,8 +626,13 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
             ) {
                 continue;
             }
-            let Some(rel) = spec.as_str().and_then(|s| s.strip_prefix("file:")) else {
+            let Some(spec_str) = spec.as_str() else {
                 continue;
+            };
+            let Some(rel) = spec_str.strip_prefix("file:") else {
+                bail!(
+                    "ohpm is required to install registry dependency `{pkg}` ({spec_str}): install DevEco Studio or put ohpm on PATH"
+                );
             };
             let target = crate::paths::join_relative(project.join("entry"), rel);
             if target.is_dir() {
@@ -631,6 +641,16 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
                     link.push(seg);
                 }
                 links.push((link, target));
+            } else if target.is_file() {
+                bail!(
+                    "ohpm is required to unpack archive dependency `{pkg}` ({}): install DevEco Studio or put ohpm on PATH",
+                    target.display()
+                );
+            } else {
+                bail!(
+                    "entry/oh-package.json5 dependency `{pkg}` target does not exist: {}",
+                    target.display()
+                );
             }
         }
     }

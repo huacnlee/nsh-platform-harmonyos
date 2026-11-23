@@ -47,6 +47,7 @@ const NSH_CRATES: &[&str] = &[
     "nsh-platform-tui",
     "nsh-platform-web",
     "nsh-platform-windows",
+    "nsh-platform-gpui",
     "nsh-ios-app",
     "nsh-ios-host",
     "nsh-linux-app",
@@ -112,24 +113,25 @@ impl LinkedCrate {
 
     /// Formats the `[dependencies]` line for `alias` in the runner's `Cargo.toml`.
     pub(crate) fn dependency_line(&self, alias: &str) -> String {
-        let mut fields = vec![format!("package = {:?}", self.package)];
+        use crate::runner::toml_string;
+        let mut fields = vec![format!("package = {}", toml_string(&self.package))];
         match &self.source {
             CrateSource::Path(dir) => {
-                fields.push(format!("path = {:?}", dir.to_string_lossy()));
+                fields.push(format!("path = {}", toml_string(&dir.to_string_lossy())));
             }
             CrateSource::Registry { version, registry } => {
-                fields.push(format!("version = {version:?}"));
+                fields.push(format!("version = {}", toml_string(version)));
                 if let Some(index) = registry {
-                    fields.push(format!("registry-index = {index:?}"));
+                    fields.push(format!("registry-index = {}", toml_string(index)));
                 }
             }
             CrateSource::Git { url, reference } => {
-                fields.push(format!("git = {url:?}"));
+                fields.push(format!("git = {}", toml_string(url)));
                 match reference {
                     GitRef::Default => {}
-                    GitRef::Branch(b) => fields.push(format!("branch = {b:?}")),
-                    GitRef::Tag(t) => fields.push(format!("tag = {t:?}")),
-                    GitRef::Rev(r) => fields.push(format!("rev = {r:?}")),
+                    GitRef::Branch(b) => fields.push(format!("branch = {}", toml_string(b))),
+                    GitRef::Tag(t) => fields.push(format!("tag = {}", toml_string(t))),
+                    GitRef::Rev(r) => fields.push(format!("rev = {}", toml_string(r))),
                 }
             }
         }
@@ -140,7 +142,7 @@ impl LinkedCrate {
             let list = self
                 .features
                 .iter()
-                .map(|f| format!("{f:?}"))
+                .map(|f| toml_string(f))
                 .collect::<Vec<_>>()
                 .join(", ");
             fields.push(format!("features = [{list}]"));
@@ -163,7 +165,7 @@ impl PatchTable {
     pub(crate) fn header(&self) -> String {
         match self {
             PatchTable::CratesIo => "[patch.crates-io]".to_owned(),
-            PatchTable::Git(url) => format!("[patch.{url:?}]"),
+            PatchTable::Git(url) => format!("[patch.{}]", crate::runner::toml_string(url)),
         }
     }
 }
@@ -205,29 +207,39 @@ struct LockedPackage {
 
 /// Resolves all Rust crates to link for a TSX app in `app`:
 /// `"rust"` crates, `nsh.lock` Rust nshms (with `nsh.json` `"dependencies"`
-/// features), and transitive Cargo nshms of the app's own `"rust"` crates.
-pub(crate) fn resolve_tsx_crates(app: &Path) -> anyhow::Result<TsxCrates> {
+/// features), and transitive Cargo nshms of the app's own `"rust"` crates
+/// filtered for the OHOS target `triple`.
+pub(crate) fn resolve_tsx_crates(app: &Path, triple: &str) -> anyhow::Result<TsxCrates> {
     let installed_root = installed_dir();
-    resolve_tsx_crates_with_root(app, installed_root.as_deref(), true)
+    resolve_tsx_crates_with_root(app, installed_root.as_deref(), Some(triple))
 }
 
 fn resolve_tsx_crates_with_root(
     app: &Path,
     installed_root: Option<&Path>,
-    discover_cargo_nshm: bool,
+    cargo_nshm_triple: Option<&str>,
 ) -> anyhow::Result<TsxCrates> {
     let text = fs::read_to_string(app.join("nsh.json")).context("reading nsh.json")?;
     let json: Value = serde_json::from_str(&text).context("nsh.json is not JSON")?;
 
     let own_dirs = crates_of(app, &json["rust"])?;
-    let mut crates = Vec::new();
+    let mut crates: Vec<LinkedCrate> = Vec::new();
     let mut seen_dirs: HashSet<PathBuf> = HashSet::new();
-    let mut seen_pkgs: HashSet<String> = HashSet::new();
+    let mut seen_pkgs: BTreeMap<String, (String, Option<PathBuf>)> = BTreeMap::new();
 
     for dir in &own_dirs {
         let package = read_package_name(dir)?;
+        let norm = normalize_crate_name(&package);
+        if let Some((prev_pkg, prev_dir)) = seen_pkgs.get(&norm)
+            && prev_dir.as_ref() != Some(dir)
+        {
+            bail!(
+                "nsh.json \"rust\": crate `{package}` ({}) collides with `{prev_pkg}` (same normalized crate name `{norm}`)",
+                dir.display()
+            );
+        }
         seen_dirs.insert(dir.clone());
-        seen_pkgs.insert(normalize_crate_name(&package));
+        seen_pkgs.insert(norm, (package.clone(), Some(dir.clone())));
         crates.push(LinkedCrate::path(package, dir.clone()));
     }
 
@@ -253,10 +265,8 @@ fn resolve_tsx_crates_with_root(
             }
 
             let norm = normalize_crate_name(&package);
-            if seen_dirs.contains(&dir) || seen_pkgs.contains(&norm) {
-                if let Some(existing) = crates.iter_mut().find(|c| {
-                    c.dir.as_ref() == Some(&dir) || normalize_crate_name(&c.package) == norm
-                }) {
+            if seen_dirs.contains(&dir) {
+                if let Some(existing) = crates.iter_mut().find(|c| c.dir.as_ref() == Some(&dir)) {
                     for feat in features {
                         if !existing.features.contains(&feat) {
                             existing.features.push(feat);
@@ -265,9 +275,15 @@ fn resolve_tsx_crates_with_root(
                 }
                 continue;
             }
+            if let Some((prev_pkg, _)) = seen_pkgs.get(&norm) {
+                bail!(
+                    "{LOCK_FILE}: nshm `{package}` ({}) collides with `{prev_pkg}` (same normalized crate name `{norm}`)",
+                    dir.display()
+                );
+            }
 
             seen_dirs.insert(dir.clone());
-            seen_pkgs.insert(norm);
+            seen_pkgs.insert(norm, (package.clone(), Some(dir.clone())));
             let mut linked = LinkedCrate::path(package, dir);
             linked.features = features;
             crates.push(linked);
@@ -276,18 +292,27 @@ fn resolve_tsx_crates_with_root(
 
     // Transitive Cargo nshms depended on directly by the app's own `"rust"` crates
     // (matching upstream PR #2874): linked after `"rust"` and `nsh.lock` entries.
-    if discover_cargo_nshm && !own_dirs.is_empty() {
-        for found in cargo_nshm(&own_dirs)? {
+    if let Some(triple) = cargo_nshm_triple
+        && !own_dirs.is_empty()
+    {
+        for found in cargo_nshm(&own_dirs, triple)? {
             let norm = normalize_crate_name(&found.package);
-            if found.dir.as_ref().is_some_and(|d| seen_dirs.contains(d))
-                || seen_pkgs.contains(&norm)
-            {
+            if found.dir.as_ref().is_some_and(|d| seen_dirs.contains(d)) {
                 continue;
+            }
+            if let Some((prev_pkg, prev_dir)) = seen_pkgs.get(&norm) {
+                if prev_pkg == &found.package || prev_dir == &found.dir {
+                    continue;
+                }
+                bail!(
+                    "transitive Cargo nshm `{}` collides with `{prev_pkg}` (same normalized crate name `{norm}`)",
+                    found.package
+                );
             }
             if let Some(d) = &found.dir {
                 seen_dirs.insert(d.clone());
             }
-            seen_pkgs.insert(norm);
+            seen_pkgs.insert(norm, (found.package.clone(), found.dir.clone()));
             crates.push(found);
         }
     }
@@ -373,6 +398,17 @@ fn read_dependency_features(config: &Value) -> anyhow::Result<BTreeMap<String, V
             .with_context(|| {
                 format!("nsh.json: dependencies.{name}.features must be an array of strings")
             })?;
+        for feat in &list {
+            if feat.is_empty()
+                || !feat.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'/' | b'.' | b'+')
+                })
+            {
+                bail!(
+                    "nsh.json: dependencies.{name}.features contains invalid feature name {feat:?}"
+                );
+            }
+        }
         if !list.is_empty() {
             out.insert(name.clone(), list);
         }
@@ -385,12 +421,28 @@ fn resolve_locked_dir(
     installed_root: Option<&Path>,
     pkg: &LockedPackage,
 ) -> anyhow::Result<PathBuf> {
-    let raw = match (&pkg.path, &pkg.dir) {
-        (Some(path), _) => app.join(path),
+    let (raw, confine_to_root) = match (&pkg.path, &pkg.dir) {
+        (Some(path), _) => (app.join(path), None),
         (None, Some(dir)) => {
             let root = installed_root
                 .context("no home directory to locate installed nshms: set NSH_HOME")?;
-            root.join(dir)
+            let rel = Path::new(dir);
+            if rel.is_absolute()
+                || rel.components().any(|c| {
+                    matches!(
+                        c,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            {
+                bail!(
+                    "{LOCK_FILE}: nshm `{}` has invalid `dir` {dir:?} (must stay inside installed nshms directory)",
+                    pkg.name
+                );
+            }
+            (root.join(rel), Some(root))
         }
         (None, None) => bail!("{LOCK_FILE}: {} has neither \"path\" nor \"dir\"", pkg.name),
     };
@@ -401,6 +453,17 @@ fn resolve_locked_dir(
             raw.display()
         )
     })?;
+    if let Some(root) = confine_to_root {
+        let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if !canonical.starts_with(&canonical_root) {
+            bail!(
+                "{LOCK_FILE}: nshm `{}` resolves outside {} ({})",
+                pkg.name,
+                canonical_root.display(),
+                canonical.display()
+            );
+        }
+    }
     if !canonical.join("Cargo.toml").is_file() {
         bail!(
             "{LOCK_FILE}: nshm `{}` at {} has no Cargo.toml",
@@ -417,7 +480,10 @@ fn patch_table_of(source: Option<&str>) -> Option<PatchTable> {
         return Some(PatchTable::CratesIo);
     }
     let rest = source.strip_prefix("git+")?;
-    let url = rest.split_once('?').map_or(rest, |(u, _)| u);
+    let without_hash = rest.split_once('#').map_or(rest, |(u, _)| u);
+    let url = without_hash
+        .split_once('?')
+        .map_or(without_hash, |(u, _)| u);
     (!url.is_empty()).then(|| PatchTable::Git(url.to_owned()))
 }
 
@@ -468,14 +534,22 @@ fn specifier_of(dir: &Path) -> Option<String> {
     })
 }
 
-/// Discovers Rust nshms reachable as normal Cargo dependencies of `own_crates`.
-fn cargo_nshm(own_crates: &[PathBuf]) -> anyhow::Result<Vec<LinkedCrate>> {
+/// Discovers Rust nshms reachable as normal Cargo dependencies of `own_crates`
+/// for the OHOS target `triple`.
+fn cargo_nshm(own_crates: &[PathBuf], triple: &str) -> anyhow::Result<Vec<LinkedCrate>> {
     let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut found: Vec<(String, LinkedCrate)> = Vec::new();
     for dir in own_crates {
         let manifest = dir.join("Cargo.toml");
         let output = Command::new(&cargo)
-            .args(["metadata", "--format-version", "1", "--manifest-path"])
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--filter-platform",
+                triple,
+                "--manifest-path",
+            ])
             .arg(&manifest)
             .output()
             .context("running cargo metadata to discover Cargo nshms")?;
@@ -615,9 +689,7 @@ fn cargo_source(pkg: &Value, dir: &Path) -> anyhow::Result<CrateSource> {
         });
     }
     if let Some(rest) = source.strip_prefix("git+") {
-        let (before_hash, hash) = rest
-            .split_once('#')
-            .map_or((rest, None), |(a, b)| (a, Some(b)));
+        let before_hash = rest.split_once('#').map_or(rest, |(a, _)| a);
         let (url, query) = before_hash
             .split_once('?')
             .map_or((before_hash, None), |(a, b)| (a, Some(b)));
@@ -625,10 +697,9 @@ fn cargo_source(pkg: &Value, dir: &Path) -> anyhow::Result<CrateSource> {
             Some(("branch", b)) => GitRef::Branch(b.to_owned()),
             Some(("tag", t)) => GitRef::Tag(t.to_owned()),
             Some(("rev", r)) => GitRef::Rev(r.to_owned()),
-            _ => match hash {
-                Some(rev) if !rev.is_empty() => GitRef::Rev(rev.to_owned()),
-                _ => GitRef::Default,
-            },
+            // Cargo metadata always appends `#<resolved-commit>` even for default-branch
+            // git deps; emitting `rev = "<commit>"` creates a distinct Cargo SourceId.
+            _ => GitRef::Default,
         };
         return Ok(CrateSource::Git {
             url: url.to_owned(),
@@ -743,7 +814,7 @@ mod tests {
         )
         .unwrap();
 
-        let resolved = resolve_tsx_crates_with_root(&app, Some(&nshms), false).unwrap();
+        let resolved = resolve_tsx_crates_with_root(&app, Some(&nshms), None).unwrap();
         let names: Vec<&str> = resolved.crates.iter().map(|c| c.package.as_str()).collect();
         assert_eq!(names, ["app-native", "acme-kit", "local-mod", "nsh-extra"]);
         assert_eq!(resolved.crates[0].features, Vec::<String>::new());
@@ -805,7 +876,7 @@ mod tests {
             }"#,
         )
         .unwrap();
-        let resolved = resolve_tsx_crates_with_root(&app, None, false).unwrap();
+        let resolved = resolve_tsx_crates_with_root(&app, None, None).unwrap();
         assert_eq!(resolved.crates.len(), 1);
         assert_eq!(resolved.crates[0].package, "app-shared");
         assert_eq!(resolved.crates[0].features, vec!["extra"]);
@@ -826,7 +897,7 @@ mod tests {
 
         fs::write(app.join("nsh.json"), "{}").unwrap();
         fs::write(app.join("nsh.lock"), r#"{ "version": 99, "packages": [] }"#).unwrap();
-        let err = resolve_tsx_crates_with_root(&app, None, false)
+        let err = resolve_tsx_crates_with_root(&app, None, None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("format 99"), "{err}");
@@ -905,6 +976,71 @@ mod tests {
             line.contains("version = \"=0.2.0\", default-features = false"),
             "{line}"
         );
+
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn rejects_path_traversal_strips_git_fragment_and_uses_default_git_ref() {
+        let base = env::temp_dir().join(format!("nsh-hm-nshm-sec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let app = base.join("app");
+        let nshms = base.join("nshms");
+        fs::create_dir_all(&app).unwrap();
+        fs::create_dir_all(&nshms).unwrap();
+
+        assert_eq!(
+            patch_table_of(Some(
+                "git+https://github.com/acme/kit?branch=main#0123456789abcdef"
+            )),
+            Some(PatchTable::Git("https://github.com/acme/kit".into()))
+        );
+        let git_pkg = serde_json::json!({
+            "version": "0.1.0",
+            "source": "git+https://github.com/acme/kit#0123456789abcdef"
+        });
+        assert_eq!(
+            cargo_source(&git_pkg, Path::new("/tmp/kit")).unwrap(),
+            CrateSource::Git {
+                url: "https://github.com/acme/kit".into(),
+                reference: GitRef::Default,
+            }
+        );
+
+        // Lock dir escaping ~/.nsh/nshms must be rejected.
+        fs::write(app.join("nsh.json"), "{}").unwrap();
+        fs::write(
+            app.join("nsh.lock"),
+            r#"{
+              "version": 2,
+              "packages": [
+                {
+                  "name": "evil",
+                  "version": "0.1.0",
+                  "source": "crates.io",
+                  "dir": "../escape",
+                  "module": "evil"
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let err = resolve_tsx_crates_with_root(&app, Some(&nshms), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("installed nshms directory"), "{err}");
+
+        // Normalized crate-name collisions (foo-bar vs foo_bar) must fail loudly.
+        let one = app.join("one");
+        let two = app.join("two");
+        write_crate(&one, "foo-bar", Some("foo/one"));
+        write_crate(&two, "foo_bar", Some("foo/two"));
+        fs::remove_file(app.join("nsh.lock")).unwrap();
+        fs::write(app.join("nsh.json"), r#"{ "rust": ["one", "two"] }"#).unwrap();
+        let err = resolve_tsx_crates_with_root(&app, Some(&nshms), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("foo-bar") && err.contains("foo_bar"), "{err}");
 
         fs::remove_dir_all(&base).unwrap();
     }
