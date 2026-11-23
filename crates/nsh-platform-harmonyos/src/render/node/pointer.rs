@@ -95,32 +95,38 @@ impl Node {
                     .any(|(link, _)| link.events.contains(event))
             })
     }
+    pub(crate) fn text_link_at(
+        &self,
+        event: EventKind,
+        x: f32,
+        y: f32,
+    ) -> Option<nsh_core::NodeId> {
+        let raster = self.raster.borrow();
+        raster
+            .as_ref()
+            .and_then(|layout| layout.0.downcast_ref::<NativeText>())
+            .and_then(|raster| {
+                let content = self.content.get();
+                let x = x - content.x;
+                let y = y - content.y;
+                raster
+                    .links
+                    .iter()
+                    .filter(|(link, rects)| {
+                        link.events.contains(event)
+                            && rects
+                                .iter()
+                                .any(|r| x >= r[0] && x < r[2] && y >= r[1] && y < r[3])
+                    })
+                    .min_by_key(|(link, _)| link.end - link.start)
+                    .map(|(link, _)| link.node)
+            })
+    }
     pub(crate) fn press(&self, event: EventKind, x: f32, y: f32) {
         if !self.touches.borrow().press_allowed(self.id) {
             return;
         }
-        let target = {
-            let raster = self.raster.borrow();
-            raster
-                .as_ref()
-                .and_then(|layout| layout.0.downcast_ref::<NativeText>())
-                .and_then(|raster| {
-                    let content = self.content.get();
-                    let x = x - content.x;
-                    let y = y - content.y;
-                    raster
-                        .links
-                        .iter()
-                        .filter(|(link, rects)| {
-                            link.events.contains(event)
-                                && rects
-                                    .iter()
-                                    .any(|r| x >= r[0] && x < r[2] && y >= r[1] && y < r[3])
-                        })
-                        .min_by_key(|(link, _)| link.end - link.start)
-                        .map(|(link, _)| link.node)
-                })
-        };
+        let target = self.text_link_at(event, x, y);
         let payload = self.press_payload(x, y);
         if let Some(id) = target {
             if self.active.get() {
@@ -184,6 +190,52 @@ impl Node {
             page_position,
             self.host.modifiers(),
             button,
+        ))
+    }
+    pub(crate) fn mouse_up_payload(
+        &self,
+        x: f32,
+        y: f32,
+        button: nsh_core::MouseButton,
+    ) -> EventPayload {
+        let (position, page_position) = self.pointer_positions(x, y);
+        EventPayload::Mouse(nsh_core::MouseEvent::released(
+            position,
+            page_position,
+            self.host.modifiers(),
+            button,
+        ))
+    }
+    pub(crate) fn wheel_payload(
+        &self,
+        x: f32,
+        y: f32,
+        delta: nsh_core::WheelDelta,
+        modifiers: nsh_core::keymap::Modifiers,
+    ) -> EventPayload {
+        let (position, page_position) = self.pointer_positions(x, y);
+        EventPayload::Wheel(nsh_core::WheelEvent::new(
+            position,
+            page_position,
+            delta,
+            modifiers,
+        ))
+    }
+    pub(crate) fn pinch_payload(
+        &self,
+        x: f32,
+        y: f32,
+        delta: f32,
+        phase: nsh_core::PinchPhase,
+        modifiers: nsh_core::keymap::Modifiers,
+    ) -> EventPayload {
+        let (position, page_position) = self.pointer_positions(x, y);
+        EventPayload::Pinch(nsh_core::PinchEvent::new(
+            position,
+            page_position,
+            nsh_core::geometry::Percentage(delta),
+            phase,
+            modifiers,
         ))
     }
     pub(crate) fn context_menu_payload(&self, x: f32, y: f32) -> EventPayload {

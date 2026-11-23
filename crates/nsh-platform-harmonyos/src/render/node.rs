@@ -110,6 +110,7 @@ pub(crate) struct Node {
     #[cfg(feature = "api-23")]
     pub(crate) accessibility_provider: crate::accessibility::provider::State,
     pub(crate) native: NativeNode,
+    pub(crate) focus_sink: RefCell<Option<NativeNode>>,
     pub(crate) wrapper: RefCell<Option<crate::interop::view::Wrapper>>,
     pub(crate) mount_parent: RefCell<Weak<RefCell<ArkUINode>>>,
     pub(crate) id: NodeId,

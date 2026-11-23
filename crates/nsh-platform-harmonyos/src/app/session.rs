@@ -115,6 +115,7 @@ pub(crate) struct HostCommand {
     pub assertive: Option<bool>,
     pub announcement: Option<String>,
     pub element_id: Option<i64>,
+    pub window_id: Option<u32>,
     pub open_id: Option<u32>,
     pub limit: Option<u32>,
     pub filters: Option<Vec<String>>,
@@ -219,6 +220,9 @@ pub(crate) struct Services {
     keyboard: Mutex<Option<crate::input::keyboard::KeyboardWindow>>,
     window_id: AtomicU32,
     window_avoid: Mutex<Option<([AvoidArea; 3], AvoidArea)>>,
+    desktop_window: Mutex<Option<nsh_core::desktop::WindowState>>,
+    desktop_title_bar: Mutex<nsh_core::Edges<nsh_core::Points>>,
+    desktop_displays: Mutex<Vec<nsh_core::desktop::Display>>,
     pub(crate) system: crate::services::system::System,
     command_tsfn: HostCommandCallback,
     next_open_id: AtomicU32,
@@ -249,6 +253,10 @@ impl Drop for LoadPermit {
 }
 
 impl Services {
+    pub(crate) fn session_id(&self) -> u32 {
+        self.id
+    }
+
     pub(crate) fn max_refresh_rate(&self) -> u32 {
         crate::app::frame_rate::normalize_display_hz(self.max_refresh_rate.load(Ordering::Relaxed))
     }
@@ -368,6 +376,60 @@ impl Services {
         *self.window_avoid.lock().unwrap()
     }
 
+    #[cfg(feature = "dev")]
+    pub(crate) fn is_desktop(&self) -> bool {
+        self.environment.lock().unwrap().idiom.as_deref() == Some("desktop")
+    }
+
+    pub(crate) fn desktop_snapshot(
+        &self,
+    ) -> (
+        Option<nsh_core::desktop::WindowState>,
+        nsh_core::Edges<nsh_core::Points>,
+        Vec<nsh_core::desktop::Display>,
+    ) {
+        (
+            *self.desktop_window.lock().unwrap(),
+            *self.desktop_title_bar.lock().unwrap(),
+            self.desktop_displays.lock().unwrap().clone(),
+        )
+    }
+
+    pub(crate) fn desktop_command(
+        &self,
+        command: &crate::services::desktop::WireCommand,
+    ) -> Result<()> {
+        let json = serde_json::to_string(command)
+            .map_err(|error| Error::from_reason(error.to_string()))?;
+        self.send_host_command(HostCommand {
+            kind: "desktop".into(),
+            text: Some(json),
+            ..Default::default()
+        })
+    }
+
+    pub(crate) fn handle_desktop_event(&self, kind: &str, payload: &str) {
+        if self.check().is_err() {
+            return;
+        }
+        let Some(event) = crate::services::desktop::parse_desktop_event(kind, payload) else {
+            return;
+        };
+        match &event {
+            crate::services::desktop::DesktopEvent::WindowState(state) => {
+                *self.desktop_window.lock().unwrap() = Some(*state);
+            }
+            crate::services::desktop::DesktopEvent::TitleBar(edges) => {
+                *self.desktop_title_bar.lock().unwrap() = *edges;
+            }
+            crate::services::desktop::DesktopEvent::Displays(displays) => {
+                *self.desktop_displays.lock().unwrap() = displays.clone();
+            }
+            _ => {}
+        }
+        self.broadcast(|| Message::HostDesktop(event.clone()));
+    }
+
     pub(crate) fn is_foreground(&self) -> bool {
         self.environment.lock().unwrap().lifecycle.as_deref() != Some("background")
     }
@@ -410,6 +472,21 @@ impl Services {
                 .unwrap()
                 .as_ref()
                 .is_some_and(|keyboard| keyboard.event(event, route, owner))
+    }
+
+    pub(crate) fn editor_key_event(
+        &self,
+        event: &crate::interop::sdk::EditorKeyEvent,
+        route: &Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        self.is_foreground()
+            && self
+                .keyboard
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|keyboard| keyboard.editor_event(event, route, owner))
     }
 
     pub(crate) fn modifiers(&self) -> nsh_core::keymap::Modifiers {
@@ -556,9 +633,10 @@ impl Services {
         })
     }
 
-    pub(crate) fn cursor(&self, cursor: nsh_core::Cursor) -> Result<()> {
+    pub(crate) fn cursor(&self, window_id: Option<u32>, cursor: nsh_core::Cursor) -> Result<()> {
         self.send_host_command(HostCommand {
             kind: "cursor".into(),
+            window_id,
             text: Some(cursor.name().into()),
             ..Default::default()
         })
@@ -766,6 +844,9 @@ impl Services {
             keyboard: Mutex::default(),
             window_id: AtomicU32::new(platform_window_id as u32),
             window_avoid: Mutex::default(),
+            desktop_window: Mutex::default(),
+            desktop_title_bar: Mutex::default(),
+            desktop_displays: Mutex::default(),
             command_tsfn,
             system: Default::default(),
             next_open_id: AtomicU32::new(1),

@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::{
     paths::{join_all, join_relative},
-    sdk::Arch,
+    sdk::{ApiLevel, Arch},
 };
 
 /// What the project takes from the app's `nsh.json`.
@@ -144,28 +144,38 @@ impl RuntimeOs {
     }
 
     /// `runtimeOS` and the SDK versions of `build-profile.json5`. Both
-    /// need API 20. HarmonyOS names its SDK by release; an OpenHarmony
-    /// project compiles against the SDK hvigor finds (`compile_api`), which
-    /// from API 21 on hvigor wants as a `"<api>.0.0"` string.
-    fn profile(self, compile_api: u32) -> (&'static str, String) {
+    /// need at least `min_api` (API 20 by default, or 23/26 when `--api` enables
+    /// API-gated features). HarmonyOS names API 20..=25 by release and API 26+
+    /// as `"<api>.0.0"`; OpenHarmony uses numeric API versions for 10..=25 and
+    /// `"<api>.0.0"` strings from API 26 on.
+    fn profile(self, compile_api: u32, min_api: ApiLevel) -> (&'static str, String) {
         match self {
-            RuntimeOs::HarmonyOs => (
-                "HarmonyOS",
-                "\"compatibleSdkVersion\": \"6.0.0(20)\",\n        \"targetSdkVersion\": \"6.0.0(20)\","
-                    .to_owned(),
-            ),
+            RuntimeOs::HarmonyOs => {
+                let version = min_api.harmonyos_version();
+                (
+                    "HarmonyOS",
+                    format!(
+                        "\"compatibleSdkVersion\": \"{version}\",\n        \"targetSdkVersion\": \"{version}\","
+                    ),
+                )
+            }
             RuntimeOs::OpenHarmony => {
-                let api = compile_api.max(MIN_API);
-                let version = if api > MIN_API {
-                    format!("\"{api}.0.0\"")
-                } else {
-                    api.to_string()
+                let min = min_api.number();
+                let api = compile_api.max(min);
+                let format_version = |level: u32| {
+                    if level >= 26 {
+                        format!("\"{level}.0.0\"")
+                    } else {
+                        level.to_string()
+                    }
                 };
+                let compile = format_version(api);
+                let compatible = format_version(min);
                 (
                     "OpenHarmony",
                     format!(
-                        "\"compileSdkVersion\": {version},\n        \"compatibleSdkVersion\": \
-                         {MIN_API},\n        \"targetSdkVersion\": {version},"
+                        "\"compileSdkVersion\": {compile},\n        \"compatibleSdkVersion\": \
+                         {compatible},\n        \"targetSdkVersion\": {compile},"
                     ),
                 )
             }
@@ -174,7 +184,7 @@ impl RuntimeOs {
 }
 
 /// The oldest API the backend runs on (HarmonyOS 6.0).
-pub(crate) const MIN_API: u32 = 20;
+pub(crate) const MIN_API: u32 = ApiLevel::Api20.number();
 
 /// What goes into the project besides the template.
 pub(crate) struct Contents<'a> {
@@ -187,6 +197,8 @@ pub(crate) struct Contents<'a> {
     pub(crate) build: &'a Path,
     /// The OS the HAP targets.
     pub(crate) runtime_os: RuntimeOs,
+    /// The minimum API level the native library and HAP target.
+    pub(crate) min_api: ApiLevel,
     /// The API of the OpenHarmony SDK hvigor builds with ([`MIN_API`]
     /// when unknown).
     pub(crate) compile_api: u32,
@@ -284,7 +296,9 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         Some(name) => format!("\"signingConfig\": \"{}\",", json_text(name)),
         None => String::new(),
     };
-    let (runtime_os, sdk_versions) = contents.runtime_os.profile(contents.compile_api);
+    let (runtime_os, sdk_versions) = contents
+        .runtime_os
+        .profile(contents.compile_api, contents.min_api);
     let substitutions = [
         ("{{bundleName}}", json_text(&config.id)),
         ("{{vendor}}", json_text(&config.name)),
@@ -447,7 +461,7 @@ mod tests {
 
     #[test]
     fn names_sdk_versions_as_hvigor_reads_them() {
-        let (os, versions) = RuntimeOs::OpenHarmony.profile(26);
+        let (os, versions) = RuntimeOs::OpenHarmony.profile(26, ApiLevel::Api20);
         assert_eq!(os, "OpenHarmony");
         assert!(
             versions.contains("\"compileSdkVersion\": \"26.0.0\","),
@@ -457,9 +471,52 @@ mod tests {
             versions.contains("\"compatibleSdkVersion\": 20,"),
             "{versions}"
         );
-        let (_, versions) = RuntimeOs::OpenHarmony.profile(0);
+        let (_, versions) = RuntimeOs::OpenHarmony.profile(26, ApiLevel::Api23);
+        assert!(
+            versions.contains("\"compileSdkVersion\": \"26.0.0\","),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("\"compatibleSdkVersion\": 23,"),
+            "{versions}"
+        );
+        let (_, versions) = RuntimeOs::OpenHarmony.profile(20, ApiLevel::Api26);
+        assert!(
+            versions.contains("\"compileSdkVersion\": \"26.0.0\","),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("\"compatibleSdkVersion\": \"26.0.0\","),
+            "{versions}"
+        );
+        let (_, versions) = RuntimeOs::OpenHarmony.profile(0, ApiLevel::Api20);
         assert!(
             versions.contains("\"compileSdkVersion\": 20,"),
+            "{versions}"
+        );
+
+        let (os, versions) = RuntimeOs::HarmonyOs.profile(26, ApiLevel::Api20);
+        assert_eq!(os, "HarmonyOS");
+        assert!(
+            versions.contains("\"compatibleSdkVersion\": \"6.0.0(20)\","),
+            "{versions}"
+        );
+        let (_, versions) = RuntimeOs::HarmonyOs.profile(26, ApiLevel::Api23);
+        assert!(
+            versions.contains("\"compatibleSdkVersion\": \"6.1.0(23)\","),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("\"targetSdkVersion\": \"6.1.0(23)\","),
+            "{versions}"
+        );
+        let (_, versions) = RuntimeOs::HarmonyOs.profile(26, ApiLevel::Api26);
+        assert!(
+            versions.contains("\"compatibleSdkVersion\": \"26.0.0\","),
+            "{versions}"
+        );
+        assert!(
+            versions.contains("\"targetSdkVersion\": \"26.0.0\","),
             "{versions}"
         );
     }
@@ -512,6 +569,7 @@ mod tests {
             library: &library,
             build: &build,
             runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
             compile_api: MIN_API,
         };
         write(&out, &config, &contents).unwrap();

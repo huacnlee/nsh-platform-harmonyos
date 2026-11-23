@@ -214,7 +214,9 @@ impl State {
             .dev_generation
             .checked_add(1)
             .ok_or_else(|| Error::from_reason("development session generation exhausted"))?;
-        let session = crate::app::dev::Session::connect(address, self.queue.clone(), token)?;
+        let is_desktop = self.config()?.host.is_desktop();
+        let session =
+            crate::app::dev::Session::connect(address, self.queue.clone(), token, is_desktop)?;
         if self.overlay.is_none() {
             let host = self.config()?.host.clone();
             self.overlay = Some(crate::app::dev::Overlay::new(
@@ -462,6 +464,8 @@ impl State {
                 source_map,
                 capabilities,
                 app_id,
+                window,
+                application,
                 ..
             } => {
                 let bundle = crate::app::dev::Session::bundle(
@@ -470,6 +474,8 @@ impl State {
                     source_map,
                     capabilities,
                     app_id,
+                    window,
+                    application,
                 )?;
                 let dev = self.dev.as_mut().unwrap();
                 dev.latest = Some(((session, version), bundle.clone()));

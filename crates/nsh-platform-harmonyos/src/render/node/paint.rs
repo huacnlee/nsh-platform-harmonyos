@@ -218,7 +218,14 @@ impl Node {
             .own(&self.style.borrow());
         if !self.clips_children() {
             for child in self.children.borrow().iter().filter_map(Weak::upgrade) {
-                if child.kind == ViewKind::Modal || child.style.borrow().hidden {
+                if (child.kind == ViewKind::Modal
+                    && !child
+                        .modal
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|modal| modal.is_main_window_host()))
+                    || child.style.borrow().hidden
+                {
                     continue;
                 }
                 let child_frame = child.frame.get();

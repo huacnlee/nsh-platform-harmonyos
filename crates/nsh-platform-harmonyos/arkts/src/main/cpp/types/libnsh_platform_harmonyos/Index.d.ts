@@ -65,6 +65,18 @@ export interface EditorEvent {
   image?: string;
 }
 
+export interface EditorKeyEvent {
+  action: number;
+  keyCode: number;
+  keyText: string;
+  unicode: number;
+  ctrl: boolean;
+  alt: boolean;
+  shift: boolean;
+  cmd: boolean;
+  timestamp: number;
+}
+
 export interface EditorReceipt {
   accepted: boolean;
   count: number;
@@ -91,6 +103,7 @@ export interface EditorSettings {
   editable: boolean;
   autoCorrect: boolean;
   reportPaste: boolean;
+  editActions?: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
   align: number;
@@ -116,6 +129,7 @@ export interface HostCommand {
   assertive?: boolean;
   announcement?: string;
   elementId?: number;
+  windowId?: number;
   openId?: number;
   limit?: number;
   filters?: Array<string>;
@@ -340,6 +354,7 @@ export interface SystemCommand {
   looped?: boolean;
   positionMs?: number;
   durationMs?: number;
+  ephemeral?: boolean;
 }
 
 /** Typed completion shared by clipboard, notification and speech services. */
@@ -406,6 +421,9 @@ export interface WebCommand {
   script?: string;
   x?: number;
   y?: number;
+  requestId?: string;
+  downloadId?: string;
+  path?: string;
 }
 
 export interface WebDownload {
@@ -414,6 +432,11 @@ export interface WebDownload {
   filename: string;
   path: string;
   bytes: number;
+  mimeType?: string;
+  method?: string;
+  requestId?: string;
+  ok?: boolean;
+  errorCode?: string;
 }
 
 export interface WebEvent {
@@ -467,6 +490,13 @@ export declare function nshAttachNativeSubtree(
   slot: NodeContent,
 ): void;
 
+export declare function nshAttachSubWindow(
+  sessionId: number,
+  windowId: number,
+  content: NodeContent,
+  platformWindowId: number,
+): boolean;
+
 export declare function nshCloseSession(sessionId: number): void;
 
 export declare function nshCreateSession(
@@ -481,10 +511,21 @@ export declare function nshCreateSession(
   }) => (request: object) => void,
 ): number;
 
+export declare function nshDesktopEvent(
+  sessionId: number,
+  kind: string,
+  payload: string,
+): void;
+
 export declare function nshEditorEvent(
   targetId: number,
   event: EditorEvent,
 ): EditorReceipt;
+
+export declare function nshEditorKeyEvent(
+  targetId: number,
+  event: EditorKeyEvent,
+): boolean;
 
 export declare function nshOpenUrlResult(
   sessionId: number,

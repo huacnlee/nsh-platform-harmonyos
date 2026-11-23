@@ -21,8 +21,10 @@ app written in Rust) or ready for a TSX app's bundles. Copy both into your app:
 }
 ```
 
-The backend's Cargo features `dev` (connects to `nsh dev`), `api-23` and `api-26` (accessibility providers and
-reduced-motion observation on newer systems) are features of the crate `nsh-platform-harmonyos`.
+The backend's Cargo features `dev` (connects to `nsh dev`), `api-23` and `api-26` (accessibility providers,
+reduced-motion observation and named accessibility actions on newer systems) are features of the crate
+`nsh-platform-harmonyos`. Standalone CLI builds enable `api-23` or `api-26` — and raise the generated
+project's `compatibleSdkVersion` — via `--api 23` or `--api 26`.
 
 ## Ship a bundle with the app
 

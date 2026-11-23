@@ -38,12 +38,21 @@ impl Node {
                 ViewKind::Scroll | ViewKind::Image | ViewKind::Stack | ViewKind::Input
             )
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                modal.presentation() != nsh_core::ModalPresentation::FullScreen
+                if modal.is_main_window_host() {
+                    false
+                } else if modal.is_desktop_window() {
+                    !modal.desktop_transparent()
+                } else {
+                    modal.presentation() != nsh_core::ModalPresentation::FullScreen
+                }
             })
     }
     pub(crate) fn header_item_visible(&self) -> bool {
         if self.kind != ViewKind::HeaderItem {
             return true;
+        }
+        if self.platform.get().os.is_desktop() {
+            return false;
         }
         let Some(parent) = self.parent_node.borrow().upgrade() else {
             return false;
@@ -436,7 +445,15 @@ impl Node {
         let (color, _) = crate::render::shadow_geometry::effective_background(base_color, style);
         let default_surface_bg = self.kind == ViewKind::Screen
             || self.modal.borrow().as_ref().is_some_and(|modal| {
-                modal.presentation() != nsh_core::ModalPresentation::FullScreen
+                if modal.is_main_window_host() {
+                    false
+                } else if modal.is_desktop_window() {
+                    !modal.desktop_transparent()
+                        && !modal.desktop_frame_none()
+                        && !modal.desktop_backdrop()
+                } else {
+                    modal.presentation() != nsh_core::ModalPresentation::FullScreen
+                }
             });
         let bg = if default_surface_bg && color.is_transparent() {
             let dark = self
@@ -469,11 +486,16 @@ impl Node {
         if let Some(modal) = self.modal.borrow().as_ref()
             && radius == [0.0; 4]
         {
-            radius = match modal.presentation() {
-                nsh_core::ModalPresentation::FullScreen => [0.0; 4],
-                nsh_core::ModalPresentation::PageSheet => [16.0, 16.0, 0.0, 0.0],
-                nsh_core::ModalPresentation::FormSheet => [16.0; 4],
-            };
+            if modal.is_desktop_window() || modal.is_main_window_host() {
+                // Desktop windows own their OS window chrome and corner radius natively.
+                radius = [0.0; 4];
+            } else {
+                radius = match modal.presentation() {
+                    nsh_core::ModalPresentation::FullScreen => [0.0; 4],
+                    nsh_core::ModalPresentation::PageSheet => [16.0, 16.0, 0.0, 0.0],
+                    nsh_core::ModalPresentation::FormSheet => [16.0; 4],
+                };
+            }
         }
         let frame = self.frame.get();
         if frame.width > 0.0 && frame.height > 0.0 {

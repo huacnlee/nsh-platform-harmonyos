@@ -25,6 +25,14 @@ impl crate::render::mount::UiContext {
     }
     pub(crate) fn editor_command(&self, command: EditorCommand) {
         let mut pending = self.arkui.borrow_mut();
+        if command.kind == "cursor"
+            && pending
+                .commands
+                .iter()
+                .any(|old| old.target_id == command.target_id && old.kind == "cursor")
+        {
+            return;
+        }
         let wake = pending.is_empty();
         pending.commands.push(command);
         drop(pending);

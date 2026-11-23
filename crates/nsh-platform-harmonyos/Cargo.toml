@@ -55,7 +55,7 @@ nsh-base.workspace = true
 napi-ohos.workspace = true
 napi-derive-ohos.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
-ohos-arkui-binding = { workspace = true, features = ["image"] }
+ohos-arkui-binding = { workspace = true, features = ["image", "udmf"] }
 ohos-accessibility-binding = { workspace = true, optional = true }
 ohos-device-binding.workspace = true
 ohos-display-binding.workspace = true
@@ -78,6 +78,7 @@ ohos-net-connection-binding.workspace = true
 ohos-vibrator-binding.workspace = true
 log.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
 ttf-parser.workspace = true
@@ -96,4 +97,5 @@ log.workspace = true
 nsh-core = { workspace = true, features = ["shader"] }
 unicode-segmentation.workspace = true
 nsh-engine.workspace = true
+serde.workspace = true
 serde_json.workspace = true

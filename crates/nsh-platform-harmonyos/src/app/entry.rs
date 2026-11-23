@@ -311,3 +311,30 @@ pub(crate) fn nsh_service_event(
         host.system.complete(key, value);
     }
 }
+
+#[napi]
+pub(crate) fn nsh_desktop_event(session_id: u32, kind: String, payload: String) {
+    if let Ok(host) = crate::app::session::get(session_id) {
+        host.handle_desktop_event(&kind, &payload);
+    }
+}
+
+#[napi]
+pub(crate) fn nsh_attach_sub_window(
+    env: Env,
+    session_id: u32,
+    window_id: u32,
+    #[napi(ts_arg_type = "NodeContent")] content: Object<'_>,
+    platform_window_id: i32,
+) -> Result<bool> {
+    if crate::app::session::get(session_id).is_err() {
+        return Ok(false);
+    }
+    crate::navigation::modal::attach_sub_window(
+        env,
+        session_id,
+        window_id,
+        content,
+        platform_window_id,
+    )
+}

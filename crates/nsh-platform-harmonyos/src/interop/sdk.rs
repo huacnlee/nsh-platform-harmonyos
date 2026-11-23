@@ -32,6 +32,7 @@ pub(crate) struct EditorSettings {
     pub editable: bool,
     pub auto_correct: bool,
     pub report_paste: bool,
+    pub edit_actions: Option<bool>,
     pub scrollbar_visible: bool,
     pub hit_test: u32,
     pub align: u32,
@@ -91,6 +92,20 @@ pub(crate) struct EditorEvent {
     pub image: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+#[napi(object)]
+pub(crate) struct EditorKeyEvent {
+    pub action: i32,
+    pub key_code: i32,
+    pub key_text: String,
+    pub unicode: u32,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub cmd: bool,
+    pub timestamp: i64,
+}
+
 #[napi(object)]
 pub(crate) struct EditorReceipt {
     pub accepted: bool,
@@ -144,6 +159,9 @@ pub(crate) struct ViewOptions {
     pub test_id: Option<String>,
     pub semantic: bool,
     pub clickable: bool,
+    pub key_focusable: bool,
+    pub focus_command_gen: u32,
+    pub focus_command_focus: bool,
     pub disabled: bool,
     pub accessible: Option<bool>,
     pub hidden: bool,
@@ -194,6 +212,9 @@ pub(crate) struct WebCommand {
     pub script: Option<String>,
     pub x: Option<f64>,
     pub y: Option<f64>,
+    pub request_id: Option<String>,
+    pub download_id: Option<String>,
+    pub path: Option<String>,
 }
 
 #[napi(object)]
@@ -217,6 +238,11 @@ pub(crate) struct WebDownload {
     pub filename: String,
     pub path: String,
     pub bytes: f64,
+    pub mime_type: Option<String>,
+    pub method: Option<String>,
+    pub request_id: Option<String>,
+    pub ok: Option<bool>,
+    pub error_code: Option<String>,
 }
 
 // Only weak routes live here. Nodes, native targets and engines retain their own lifetime.
@@ -377,6 +403,14 @@ pub(crate) fn nsh_editor_event(target_id: u32, event: EditorEvent) -> Result<Edi
 }
 
 #[napi]
+pub(crate) fn nsh_editor_key_event(target_id: u32, event: EditorKeyEvent) -> Result<bool> {
+    NativeAttachment::dispatch(target_id, || {
+        let input = EDITORS.with(|routes| routes.borrow().get(&target_id).and_then(Weak::upgrade));
+        input.is_some_and(|input| input.native_key_event(event))
+    })
+}
+
+#[napi]
 pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
     NativeAttachment::dispatch(action.target_id, || {
         let owner = VIEWS.with(|views| {
@@ -388,7 +422,15 @@ pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
         owner.is_some_and(|owner| {
             let mut accepted = false;
             crate::render::node::callback(|| {
-                if action.kind.is_some() {
+                if action.kind.as_deref() == Some("focus") {
+                    if action.action == "focus" {
+                        owner.emit(nsh_core::EventKind::Focus, nsh_core::EventPayload::None);
+                        accepted = true;
+                    } else if action.action == "blur" {
+                        owner.emit(nsh_core::EventKind::Blur, nsh_core::EventPayload::None);
+                        accepted = true;
+                    }
+                } else if action.kind.is_some() {
                     accepted = owner.selection_action(&action)?;
                 } else {
                     let spec = owner.accessibility_state.spec.borrow();

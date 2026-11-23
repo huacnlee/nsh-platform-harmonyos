@@ -133,6 +133,73 @@ impl System {
                 };
                 (EventKind::Speech, id, true, data)
             }
+            Command::AuthSession { id, page } => {
+                // One auth session runs at a time per route; drop any prior pending entry.
+                let previous: Vec<u32> = {
+                    let mut requests = self.requests.lock().unwrap();
+                    let keys: Vec<u32> = requests
+                        .iter()
+                        .filter_map(|(&key, r)| {
+                            (r.kind == EventKind::AuthSession && Weak::ptr_eq(&r.route, &route))
+                                .then_some(key)
+                        })
+                        .collect();
+                    for key in &keys {
+                        requests.remove(key);
+                    }
+                    keys
+                };
+                for key in previous {
+                    let _ = host.send_host_command(HostCommand {
+                        kind: "system".into(),
+                        open_id: Some(key),
+                        system: Some(SystemCommand {
+                            op: "auth-session-close".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                }
+                (
+                    EventKind::AuthSession,
+                    id,
+                    false,
+                    SystemCommand {
+                        op: "auth-session-open".into(),
+                        uri: Some(page.url),
+                        name: Some(page.callback_scheme),
+                        ephemeral: Some(page.ephemeral),
+                        ..Default::default()
+                    },
+                )
+            }
+            Command::CloseAuthSession(id) => {
+                let key = {
+                    let mut requests = self.requests.lock().unwrap();
+                    let key = requests.iter().find_map(|(&key, r)| {
+                        (r.kind == EventKind::AuthSession
+                            && r.id == id
+                            && Weak::ptr_eq(&r.route, &route))
+                        .then_some(key)
+                    });
+                    if let Some(key) = key {
+                        requests.remove(&key);
+                    }
+                    key
+                };
+                if let Some(key) = key {
+                    host.send_host_command(HostCommand {
+                        kind: "system".into(),
+                        open_id: Some(key),
+                        system: Some(SystemCommand {
+                            op: "auth-session-close".into(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    })?;
+                }
+                return Ok(());
+            }
             Command::Share { id, sheet } => (
                 EventKind::Share,
                 id,
@@ -262,44 +329,130 @@ impl System {
         request: nsh_core::file_dialog::FileRequest,
     ) -> napi_ohos::Result<()> {
         use nsh_core::file_dialog::FileRequest as F;
+        let fail = |message: String| {
+            if let Some(route) = route.upgrade() {
+                route.send(Message::HostEvent(
+                    EventKind::FileRequest,
+                    EventPayload::file_failed(id, message),
+                ));
+            }
+            Ok(())
+        };
         match request {
-            F::OpenPath(path) => self.submit(
-                host,
-                Request {
-                    route,
-                    kind: EventKind::FileRequest,
-                    id,
-                    stream: false,
-                    answer: true,
-                    paste: None,
-                },
-                SystemCommand {
-                    op: "file-open-path".into(),
-                    uri: Some(path.to_string_lossy().into_owned()),
-                    ..Default::default()
-                },
-            ),
-            F::OpenDialog(_) | F::SaveDialog(_) | F::RevealPath(_) | F::MoveToTrash(_) => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::FileRequest,
-                        EventPayload::file_failed(
-                            id,
-                            "local path file dialogs and file manager actions are not supported on HarmonyOS",
-                        ),
-                    ));
+            F::OpenPath(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
                 }
-                Ok(())
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-open-path".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
             }
-            _ => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::FileRequest,
-                        EventPayload::file_failed(id, "unsupported file request on HarmonyOS"),
-                    ));
+            F::OpenDialog(dialog) => {
+                let mode = match dialog.kind {
+                    nsh_core::file_dialog::OpenDialogKind::Folders => "folders",
+                    nsh_core::file_dialog::OpenDialogKind::FilesAndFolders => "both",
+                    _ => "files",
+                };
+                let filters = format_ohos_open_filters(&dialog.filters);
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-open-dialog".into(),
+                        name: Some(mode.into()),
+                        count: Some(if dialog.multiple { 500 } else { 1 }),
+                        paths: (!filters.is_empty()).then_some(filters),
+                        uri: dialog.directory.map(|p| p.to_string_lossy().into_owned()),
+                        title: dialog.title,
+                        ..Default::default()
+                    },
+                )
+            }
+            F::SaveDialog(dialog) => {
+                let choices = format_ohos_save_choices(&dialog.filters);
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-save-dialog".into(),
+                        name: dialog.file_name,
+                        paths: (!choices.is_empty()).then_some(choices),
+                        uri: dialog.directory.map(|p| p.to_string_lossy().into_owned()),
+                        title: dialog.title,
+                        ..Default::default()
+                    },
+                )
+            }
+            F::RevealPath(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
                 }
-                Ok(())
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-reveal-path".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
             }
+            F::MoveToTrash(path) => {
+                if let Err(err) = validate_existing_file_request_path(&path) {
+                    return fail(err);
+                }
+                self.submit(
+                    host,
+                    Request {
+                        route,
+                        kind: EventKind::FileRequest,
+                        id,
+                        stream: false,
+                        answer: true,
+                        paste: None,
+                    },
+                    SystemCommand {
+                        op: "file-move-to-trash".into(),
+                        uri: Some(path.to_string_lossy().into_owned()),
+                        ..Default::default()
+                    },
+                )
+            }
+            _ => fail("unsupported file request on HarmonyOS".into()),
         }
     }
 
@@ -651,7 +804,9 @@ impl System {
             }
             return;
         }
-        let payload = if request.kind == EventKind::Share {
+        let payload = if request.kind == EventKind::AuthSession {
+            auth_session_payload(request.id, value)
+        } else if request.kind == EventKind::Share {
             if let Some(message) = value.error {
                 nsh_core::share::ShareError::failed(message).payload(request.id)
             } else if value.phase.as_deref() == Some("shared") {
@@ -662,7 +817,10 @@ impl System {
         } else if request.kind == EventKind::FileRequest {
             match value.error {
                 Some(error) => EventPayload::file_failed(request.id, error),
-                None => EventPayload::file_answer(request.id, Vec::new()),
+                None => EventPayload::file_answer(
+                    request.id,
+                    parse_file_request_paths(value.files.as_deref()),
+                ),
             }
         } else if request.kind == EventKind::Audio {
             use nsh_core::audio::{AudioError, AudioEvent as E};
@@ -838,6 +996,7 @@ pub(crate) struct SystemCommand {
     pub looped: Option<bool>,
     pub position_ms: Option<f64>,
     pub duration_ms: Option<f64>,
+    pub ephemeral: Option<bool>,
 }
 impl SystemCommand {
     fn notification_listener(command: nsh_core::notifications::NotificationCommand) -> Self {
@@ -1006,6 +1165,107 @@ pub(crate) fn read_picked(
     request.finish(raw)
 }
 
+/// Formats `FileFilter` entries for HarmonyOS `DocumentSelectOptions.fileSuffixFilters`
+/// (`"Description|.ext1,.ext2"`).
+#[allow(dead_code)]
+fn format_ohos_open_filters(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
+    let mut out = Vec::new();
+    for filter in filters {
+        let suffixes: Vec<String> = filter
+            .extensions
+            .iter()
+            .filter(|ext| !ext.is_empty())
+            .map(|ext| format!(".{ext}"))
+            .collect();
+        if suffixes.is_empty() {
+            continue;
+        }
+        let joined = suffixes.join(",");
+        let name = filter.name.replace('|', " ");
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            out.push(joined);
+        } else {
+            out.push(format!("{trimmed}|{joined}"));
+        }
+    }
+    out
+}
+
+/// Formats `FileFilter` entries for HarmonyOS `DocumentSaveOptions.fileSuffixChoices`
+/// (one `"Description|.ext"` option per suffix).
+#[allow(dead_code)]
+fn format_ohos_save_choices(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
+    let mut out = Vec::new();
+    for filter in filters {
+        let name = filter.name.replace('|', " ");
+        let trimmed = name.trim();
+        for ext in &filter.extensions {
+            if ext.is_empty() {
+                continue;
+            }
+            if trimmed.is_empty() {
+                out.push(format!(".{ext}"));
+            } else {
+                out.push(format!("{trimmed}|.{ext}"));
+            }
+        }
+    }
+    out
+}
+
+/// Validates that a file path passed to `open_path`, `reveal_path`, or `move_to_trash`
+/// is absolute (or already a `file://` URI) and exists on disk when given as a filesystem path.
+#[allow(dead_code)]
+fn validate_existing_file_request_path(path: &std::path::Path) -> Result<(), String> {
+    let raw = path.to_string_lossy();
+    if raw.is_empty() {
+        return Err("path must not be empty".into());
+    }
+    if raw.contains("://") {
+        return Ok(());
+    }
+    if !path.is_absolute() {
+        return Err(format!("path must be absolute: {}", path.display()));
+    }
+    if !path.exists() {
+        return Err(format!("path does not exist: {}", path.display()));
+    }
+    Ok(())
+}
+
+/// Parses the JSON array of chosen paths returned by `NativeSystem.ets` file dialogs.
+#[allow(dead_code)]
+fn parse_file_request_paths(files: Option<&str>) -> Vec<std::path::PathBuf> {
+    let Some(raw) = files.filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let Ok(list) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .filter(|path| !path.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Converts a `NativeAuthSession` reply into the `EventKind::AuthSession` payload.
+#[allow(dead_code)]
+fn auth_session_payload(id: u32, value: SystemEvent) -> nsh_core::EventPayload {
+    use nsh_core::auth_session::{AuthSessionError, AuthSessionOutcome};
+    if let Some(message) = value.error.filter(|s| !s.is_empty()) {
+        let mut error = AuthSessionError::failed(message);
+        error.code = value.code.filter(|s| !s.is_empty());
+        return error.payload(id);
+    }
+    if value.phase.as_deref() == Some("completed")
+        && let Some(url) = value.uri.filter(|s| !s.is_empty())
+    {
+        return AuthSessionOutcome::Completed(url).payload(id);
+    }
+    AuthSessionOutcome::Cancelled.payload(id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1140,5 +1400,112 @@ mod tests {
             .unwrap();
         }
         assert_eq!(requests.keys().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
+    }
+    #[test]
+    fn file_dialog_filters_and_paths_format_for_ohos_picker() {
+        use nsh_core::file_dialog::FileFilter;
+        let filters = [
+            FileFilter::new("Markdown", ["md", "markdown"]),
+            FileFilter::new("", ["txt"]),
+        ];
+        assert_eq!(
+            format_ohos_open_filters(&filters),
+            vec!["Markdown|.md,.markdown", ".txt"]
+        );
+        assert_eq!(
+            format_ohos_save_choices(&filters),
+            vec!["Markdown|.md", "Markdown|.markdown", ".txt"]
+        );
+        assert_eq!(
+            parse_file_request_paths(Some(r#"["/storage/docs/a.md","/storage/docs/b.txt"]"#)),
+            vec![
+                std::path::PathBuf::from("/storage/docs/a.md"),
+                std::path::PathBuf::from("/storage/docs/b.txt"),
+            ]
+        );
+        assert!(parse_file_request_paths(Some("[]")).is_empty());
+        assert!(parse_file_request_paths(None).is_empty());
+    }
+    #[test]
+    fn file_request_path_validation_rejects_relative_and_missing_paths() {
+        let temp_dir = std::env::temp_dir();
+        assert!(validate_existing_file_request_path(&temp_dir).is_ok());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "file://docs/storage/Users/currentUser/Documents/a.txt"
+            ))
+            .is_ok()
+        );
+        assert!(validate_existing_file_request_path(std::path::Path::new("note.md")).is_err());
+        assert!(
+            validate_existing_file_request_path(std::path::Path::new(
+                "/nonexistent-nsh-path-12345/note.md"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn auth_session_payload_maps_completed_cancelled_and_error_outcomes() {
+        use nsh_core::{EventPayload, PayloadValue};
+
+        let completed = auth_session_payload(
+            7,
+            SystemEvent {
+                phase: Some("completed".into()),
+                uri: Some("myapp://callback?code=abc".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = completed else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(7.0))));
+        assert!(fields.contains(&("url", PayloadValue::Str("myapp://callback?code=abc".into()))));
+
+        let cancelled = auth_session_payload(
+            8,
+            SystemEvent {
+                phase: Some("cancelled".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = cancelled else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(8.0))));
+        assert!(fields.contains(&("action", PayloadValue::Str("cancelled".into()))));
+
+        let failed = auth_session_payload(
+            9,
+            SystemEvent {
+                error: Some("dialog failed".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = failed else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(9.0))));
+        assert!(fields.contains(&("error", PayloadValue::Str("dialog failed".into()))));
+        assert!(!fields.iter().any(|(key, _)| *key == "code"));
+
+        let unavailable = auth_session_payload(
+            10,
+            SystemEvent {
+                error: Some("no browser".into()),
+                code: Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = unavailable else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(10.0))));
+        assert!(fields.contains(&("error", PayloadValue::Str("no browser".into()))));
+        assert!(fields.contains(&(
+            "code",
+            PayloadValue::Str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into())
+        )));
     }
 }

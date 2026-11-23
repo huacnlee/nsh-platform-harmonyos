@@ -29,7 +29,12 @@ pub(crate) struct Session {
     queue: Weak<Queue>,
 }
 impl Session {
-    pub(crate) fn connect(address: String, queue: Weak<Queue>, token: u64) -> Result<Self> {
+    pub(crate) fn connect(
+        address: String,
+        queue: Weak<Queue>,
+        token: u64,
+        is_desktop: bool,
+    ) -> Result<Self> {
         let url = url::Url::parse(&address).map_err(error)?;
         if !matches!(url.scheme(), "ws" | "wss")
             || url.host_str().is_none()
@@ -54,7 +59,11 @@ impl Session {
                 address,
                 HostInfo {
                     device: "HarmonyOS".into(),
-                    platform: HostPlatform::Android,
+                    platform: if is_desktop {
+                        HostPlatform::Linux
+                    } else {
+                        HostPlatform::Android
+                    },
                     bytecode_version: nsh_engine::BYTECODE_VERSION.into(),
                     ui_sets: crate::ui_sets()
                         .iter()
@@ -90,6 +99,8 @@ impl Session {
         map: Option<String>,
         capabilities: Option<String>,
         app_id: Option<String>,
+        window: Option<String>,
+        application: Option<String>,
     ) -> Result<Bundle> {
         let mut bundle = match format {
             // SAFETY: DevClient negotiated this engine's bytecode version with
@@ -100,6 +111,16 @@ impl Session {
         .with_policy(Policy::development())
         .with_app_id(app_id.as_deref());
         bundle.source_map = map.map(Into::into);
+        if let Some(window) = window.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(window).map_err(error)?;
+            bundle.main_window =
+                Some(nsh_core::desktop::MainWindowOptions::from_json(&value).map_err(error)?);
+        }
+        if let Some(application) = application.as_deref() {
+            let value: serde_json::Value = serde_json::from_str(application).map_err(error)?;
+            bundle.application =
+                Some(nsh_core::desktop::ApplicationOptions::from_json(&value).map_err(error)?);
+        }
         bundle
             .with_capabilities_json(capabilities.as_deref())
             .map_err(error)

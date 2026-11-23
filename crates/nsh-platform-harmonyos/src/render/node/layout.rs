@@ -118,6 +118,9 @@ impl Node {
         {
             scroll.sync_inferred_size()?;
         }
+        if let Some(input) = self.input.borrow().as_ref() {
+            input.frame_moved();
+        }
         self.invalidate_ink(self.applied.get().ink_outset)?;
         let size_changed = old.width != frame.width || old.height != frame.height;
         if size_changed {
@@ -229,7 +232,13 @@ impl Node {
         let mounted = self.mounted();
         let ptr = Rc::as_ptr(&mounted) as usize;
         let native = mounted.borrow();
-        if self.kind == ViewKind::Modal {
+        if self.kind == ViewKind::Modal
+            && !self
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| modal.is_main_window_host())
+        {
             // Dialog lays out its content in a native Column. An absolute
             // Position removes that content from the Column's measured size,
             // leaving hit testing centered around a zero-sized parent.

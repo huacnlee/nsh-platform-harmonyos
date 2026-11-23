@@ -19,6 +19,7 @@ import i18n from "@ohos.i18n";
 import pointer from "@ohos.multimodalInput.pointer";
 import {
   EditorEventPayload,
+  EditorKeyEventPayload,
   EditorReceipt,
   MenuActionPayload,
   NshRuntimeContext,
@@ -30,6 +31,7 @@ import { NativeTabBar, TabBarContext } from "./NativeTabBar";
 import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames";
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
+import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -79,6 +81,7 @@ interface HostCommandPayload {
   assertive?: boolean;
   announcement?: string;
   elementId?: number;
+  windowId?: number;
   openId?: number;
   limit?: number;
   filters?: string[];
@@ -107,6 +110,13 @@ interface NshNativeModule {
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
+  nshDesktopEvent(sessionId: number, kind: string, payload: string): void;
+  nshAttachSubWindow(
+    sessionId: number,
+    windowId: number,
+    content: NodeContent,
+    platformWindowId: number,
+  ): boolean;
   nshSetLifecycle(sessionId: number, lifecycle: string): void;
   nshUpdateKeyboard(sessionId: number, duration: number): void;
   nshUpdateConfig(
@@ -138,6 +148,7 @@ interface NshNativeModule {
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
+  nshEditorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean;
   nshViewAction(action: MenuActionPayload): boolean;
   nshWebControllerAttached(targetId: number, nativeTag: string): boolean;
   nshWebNavigate(targetId: number, url: string): boolean;
@@ -242,6 +253,8 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private readonly mod: NshNativeModule;
   private active: boolean = true;
   private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  private focusHandler?: (componentId: string) => boolean;
+  private uiContextResolver?: (componentId: string) => UIContext | undefined;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
@@ -254,6 +267,30 @@ class ComponentRuntimeContext implements NshRuntimeContext {
 
   setColorMode(colorMode: ThemeColorMode): void {
     this.themeColorMode = colorMode;
+  }
+
+  setFocusHandler(handler?: (componentId: string) => boolean): void {
+    this.focusHandler = handler;
+  }
+
+  setUIContextResolver(resolver?: (componentId: string) => UIContext | undefined): void {
+    this.uiContextResolver = resolver;
+  }
+
+  getUIContextFor(componentId: string): UIContext {
+    return this.uiContextResolver?.(componentId) ?? this.ui;
+  }
+
+  requestFocus(componentId: string): boolean {
+    if (this.focusHandler?.(componentId)) {
+      return true;
+    }
+    try {
+      this.ui.getFocusController().requestFocus(componentId);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   deactivate(): void {
@@ -312,6 +349,17 @@ class ComponentRuntimeContext implements NshRuntimeContext {
       return this.mod.nshEditorEvent(targetId, event);
     } catch {
       return { accepted: false, count: 0 };
+    }
+  }
+
+  editorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean {
+    if (!this.active) {
+      return false;
+    }
+    try {
+      return this.mod.nshEditorKeyEvent(targetId, event);
+    } catch {
+      return false;
     }
   }
 
@@ -417,6 +465,8 @@ class HostSession {
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
+  private readonly desktop?: NativeDesktop;
+  private readonly isDesktop: boolean;
   private readonly plugin: NshPlugin = new NshPlugin();
   private closed: boolean = false;
   private savedPointerVisible?: boolean;
@@ -471,6 +521,30 @@ class HostSession {
     this.syncWindowMetrics();
   };
 
+  private readonly onSecondInstance = (rawArgs?: string[]): void => {
+    if (this.closed || !this.isDesktop) {
+      return;
+    }
+    try {
+      this.mainWindow.showWindow().catch((): void => {});
+    } catch {}
+    const args: string[] = [];
+    if (Array.isArray(rawArgs)) {
+      for (let i = 0; i < rawArgs.length; i++) {
+        if (typeof rawArgs[i] === "string") {
+          args.push(rawArgs[i]);
+        }
+      }
+    }
+    try {
+      this.mod.nshDesktopEvent(
+        this.sessionId,
+        "second-instance",
+        JSON.stringify({ args, cwd: "" }),
+      );
+    } catch {}
+  };
+
   private constructor(
     mod: NshNativeModule,
     uiContext: UIContext,
@@ -514,6 +588,9 @@ class HostSession {
     const displayId = mainWindow.getWindowProperties().displayId;
     if (displayId !== undefined) {
       pixelRatio = display.getDisplayByIdSync(displayId).densityPixels;
+    }
+    if (pixelRatio > 0) {
+      pixelRatio = Math.round(pixelRatio * 10000) / 10000;
     }
     const lifecycle = mainWindow.isWindowShowing()
       ? mainWindow.isFocused()
@@ -572,6 +649,45 @@ class HostSession {
     this.system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
       this.mod.nshServiceEvent(this.sessionId, key, event),
     );
+    this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
+    if (this.isDesktop) {
+      this.desktop = new NativeDesktop(
+        uiContext,
+        abilityContext,
+        mainWindow,
+        (kind: string, payload: string): void => {
+          if (!this.closed) {
+            this.mod.nshDesktopEvent(this.sessionId, kind, payload);
+          }
+        },
+        (windowId: number, content: NodeContent, platformWindowId: number): boolean => {
+          if (this.closed) {
+            return false;
+          }
+          try {
+            return this.mod.nshAttachSubWindow(this.sessionId, windowId, content, platformWindowId);
+          } catch (error) {
+            console.error(`[NSH] attachSubWindow(${windowId}) failed: ${String(error)}`);
+            return false;
+          }
+        },
+        (): void => {
+          this.syncWindowMetrics();
+        },
+        (targetId: number, content: FrameNode | null): boolean =>
+          this.runtimeContext.attachNativeNode(targetId, content),
+        (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
+      );
+      this.runtimeContext.setFocusHandler((componentId: string): boolean =>
+        this.desktop?.requestComponentFocus(componentId) ?? false,
+      );
+      this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
+        this.desktop?.resolveComponentUIContext(componentId),
+      );
+      try {
+        abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
+      } catch {}
+    }
     this.bindWindowListeners();
     this.subscribeLifecycleListeners();
     this.subscribeAccessibility();
@@ -667,7 +783,7 @@ class HostSession {
         newConfig.language ?? "",
         i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
         deviceInfo.deviceType,
-        this.runtimeContext.getUIContext().vp2px(1),
+        Math.round(this.runtimeContext.getUIContext().vp2px(1) * 10000) / 10000,
         localeDetails.languages,
         localeDetails.timeZone,
         localeDetails.regionalLocale,
@@ -692,6 +808,12 @@ class HostSession {
     }
     this.mobileControls.clear();
     this.tabBars.clear();
+    if (this.isDesktop) {
+      try {
+        this.abilityContext.eventHub.off("nsh.secondInstance", this.onSecondInstance);
+      } catch {}
+    }
+    this.desktop?.close();
     this.system.close();
     this.updateCursor("auto");
     this.updateSystemBars();
@@ -841,6 +963,9 @@ class HostSession {
   }
 
   private updateSystemBars(command?: HostCommandPayload): void {
+    if (this.isDesktop) {
+      return;
+    }
     // Keep restoration ordered after outstanding writes, including when a
     // surface stops while a window API promise is still pending.
     this.barsWork = this.barsWork
@@ -897,7 +1022,7 @@ class HostSession {
       });
   }
 
-  private updateCursor(name: string): void {
+  private updateCursor(name: string, windowId?: number): void {
     const controller = this.runtimeContext.getUIContext().getCursorController();
     if (name === "none") {
       if (this.savedPointerVisible === undefined) {
@@ -964,10 +1089,18 @@ class HostSession {
         style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
         break;
       default:
-        controller.restoreDefault();
+        if (windowId !== undefined) {
+          this.desktop?.updateWindowCursor(windowId, undefined);
+        } else {
+          controller.restoreDefault();
+        }
         return;
     }
-    controller.setCursor(style);
+    if (windowId !== undefined) {
+      this.desktop?.updateWindowCursor(windowId, style);
+    } else {
+      controller.setCursor(style);
+    }
   }
 
   private handleHostCommand(command: HostCommandPayload): void {
@@ -991,8 +1124,12 @@ class HostSession {
       this.system.cancel(command.openId ?? 0);
       return;
     }
+    if (command.kind === "desktop") {
+      this.desktop?.execute(command.text ?? "{}");
+      return;
+    }
     if (command.kind === "cursor") {
-      this.updateCursor(command.text ?? "auto");
+      this.updateCursor(command.text ?? "auto", command.windowId);
       return;
     }
     if (command.kind === "restore-bars") {
@@ -1035,6 +1172,8 @@ class HostSession {
           control.setColorMode(mode),
         );
         this.tabBars.forEach((bar: NativeTabBar): void => bar.setColorMode(mode));
+        this.desktop?.setColorMode(mode);
+        this.system.setColorMode(mode);
         this.runtimeContext.setColorMode(mode);
       }
       return;

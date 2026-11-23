@@ -85,5 +85,16 @@ mod video_mailbox;
 #[allow(dead_code)]
 mod scene_policy;
 
+#[path = "../../src/services/desktop.rs"]
+#[allow(dead_code)]
+mod desktop;
+
 #[path = "../../src/text/family.rs"]
 mod text_family;
+
+#[path = "../../src/render/canvas_render/spec.rs"]
+mod canvas_render;
+
+#[path = "../../src/media/web_downloads.rs"]
+#[allow(dead_code)]
+mod web_downloads;

@@ -7,6 +7,7 @@ import {
   ComponentContent,
   NodeContent,
 } from "@ohos.arkui.node";
+import { LengthMetrics } from "@kit.ArkUI";
 import { UIContext } from "@ohos.arkui.UIContext";
 import deviceInfo from "@ohos.deviceInfo";
 import { NshRuntimeContext } from "./NativeEditors";
@@ -32,6 +33,9 @@ export interface Settings {
   hue: number;
   semantic: boolean;
   clickable: boolean;
+  keyFocusable?: boolean;
+  focusCommandGen?: number;
+  focusCommandFocus?: boolean;
   disabled: boolean;
   accessible?: boolean | null;
   hidden: boolean;
@@ -61,6 +65,7 @@ interface MenuParameters {
   menu: ViewMenu;
 }
 interface MenuLease {
+  ui: UIContext;
   content: ComponentContent<MenuParameters>;
   generation: number;
   opening: Promise<void>;
@@ -150,7 +155,24 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       .accessibilitySelected(s.selected);
     node.accessibilityRole(role(s.role));
     node.accessibilityChecked(s.checked === null ? undefined : s.checked);
-    node.enabled(!s.disabled).onClick(s.clickable || s.menu != null ? (): void => {} : undefined);
+    const keyFocusable = s.keyFocusable === true && !s.disabled;
+    node
+      .enabled(!s.disabled)
+      .onClick(s.clickable || keyFocusable || s.menu != null ? (): void => {} : undefined)
+      .focusOnTouch(keyFocusable);
+    // Do not call `.focusable(false)` on the wrapper `Stack`: in ArkUI that
+    // disables focus for the entire descendant subtree (including child editors).
+    if (keyFocusable) {
+      node
+        .focusable(true)
+        .focusBox({ strokeWidth: LengthMetrics.vp(0) })
+        .onFocus((): void => {
+          this.entry.focusEvent("focus");
+        })
+        .onBlur((): void => {
+          this.entry.focusEvent("blur");
+        });
+    }
     if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
     }
@@ -204,6 +226,9 @@ function nativeView(params: ViewParameters) {
   .width(params.settings.width)
   .height(params.settings.height)
   .attributeModifier(new ViewModifier(params.entry, params.settings))
+  .onAppear((): void => {
+    params.entry.appeared();
+  })
   .onAccessibilityActionIntercept(
     (action: AccessibilityAction): AccessibilityActionInterceptResult => {
       if (action === AccessibilityAction.ACCESSIBILITY_CLICK && params.entry.action("activate")) {
@@ -293,6 +318,9 @@ class ViewEntry {
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
   private pointerPosting: PointerPosting;
+  private appearedReady: boolean = false;
+  private focusPending: boolean = false;
+  private lastFocusCommandGen: number = 0;
   constructor(
     settings: Settings,
     context: NshRuntimeContext,
@@ -372,6 +400,7 @@ class ViewEntry {
       }
       this.attached = true;
       this.syncMenu();
+      this.syncFocus();
     } catch (error) {
       if (this.attached) {
         try {
@@ -425,6 +454,60 @@ class ViewEntry {
     }
     if (!this.closed) {
       this.syncMenu();
+      this.syncFocus();
+    }
+  }
+  appeared(): void {
+    this.appearedReady = true;
+    if (this.focusPending && !this.closed && this.context.isActive()) {
+      this.focusPending = false;
+      this.requestViewFocus();
+    }
+  }
+  focusEvent(name: string): void {
+    if (this.closed || !this.context.isActive() || this.settings.keyFocusable !== true) {
+      return;
+    }
+    this.context.viewAction({
+      targetId: this.settings.targetId,
+      action: name,
+      kind: "focus",
+    });
+  }
+  private viewId(): string {
+    return this.settings.testId ?? `nsh-view-${this.settings.targetId}`;
+  }
+  private viewUIContext(): UIContext {
+    const id = this.viewId();
+    return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.ui;
+  }
+  private requestViewFocus(): boolean {
+    const id = this.viewId();
+    try {
+      if (this.context.requestFocus) {
+        return this.context.requestFocus(id);
+      }
+      this.ui.getFocusController().requestFocus(id);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+  private syncFocus(): void {
+    const gen = this.settings.focusCommandGen ?? 0;
+    if (gen === 0 || gen === this.lastFocusCommandGen) {
+      return;
+    }
+    this.lastFocusCommandGen = gen;
+    if (this.settings.focusCommandFocus === true) {
+      if (!this.appearedReady || !this.requestViewFocus()) {
+        this.focusPending = true;
+      }
+    } else {
+      this.focusPending = false;
+      try {
+        this.viewUIContext().getFocusController().clearFocus();
+      } catch (_) {}
     }
   }
   private syncMenu(): void {
@@ -457,7 +540,7 @@ class ViewEntry {
     if (previous) {
       this.retireMenu(previous);
     }
-    const ui = this.ui;
+    const ui = this.viewUIContext();
     const frame = this.focusTargetNode() ?? this.node.getFrameNode();
     if (!frame) {
       return;
@@ -465,9 +548,7 @@ class ViewEntry {
     // C custom nodes have a disabled focus type. Their native Stack wrapper
     // owns selection focus, so keys bubble only inside this surface and the
     // menu restores that focus without taking it back from a host control.
-    ui.getFocusController().requestFocus(
-      this.settings.testId ?? `nsh-view-${this.settings.targetId}`,
-    );
+    ui.getFocusController().requestFocus(this.viewId());
     const content = new ComponentContent<MenuParameters>(
       ui,
       wrapBuilder(menuContent),
@@ -475,6 +556,7 @@ class ViewEntry {
       { nestingBuilderSupported: true },
     );
     const lease: MenuLease = {
+      ui: ui,
       content: content,
       generation: menu.generation,
       opening: Promise.resolve(),
@@ -504,7 +586,9 @@ class ViewEntry {
       lease,
       lease.opening,
       (): Promise<void> =>
-        lease.disappeared ? Promise.resolve() : this.ui.getPromptAction().closeMenu(lease.content),
+        lease.disappeared
+          ? Promise.resolve()
+          : lease.ui.getPromptAction().closeMenu(lease.content),
       (): void => lease.content.dispose(),
     );
   }

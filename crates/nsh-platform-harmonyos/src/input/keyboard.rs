@@ -3,12 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use nsh_core::{
     NodeId,
-    keymap::{Key, KeyMatch, Keymap, Keystroke, Modifiers},
+    keymap::{Key, Keymap, Keystroke, Modifiers},
 };
 use ohos_arkui_binding::{
     component::attribute::{ArkUICommonAttribute, ArkUIEvent},
     event::{KeyCode as N, KeyEvent, KeyEventType},
 };
+
+const KEY_SCROLL_LINE_STEP_VP: f32 = 40.0;
 
 impl crate::render::node::Node {
     pub(crate) fn dismiss_keyboard(&self) -> crate::render::node::Result<()> {
@@ -32,6 +34,41 @@ impl crate::render::node::Node {
         }
         Ok(())
     }
+    pub(crate) fn key_window_id(&self) -> NodeId {
+        if self
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| modal.is_desktop_window())
+        {
+            return self.id;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if node
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| modal.is_desktop_window())
+            {
+                return node.id;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        nsh_core::ROOT_ID
+    }
+    pub(crate) fn key_surface_root(self: &std::rc::Rc<Self>) -> std::rc::Rc<Self> {
+        let mut node = self.clone();
+        loop {
+            if node.id == nsh_core::ROOT_ID || node.kind == nsh_core::ViewKind::Modal {
+                return node;
+            }
+            let Some(parent) = node.parent_node.borrow().upgrade() else {
+                return node;
+            };
+            node = parent;
+        }
+    }
     fn find_input(&self, id: NodeId) -> Option<std::rc::Rc<crate::input::editor::Input>> {
         if self.id == id {
             return self.input.borrow().clone();
@@ -43,18 +80,52 @@ impl crate::render::node::Node {
             .find_map(|node| node.find_input(id))
     }
 }
-#[derive(Default)]
 pub(crate) struct Snapshot {
     pub(crate) map: Arc<Keymap>,
+    pub(crate) menu: Option<Arc<[nsh_core::desktop::MenuItem]>>,
+    pub(crate) menu_bar_mode: nsh_core::desktop::MenuBarMode,
+    pub(crate) menu_bar_revealed: bool,
+    pub(crate) quit_on_request: bool,
+    pub(crate) desktop: bool,
     pub(crate) focused: Option<NodeId>,
     pub(crate) input: Option<NodeId>,
     pub(crate) selection: Option<NodeId>,
     pub(crate) composing: bool,
 }
+impl Default for Snapshot {
+    fn default() -> Self {
+        Self {
+            map: Default::default(),
+            menu: None,
+            menu_bar_mode: nsh_core::desktop::MenuBarMode::Shown,
+            menu_bar_revealed: false,
+            quit_on_request: true,
+            desktop: false,
+            focused: None,
+            input: None,
+            selection: None,
+            composing: false,
+        }
+    }
+}
 #[derive(Default)]
 struct Held {
     keys: Vec<(N, bool)>,
+    last_editor_key: Option<(i64, i32, N)>,
+    alt_armed: bool,
 }
+
+struct KeyInput<'a> {
+    action: i32,
+    code: N,
+    unicode: u32,
+    key_text: &'a str,
+    pressed_keys: Option<&'a [i32]>,
+    explicit_modifiers: Option<Modifiers>,
+    timestamp: i64,
+    from_editor: bool,
+}
+
 /// Per-window modifier bookkeeping, with no window-global native registration.
 pub(crate) struct KeyboardWindow {
     id: i32,
@@ -65,7 +136,10 @@ impl KeyboardWindow {
         self.id
     }
     pub(crate) fn clear(&self) {
-        self.held.lock().unwrap().keys.clear();
+        let mut held = self.held.lock().unwrap();
+        held.keys.clear();
+        held.last_editor_key = None;
+        held.alt_armed = false;
     }
     pub(crate) fn modifiers(&self) -> Modifiers {
         self.held.lock().unwrap().modifiers()
@@ -88,13 +162,94 @@ impl KeyboardWindow {
             KeyEventType::Up => 2,
             _ => return false,
         };
-        let code = event.key_code();
-        let mut held = self.held.lock().unwrap();
-        // Focus may have entered while modifiers were held in the host. Read the
-        // event's pressed set instead of depending on keydowns outside our tree.
         let mut pressed = [0; 64];
-        if let Ok(count) = event.pressed_keys(&mut pressed) {
-            let keys = &pressed[..count.min(pressed.len())];
+        let pressed_keys = event
+            .pressed_keys(&mut pressed)
+            .ok()
+            .map(|count| &pressed[..count.min(pressed.len())]);
+        let key_text = event.key_text();
+        self.dispatch(
+            KeyInput {
+                action,
+                code: event.key_code(),
+                unicode: event.unicode(),
+                key_text: &key_text,
+                pressed_keys,
+                explicit_modifiers: None,
+                timestamp: event.event_time(),
+                from_editor: false,
+            },
+            route,
+            owner,
+        )
+    }
+
+    pub(crate) fn editor_event(
+        &self,
+        event: &crate::interop::sdk::EditorKeyEvent,
+        route: &crate::app::runtime::Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        if event.action != 1 && event.action != 2 {
+            return false;
+        }
+        let code = N::try_from_raw(event.key_code).unwrap_or(N::Unknown);
+        self.dispatch(
+            KeyInput {
+                action: event.action,
+                code,
+                unicode: event.unicode,
+                key_text: &event.key_text,
+                pressed_keys: None,
+                explicit_modifiers: Some(Modifiers {
+                    ctrl: event.ctrl,
+                    alt: event.alt,
+                    shift: event.shift,
+                    cmd: event.cmd,
+                }),
+                timestamp: event.timestamp,
+                from_editor: true,
+            },
+            route,
+            owner,
+        )
+    }
+
+    fn dispatch(
+        &self,
+        input: KeyInput<'_>,
+        route: &crate::app::runtime::Dispatcher,
+        owner: &std::rc::Rc<crate::render::node::Node>,
+    ) -> bool {
+        let action = input.action;
+        let code = input.code;
+        let mut held = self.held.lock().unwrap();
+        if input.from_editor {
+            held.last_editor_key = Some((input.timestamp, action, code));
+        } else if held.last_editor_key.take() == Some((input.timestamp, action, code)) {
+            return false;
+        }
+        if action == 1
+            && !matches!(
+                code,
+                N::ShiftLeft
+                    | N::ShiftRight
+                    | N::CtrlLeft
+                    | N::CtrlRight
+                    | N::AltLeft
+                    | N::AltRight
+                    | N::MetaLeft
+                    | N::MetaRight
+            )
+        {
+            owner
+                .control
+                .set_input_modality(nsh_core::platform::InputModality::Keyboard);
+        }
+        // Focus may have entered while modifiers were held in the host. Sync from
+        // the event's pressed set or modifier state instead of relying solely on
+        // prior keydowns inside our tree.
+        if let Some(keys) = input.pressed_keys {
             held.keys.retain(|(key, _)| {
                 *key == code || keys.iter().any(|raw| N::try_from_raw(*raw) == Some(*key))
             });
@@ -106,6 +261,8 @@ impl KeyboardWindow {
                     held.keys.push((key, false));
                 }
             }
+        } else if let Some(modifiers) = input.explicit_modifiers {
+            held.sync_modifiers(code, modifiers);
         }
         let held_before = held.keys.iter().any(|(old, _)| *old == code);
         let modifiers = held.modifiers();
@@ -115,11 +272,12 @@ impl KeyboardWindow {
         } else {
             nsh_core::EventKind::KeyUp
         };
+        let window = owner.key_window_id();
         let focus = owner
             .key_focus
             .borrow()
             .upgrade()
-            .filter(|node| node.visible_in_tree());
+            .filter(|node| node.visible_in_tree() && node.key_window_id() == window);
         let target = focus.as_ref().unwrap_or(owner);
         let mut ancestor = Some(target.clone());
         let (mut observes, mut captures) = (false, false);
@@ -127,48 +285,19 @@ impl KeyboardWindow {
             let (listens, prevents) = node.interaction.key_interest(kind, stroke.as_ref());
             observes |= listens;
             captures |= prevents;
-            if node.modal.borrow().is_some() {
+            if node
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| !modal.is_main_window_host())
+            {
                 break;
             }
             ancestor = node.parent_node.borrow().upgrade();
         }
         if (observes || captures) && !route.keyboard.lock().unwrap().composing {
             let mut details = nsh_core::KeyEvent::default();
-            let text = char::from_u32(event.unicode()).filter(|ch| !ch.is_control());
-            let named = match code {
-                N::ShiftLeft | N::ShiftRight => "Shift",
-                N::AltLeft | N::AltRight => "Alt",
-                N::CtrlLeft | N::CtrlRight => "Control",
-                N::MetaLeft | N::MetaRight => "Meta",
-                N::DpadLeft => "ArrowLeft",
-                N::DpadRight => "ArrowRight",
-                N::DpadDown => "ArrowDown",
-                N::DpadUp => "ArrowUp",
-                N::MoveHome => "Home",
-                N::MoveEnd => "End",
-                N::Del => "Backspace",
-                N::ForwardDel => "Delete",
-                N::Enter => "Enter",
-                N::Escape => "Escape",
-                N::Tab => "Tab",
-                N::PageUp => "PageUp",
-                N::PageDown => "PageDown",
-                N::Insert => "Insert",
-                _ => "",
-            };
-            let logical = if !named.is_empty() {
-                named.to_owned()
-            } else if let Some(text) = text {
-                text.to_string()
-            } else {
-                let text = event.key_text();
-                if text.is_empty() {
-                    "Unidentified".into()
-                } else {
-                    text
-                }
-            };
-            details.key = logical.into();
+            details.key = logical_key(code, input.unicode, modifiers.shift, input.key_text).into();
             // ArkUI exposes a logical key identifier but no hardware scan code.
             details.modifiers = modifiers;
             match code {
@@ -210,15 +339,40 @@ impl KeyboardWindow {
         } else {
             captures = false;
         }
-        let shortcut = held.event(action, code, |stroke, repeat| {
-            // Capture is recomputed for each transition. Only shortcut
-            // consumption is retained for the matching hardware release.
-            if captures {
-                return false;
-            }
+        let alt_released_alone = held.track_alt_alone(action, code, held_before);
+        let allow_key_scroll = !observes
+            && focus
+                .as_ref()
+                .is_none_or(|node| node.scroll.borrow().is_some());
+        let shortcut = held.event(action, code, captures, |stroke, repeat| {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.composing {
                 return false;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && stroke.key == Key::Escape
+                && stroke.modifiers == Modifiers::default()
+                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                && snapshot.menu_bar_revealed
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::Hide,
+                ));
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && stroke.key == Key::F(10)
+                && stroke.modifiers == Modifiers::default()
+                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::ToggleF10,
+                ));
+                return true;
             }
             if snapshot.focused.is_none()
                 && let Some(id) = snapshot.selection
@@ -229,6 +383,7 @@ impl KeyboardWindow {
                     Key::Char('c')
                         if stroke.modifiers.ctrl
                             && !stroke.modifiers.alt
+                            && !stroke.modifiers.shift
                             && !stroke.modifiers.cmd =>
                     {
                         Some(Command::Copy)
@@ -236,6 +391,7 @@ impl KeyboardWindow {
                     Key::Char('a')
                         if stroke.modifiers.ctrl
                             && !stroke.modifiers.alt
+                            && !stroke.modifiers.shift
                             && !stroke.modifiers.cmd =>
                     {
                         Some(Command::SelectAll)
@@ -251,8 +407,8 @@ impl KeyboardWindow {
             }
             let matched = snapshot
                 .map
-                .find(stroke, snapshot.focused.is_some(), repeat);
-            if let KeyMatch::Fire(id) = matched {
+                .find_in(window, stroke, snapshot.focused.is_some(), repeat);
+            if let Some(id) = matched.fired() {
                 route.send(crate::app::runtime::Message::HostEvent(
                     nsh_core::EventKind::KeyCommand,
                     nsh_core::EventPayload::Value(nsh_core::PayloadValue::Number(id as f64)),
@@ -261,11 +417,62 @@ impl KeyboardWindow {
             if matched.consumed() {
                 return true;
             }
+            if !repeat
+                && snapshot.desktop
+                && let Some(menu) = snapshot.menu.as_deref()
+                && let Some(shortcut) = crate::services::desktop::shortcut_from_keystroke(stroke)
+                && let Some(action) = nsh_core::desktop::MenuItem::find_shortcut(menu, &shortcut)
+                && (snapshot.focused.is_none() || action.fires_while_editing())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuAction {
+                    id: action.id,
+                    role: action.role,
+                });
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && window == nsh_core::ROOT_ID
+                && snapshot.focused.is_none()
+                && stroke.modifiers
+                    == (Modifiers {
+                        alt: true,
+                        ..Modifiers::default()
+                    })
+                && let Key::Char(ch) = stroke.key
+                && ch.is_ascii_alphabetic()
+                && let Some(menu) = snapshot.menu.as_deref()
+                && crate::services::desktop::menu_bar_has_initial(menu, ch)
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::OpenInitial(ch),
+                ));
+                return true;
+            }
+            if !repeat
+                && snapshot.desktop
+                && stroke.key == Key::Char('q')
+                && stroke.modifiers
+                    == (Modifiers {
+                        ctrl: true,
+                        ..Modifiers::default()
+                    })
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuAction {
+                    id: 0,
+                    role: Some(nsh_core::desktop::MenuRole::Quit),
+                });
+                return true;
+            }
             if !repeat {
                 if stroke.key == Key::Escape && stroke.modifiers == Modifiers::default() {
                     if snapshot.input.is_some() {
-                        route.send(crate::app::runtime::Message::DismissKeyboard);
-                        return true;
+                        if !snapshot.desktop {
+                            route.send(crate::app::runtime::Message::DismissKeyboard);
+                            return true;
+                        }
+                        drop(snapshot);
+                        return back(route);
                     }
                     drop(snapshot);
                     return back(route);
@@ -288,8 +495,64 @@ impl KeyboardWindow {
                     return back(route);
                 }
             }
+            if snapshot.desktop
+                && snapshot.focused.is_none()
+                && snapshot.selection.is_none()
+                && allow_key_scroll
+            {
+                use nsh_core::scroll::KeyMove;
+                let scroll_move = if stroke.modifiers == Modifiers::default() {
+                    match stroke.key {
+                        Key::PageUp => Some((KeyMove::Pages(-1.0), false)),
+                        Key::PageDown => Some((KeyMove::Pages(1.0), false)),
+                        Key::Home => Some((KeyMove::Start, false)),
+                        Key::End => Some((KeyMove::End, false)),
+                        Key::Up => Some((
+                            KeyMove::Points(nsh_core::Points(-KEY_SCROLL_LINE_STEP_VP)),
+                            false,
+                        )),
+                        Key::Down => Some((
+                            KeyMove::Points(nsh_core::Points(KEY_SCROLL_LINE_STEP_VP)),
+                            false,
+                        )),
+                        Key::Char(' ') => Some((KeyMove::Pages(1.0), false)),
+                        _ => None,
+                    }
+                } else if stroke.modifiers
+                    == (Modifiers {
+                        shift: true,
+                        ..Modifiers::default()
+                    })
+                    && stroke.key == Key::Char(' ')
+                {
+                    Some((KeyMove::Pages(-1.0), false))
+                } else {
+                    None
+                };
+                if let Some((key_move, horizontal)) = scroll_move {
+                    route.send(crate::app::runtime::Message::KeyScroll {
+                        window,
+                        key_move,
+                        horizontal,
+                    });
+                    return true;
+                }
+            }
             false
         });
+        if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
+            let snapshot = route.keyboard.lock().unwrap();
+            if snapshot.desktop
+                && !snapshot.composing
+                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+            {
+                route.send(crate::app::runtime::Message::DesktopMenuBar(
+                    crate::services::desktop::MenuBarKeyAction::ToggleAlt,
+                ));
+                return true;
+            }
+        }
         shortcut || captures
     }
 }
@@ -309,8 +572,48 @@ pub(crate) fn install(
     owner: &std::rc::Rc<crate::render::node::Node>,
 ) -> crate::render::node::Result<()> {
     owner.native.borrow().set_focusable(true)?;
+    if owner.platform.get().os.is_desktop() {
+        // ArkUI delegates focus requested on a container to its first focusable
+        // leaf descendant (e.g. a search TextInput). A childless leaf focus sink
+        // inside the root absorbs surface-level focus so global shortcuts bubble
+        // to `on_key_event` without focusing an editor or clearing selections.
+        let sink = ohos_arkui_binding::component::built_in_component::Stack::new()?.into_node();
+        {
+            use ohos_arkui_binding::{
+                common::attribute::ArkUINodeAttributeNumber,
+                types::{
+                    advanced::LengthMetricUnit,
+                    attribute::ArkUINodeAttributeType as A,
+                    view::{AccessibilityMode, HitTestMode},
+                },
+            };
+            let node = sink.borrow();
+            node.set_length_metric_unit(LengthMetricUnit::Vp)?;
+            node.width(1.0)?;
+            node.height(1.0)?;
+            node.opacity(0.0)?;
+            node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+            node.set_i32_attribute(
+                A::AccessibilityMode,
+                AccessibilityMode::DisabledForDescendants.into(),
+            )?;
+            node.set_focusable(true)?;
+            let _ = node.set_default_focus(true);
+            let _ = node.set_focus_box([
+                ArkUINodeAttributeNumber::Float(0.0),
+                ArkUINodeAttributeNumber::Float(0.0),
+                ArkUINodeAttributeNumber::Uint(0),
+            ]);
+        }
+        owner.native.borrow_mut().insert_child(sink.clone(), 0)?;
+        *owner.focus_sink.borrow_mut() = Some(sink);
+    }
     let weak = std::rc::Rc::downgrade(owner);
-    owner.native.borrow_mut().on_key_pre_ime(move |event| {
+    // Use post-IME key delivery so active IMEs (including desktop candidate
+    // windows that do not populate PreviewText) consume editing and navigation
+    // keys while composing. Focused editors route post-IME keys before ArkUI's
+    // built-in TextArea/TextInput handler via `nsh_editor_key_event`.
+    owner.native.borrow_mut().on_key_event(move |event| {
         if let Some(owner) = weak.upgrade()
             && let Some(event) = event.key_event()
             && let Some(route) = owner.dispatcher.upgrade()
@@ -318,14 +621,29 @@ pub(crate) fn install(
         {
             event.set_consumed(true);
             event.stop_propagation(true);
-            return Some(true);
         }
-        Some(false)
     });
     Ok(())
 }
 
 impl Held {
+    fn sync_modifiers(&mut self, code: N, modifiers: Modifiers) {
+        let mut sync = |left: N, right: N, active: bool| {
+            if active {
+                if code != left && code != right && !self.has(left, right) {
+                    self.keys.push((left, false));
+                }
+            } else {
+                self.keys.retain(|(held_code, _)| {
+                    *held_code == code || (*held_code != left && *held_code != right)
+                });
+            }
+        };
+        sync(N::CtrlLeft, N::CtrlRight, modifiers.ctrl);
+        sync(N::AltLeft, N::AltRight, modifiers.alt);
+        sync(N::ShiftLeft, N::ShiftRight, modifiers.shift);
+        sync(N::MetaLeft, N::MetaRight, modifiers.cmd);
+    }
     fn modifiers(&self) -> Modifiers {
         Modifiers {
             ctrl: self.has(N::CtrlLeft, N::CtrlRight),
@@ -337,12 +655,56 @@ impl Held {
     fn cancel(&mut self, action: i32) -> bool {
         if action == 0 {
             self.keys.clear();
+            self.last_editor_key = None;
+            self.alt_armed = false;
             true
         } else {
             false
         }
     }
-    fn event(&mut self, action: i32, code: N, fire: impl FnOnce(Keystroke, bool) -> bool) -> bool {
+    fn track_alt_alone(&mut self, action: i32, code: N, held_before: bool) -> bool {
+        let is_alt = matches!(code, N::AltLeft | N::AltRight);
+        match action {
+            1 => {
+                if is_alt {
+                    let modifiers = self.modifiers();
+                    let others = modifiers.ctrl || modifiers.shift || modifiers.cmd;
+                    if !held_before && !others && self.keys.is_empty() {
+                        self.alt_armed = true;
+                    } else if others {
+                        self.alt_armed = false;
+                    }
+                } else {
+                    self.alt_armed = false;
+                }
+                false
+            }
+            2 => {
+                if is_alt {
+                    let armed = std::mem::replace(&mut self.alt_armed, false);
+                    let modifiers = self.modifiers();
+                    let other_alt = self
+                        .keys
+                        .iter()
+                        .any(|(k, _)| *k != code && matches!(k, N::AltLeft | N::AltRight));
+                    armed && !other_alt && !modifiers.ctrl && !modifiers.shift && !modifiers.cmd
+                } else {
+                    false
+                }
+            }
+            _ => {
+                self.alt_armed = false;
+                false
+            }
+        }
+    }
+    fn event(
+        &mut self,
+        action: i32,
+        code: N,
+        captured: bool,
+        fire: impl FnOnce(Keystroke, bool) -> bool,
+    ) -> bool {
         if self.cancel(action) {
             return false;
         }
@@ -357,8 +719,8 @@ impl Held {
             return false;
         }
         let modifiers = self.modifiers();
-        let consumed =
-            key(code).is_some_and(|key| fire(Keystroke { key, modifiers }, old.is_some()));
+        let consumed = captured
+            || key(code).is_some_and(|key| fire(Keystroke { key, modifiers }, old.is_some()));
         if let Some(index) = old {
             self.keys[index].1 |= consumed;
         } else {
@@ -372,6 +734,56 @@ impl Held {
             .any(|(code, _)| *code == left || *code == right)
     }
 }
+fn logical_key(code: N, unicode: u32, shift: bool, key_text: &str) -> String {
+    let named = match code {
+        N::ShiftLeft | N::ShiftRight => "Shift",
+        N::AltLeft | N::AltRight => "Alt",
+        N::CtrlLeft | N::CtrlRight => "Control",
+        N::MetaLeft | N::MetaRight => "Meta",
+        N::DpadLeft => "ArrowLeft",
+        N::DpadRight => "ArrowRight",
+        N::DpadDown => "ArrowDown",
+        N::DpadUp => "ArrowUp",
+        N::MoveHome => "Home",
+        N::MoveEnd => "End",
+        N::Del => "Backspace",
+        N::ForwardDel => "Delete",
+        N::Enter | N::NumpadEnter => "Enter",
+        N::Escape => "Escape",
+        N::Tab => "Tab",
+        N::Space => " ",
+        N::PageUp => "PageUp",
+        N::PageDown => "PageDown",
+        N::Insert => "Insert",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named.to_owned();
+    }
+    if let Some(ch) = char::from_u32(unicode).filter(|ch| !ch.is_control()) {
+        return ch.to_string();
+    }
+    if let Some(mapped) = key(code) {
+        match mapped {
+            Key::Char(ch) => {
+                let ch = if shift && ch.is_ascii_lowercase() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    ch
+                };
+                return ch.to_string();
+            }
+            Key::F(n) => return format!("F{n}"),
+            _ => {}
+        }
+    }
+    if key_text.is_empty() || key_text.starts_with("KEYCODE_") {
+        "Unidentified".into()
+    } else {
+        key_text.to_owned()
+    }
+}
+
 fn key(code: N) -> Option<Key> {
     use Key as K;
     Some(match code {
@@ -423,7 +835,7 @@ fn key(code: N) -> Option<Key> {
         N::F10 => K::F(10),
         N::F11 => K::F(11),
         N::F12 => K::F(12),
-        N::Enter => K::Enter,
+        N::Enter | N::NumpadEnter => K::Enter,
         N::Escape => K::Escape,
         N::Tab => K::Tab,
         N::Space => K::Char(' '),
@@ -459,36 +871,93 @@ mod tests {
     #[test]
     fn repeat_and_consumed_release_survive_callback_borrowing() {
         let mut held = Held::default();
-        assert!(held.event(1, N::A, |_, repeat| {
+        assert!(held.event(1, N::A, false, |_, repeat| {
             assert!(!repeat);
             true
         }));
-        assert!(!held.event(1, N::A, |_, repeat| {
+        assert!(!held.event(1, N::A, false, |_, repeat| {
             assert!(repeat);
             false
         }));
-        assert!(held.event(2, N::A, |_, _| panic!("up must not dispatch")));
-        assert!(!held.event(2, N::A, |_, _| false));
+        assert!(held.event(2, N::A, false, |_, _| panic!("up must not dispatch")));
+        assert!(!held.event(2, N::A, false, |_, _| false));
+    }
+    #[test]
+    fn captured_key_down_consumes_matching_release() {
+        let mut held = Held::default();
+        assert!(held.event(1, N::Enter, true, |_, _| panic!(
+            "captured key must not run shortcut callback"
+        )));
+        assert!(held.event(2, N::Enter, false, |_, _| false));
+        assert!(!held.event(2, N::Enter, false, |_, _| false));
+    }
+    #[test]
+    fn right_modifier_release_clears_externally_synced_left_modifier() {
+        let mut held = Held::default();
+        held.sync_modifiers(
+            N::A,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(held.modifiers().shift);
+        held.sync_modifiers(N::ShiftRight, Modifiers::default());
+        assert!(!held.modifiers().shift);
     }
     #[test]
     fn cancellation_does_not_require_a_decodable_key_code() {
         let mut held = Held::default();
-        held.event(1, N::CtrlLeft, |_, _| false);
+        held.event(1, N::CtrlLeft, false, |_, _| false);
         assert!(held.cancel(0));
         assert!(held.keys.is_empty());
     }
     #[test]
     fn modifier_state_and_cancel_are_native_only() {
         let mut held = Held::default();
-        held.event(1, N::CtrlLeft, |_, _| false);
-        held.event(1, N::C, |stroke, _| {
+        held.event(1, N::CtrlLeft, false, |_, _| false);
+        held.event(1, N::C, false, |stroke, _| {
             assert!(stroke.modifiers.ctrl);
             false
         });
-        held.event(0, N::C, |_, _| false);
-        held.event(1, N::C, |stroke, _| {
+        held.event(0, N::C, false, |_, _| false);
+        held.event(1, N::C, false, |stroke, _| {
             assert!(!stroke.modifiers.ctrl);
             false
         });
+    }
+    #[test]
+    fn logical_key_maps_space_and_letters_when_unicode_is_zero() {
+        assert_eq!(logical_key(N::Space, 0, true, "KEYCODE_SPACE"), " ");
+        assert_eq!(logical_key(N::A, 0, false, "KEYCODE_A"), "a");
+        assert_eq!(logical_key(N::A, 0, true, "KEYCODE_A"), "A");
+        assert_eq!(logical_key(N::F5, 0, false, "KEYCODE_F5"), "F5");
+        assert_eq!(logical_key(N::A, 'ä' as u32, false, "KEYCODE_A"), "ä");
+        assert_eq!(logical_key(N::NumpadEnter, 0, false, ""), "Enter");
+    }
+    #[test]
+    fn sync_modifiers_tracks_external_state_without_overwriting_active_modifier() {
+        let mut held = Held::default();
+        held.sync_modifiers(
+            N::B,
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(held.modifiers().ctrl);
+        assert!(held.modifiers().shift);
+        assert!(!held.modifiers().alt);
+        // Pressing Ctrl itself must not pre-populate Ctrl before held.event checks repeat.
+        let mut fresh = Held::default();
+        fresh.sync_modifiers(
+            N::CtrlLeft,
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+        );
+        assert!(!fresh.modifiers().ctrl);
     }
 }

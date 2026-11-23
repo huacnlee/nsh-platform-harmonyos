@@ -34,7 +34,7 @@ const BUDGET: usize = 96 << 20;
 struct Image {
     uri: Arc<str>,
     bitmap: Option<Bitmap>,
-    job: Arc<AtomicBool>,
+    job: Option<Arc<AtomicBool>>,
 }
 pub(crate) struct CanvasView {
     owner: Weak<Node>,
@@ -76,7 +76,9 @@ impl CanvasView {
         self.texts.borrow_mut().clear();
         let mut images = self.images.borrow_mut();
         for image in images.iter() {
-            image.job.store(true, Ordering::Relaxed);
+            if let Some(job) = &image.job {
+                job.store(true, Ordering::Relaxed);
+            }
         }
         let mut next = Vec::new();
         for image in drawing.images() {
@@ -87,7 +89,7 @@ impl CanvasView {
                 .iter_mut()
                 .find(|i| i.uri == image.uri)
                 .and_then(|i| i.bitmap.take());
-            let job = if bitmap.is_none() {
+            let job = bitmap.is_none().then(|| {
                 owner.images.load(
                     crate::media::image::Target::Canvas {
                         id: owner.id,
@@ -97,9 +99,7 @@ impl CanvasView {
                     image.uri.to_string(),
                     None,
                 )
-            } else {
-                Arc::new(AtomicBool::new(false))
-            };
+            });
             next.push(Image {
                 uri: image.uri.clone(),
                 bitmap,
@@ -208,12 +208,13 @@ impl CanvasView {
         Ok(())
     }
     fn replay(&self, canvas: &Canvas, owner: &Node) {
+        let images = self.images.borrow();
         let mut replay = Replay {
             canvas,
             matrix: RefCell::new(Matrix::new()),
             scale: owner.scale.get(),
             slots: &self.slots.borrow(),
-            images: &self.images.borrow(),
+            images: ImageLookup::Live(&images),
             fonts: &owner.fonts,
             texts: &mut self.texts.borrow_mut(),
             text_index: 0,
@@ -228,10 +229,40 @@ impl CanvasView {
 impl Drop for CanvasView {
     fn drop(&mut self) {
         for image in self.images.get_mut() {
-            image.job.store(true, Ordering::Relaxed);
+            if let Some(job) = &image.job {
+                job.store(true, Ordering::Relaxed);
+            }
         }
         self.budget.set(self.budget.get() - self.image_bytes.get());
     }
+}
+
+/// Replays a `Drawing` onto an offscreen bitmap-backed `Canvas` (safe on worker threads).
+pub(crate) fn replay_offscreen(
+    canvas: &Canvas,
+    drawing: &Drawing,
+    scale: f32,
+    images: &[(Arc<str>, Bitmap)],
+    fonts: &Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
+    rtl: bool,
+) {
+    let mut texts = Vec::new();
+    let slots = vec![AnimationValue::Number(0.0); drawing.slots.len()];
+    let mut replay = Replay {
+        canvas,
+        matrix: RefCell::new(Matrix::new()),
+        scale,
+        slots: &slots,
+        images: ImageLookup::Offscreen(images),
+        fonts,
+        texts: &mut texts,
+        text_index: 0,
+        rtl,
+        state: State::default(),
+        saved: Vec::new(),
+        path: Geometry::default(),
+    };
+    replay.run(drawing);
 }
 #[derive(Clone, Copy, PartialEq)]
 struct Affine([f32; 6]);
@@ -321,12 +352,30 @@ impl Default for State {
         }
     }
 }
+enum ImageLookup<'a> {
+    Live(&'a [Image]),
+    Offscreen(&'a [(Arc<str>, Bitmap)]),
+}
+impl<'a> ImageLookup<'a> {
+    fn get(&self, uri: &str) -> Option<&'a Bitmap> {
+        match self {
+            Self::Live(images) => images
+                .iter()
+                .find(|i| i.uri.as_ref() == uri)
+                .and_then(|i| i.bitmap.as_ref()),
+            Self::Offscreen(images) => images
+                .iter()
+                .find(|(u, _)| u.as_ref() == uri)
+                .map(|(_, bitmap)| bitmap),
+        }
+    }
+}
 struct Replay<'a> {
     canvas: &'a Canvas,
     matrix: RefCell<Matrix>,
     scale: f32,
     slots: &'a [AnimationValue],
-    images: &'a [Image],
+    images: ImageLookup<'a>,
     fonts: &'a Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     texts: &'a mut Vec<ShapedText>,
     text_index: usize,
@@ -492,12 +541,7 @@ impl Replay<'_> {
                     source,
                     dest,
                 } => {
-                    if let Some(bitmap) = self
-                        .images
-                        .iter()
-                        .find(|i| i.uri == image.uri)
-                        .and_then(|i| i.bitmap.as_ref())
-                    {
+                    if let Some(bitmap) = self.images.get(&image.uri) {
                         let [x, y, w, h] = dest.map(|n| self.num(n));
                         let w = if w.is_nan() {
                             source.map_or(bitmap.width() as f32, |s| s.size.width.0)

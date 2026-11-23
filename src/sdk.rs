@@ -76,6 +76,50 @@ impl Arch {
     }
 }
 
+/// Minimum OpenHarmony / HarmonyOS API level targeted by the native library
+/// and generated project (`--api`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub(crate) enum ApiLevel {
+    #[default]
+    Api20 = 20,
+    Api23 = 23,
+    Api26 = 26,
+}
+
+impl ApiLevel {
+    pub(crate) fn parse(value: &str) -> anyhow::Result<ApiLevel> {
+        match value.trim() {
+            "20" => Ok(ApiLevel::Api20),
+            "23" => Ok(ApiLevel::Api23),
+            "26" => Ok(ApiLevel::Api26),
+            other => bail!("--api is 20, 23 or 26, not {other}"),
+        }
+    }
+
+    /// Numeric API level (`20`, `23` or `26`).
+    pub(crate) const fn number(self) -> u32 {
+        self as u32
+    }
+
+    /// Cargo feature on `nsh-platform-harmonyos` enabling API-gated bindings.
+    pub(crate) const fn backend_feature(self) -> Option<&'static str> {
+        match self {
+            ApiLevel::Api20 => None,
+            ApiLevel::Api23 => Some("api-23"),
+            ApiLevel::Api26 => Some("api-26"),
+        }
+    }
+
+    /// HarmonyOS SDK version string written into `build-profile.json5`.
+    pub(crate) const fn harmonyos_version(self) -> &'static str {
+        match self {
+            ApiLevel::Api20 => "6.0.0(20)",
+            ApiLevel::Api23 => "6.1.0(23)",
+            ApiLevel::Api26 => "26.0.0",
+        }
+    }
+}
+
 /// The OpenHarmony NDK: the SDK's `native` directory.
 pub(crate) struct Ndk {
     pub(crate) native: PathBuf,
@@ -175,6 +219,32 @@ impl Ndk {
             .iter()
             .rev()
             .find_map(|version| Self::resolve(version, depth - 1))
+    }
+
+    /// API version declared in `oh-uni-package.json`, when present.
+    pub(crate) fn api_version(&self) -> Option<u32> {
+        let text = fs::read_to_string(self.native.join("oh-uni-package.json")).ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        match &json["apiVersion"] {
+            serde_json::Value::Number(n) => n.as_u64().and_then(|v| u32::try_from(v).ok()),
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Fails early when the discovered NDK is older than `required`.
+    pub(crate) fn check_api(&self, required: ApiLevel) -> anyhow::Result<()> {
+        if let Some(available) = self.api_version()
+            && available < required.number()
+        {
+            bail!(
+                "--api {} requires an OpenHarmony NDK for API {} or later, but {} is API {available}",
+                required.number(),
+                required.number(),
+                self.native.display(),
+            );
+        }
+        Ok(())
     }
 
     /// A cargo command that cross-compiles for `arch` with this NDK.
@@ -549,5 +619,47 @@ mod tests {
         assert_eq!(parse_device_arch("x86_64\n"), Some(Arch::X86_64));
         assert_eq!(parse_device_arch("default,armeabi-v7a"), Some(Arch::Armv7a));
         assert_eq!(parse_device_arch(""), None);
+    }
+
+    #[test]
+    fn parses_api_levels_and_checks_ndk_version() {
+        assert_eq!(ApiLevel::default(), ApiLevel::Api20);
+        assert_eq!(ApiLevel::parse("20").unwrap(), ApiLevel::Api20);
+        assert_eq!(ApiLevel::parse("23").unwrap(), ApiLevel::Api23);
+        assert_eq!(ApiLevel::parse("26").unwrap(), ApiLevel::Api26);
+        assert!(ApiLevel::parse("19").is_err());
+        assert!(ApiLevel::parse("21").is_err());
+        assert!(ApiLevel::parse("api-26").is_err());
+
+        assert_eq!(ApiLevel::Api20.backend_feature(), None);
+        assert_eq!(ApiLevel::Api23.backend_feature(), Some("api-23"));
+        assert_eq!(ApiLevel::Api26.backend_feature(), Some("api-26"));
+        assert_eq!(ApiLevel::Api20.harmonyos_version(), "6.0.0(20)");
+        assert_eq!(ApiLevel::Api23.harmonyos_version(), "6.1.0(23)");
+        assert_eq!(ApiLevel::Api26.harmonyos_version(), "26.0.0");
+
+        let dir = env::temp_dir().join(format!("nsh-hm-ndk-api-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let ndk = Ndk {
+            native: dir.clone(),
+        };
+        assert_eq!(ndk.api_version(), None);
+        ndk.check_api(ApiLevel::Api26).unwrap();
+
+        fs::write(
+            dir.join("oh-uni-package.json"),
+            r#"{"apiVersion": "22", "version": "6.0.2.10"}"#,
+        )
+        .unwrap();
+        assert_eq!(ndk.api_version(), Some(22));
+        ndk.check_api(ApiLevel::Api20).unwrap();
+        let err = ndk.check_api(ApiLevel::Api23).unwrap_err().to_string();
+        assert!(err.contains("--api 23"), "{err}");
+        assert!(err.contains("API 22"), "{err}");
+
+        fs::write(dir.join("oh-uni-package.json"), r#"{"apiVersion": 26}"#).unwrap();
+        assert_eq!(ndk.api_version(), Some(26));
+        ndk.check_api(ApiLevel::Api26).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

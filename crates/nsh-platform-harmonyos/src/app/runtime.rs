@@ -127,6 +127,22 @@ pub(crate) enum Message {
         [crate::app::session::AvoidArea; 3],
         crate::app::session::AvoidArea,
     ),
+    HostDesktop(crate::services::desktop::DesktopEvent),
+    DesktopMenuBar(crate::services::desktop::MenuBarKeyAction),
+    DesktopMenuAction {
+        id: u32,
+        role: Option<nsh_core::desktop::MenuRole>,
+    },
+    DesktopSelectionMenu {
+        target: nsh_core::NodeId,
+        x: f32,
+        y: f32,
+    },
+    KeyScroll {
+        window: nsh_core::NodeId,
+        key_move: nsh_core::scroll::KeyMove,
+        horizontal: bool,
+    },
     HostEvent(nsh_core::EventKind, nsh_core::EventPayload),
     TextSelection(
         nsh_core::NodeId,
@@ -508,6 +524,96 @@ impl State {
                 self.update_environment(changes)?;
             }
             Message::HostWindow(..) => {}
+            Message::HostDesktop(event) => {
+                use crate::services::desktop::DesktopEvent;
+                match event {
+                    DesktopEvent::WindowState(state) => {
+                        if self.environment.os.is_desktop() {
+                            let prev_state = self.environment.window_state;
+                            let became_focused =
+                                state.focused && !prev_state.is_some_and(|prev| prev.focused);
+                            let lost_focus =
+                                !state.focused && prev_state.is_some_and(|prev| prev.focused);
+                            let mode_changed = prev_state.map(|prev| prev.mode) != Some(state.mode);
+                            if prev_state != Some(state) {
+                                self.environment.window_state = Some(state);
+                                let effective = self.effective_environment(self.environment);
+                                self.engine
+                                    .as_ref()
+                                    .unwrap()
+                                    .control()
+                                    .set_environment(effective);
+                                let mounter = self.mounter.as_mut().unwrap();
+                                mounter.environment(effective)?;
+                                mounter.on_main_window_state(state);
+                                if mode_changed || lost_focus {
+                                    mounter.on_main_window_chrome_change(state)?;
+                                }
+                            }
+                            if became_focused
+                                && self.laid_out
+                                && let Some(mounter) = &self.mounter
+                            {
+                                mounter.request_desktop_focus();
+                            }
+                        }
+                    }
+                    DesktopEvent::TitleBar(edges) => {
+                        if self.environment.os.is_desktop() && self.environment.title_bar != edges {
+                            self.environment.title_bar = edges;
+                            let effective = self.effective_environment(self.environment);
+                            self.engine
+                                .as_ref()
+                                .unwrap()
+                                .control()
+                                .set_environment(effective);
+                            let mounter = self.mounter.as_ref().unwrap();
+                            mounter.environment(effective)?;
+                            mounter.on_main_window_title_bar(edges);
+                        }
+                    }
+                    DesktopEvent::Displays(displays) => {
+                        if self.environment.os.is_desktop() {
+                            self.engine
+                                .as_ref()
+                                .unwrap()
+                                .control()
+                                .set_displays(displays);
+                        }
+                    }
+                    other => {
+                        self.mounter.as_mut().unwrap().desktop_event(other)?;
+                    }
+                }
+            }
+            Message::DesktopMenuBar(action) => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_menu_bar_key(action)?;
+            }
+            Message::DesktopMenuAction { id, role } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_menu_action(id, role)?;
+            }
+            Message::DesktopSelectionMenu { target, x, y } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .desktop_selection_menu(target, x, y)?;
+            }
+            Message::KeyScroll {
+                window,
+                key_move,
+                horizontal,
+            } => {
+                self.mounter
+                    .as_ref()
+                    .unwrap()
+                    .key_scroll(window, key_move, horizontal)?;
+            }
             Message::HostEvent(kind, payload) => self
                 .engine
                 .as_ref()
@@ -521,7 +627,7 @@ impl State {
                     .unwrap()
                     .accessibility_event(id, event)?;
             }
-            Message::Image(ready) => self.mounter.as_ref().unwrap().image_ready(ready)?,
+            Message::Image(ready) => self.mounter.as_mut().unwrap().image_ready(ready)?,
             Message::ImageProgress(progress) => {
                 self.mounter.as_ref().unwrap().image_progress(progress)
             }
@@ -546,7 +652,11 @@ impl State {
                     .mounter
                     .as_mut()
                     .expect("running surface has a mounter");
+                let first_batch = mounter.batch_count() == 0;
                 let result = mounter.apply(batch);
+                if first_batch && self.environment.os.is_desktop() && result.is_ok() {
+                    mounter.request_desktop_focus();
+                }
                 self.retire()?;
                 if let Err(error) = result {
                     #[cfg(feature = "dev")]
@@ -630,20 +740,33 @@ impl State {
             );
         }
     }
+    fn effective_environment(
+        &self,
+        mut env: nsh_core::platform::Environment,
+    ) -> nsh_core::platform::Environment {
+        if let Some(mounter) = &self.mounter {
+            let inset = mounter.menu_bar_inset();
+            if inset > 0.0 {
+                env.window.height = nsh_core::Points((env.window.height.0 - inset).max(0.0));
+            }
+        }
+        env
+    }
     fn update_environment(&mut self, changes: NshEnvironment) -> Result<()> {
         let environment = changes.apply(self.environment)?;
         if environment == self.environment {
             return Ok(());
         }
+        let effective = self.effective_environment(environment);
         if let Some(mounter) = &self.mounter {
             // Publish density before the engine records text for this environment.
             mounter.text_scale.store(
-                environment.pixel_ratio.to_bits(),
+                effective.pixel_ratio.to_bits(),
                 std::sync::atomic::Ordering::Relaxed,
             );
         }
         if let Some(engine) = &self.engine {
-            engine.control().set_environment(environment);
+            engine.control().set_environment(effective);
         }
         let lifecycle_changed = self.environment.lifecycle != environment.lifecycle;
         self.environment = environment;
@@ -654,7 +777,7 @@ impl State {
             }
             // Lifecycle metadata must reach the compositor even if stopping
             // an independent input/scroll owner failed.
-            updated = updated.and(mounter.environment(environment));
+            updated = updated.and(mounter.environment(effective));
         }
         // A failed native cleanup must not leave the old active frame vote or
         // worker visibility in place after the lifecycle has already changed.
@@ -979,6 +1102,9 @@ impl Runtime {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
             clipboard_images: Some(true),
+            canvas_render: true,
+            webview_requests: true,
+            auth_session: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,
@@ -991,7 +1117,18 @@ impl Runtime {
             ..Environment::default()
         };
         let environment = config.host.environment().apply(environment)?;
-        let environment = config.environment.clone().apply(environment)?;
+        let mut environment = config.environment.clone().apply(environment)?;
+        let os = crate::services::desktop::os_for_idiom(environment.idiom);
+        environment.os = os;
+        let initial_displays = if os.is_desktop() {
+            let (window_state, title_bar, displays) = config.host.desktop_snapshot();
+            environment.window_state = window_state;
+            environment.title_bar = title_bar;
+            displays
+        } else {
+            Vec::new()
+        };
+        dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
         state.borrow_mut().environment = environment;
         let access = match &app.app {
             nsh_engine::App::Js(bundle) => bundle.policy.access(),
@@ -1005,6 +1142,21 @@ impl Runtime {
         );
         let access = Arc::new(access);
         let assets = app.assets.clone();
+        let main_window_options = app.app.main_window().cloned();
+        let storage: Option<Arc<dyn nsh_engine::StorageBackend>> =
+            config.storage.as_ref().map(|directory| {
+                nsh_engine::FileStorage::open(directory) as Arc<dyn nsh_engine::StorageBackend>
+            });
+        let main_window_launch = if os.is_desktop() {
+            main_window_options.as_ref().and_then(|options| {
+                let kept = storage
+                    .as_deref()
+                    .and_then(|backend| options.kept_placement(backend, &initial_displays));
+                crate::services::desktop::wire_main_window_launch(options, kept)
+            })
+        } else {
+            None
+        };
         #[allow(unused_mut)]
         let mut engine_config = EngineConfig {
             app: app.app,
@@ -1017,16 +1169,14 @@ impl Runtime {
             filesystem: None,
             assets: Some(engine_assets),
             environment,
-            header_heights: (nsh_core::Points(52.0), nsh_core::Points(52.0)),
+            header_heights: crate::services::desktop::header_heights_for_os(os),
             limits: config.limits,
             ui_sets: crate::ui_sets(),
             runtime: None,
             support_dir: None,
             data_dir: Some(config.host.data_directory()),
             cache: config.cache.clone(),
-            storage: config.storage.as_ref().map(|directory| {
-                nsh_engine::FileStorage::open(directory) as Arc<dyn nsh_engine::StorageBackend>
-            }),
+            storage,
             clock: Default::default(),
             context: Default::default(),
             pinned: Default::default(),
@@ -1061,6 +1211,9 @@ impl Runtime {
             move || OhosTextEngine::new(engine_scale, engine_fonts),
             Sink(dispatcher.clone(), app.chunks),
             move |control| {
+                if !initial_displays.is_empty() {
+                    control.set_displays(initial_displays);
+                }
                 if let Some(tokens) = host_tokens {
                     control.set_tokens(Some(tokens));
                 }
@@ -1075,6 +1228,10 @@ impl Runtime {
         #[cfg(feature = "dev")]
         if let Some(testing) = &app.testing {
             testing.model.engine_started(control.clone());
+        }
+        let mut initial_main_window = crate::services::desktop::MainWindowState::default();
+        if let Some(options) = &main_window_options {
+            initial_main_window.apply_attributes(&options.attributes);
         }
         let context = Rc::new(crate::render::mount::UiContext {
             theme: RefCell::default(),
@@ -1114,9 +1271,14 @@ impl Runtime {
             canvas_bytes: Rc::new(Cell::new(0)),
             fonts,
             platform: Cell::new(environment),
+            main_window: RefCell::new(initial_main_window),
             appearance: Cell::new(nsh_core::platform::Appearance::System),
         });
-        let mounter = Mounter::new(parent, size, context).map_err(napi_error)?;
+        let mut mounter = Mounter::new(parent, size, context).map_err(napi_error)?;
+        if let Some(launch) = main_window_launch {
+            mounter.note_main_window_launch_applied();
+            config.host.desktop_command(&launch)?;
+        }
         state.borrow_mut().mounter = Some(mounter);
         state.borrow_mut().engine = Some(engine);
         let runtime = Self {
@@ -1190,7 +1352,8 @@ impl Runtime {
             // `Message::Resize` only relayouts the viewport; reactive
             // environment signals (`windowSize()`, `window()`, `md:`/`lg:`
             // classes) read `Environment::window`.
-            engine.control().set_environment(state.environment);
+            let effective = state.effective_environment(state.environment);
+            engine.control().set_environment(effective);
         }
         Ok(())
     }
@@ -1240,7 +1403,14 @@ impl Runtime {
     }
     pub(crate) fn layout_changed(&self) -> napi_ohos::Result<()> {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+        let first_layout = !state.laid_out;
         state.laid_out = true;
+        if first_layout
+            && state.environment.os.is_desktop()
+            && let Some(mounter) = &state.mounter
+        {
+            mounter.request_desktop_focus();
+        }
         let changes = if let Some(mounter) = &state.mounter {
             mounter
                 .host

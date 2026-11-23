@@ -1,6 +1,7 @@
 pub(crate) mod animation;
 pub(crate) mod arkui;
 pub(crate) mod canvas;
+pub(crate) mod canvas_render;
 pub(crate) mod composition;
 pub(crate) mod decor;
 pub(crate) mod effects;

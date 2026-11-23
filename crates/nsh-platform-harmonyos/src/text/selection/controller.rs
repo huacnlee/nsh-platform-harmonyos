@@ -89,7 +89,7 @@ impl Node {
             .is_some_and(|a| !a.model.is_empty())
     }
     pub(crate) fn selection_refresh(&self) -> Result<()> {
-        if !self.selectable() {
+        if !(self.selectable() || self.interaction.selectable_view()) {
             return self.selection_clear();
         }
         if let Some(area) = self.selection_area.borrow_mut().as_mut() {
@@ -131,6 +131,7 @@ impl Node {
             route.keyboard.lock().unwrap().selection = None;
         }
         owner.selection.menu.set(false);
+        owner.selection.desktop.set(false);
         owner.selection_clear_local()?;
         owner.update_wrapper()
     }
@@ -160,12 +161,88 @@ impl Node {
         }
         *self.selection_area.borrow_mut() = Some(area);
         *self.selected_text.borrow_mut() = Some(Rc::downgrade(self));
+        self.selection.desktop.set(false);
         if let Some(route) = self.dispatcher.upgrade() {
             route.keyboard.lock().unwrap().selection = Some(self.id);
         }
         self.ensure_wrapper()?;
         self.selection_menu_show(true)?;
         self.touches.borrow_mut().selection_started(self, (x, y))?;
+        Ok(true)
+    }
+    pub(crate) fn selection_press(
+        self: &Rc<Self>,
+        x: f32,
+        y: f32,
+        clicks: u32,
+        extend: bool,
+    ) -> Result<bool> {
+        if !self.selectable()
+            || !self.visible_in_tree()
+            || self.accessibility_state.spec.borrow().state.disabled
+        {
+            return Ok(false);
+        }
+        let target_root = Area::root(self);
+        if extend
+            && let Some(existing) = self
+                .selected_text
+                .borrow()
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+            && Rc::ptr_eq(&Area::root(&existing), &target_root)
+            && let Some(area) = existing.selection_area.borrow_mut().as_mut()
+        {
+            existing.selection.desktop.set(true);
+            existing.selection.menu.set(false);
+            area.update(self, |model, texts, matrix| {
+                model.press(texts, project(matrix, (x, y)), clicks, true);
+            })?;
+            existing.update_wrapper()?;
+            return Ok(true);
+        }
+        self.clear_text_selection()?;
+        let mut area = Area::new(&target_root);
+        area.update(self, |model, texts, matrix| {
+            model.press(texts, project(matrix, (x, y)), clicks, false);
+        })?;
+        *self.selection_area.borrow_mut() = Some(area);
+        *self.selected_text.borrow_mut() = Some(Rc::downgrade(self));
+        self.selection.desktop.set(true);
+        self.selection.menu.set(false);
+        if let Some(route) = self.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().selection = Some(self.id);
+        }
+        self.update_wrapper()?;
+        Ok(true)
+    }
+    pub(crate) fn selection_select_all_target(self: &Rc<Self>, desktop: bool) -> Result<bool> {
+        if !(self.selectable() || self.interaction.selectable_view())
+            || !self.visible_in_tree()
+            || self.accessibility_state.spec.borrow().state.disabled
+        {
+            return Ok(false);
+        }
+        let target_root = Area::root(self);
+        self.clear_text_selection()?;
+        let mut area = Area::new(&target_root);
+        area.update(self, |model, texts, _| {
+            model.select_all(texts);
+        })?;
+        if area.model.is_empty() {
+            return Ok(false);
+        }
+        *self.selection_area.borrow_mut() = Some(area);
+        *self.selected_text.borrow_mut() = Some(Rc::downgrade(self));
+        self.selection.desktop.set(desktop);
+        self.selection.menu.set(false);
+        if let Some(route) = self.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().selection = Some(self.id);
+        }
+        if !desktop {
+            self.ensure_wrapper()?;
+        }
+        self.update_wrapper()?;
         Ok(true)
     }
     pub(crate) fn selection_set(&self, range: Range<usize>) -> Result<()> {
@@ -347,6 +424,16 @@ impl Node {
         canvas.attach_brush(&brush);
         let geometry = self.selection.geometry.borrow();
         if handles {
+            if self
+                .selected_text
+                .borrow()
+                .as_ref()
+                .and_then(std::rc::Weak::upgrade)
+                .is_some_and(|owner| owner.selection.desktop.get())
+            {
+                canvas.detach_brush();
+                return;
+            }
             if let Some(edges) = geometry.handles {
                 for (index, (x, top, bottom)) in edges.into_iter().enumerate() {
                     if !self.selection.handles.get()[index] {

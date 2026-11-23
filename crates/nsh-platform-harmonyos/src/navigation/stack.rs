@@ -218,6 +218,13 @@ impl Screen {
         self.paint()
     }
     pub(crate) fn large_title_offset(&self) -> f32 {
+        if self
+            .owner
+            .upgrade()
+            .is_some_and(|owner| owner.platform.get().os.is_desktop())
+        {
+            return 0.0;
+        }
         let c = self.config.borrow();
         if c.header_visible && !c.header_transparent && c.large_title {
             52.0 + self
@@ -253,14 +260,19 @@ impl Screen {
             .resolve(owner.platform.get().color_scheme)
             == nsh_engine::ColorScheme::Dark;
         let fg = owner.theme.borrow().color("foreground", dark);
+        let desktop = owner.platform.get().os.is_desktop();
+        let show_native_header = c.header_visible && !desktop;
         let overlap = owner.top_overlap();
-        let height = if c.header_visible {
+        let height = if show_native_header {
             52.0 + overlap
         } else {
             0.0
         };
         if owner.parent.get().is_some() {
-            if !c.large_title && !c.header_transparent && (c.header_height.0 - height).abs() > 0.01
+            if !desktop
+                && !c.large_title
+                && !c.header_transparent
+                && (c.header_height.0 - height).abs() > 0.01
             {
                 owner
                     .control
@@ -268,7 +280,7 @@ impl Screen {
             }
             let safe = owner.platform.get().safe_area;
             let insets = EdgeInsets {
-                top: if c.header_visible && !c.header_transparent {
+                top: if show_native_header && !c.header_transparent {
                     Points::ZERO
                 } else {
                     Points(overlap)
@@ -287,7 +299,7 @@ impl Screen {
         let h = self.header.borrow();
         h.width(owner.frame.get().width)?;
         h.height(height)?;
-        h.set_i32_attribute(A::Visibility, i32::from(!c.header_visible))?;
+        h.set_i32_attribute(A::Visibility, i32::from(!show_native_header))?;
         h.background_color(if c.header_transparent {
             0
         } else {
@@ -726,6 +738,9 @@ impl Screen {
         let Some(owner) = self.owner.upgrade() else {
             return false;
         };
+        if owner.platform.get().os.is_desktop() {
+            return false;
+        }
         let c = self.config.borrow();
         self.is_top()
             && self.has_back.get()
@@ -790,6 +805,9 @@ impl Screen {
     }
     pub(crate) fn item_position(&self, child: &Node) -> Option<(f32, f32)> {
         let owner = self.owner.upgrade()?;
+        if owner.platform.get().os.is_desktop() {
+            return None;
+        }
         let c = self.config.borrow();
         if !c.header_visible {
             return None;

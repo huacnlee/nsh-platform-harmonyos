@@ -144,6 +144,18 @@ fn preload(
         if let Some(schemes) = manifest.get("schemes") {
             bundle.url_schemes = nsh_core::url_scheme::schemes_from_json(schemes);
         }
+        if let Some(window) = manifest.get("window") {
+            bundle.main_window = Some(
+                nsh_core::desktop::MainWindowOptions::from_json(window)
+                    .map_err(|e| format!("app.json: {e}"))?,
+            );
+        }
+        if let Some(application) = manifest.get("application") {
+            bundle.application = Some(
+                nsh_core::desktop::ApplicationOptions::from_json(application)
+                    .map_err(|e| format!("app.json: {e}"))?,
+            );
+        }
         if let Some(value) = manifest.get("entryChunks") {
             let names: Vec<String> = serde_json::from_value(value.clone())
                 .map_err(|e| format!("app.json entryChunks: {e}"))?;
@@ -500,5 +512,28 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn app_manifest_parses_main_window_options() {
+        let mut bundle = Bundle::default();
+        preload(
+            &mut bundle,
+            resources(&[(
+                "app.json",
+                r#"{"id":"com.example.gallery","window":{"title":"Gallery","titleBar":{"style":"hidden","height":44}}}"#,
+            )]),
+        )
+        .unwrap();
+        let main_window = bundle
+            .main_window
+            .expect("main_window parsed from app.json");
+        assert_eq!(main_window.attributes.title.as_deref(), Some("Gallery"));
+        let title_bar = main_window
+            .attributes
+            .title_bar
+            .expect("title_bar parsed from app.json");
+        assert_eq!(title_bar.style, nsh_core::desktop::TitleBarStyle::Hidden);
+        assert_eq!(title_bar.height, Some(nsh_core::Points(44.0)));
     }
 }

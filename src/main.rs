@@ -44,10 +44,10 @@ const USAGE: &str = "\
 nsh-platform-harmonyos: run Native Shell apps on HarmonyOS and OpenHarmony
 
 Usage (through nsh, which finds this program on PATH):
-  nsh package [APP] --target harmonyos [--arch ARCH] [--out DIR] [--runtime-os OS]
-  nsh run [APP] --target harmonyos [--arch ARCH] [--device ID] [--release]
-  nsh dev [APP] --target harmonyos [--arch ARCH] [--device ID] [--port PORT] [--release]
-  nsh test [PATH] --target harmonyos [--arch ARCH] [--device ID] [--filter NAME] [--junit FILE]
+  nsh package [APP] --target harmonyos [--arch ARCH] [--api LEVEL] [--out DIR] [--runtime-os OS]
+  nsh run [APP] --target harmonyos [--arch ARCH] [--api LEVEL] [--device ID] [--release]
+  nsh dev [APP] --target harmonyos [--arch ARCH] [--api LEVEL] [--device ID] [--port PORT] [--release]
+  nsh test [PATH] --target harmonyos [--arch ARCH] [--api LEVEL] [--device ID] [--filter NAME] [--junit FILE]
 
 Commands:
   package   Build the app into a DevEco Studio project (default: .nsh/out/harmonyos),
@@ -61,6 +61,8 @@ Commands:
 Options:
   -o, --out DIR          Where `package` writes the project
       --runtime-os OS    harmonyos (default: Huawei's devices, AppGallery) or openharmony
+      --api LEVEL        Minimum API level: 20 (default), 23 (enables api-23 accessibility),
+                         or 26 (enables api-26 named accessibility actions)
       --arch ARCH        Native architecture to build: arm64 (default for `package`),
                          armv7a or x86_64 (default for `run`, `dev` and `test`: the device's)
       --device ID        The device `hdc` installs on (hdc list targets)
@@ -88,6 +90,7 @@ struct Options {
     app: Option<PathBuf>,
     out: Option<PathBuf>,
     runtime_os: project::RuntimeOs,
+    api: sdk::ApiLevel,
     arch: Option<sdk::Arch>,
     device: Option<String>,
     port: Option<u16>,
@@ -148,6 +151,9 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
             Some("--runtime-os") => {
                 options.runtime_os =
                     project::RuntimeOs::parse(&text_arg(value("--runtime-os")?, "--runtime-os")?)?;
+            }
+            Some("--api") => {
+                options.api = sdk::ApiLevel::parse(&text_arg(value("--api")?, "--api")?)?;
             }
             Some("--arch") => {
                 options.arch = Some(sdk::Arch::parse(&text_arg(value("--arch")?, "--arch")?)?);
@@ -365,6 +371,20 @@ fn package(
 ) -> anyhow::Result<Packaged> {
     let config = project::AppConfig::read(app)?;
     let ndk = sdk::Ndk::find()?;
+    ndk.check_api(options.api)?;
+    let base_sdk = sdk::BaseSdk::find();
+    if options.runtime_os == project::RuntimeOs::OpenHarmony
+        && let Some(base) = &base_sdk
+        && base.api < options.api.number()
+    {
+        bail!(
+            "--api {} requires an OpenHarmony SDK for API {} or later, but {} is API {}",
+            options.api.number(),
+            options.api.number(),
+            base.dir.display(),
+            base.api,
+        );
+    }
     let work = join_all(app, [".nsh", "harmonyos"]);
     let build = work.join("build");
     // NSH bundles a TSX app (and describes its crates into the generated
@@ -397,7 +417,7 @@ fn package(
         }
     };
     let runner = work.join("runner");
-    runner::write(&runner, linked, dev)?;
+    runner::write(&runner, linked, dev, options.api)?;
     let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
     project::write(
         out,
@@ -407,7 +427,11 @@ fn package(
             library: &library,
             build: &build,
             runtime_os: options.runtime_os,
-            compile_api: sdk::BaseSdk::find().map_or(project::MIN_API, |sdk| sdk.api),
+            min_api: options.api,
+            compile_api: base_sdk
+                .map(|sdk| sdk.api)
+                .or_else(|| ndk.api_version())
+                .unwrap_or(project::MIN_API),
         },
     )?;
     let profile = fs::read_to_string(out.join("build-profile.json5")).unwrap_or_default();
@@ -940,16 +964,26 @@ mod tests {
         assert_eq!(options.app, Some("examples/counter".into()));
         assert_eq!(options.out, Some("dist".into()));
         assert_eq!(options.runtime_os, project::RuntimeOs::OpenHarmony);
+        assert_eq!(options.api, sdk::ApiLevel::Api20);
         assert_eq!(options.arch, None);
         assert_eq!(options.package_arch(), sdk::Arch::Arm64);
         assert_eq!(options.release, Some(false));
         assert!(options.verbose && options.hap);
         assert!(parse(args("package --sign")).is_err());
         assert!(parse(args("package --runtime-os android")).is_err());
+        assert!(parse(args("package --api 19")).is_err());
+        assert!(parse(args("package --api 22")).is_err());
+        assert!(parse(args("package --api")).is_err());
         assert!(parse(args("package --arch riscv64")).is_err());
         assert!(parse(args("package --arch arm64,armv7a")).is_err());
         assert!(parse(args("package --abi arm64")).is_err());
         assert!(parse(args("package --target arm64")).is_err());
+
+        let api23 = parse(args("package --api 23")).unwrap();
+        assert_eq!(api23.api, sdk::ApiLevel::Api23);
+
+        let api26 = parse(args("run --api=26")).unwrap();
+        assert_eq!(api26.api, sdk::ApiLevel::Api26);
 
         let arm64 = parse(args("package --arch arm64")).unwrap();
         assert_eq!(arm64.package_arch(), sdk::Arch::Arm64);

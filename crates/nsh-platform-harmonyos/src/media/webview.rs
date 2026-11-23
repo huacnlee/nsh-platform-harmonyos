@@ -16,9 +16,12 @@ use ohos_web_binding::{
     ArkWebResponse, CustomProtocol, CustomProtocolHandler, CustomProtocolOption, ResourceHandle,
     Web, WebProxy, WebProxyBuilder,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use super::web_evaluation::{EvalGuard, Evaluations, JsDone, ScriptHost, abort_payload};
+use super::{
+    web_downloads,
+    web_evaluation::{EvalGuard, Evaluations, JsDone, ScriptHost, abort_payload},
+};
 use crate::{
     app::{runtime::Dispatcher, session::Services},
     interop::{
@@ -98,6 +101,7 @@ struct Route {
     assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
     url_schemes: Vec<nsh_core::web_resource::WebUrlScheme>,
+    defer_downloads: Cell<bool>,
     proxy: RefCell<Option<WebProxy>>,
     web: RefCell<Option<Web>>,
     controller_ready: Cell<bool>,
@@ -105,8 +109,19 @@ struct Route {
     evaluations: Rc<Evaluations>,
 }
 
+/// Retains a web view's `(NodeId, EngineControl)` across view teardown while
+/// ArkWeb still has active downloads whose stop confirmation `nsh-core` needs
+/// before cleaning its private staging directories.
+struct DownloadSink {
+    node_id: nsh_core::NodeId,
+    control: EngineControl,
+    active_ids: FxHashSet<String>,
+    closed: bool,
+}
+
 thread_local! {
     static ROUTES: RefCell<FxHashMap<u32, Rc<Route>>> = RefCell::default();
+    static DOWNLOAD_SINKS: RefCell<FxHashMap<u32, DownloadSink>> = RefCell::default();
 }
 
 fn eval_on_web(dispatcher: &std::sync::Weak<Dispatcher>, web: &Web, script: &str, done: JsDone) {
@@ -204,6 +219,15 @@ impl Drop for RouteRegistration {
         ROUTES.with(|routes| {
             routes.borrow_mut().remove(&self.0);
         });
+        DOWNLOAD_SINKS.with(|sinks| {
+            let mut sinks = sinks.borrow_mut();
+            if let Some(sink) = sinks.get_mut(&self.0) {
+                sink.closed = true;
+                if sink.active_ids.is_empty() {
+                    sinks.remove(&self.0);
+                }
+            }
+        });
     }
 }
 
@@ -267,6 +291,7 @@ impl WebView {
                 assets: owner.assets.clone(),
                 host: owner.host.clone(),
                 url_schemes: Vec::new(),
+                defer_downloads: Cell::new(false),
                 proxy: RefCell::new(None),
                 web: RefCell::new(None),
                 controller_ready: Cell::new(false),
@@ -328,7 +353,7 @@ impl WebView {
             *self.applied_source.borrow_mut() = None;
             *self.applied_document.borrow_mut() = None;
             *self.pending_settings.borrow_mut() = None;
-            self.pending_commands.borrow_mut().clear();
+            self.fail_pending_requests(&node, "WebView context lost");
             let was_mounted = self.arkts_mounted.replace(false);
             self.waiting_transition.set(false);
             if let Some(target) = self.target.borrow_mut().take() {
@@ -348,7 +373,11 @@ impl WebView {
         if self.closed.get() {
             return Ok(());
         }
+        let defer_downloads = props.defer_downloads;
         *self.props.borrow_mut() = Some(props);
+        if let Some(route) = self.route_ref.borrow().as_ref() {
+            route.defer_downloads.set(defer_downloads);
+        }
         if let Some(node) = self.node.upgrade() {
             self.sync(&node)?;
         }
@@ -374,6 +403,59 @@ impl WebView {
         }
         if let Command::CancelEvaluate { request } = command {
             self.evaluations.cancel(request);
+            return Ok(());
+        }
+        if let Command::WebViewRequest(request) = command {
+            let reply_error = |message: &str| {
+                node.control.dispatch_event(
+                    node.id,
+                    EventKind::WebViewReply,
+                    nsh_core::webview::reply(request.id, Err(message.to_owned())),
+                );
+            };
+            if self.closed.get() || !self.ready.get() {
+                reply_error("WebView is not ready");
+                return Ok(());
+            }
+            let Some(target_id) = self.target.borrow().as_ref().map(NativeAttachment::id) else {
+                reply_error("WebView target is unavailable");
+                return Ok(());
+            };
+            let web_command = match request.operation {
+                nsh_core::webview::WebViewOperation::StartDownload { id, staging } => {
+                    let path = match web_downloads::validate_staging_path(&staging) {
+                        Ok(path) => path,
+                        Err(error) => {
+                            reply_error(&error);
+                            return Ok(());
+                        }
+                    };
+                    WebCommand {
+                        target_id,
+                        kind: "download-start".into(),
+                        request_id: Some(request.id.to_string()),
+                        download_id: Some(id),
+                        path: Some(path),
+                        ..Default::default()
+                    }
+                }
+                nsh_core::webview::WebViewOperation::CancelDownload { id } => WebCommand {
+                    target_id,
+                    kind: "download-cancel".into(),
+                    request_id: Some(request.id.to_string()),
+                    download_id: Some(id),
+                    ..Default::default()
+                },
+                _ => {
+                    reply_error("Unsupported WebView operation");
+                    return Ok(());
+                }
+            };
+            if self.arkts_mounted.get() {
+                node.web_command(web_command);
+            } else {
+                self.pending_commands.borrow_mut().push(web_command);
+            }
             return Ok(());
         }
         if self.closed.get() || !self.ready.get() {
@@ -528,6 +610,18 @@ impl WebView {
         Ok(())
     }
 
+    fn fail_pending_requests(&self, node: &Node, reason: &str) {
+        for command in self.pending_commands.borrow_mut().drain(..) {
+            if let Some(id) = web_downloads::parse_request_id(command.request_id.as_deref()) {
+                node.control.dispatch_event(
+                    node.id,
+                    EventKind::WebViewReply,
+                    nsh_core::webview::reply(id, Err(reason.to_owned())),
+                );
+            }
+        }
+    }
+
     pub(crate) fn close(&self) -> Result<()> {
         if self.closed.replace(true) {
             return Ok(());
@@ -536,7 +630,11 @@ impl WebView {
         self.route_ref.borrow_mut().take();
         self.route.borrow_mut().take();
         *self.pending_settings.borrow_mut() = None;
-        self.pending_commands.borrow_mut().clear();
+        if let Some(node) = self.node.upgrade() {
+            self.fail_pending_requests(&node, "WebView closed");
+        } else {
+            self.pending_commands.borrow_mut().clear();
+        }
         let was_mounted = self.arkts_mounted.replace(false);
         self.waiting_transition.set(false);
         if let Some(node) = self.node.upgrade()
@@ -558,11 +656,11 @@ impl WebView {
         self.evaluations.navigated();
         let attachment = NativeAttachment::new(&self.native)?;
         let id = attachment.id();
-        let url_schemes = self
+        let (url_schemes, defer_downloads) = self
             .props
             .borrow()
             .as_ref()
-            .map(|p| p.url_schemes.clone())
+            .map(|p| (p.url_schemes.clone(), p.defer_downloads))
             .unwrap_or_default();
         let entry = Rc::new(Route {
             node: self.node.clone(),
@@ -571,6 +669,7 @@ impl WebView {
             assets: node.assets.clone(),
             host: node.host.clone(),
             url_schemes,
+            defer_downloads: Cell::new(defer_downloads),
             proxy: RefCell::new(None),
             web: RefCell::new(None),
             controller_ready: Cell::new(false),
@@ -585,7 +684,7 @@ impl WebView {
         *self.applied_source.borrow_mut() = None;
         *self.applied_document.borrow_mut() = None;
         *self.pending_settings.borrow_mut() = None;
-        self.pending_commands.borrow_mut().clear();
+        self.fail_pending_requests(node, "WebView recreated");
         let was_mounted = self.arkts_mounted.replace(false);
         self.waiting_transition.set(false);
         if let Some(old) = self.target.replace(Some(attachment)) {
@@ -780,7 +879,7 @@ impl WebView {
             || self.arkts_mounted.get()
         {
             *self.pending_settings.borrow_mut() = None;
-            self.pending_commands.borrow_mut().clear();
+            self.fail_pending_requests(node, "WebView mount cancelled");
             return;
         }
         self.emit_arkts_mount(node);
@@ -953,7 +1052,7 @@ pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> 
     })
 }
 
-pub(crate) fn download_allowed(target_id: u32, url: &str) -> napi_ohos::Result<bool> {
+pub(crate) fn download_allowed(target_id: u32, _url: &str) -> napi_ohos::Result<bool> {
     NativeAttachment::dispatch(target_id, || {
         let Some(route) = ROUTES.with(|routes| routes.borrow().get(&target_id).cloned()) else {
             return false;
@@ -961,14 +1060,90 @@ pub(crate) fn download_allowed(target_id: u32, url: &str) -> napi_ohos::Result<b
         let Some(node) = route.node.upgrade() else {
             return false;
         };
-        node.interaction.mask().contains(EventKind::Download)
-            && (route.access.allows_webview(url)
-                || (route.access.allows_webviews()
-                    && (url.starts_with("data:") || url.starts_with("blob:"))))
+        // Offer the transfer to `nsh-core` whenever the app listens or a Rust
+        // builder asked to defer downloads. `nsh-core` enforces `webview.hosts`
+        // so disallowed URLs still log a denial and report `ERR_ACCESS_DENIED`.
+        let mask = node.interaction.mask();
+        route.defer_downloads.get()
+            || mask.contains(EventKind::Download)
+            || mask.contains(EventKind::DownloadPending)
     })
 }
 
+fn dispatch_download_lifecycle(event: WebEvent) -> bool {
+    let target_id = event.target_id;
+    let route_target = ROUTES.with(|routes| {
+        routes
+            .borrow()
+            .get(&target_id)
+            .and_then(|route| route.node.upgrade())
+            .map(|node| (node.id, node.control.clone()))
+    });
+    let target = route_target.or_else(|| {
+        DOWNLOAD_SINKS.with(|sinks| {
+            sinks
+                .borrow()
+                .get(&target_id)
+                .map(|sink| (sink.node_id, sink.control.clone()))
+        })
+    });
+    let Some((node_id, control)) = target else {
+        return false;
+    };
+    let Some(download) = event.download else {
+        return true;
+    };
+    match event.phase.as_str() {
+        "download-end" => {
+            let download_id = download.id.clone();
+            if let Some(payload) = web_downloads::build_end_payload(
+                download.id,
+                &download.state,
+                download.bytes,
+                download.error_code,
+                event.code,
+                event.message,
+            ) {
+                control.dispatch_event(node_id, EventKind::DownloadEnd, payload);
+            }
+            finish_download_sink(target_id, &download_id);
+        }
+        "web-reply" => {
+            let ok = download.ok.unwrap_or(false);
+            let cancel_done = ok && download.state == "cancel-ok" && !download.id.is_empty();
+            let download_id = download.id;
+            if let Some(payload) = web_downloads::build_reply_payload(
+                download.request_id.as_deref(),
+                ok,
+                event.message,
+            ) {
+                control.dispatch_event(node_id, EventKind::WebViewReply, payload);
+            }
+            if cancel_done {
+                finish_download_sink(target_id, &download_id);
+            }
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn finish_download_sink(target_id: u32, download_id: &str) {
+    DOWNLOAD_SINKS.with(|sinks| {
+        let mut sinks = sinks.borrow_mut();
+        if let Some(sink) = sinks.get_mut(&target_id) {
+            sink.active_ids.remove(download_id);
+            if sink.closed && sink.active_ids.is_empty() {
+                sinks.remove(&target_id);
+            }
+        }
+    });
+}
+
 pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
+    if matches!(event.phase.as_str(), "download-end" | "web-reply") {
+        return Ok(dispatch_download_lifecycle(event));
+    }
     NativeAttachment::dispatch(event.target_id, || {
         let Some(route) = ROUTES.with(|routes| routes.borrow().get(&event.target_id).cloned())
         else {
@@ -1036,24 +1211,40 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                     EventPayload::None,
                 );
             }
-            "download" => {
+            "download-offer" => {
                 if let Some(download) = event.download {
-                    node.control.dispatch_event(
-                        node.id,
-                        EventKind::Download,
-                        EventPayload::Map(vec![
-                            ("state", PayloadValue::Str(download.state)),
-                            ("id", PayloadValue::Str(download.id)),
-                            ("url", PayloadValue::Str(event.url)),
-                            ("filename", PayloadValue::Str(download.filename)),
-                            ("path", PayloadValue::Str(download.path)),
-                            ("bytes", PayloadValue::Number(download.bytes)),
-                            (
-                                "message",
-                                PayloadValue::Str(event.message.unwrap_or_default()),
-                            ),
-                        ]),
+                    let download_id = download.id.clone();
+                    DOWNLOAD_SINKS.with(|sinks| {
+                        let mut sinks = sinks.borrow_mut();
+                        let sink = sinks
+                            .entry(event.target_id)
+                            .or_insert_with(|| DownloadSink {
+                                node_id: node.id,
+                                control: node.control.clone(),
+                                active_ids: FxHashSet::default(),
+                                closed: false,
+                            });
+                        sink.closed = false;
+                        sink.active_ids.insert(download_id);
+                    });
+                    let payload = web_downloads::build_offer_payload(
+                        download.id,
+                        event.url,
+                        &download.filename,
+                        download.mime_type,
+                        download.bytes,
+                        download.method,
                     );
+                    node.control
+                        .dispatch_event(node.id, EventKind::DownloadOffer, payload);
+                }
+            }
+            "download-progress" => {
+                if let Some(download) = event.download {
+                    let payload =
+                        web_downloads::build_progress_payload(download.id, download.bytes);
+                    node.control
+                        .dispatch_event(node.id, EventKind::DownloadProgress, payload);
                 }
             }
             "error" => {

@@ -65,7 +65,7 @@ impl Input {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(route) = owner.dispatcher.upgrade()
         {
-            use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+            use nsh_core::keymap::{Key, Keystroke, Modifiers};
             let stroke = match kind {
                 "return" => Some(Keystroke {
                     key: Key::Enter,
@@ -85,8 +85,13 @@ impl Input {
                 _ => None,
             };
             if let Some(stroke) = stroke {
-                let matched = route.keyboard.lock().unwrap().map.find(stroke, true, false);
-                if let KeyMatch::Fire(id) = matched {
+                let matched = route.keyboard.lock().unwrap().map.find_in(
+                    owner.key_window_id(),
+                    stroke,
+                    true,
+                    false,
+                );
+                if let Some(id) = matched.fired() {
                     route.send(crate::app::runtime::Message::HostEvent(
                         EventKind::KeyCommand,
                         EventPayload::Value(PayloadValue::Number(id as f64)),
@@ -176,6 +181,39 @@ impl Input {
         }
         self.event(event)?;
         Ok(self.state.borrow().count)
+    }
+    pub(crate) fn native_key_event(&self, event: crate::interop::sdk::EditorKeyEvent) -> bool {
+        if self.closed.get() {
+            return false;
+        }
+        let Some(owner) = self.owner.upgrade() else {
+            return false;
+        };
+        let Some(route) = owner.dispatcher.upgrade() else {
+            return false;
+        };
+        let surface = owner.key_surface_root();
+        owner.host.editor_key_event(&event, &route, &surface)
+    }
+    pub(crate) fn report_paste(&self) -> bool {
+        self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report
+    }
+    pub(crate) fn is_ime_cursor_sink(&self) -> bool {
+        let config = self.config.borrow();
+        !config.secure
+            && config.paste_behavior == nsh_core::PasteBehavior::Report
+            && self.hit_test.get() == i32::from(HitTestMode::None) as u32
+            && config.caret_hidden
+            && argb(config.style.color) == 0
+    }
+    pub(crate) fn select_all(&self) -> Result<()> {
+        self.command("select-all", 0, 0);
+        Ok(())
+    }
+    pub(crate) fn frame_moved(&self) {
+        if !self.closed.get() && self.state.borrow().is_focused() && self.is_ime_cursor_sink() {
+            self.command("cursor", 0, 0);
+        }
     }
     fn event(&self, event: EditorEvent) -> Result<()> {
         let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
@@ -325,11 +363,13 @@ impl Input {
             }
             "delete-to-doc-start" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
-                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
+                    use nsh_core::keymap::{Key, Keystroke, Modifiers};
+                    let window = owner.key_window_id();
                     let (select_id, delete_id) = {
                         let snapshot = route.keyboard.lock().unwrap();
                         (
-                            snapshot.map.find(
+                            snapshot.map.find_in(
+                                window,
                                 Keystroke {
                                     key: Key::Home,
                                     modifiers: Modifiers {
@@ -341,7 +381,8 @@ impl Input {
                                 true,
                                 false,
                             ),
-                            snapshot.map.find(
+                            snapshot.map.find_in(
+                                window,
                                 Keystroke {
                                     key: Key::Backspace,
                                     modifiers: Modifiers::default(),
@@ -351,12 +392,12 @@ impl Input {
                             ),
                         )
                     };
-                    if let KeyMatch::Fire(id) = select_id {
+                    if let Some(id) = select_id.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,
                             EventPayload::Value(PayloadValue::Number(id as f64)),
                         ));
-                        if let KeyMatch::Fire(del) = delete_id {
+                        if let Some(del) = delete_id.fired() {
                             route.send(crate::app::runtime::Message::HostEvent(
                                 EventKind::KeyCommand,
                                 EventPayload::Value(PayloadValue::Number(del as f64)),
@@ -369,8 +410,9 @@ impl Input {
             }
             "undo" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
-                    use nsh_core::keymap::{Key, KeyMatch, Keystroke, Modifiers};
-                    let matched = route.keyboard.lock().unwrap().map.find(
+                    use nsh_core::keymap::{Key, Keystroke, Modifiers};
+                    let matched = route.keyboard.lock().unwrap().map.find_in(
+                        owner.key_window_id(),
                         Keystroke {
                             key: Key::Char('z'),
                             modifiers: Modifiers {
@@ -381,7 +423,7 @@ impl Input {
                         true,
                         false,
                     );
-                    if let KeyMatch::Fire(id) = matched {
+                    if let Some(id) = matched.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,
                             EventPayload::Value(PayloadValue::Number(id as f64)),
@@ -526,6 +568,7 @@ impl Input {
             editable: config.editable,
             auto_correct: config.auto_correct,
             report_paste: config.paste_behavior == nsh_core::PasteBehavior::Report,
+            edit_actions: Some(owner.interaction.mask().contains(EventKind::EditAction)),
             scrollbar_visible: config.scrollbar_visible && !config.replaced,
             hit_test: self.hit_test.get(),
             align: match config.align {
