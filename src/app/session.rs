@@ -30,6 +30,7 @@ use crate::app::{
 const MAX_RESOURCE: usize = 64 << 20;
 
 static NEXT_SESSION_ID: AtomicU32 = AtomicU32::new(1);
+static HAS_CREATED_SESSION: AtomicBool = AtomicBool::new(false);
 static SESSIONS: LazyLock<Mutex<FxHashMap<u32, Weak<Services>>>> = LazyLock::new(Mutex::default);
 
 struct UiSession {
@@ -131,6 +132,43 @@ pub(crate) fn get(session_id: u32) -> Result<Arc<Services>> {
     };
     services.check()?;
     Ok(services)
+}
+
+/// Resolves an active host session for platform extension points.
+///
+/// Prefers the most recently created foreground session; when
+/// `require_foreground` is `false`, falls back to any active session.
+/// Returns `Err(false)` if no session has ever been created (`NotStarted`),
+/// or `Err(true)` if sessions existed but none currently match.
+pub(crate) fn any_active_session(
+    require_foreground: bool,
+) -> std::result::Result<Arc<Services>, bool> {
+    if !HAS_CREATED_SESSION.load(Ordering::Acquire) {
+        return Err(false);
+    }
+    let live: Vec<(u32, Arc<Services>)> = {
+        let mut sessions = SESSIONS.lock().unwrap();
+        sessions.retain(|_, weak| weak.strong_count() > 0);
+        sessions
+            .iter()
+            .filter_map(|(&id, weak)| {
+                let host = weak.upgrade()?;
+                host.check().ok()?;
+                Some((id, host))
+            })
+            .collect()
+    };
+    if let Some((_, host)) = live
+        .iter()
+        .filter(|(_, host)| host.is_foreground())
+        .max_by_key(|(id, _)| *id)
+    {
+        return Ok(host.clone());
+    }
+    if !require_foreground && let Some((_, host)) = live.iter().max_by_key(|(id, _)| *id) {
+        return Ok(host.clone());
+    }
+    Err(true)
 }
 
 /// Resolves an explicit window or the sole active UI session. Multiple active
@@ -299,6 +337,12 @@ impl Services {
     }
     pub(crate) fn cache_directory(&self) -> PathBuf {
         self.cache_dir.join("nsh")
+    }
+    pub(crate) fn raw_cache_dir(&self) -> &std::path::Path {
+        &self.cache_dir
+    }
+    pub(crate) fn raw_files_dir(&self) -> &std::path::Path {
+        &self.files_dir
     }
     pub(crate) fn video_cache_directory(&self) -> Result<PathBuf> {
         self.check()?;
@@ -1045,6 +1089,7 @@ impl Services {
             sessions.retain(|_, weak| weak.strong_count() > 0);
             sessions.insert(id, Arc::downgrade(&services));
         }
+        HAS_CREATED_SESSION.store(true, Ordering::Release);
         Ok(id)
     }
 
@@ -1136,6 +1181,7 @@ impl Services {
             self.keyboard.lock().unwrap().take();
             self.open_urls.lock().unwrap().clear();
             self.picks.lock().unwrap().clear();
+            crate::extensions::on_session_closed(self.id);
             self.broadcast(|| Message::HostClosed);
             let _ = self.queue.try_send(Operation::Stop);
         }

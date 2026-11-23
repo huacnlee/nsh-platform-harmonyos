@@ -338,3 +338,37 @@ pub(crate) fn nsh_attach_sub_window(
         platform_window_id,
     )
 }
+
+#[napi]
+pub(crate) fn nsh_run_ui_task(
+    env: Env,
+    session_id: u32,
+    task_id: u32,
+    #[napi(ts_arg_type = "import('@ohos.arkui.UIContext').UIContext")] ui_context: Object<'_>,
+    bundle_name: String,
+) {
+    if crate::app::session::get(session_id).is_err() {
+        return;
+    }
+    crate::extensions::run_ui_task(&env, task_id, ui_context, &bundle_name);
+}
+
+#[napi]
+pub(crate) fn nsh_ability_result(
+    session_id: u32,
+    request_id: u32,
+    ok: bool,
+    payload: Option<String>,
+    code: Option<i32>,
+    message: Option<String>,
+) {
+    if crate::app::session::get(session_id).is_err() {
+        return;
+    }
+    crate::extensions::complete_ability_result(request_id, ok, payload, code, message);
+}
+
+#[napi]
+pub(crate) fn nsh_ability_want(kind: String, payload: String) {
+    crate::extensions::deliver_ability_want(&kind, &payload);
+}

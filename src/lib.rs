@@ -11,6 +11,7 @@
 
 mod accessibility;
 mod app;
+mod extensions;
 mod input;
 mod interop;
 mod linked;
@@ -25,9 +26,17 @@ mod text;
 /// and `--target` on the command line.
 pub const PLATFORM: &str = "harmonyos";
 
+/// The N-API bindings exposed to `nshm` crates using [`run_on_ui_thread`].
+pub use napi_ohos;
+
 pub use app::{
     NshCacheOptions, NshCapabilities, NshEnvironment, NshOptions, NshPackage, NshPackageInfo,
     NshScrollHandle, NshSurface, NshTrust, get_capabilities, init_logging,
+};
+pub use extensions::{
+    AbilityError, AbilityResult, AbilityWantEvent, AbilityWantKind, ExtensionError, UiThread, Want,
+    WantObserverGuard, ability, cache_dir, files_dir, launch_want, on_ability_want, prepare_image,
+    prepare_image_bytes, run_on_ui_thread,
 };
 pub use interop::NshNativeProperty;
 pub use linked::LinkedApp;

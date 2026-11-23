@@ -32,6 +32,7 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
+import { setAbilityWantSink, startAbilityForResult } from "./NativeExtensions";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -142,6 +143,16 @@ interface NshNativeModule {
   ): void;
   nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void;
   nshPickImagesResult(sessionId: number, pickId: number, files: PickedDescriptor[]): void;
+  nshRunUiTask(sessionId: number, taskId: number, uiContext: UIContext, bundleName: string): void;
+  nshAbilityResult(
+    sessionId: number,
+    requestId: number,
+    ok: boolean,
+    payload?: string,
+    code?: number,
+    message?: string,
+  ): void;
+  nshAbilityWant(kind: string, payload: string): void;
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
@@ -1146,6 +1157,28 @@ class HostSession {
       this.runtimeContext.getUIContext().getRouter().back();
       return;
     }
+    if (command.kind === "ui-task") {
+      this.mod.nshRunUiTask(
+        this.sessionId,
+        command.openId ?? 0,
+        this.runtimeContext.getUIContext(),
+        this.bundleName(),
+      );
+      return;
+    }
+    if (command.kind === "ability-start-for-result") {
+      const requestId = command.openId ?? 0;
+      startAbilityForResult(
+        this.abilityContext,
+        command.text ?? "{}",
+        (ok: boolean, payload?: string, code?: number, message?: string): void => {
+          if (!this.closed) {
+            this.mod.nshAbilityResult(this.sessionId, requestId, ok, payload, code, message);
+          }
+        },
+      );
+      return;
+    }
     if (command.kind === "system") {
       this.system
         .execute(command.openId ?? 0, command.system ?? { op: "" })
@@ -1380,11 +1413,15 @@ class HostSession {
   }
 }
 
-getNativeModule().nshRegisterSessionBinder(
+const nativeHostModule = getNativeModule();
+nativeHostModule.nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
   showNativeAlert,
 );
+setAbilityWantSink((kind: string, payload: string): void => {
+  nativeHostModule.nshAbilityWant(kind, payload);
+});
 
 function maximumRefreshRate(mainWindow: window.Window): number {
   const id = mainWindow.getWindowProperties().displayId;

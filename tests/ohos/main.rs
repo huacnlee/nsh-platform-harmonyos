@@ -102,3 +102,7 @@ mod canvas_render;
 #[path = "../../src/media/web_downloads.rs"]
 #[allow(dead_code)]
 mod web_downloads;
+
+#[path = "../../src/extensions/state.rs"]
+#[allow(dead_code, unreachable_pub)]
+mod extensions_state;

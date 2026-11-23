@@ -16,5 +16,6 @@ export {
   initLogging,
   onBackPressIntercept,
 } from "libnsh_platform_harmonyos.so";
+export { onAbilityWant } from "./src/main/ets/NativeExtensions";
 export { onNotificationWant } from "./src/main/ets/NativeNotifications";
 export { prepareWebEngine } from "./src/main/ets/NativeWebViews";

@@ -472,6 +472,10 @@ export declare function getCapabilities(): NshCapabilities
 /** Installs the optional HiLog logger for a development host. */
 export declare function initLogging(): void
 
+export declare function nshAbilityResult(sessionId: number, requestId: number, ok: boolean, payload?: string | undefined | null, code?: number | undefined | null, message?: string | undefined | null): void
+
+export declare function nshAbilityWant(kind: string, payload: string): void
+
 export declare function nshAttachNativeNode(targetId: number, content: FrameNode): void
 
 export declare function nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void
@@ -497,6 +501,8 @@ export declare function nshRegisterSessionBinder(sdkApiVersion: number, binder: 
 export declare function nshReportHostError(sessionId: number, message: string): void
 
 export declare function nshRetireNativeNode(targetId: number): void
+
+export declare function nshRunUiTask(sessionId: number, taskId: number, uiContext: import('@ohos.arkui.UIContext').UIContext, bundleName: string): void
 
 export declare function nshServiceEvent(sessionId: number, key: number, value: SystemEvent): void
 
