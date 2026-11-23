@@ -773,9 +773,11 @@ impl ImageView {
             .as_ref()
             .and_then(|source| source.data.as_ref())
             .is_some_and(|data| data.rgba().is_some());
-        if !seamless {
+        self.native.borrow().reset_attribute(A::ImageAlt)?;
+        if seamless {
+            self.decoded.borrow_mut()[1] = None;
+        } else {
             self.native.borrow().reset_attribute(A::ImageSrc)?;
-            self.native.borrow().reset_attribute(A::ImageAlt)?;
             *self.decoded.borrow_mut() = [None, None];
         }
         self.native.borrow().set_i32_attribute(
@@ -824,6 +826,10 @@ impl ImageView {
                     Ok(decoded) => decoded,
                     Err(error) => {
                         if !placeholder {
+                            if self.decoded.borrow()[0].is_some() {
+                                self.native.borrow().reset_attribute(A::ImageSrc)?;
+                                self.decoded.borrow_mut()[0] = None;
+                            }
                             self.failed(error);
                         }
                         return Ok(());
@@ -842,7 +848,13 @@ impl ImageView {
                 }
                 self.decoded.borrow_mut()[usize::from(placeholder)] = Some(decoded);
             }
-            Err(message) if !placeholder => self.failed(message),
+            Err(message) if !placeholder => {
+                if self.decoded.borrow()[0].is_some() {
+                    self.native.borrow().reset_attribute(A::ImageSrc)?;
+                    self.decoded.borrow_mut()[0] = None;
+                }
+                self.failed(message);
+            }
             Err(_) => {}
         }
         Ok(())

@@ -1,9 +1,7 @@
-**/target/
+/target
 .nsh/
-**/node_modules/
-**/.DS_Store
-**/oh_modules/
-**/.hvigor/
-**/build/
-Cargo.lock
-/template/signature
+node_modules/
+.DS_Store
+oh_modules/
+.hvigor/
+build/
