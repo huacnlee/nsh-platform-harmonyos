@@ -123,7 +123,7 @@ value = "123456"
 "@acme/kit" = "file:ohos/kit.har"
 ```
 
-Supported keys: `permissions` (merged into `module.json5` `requestPermissions`, with plain-text `reason` auto-added to `string.json`), `querySchemes`, `metadata`, `abilities`, `extensionAbilities`, `dependencies` (merged into `entry/oh-package.json5`, with local `.har`/directory paths copied into `entry/nshm-deps/`), and `strings`. The app's `nsh.json` `"harmonyos"` wins over crate entries and resolves clashes between crates.
+Supported keys: `permissions` (merged into `module.json5` `requestPermissions`, with plain-text `reason` auto-added to `string.json`), `querySchemes`, `metadata`, `abilities`, `extensionAbilities`, `dependencies` (merged into `entry/oh-package.json5` and `entry/build-profile.json5` `arkOptions.runtimeOnly.packages` for dynamic N-API loading, with local `.har`/directory paths copied into `entry/nshm-deps/`), and `strings`. The app's `nsh.json` `"harmonyos"` wins over crate entries and resolves clashes between crates.
 
 ## Publishing to HarmonyOS phones
 

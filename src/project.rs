@@ -524,6 +524,28 @@ fn stage_ohpm_dependencies(out: &Path, harmonyos: &HarmonyMeta) -> anyhow::Resul
     Ok(indent_json(&Value::Object(deps), 2))
 }
 
+fn build_entry_build_option(harmonyos: &HarmonyMeta) -> String {
+    if harmonyos.dependencies.is_empty() {
+        return "{}".to_owned();
+    }
+    let packages: Vec<Value> = harmonyos
+        .dependencies
+        .keys()
+        .cloned()
+        .map(Value::String)
+        .collect();
+    indent_json(
+        &json!({
+            "arkOptions": {
+                "runtimeOnly": {
+                    "packages": packages,
+                }
+            }
+        }),
+        2,
+    )
+}
+
 /// Writes the project to `out`.
 pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> anyhow::Result<()> {
     if config.id.split('.').count() < 3 {
@@ -562,6 +584,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
     let abilities = build_abilities(&config.schemes, &config.harmonyos.abilities);
     let module_extras = build_module_extras(&config.harmonyos);
     let entry_dependencies = stage_ohpm_dependencies(out, &config.harmonyos)?;
+    let entry_build_option = build_entry_build_option(&config.harmonyos);
 
     let substitutions = [
         ("{{bundleName}}", json_text(&config.id)),
@@ -579,6 +602,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         ("{{moduleExtras}}", module_extras),
         ("{{entryStrings}}", entry_strings),
         ("{{entryDependencies}}", entry_dependencies),
+        ("{{entryBuildOption}}", entry_build_option),
     ];
 
     for (path, bytes) in crate::embedded::TEMPLATE {
@@ -969,6 +993,11 @@ mod tests {
         assert!(parsed["module"].get("metadata").is_none());
         assert!(parsed["module"].get("extensionAbilities").is_none());
         assert!(!module.contains("{{"), "{module}");
+        let entry_profile: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&out, ["entry", "build-profile.json5"])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entry_profile["buildOption"], json!({}));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1117,6 +1146,14 @@ mod tests {
             join_relative(out.join("entry"), kit_rel.strip_prefix("file:").unwrap())
                 .join("oh-package.json5")
                 .is_file()
+        );
+        let entry_profile: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&out, ["entry", "build-profile.json5"])).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            entry_profile["buildOption"]["arkOptions"]["runtimeOnly"]["packages"],
+            json!(["@acme/local-kit", "@acme/scanner", "@ohos/lottie"])
         );
 
         fs::remove_dir_all(&dir).unwrap();
