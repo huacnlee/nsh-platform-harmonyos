@@ -421,6 +421,26 @@ impl Mounter {
         }
         Ok(())
     }
+    pub(crate) fn hit_app(&self, point_px: (f32, f32)) -> crate::input::intercept::SurfaceHit {
+        use crate::input::intercept::{SurfaceHit, viewport_px_to_root_vp};
+        if self.fullscreen_video.borrow().strong_count() > 0 {
+            return SurfaceHit::Hit;
+        }
+        let Some(root) = self.nodes.get(&nsh_core::ROOT_ID) else {
+            return SurfaceHit::Miss;
+        };
+        let Some(point_vp) = viewport_px_to_root_vp(point_px, root.scale.get()) else {
+            return SurfaceHit::Indeterminate;
+        };
+        match crate::input::touch::hit_app(root, point_vp) {
+            Ok(true) => SurfaceHit::Hit,
+            Ok(false) => SurfaceHit::Miss,
+            Err(error) => {
+                log::warn!("OHOS surface touch hit-test failed: {error}");
+                SurfaceHit::Indeterminate
+            }
+        }
+    }
     pub(crate) fn wants_back(&self) -> bool {
         self.fullscreen_video.borrow().strong_count() > 0
             || self.dialogs.visible()

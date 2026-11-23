@@ -18,6 +18,9 @@ pub struct NshOptions {
     pub cache_options: Option<NshCacheOptions>,
     /// Allow explicit status-bar and fullscreen-video requests to manage window bars. Default true.
     pub manages_status_bar: Option<bool>,
+    /// Allow touches on regions without hit-testable NSH content (for example a `box-none` app
+    /// root) to pass through to sibling views behind this surface. Default false.
+    pub pass_through_touches: Option<bool>,
     /// System observations available before the app starts.
     pub environment: Option<NshEnvironment>,
     /// Interpreter stack ceiling in bytes (64 KiB through 4 MiB).
@@ -104,6 +107,7 @@ pub(crate) struct Config {
     pub(crate) storage: Option<std::path::PathBuf>,
     pub(crate) cache: nsh_engine::CacheOptions,
     pub(crate) manages_status_bar: bool,
+    pub(crate) pass_through_touches: bool,
 }
 impl Config {
     pub(crate) fn new(
@@ -194,6 +198,7 @@ impl Config {
             storage,
             cache,
             manages_status_bar: options.manages_status_bar.unwrap_or(true),
+            pass_through_touches: options.pass_through_touches.unwrap_or(false),
             host,
             assets,
             has_custom_assets,

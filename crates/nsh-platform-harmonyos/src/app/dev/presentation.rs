@@ -42,6 +42,9 @@ impl Presentation {
         self.copying = false;
         Some(result)
     }
+    pub(super) fn visible(&self) -> bool {
+        self.visible && !self.closed
+    }
     pub(super) fn closed(&self) -> bool {
         self.closed
     }
@@ -104,8 +107,23 @@ mod tests {
         );
         state.close();
         assert!(state.closed());
+        assert!(!state.visible());
         assert!(state.finish_copy(replacement, Ok(())).is_none());
         assert!(state.begin_copy().is_none());
         assert!(!state.show("disposed error"));
+    }
+
+    #[test]
+    fn visible_tracks_open_hidden_and_closed_overlay_states() {
+        let mut state = Presentation::default();
+        assert!(!state.visible());
+        assert!(state.show("boom"));
+        assert!(state.visible());
+        state.hide();
+        assert!(!state.visible());
+        assert!(state.show("boom again"));
+        assert!(state.visible());
+        state.close();
+        assert!(!state.visible());
     }
 }

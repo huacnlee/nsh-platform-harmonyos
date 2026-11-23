@@ -43,6 +43,10 @@ mod dev_presentation;
 #[allow(dead_code)]
 mod editor_state;
 
+#[path = "../../src/input/intercept.rs"]
+#[allow(dead_code)]
+mod input_intercept;
+
 #[path = "../../src/services/executor.rs"]
 mod executor;
 

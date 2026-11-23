@@ -287,6 +287,11 @@ export interface NshOptions {
   cacheOptions?: NshCacheOptions;
   /** Allow explicit status-bar and fullscreen-video requests to manage window bars. Default true. */
   managesStatusBar?: boolean;
+  /**
+   * Allow touches on regions without hit-testable NSH content (for example a `box-none` app
+   * root) to pass through to sibling views behind this surface. Default false.
+   */
+  passThroughTouches?: boolean;
   /** System observations available before the app starts. */
   environment?: NshEnvironment;
   /** Interpreter stack ceiling in bytes (64 KiB through 4 MiB). */

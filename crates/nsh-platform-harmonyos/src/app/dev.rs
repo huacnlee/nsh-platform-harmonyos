@@ -436,6 +436,9 @@ impl Overlay {
             Ok(())
         });
     }
+    pub(crate) fn blocks_touches(&self) -> bool {
+        self.presentation.borrow().visible()
+    }
     pub(crate) fn show(&self, message: &str) {
         use ohos_arkui_binding::{
             component::attribute::ArkUICommonAttribute,

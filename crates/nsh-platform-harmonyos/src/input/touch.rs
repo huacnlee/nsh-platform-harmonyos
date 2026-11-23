@@ -1089,6 +1089,10 @@ fn block(node: &Rc<Node>, blocked: bool) -> Result<()> {
     }
     Ok(())
 }
+pub(crate) fn hit_app(root: &Rc<Node>, point: (f32, f32)) -> Result<bool> {
+    Ok(hit(root, point, &nsh_core::Matrix::IDENTITY)?
+        .is_some_and(|node| node.id != nsh_core::ROOT_ID))
+}
 pub(crate) fn hit(
     root: &Rc<Node>,
     point: (f32, f32),

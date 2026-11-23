@@ -806,6 +806,21 @@ impl State {
         self.host.borrow_mut().take();
         Ok(())
     }
+    fn hit_app(&self, point_px: (f32, f32)) -> crate::input::intercept::SurfaceHit {
+        #[cfg(feature = "dev")]
+        if self
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.blocks_touches())
+        {
+            return crate::input::intercept::SurfaceHit::Hit;
+        }
+        self.phase
+            .runtime()
+            .map_or(crate::input::intercept::SurfaceHit::Miss, |runtime| {
+                runtime.hit_app(point_px)
+            })
+    }
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -847,6 +862,7 @@ impl NshSurface {
         crate::init_logging();
         let host = crate::app::entry::bind_session(&env, &ui_context)?;
         let config = Config::new(host.clone(), options.unwrap_or_default())?;
+        let pass_through_touches = config.pass_through_touches;
         host.scale()?;
         let content = ContentRoot::new(env)?;
         let viewport = Custom::new().map_err(native_error)?.into_node();
@@ -993,6 +1009,36 @@ impl NshSurface {
                     Ok(())
                 })
             });
+            if pass_through_touches {
+                let intercept_state = Rc::downgrade(&state);
+                viewport.borrow_mut().on_event(
+                    ohos_arkui_binding::types::event::NodeEventType::OnTouchIntercept,
+                    move |event| {
+                        let Some(input) = event.input_event() else {
+                            return;
+                        };
+                        let Some(state) = intercept_state.upgrade() else {
+                            return;
+                        };
+                        // ArkUI delivers the triggering finger's viewport-local px position
+                        // directly via `pointer_x()`/`pointer_y()` during `OnTouchIntercept`,
+                        // including for additional fingers in multi-touch (where
+                        // `get_changed_pointer_id()` remains 0).
+                        let point_px = (input.pointer_x(), input.pointer_y());
+                        let hit = match state.try_borrow() {
+                            Ok(state) => state.hit_app(point_px),
+                            Err(_) => crate::input::intercept::SurfaceHit::Indeterminate,
+                        };
+                        if hit.should_block_descendants()
+                            && let Err(error) = input.pointer_set_intercept_hit_test_mode(
+                                ohos_arkui_binding::arkui_input_binding::HitTest::BlockDescendants,
+                            )
+                        {
+                            log::warn!("OHOS surface touch intercept failed: {error}");
+                        }
+                    },
+                );
+            }
             state
                 .borrow_mut()
                 .content

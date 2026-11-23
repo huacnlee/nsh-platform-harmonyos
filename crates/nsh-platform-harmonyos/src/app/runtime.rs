@@ -1461,6 +1461,17 @@ impl Runtime {
         }
         Ok(())
     }
+    pub(crate) fn hit_app(&self, point_px: (f32, f32)) -> crate::input::intercept::SurfaceHit {
+        let Ok(state) = self.state.try_borrow() else {
+            return crate::input::intercept::SurfaceHit::Indeterminate;
+        };
+        state
+            .mounter
+            .as_ref()
+            .map_or(crate::input::intercept::SurfaceHit::Miss, |mounter| {
+                mounter.hit_app(point_px)
+            })
+    }
     pub(crate) fn is_running(&self) -> bool {
         self._dispatcher
             .live

@@ -88,6 +88,29 @@ Column() {
 
 The slot's size is the app's window: NSH lays the app out at the slot's size and relayouts when it resizes. Loading again replaces the running app. The project `nsh package` writes (`template/entry/src/main/ets/pages/Index.ets`) is a complete example.
 
+### Overlaying native views
+
+To show an `NshSurface` over a native view such as an `XComponent` and let touches on empty or `pointerEvents: "box-none"` / `"none"` regions reach the view underneath, pass `passThroughTouches: true` in `NshOptions`:
+
+```ts
+const surface = new NshSurface(this.getUIContext(), {
+  passThroughTouches: true,
+});
+```
+
+```ts
+Stack() {
+  XComponent({ id: 'canvas', type: XComponentType.SURFACE, libraryname: 'entry' })
+    .width('100%')
+    .height('100%')
+  ContentSlot(this.surface.content)
+}
+.width('100%')
+.height('100%')
+```
+
+When enabled, touches that do not hit any app content (including while no app is mounted yet) skip the surface subtree via `HitTestMode.BLOCK_DESCENDANTS`, while hit-testable NSH views, modals, fullscreen video and the development error overlay keep receiving touches. Place `ContentSlot(this.surface.content)` directly in the parent `Stack`, or set `.hitTestBehavior(HitTestMode.None)` on any intermediate host container wrapping `ContentSlot` — a default ArkUI `Stack` wrapper still blocks sibling views underneath even when the surface skips hit testing.
+
 ## `NshSurface`
 
 | Member | Description |
