@@ -1,5 +1,4 @@
 import { NativeMenuItem, NativeMenuCleanup } from "./NativeMenus";
-import { PointerPosting } from "./NativePointer";
 import {
   BuilderNode,
   NodeRenderType,
@@ -30,7 +29,6 @@ export interface Settings {
   testId?: string | null;
   width: number;
   height: number;
-  hue: number;
   semantic: boolean;
   clickable: boolean;
   keyFocusable?: boolean;
@@ -140,7 +138,6 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
       .id(s.testId ?? `nsh-view-${s.targetId}`)
       .width(s.width)
       .height(s.height)
-      .hueRotate(s.hue)
       .clip(false)
       .tabStop(s.menu != null)
       .hitTestBehavior(HitTestMode.Transparent)
@@ -172,6 +169,8 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
         .onBlur((): void => {
           this.entry.focusEvent("blur");
         });
+    } else {
+      node.onFocus(undefined).onBlur(undefined);
     }
     if (useApi23) {
       (node as StateAttribute).accessibilityStateDescription(s.value);
@@ -317,7 +316,6 @@ class ViewEntry {
   private disposePending: boolean = false;
   private retirementFailure?: Error;
   private menuLease?: MenuLease;
-  private pointerPosting: PointerPosting;
   private appearedReady: boolean = false;
   private focusPending: boolean = false;
   private lastFocusCommandGen: number = 0;
@@ -325,13 +323,11 @@ class ViewEntry {
     settings: Settings,
     context: NshRuntimeContext,
     menus: NativeMenuCleanup,
-    posting: PointerPosting,
   ) {
     this.state = new ViewState(settings);
     this.menus = menus;
     this.context = context;
     this.ui = context.getUIContext();
-    this.pointerPosting = posting;
     if (settings.textureSurface !== undefined) {
       this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, {
         type: NodeRenderType.RENDER_TYPE_TEXTURE,
@@ -353,13 +349,23 @@ class ViewEntry {
   }
   private focusTargetNode(): FrameNode | null {
     const root = this.node.getFrameNode();
+    const expectedId = this.viewId();
+    // Walk down to the inner `nativeView` Stack (which carries `viewId()`),
+    // skipping the outer `SourceRoot` container Stack.
     let cursor: FrameNode | null = root;
+    let lastStack: FrameNode | null = null;
     let depth = 0;
-    while (cursor && cursor.getNodeType() !== "Stack" && depth < 8) {
+    while (cursor && depth < 8) {
+      if (cursor.getId() === expectedId) {
+        return cursor;
+      }
+      if (cursor.getNodeType() === "Stack") {
+        lastStack = cursor;
+      }
       cursor = cursor.getFirstChild();
       depth += 1;
     }
-    return cursor ?? root;
+    return lastStack ?? root;
   }
   private abortCreate(): void {
     this.closed = true;
@@ -597,7 +603,7 @@ class ViewEntry {
     const menu = this.settings.menu;
     return {
       placement: Placement.TopLeft,
-      offset: { x: menu?.x ?? 0, y: -(menu?.y ?? 0) },
+      offset: { x: menu?.x ?? 0, y: menu?.y ?? 0 },
       showInSubWindow: false,
       onDisappear: (): void => {
         lease.disappeared = true;
@@ -644,11 +650,7 @@ class ViewEntry {
       }
       // Detachment and builder disposal have separate ownership. A failed
       // builder remains retryable even after its native target is retired.
-      if (this.pointerPosting.busy) {
-        this.pointerPosting.retirements.push((): void => this.disposeBuilders());
-      } else {
-        this.disposeBuilders();
-      }
+      this.disposeBuilders();
     } catch (error) {
       quarantinedViews.add(this);
       this.retirementFailure = new Error(`Native wrapper retirement failed: ${String(error)}`);
@@ -695,7 +697,6 @@ class ViewEntry {
 export class NativeViews {
   private entries: Map<number, ViewEntry> = new Map();
   private menus: NativeMenuCleanup = new NativeMenuCleanup();
-  private pointerPosting: PointerPosting = new PointerPosting();
   private retryQuarantined(context: NshRuntimeContext): void {
     for (const view of Array.from(quarantinedViews)) {
       if (!view.belongsTo(context)) {
@@ -741,7 +742,7 @@ export class NativeViews {
         if (entry) {
           entry.update(state);
         } else {
-          const created = new ViewEntry(state, context, this.menus, this.pointerPosting);
+          const created = new ViewEntry(state, context, this.menus);
           created.create();
           this.entries.set(state.targetId, created);
         }
@@ -777,6 +778,7 @@ export class NativeViews {
         failure ??= new Error(String(error));
       }
     }
+    this.menus.dispose();
     if (failure) {
       throw failure;
     }

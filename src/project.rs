@@ -366,7 +366,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
 
     let rawfile = join_all(out, ["entry", "src", "main", "resources", "rawfile"]);
     fs::create_dir_all(&rawfile)?;
-    for name in ["bundle.js", "app.json", "capabilities.json"] {
+    for name in ["app.json", "capabilities.json"] {
         let source = contents.build.join(name);
         if source.is_file() {
             fs::copy(&source, rawfile.join(name))?;

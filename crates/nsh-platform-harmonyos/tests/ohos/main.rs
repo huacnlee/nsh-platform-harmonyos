@@ -59,21 +59,25 @@ mod shadow_geometry;
 #[path = "../../src/render/frame_clock.rs"]
 mod frame_clock;
 
-#[path = "../../src/app/chunks.rs"]
+#[path = "../../src/app/chunks_spec.rs"]
 mod chunks;
 
 #[path = "../../src/render/transition.rs"]
 #[allow(dead_code)]
 mod transition;
 
-#[path = "../../src/services/system.rs"]
+#[path = "../../src/services/audio_spec.rs"]
+#[allow(dead_code)]
+mod audio_spec;
+
+#[path = "../../src/services/system_spec.rs"]
 #[allow(dead_code)]
 mod system;
 
 #[path = "../../src/media/web_evaluation.rs"]
 mod web_evaluation;
 
-#[path = "../../src/app/frame_rate.rs"]
+#[path = "../../src/app/frame_rate_spec.rs"]
 #[allow(dead_code)]
 mod frame_rate;
 
@@ -89,7 +93,7 @@ mod video_mailbox;
 #[allow(dead_code)]
 mod scene_policy;
 
-#[path = "../../src/services/desktop.rs"]
+#[path = "../../src/services/desktop_spec.rs"]
 #[allow(dead_code)]
 mod desktop;
 

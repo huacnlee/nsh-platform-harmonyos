@@ -180,8 +180,9 @@ impl NshEnvironment {
         if let Some(value) = self.locale {
             let locale = Locale::parse(&value)
                 .ok_or_else(|| napi_ohos::Error::from_reason("invalid locale tag"))?;
+            let locale_changed = env.locale != locale;
             env.locale = locale;
-            if self.regional_locale.is_none() {
+            if locale_changed && self.regional_locale.is_none() {
                 let preferences = nsh_core::platform::LocaleSettings::parse(&value);
                 env.locale_settings.hour_cycle = preferences.hour_cycle;
                 env.locale_settings.first_day_of_week = preferences.first_day_of_week;

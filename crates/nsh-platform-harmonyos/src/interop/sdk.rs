@@ -153,7 +153,6 @@ pub(crate) struct ViewOptions {
     pub target_id: u32,
     pub width: f64,
     pub height: f64,
-    pub hue: f64,
     pub texture_insets: Option<TextureInsets>,
     pub texture_surface: Option<String>,
     pub test_id: Option<String>,
@@ -192,7 +191,7 @@ pub(crate) struct WebSettings {
     pub user_agent: Option<String>,
     pub injected_javascript: Option<String>,
     pub document_start_script: String,
-    pub download_directory: String,
+    pub url_schemes: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

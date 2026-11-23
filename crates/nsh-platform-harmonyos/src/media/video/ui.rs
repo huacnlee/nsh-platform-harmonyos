@@ -86,7 +86,7 @@ pub(super) struct Ui {
     fullscreen_size: Cell<Size>,
     state: Cell<UiState>,
     mode: Cell<ResizeMode>,
-    scale: f32,
+    scale: Cell<f32>,
     updating_slider: Rc<Cell<bool>>,
     /// The user holds the slider's thumb (Begin to End).
     scrubbing: Rc<Cell<bool>>,
@@ -193,6 +193,12 @@ impl Ui {
                 ohos_arkui_binding::types::view::AccessibilityMode::Enabled.into(),
             )?;
         }
+        toggle
+            .borrow()
+            .set_string_attribute(A::AccessibilityText, "Play")?;
+        fullscreen_toggle
+            .borrow()
+            .set_string_attribute(A::AccessibilityText, "Enter fullscreen")?;
         for text in [&current, &total] {
             let text = text.borrow();
             text.set_f32_attribute(A::FontSize, 14.0)?;
@@ -213,6 +219,7 @@ impl Ui {
             slider.set_u32_attribute(A::SliderSelectedColor, 0xffff_ffff)?;
             slider.set_u32_attribute(A::SliderBlockColor, 0xffff_ffff)?;
             slider.set_f32_attribute(A::SliderTrackThickness, 3.0)?;
+            slider.set_string_attribute(A::AccessibilityText, "Seek")?;
         }
         let playing = Rc::new(Cell::new(false));
         let glyph = playing.clone();
@@ -328,7 +335,7 @@ impl Ui {
             fullscreen_size: Cell::new(Size::default()),
             state: Cell::new(UiState::default()),
             mode: Cell::new(ResizeMode::Contain),
-            scale: owner.scale.get(),
+            scale: Cell::new(owner.scale.get()),
             updating_slider,
             scrubbing,
         });
@@ -407,6 +414,12 @@ impl Ui {
         }
         self.apply_visibility()?;
         self.layout()
+    }
+    pub(super) fn density_changed(&self, scale: f32) -> Result<()> {
+        if (self.scale.replace(scale) - scale).abs() > f32::EPSILON {
+            self.layout()?;
+        }
+        Ok(())
     }
     pub(super) fn frame(&self, size: Size) -> Result<()> {
         self.size.set(size);
@@ -531,6 +544,14 @@ impl Ui {
         self.native
             .borrow()
             .set_i32_attribute(A::ZIndex, if enabled { i32::MAX } else { 0 })?;
+        self.fullscreen_toggle.borrow().set_string_attribute(
+            A::AccessibilityText,
+            if enabled {
+                "Exit fullscreen"
+            } else {
+                "Enter fullscreen"
+            },
+        )?;
         self.fullscreen_toggle
             .borrow()
             .mark_dirty(NodeDirtyFlag::NeedRender)?;
@@ -614,7 +635,7 @@ impl Ui {
             } else {
                 self.mode.get()
             },
-            self.scale,
+            self.scale.get(),
         );
         self.surface.borrow().width(width)?;
         self.surface.borrow().height(height)?;
@@ -750,7 +771,9 @@ pub(crate) fn update(token: u64, state: UiState) {
     let ui = LIVE.with_borrow(|live| live.get(&token).and_then(Weak::upgrade));
     if let Some(ui) = ui.filter(|ui| !ui.closed.get()) {
         callback(|| {
-            let was_playing = ui.state.replace(state).playing;
+            let prev = ui.state.replace(state);
+            let was_playing = prev.playing;
+            let dimensions_changed = prev.width != state.width || prev.height != state.height;
             if was_playing != state.playing {
                 let mut visibility = ui.visibility.get();
                 visibility.show(state.playing, ui.now());
@@ -759,6 +782,10 @@ pub(crate) fn update(token: u64, state: UiState) {
                 ui.schedule_controls_hide();
             }
             if ui.playing.replace(state.playing) != state.playing {
+                ui.toggle.borrow().set_string_attribute(
+                    A::AccessibilityText,
+                    if state.playing { "Pause" } else { "Play" },
+                )?;
                 ui.toggle.borrow().mark_dirty(NodeDirtyFlag::NeedRender)?;
             }
             ui.current
@@ -779,7 +806,10 @@ pub(crate) fn update(token: u64, state: UiState) {
                 ui.updating_slider.set(false);
                 updated?;
             }
-            ui.layout()
+            if dimensions_changed {
+                ui.layout()?;
+            }
+            Ok(())
         });
     }
 }

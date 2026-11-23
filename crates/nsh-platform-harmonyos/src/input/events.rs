@@ -323,28 +323,38 @@ impl Interaction {
                                     .control
                                     .set_input_modality(nsh_core::platform::InputModality::Pointer);
                             }
-                            if owner.id == nsh_core::ROOT_ID
-                                || owner.kind == nsh_core::ViewKind::Modal
-                            {
+                            let is_root = owner.id == nsh_core::ROOT_ID
+                                || owner.kind == nsh_core::ViewKind::Modal;
+                            if is_root {
                                 owner.touches.borrow_mut().input(&owner, &input)?;
                             }
                             let x = input.pointer_x_by_index(0);
                             let y = input.pointer_y_by_index(0);
+                            let mask = owner.interaction.mask();
                             match input.action {
                                 UIInputAction::Down => {
-                                    owner
-                                        .touches
-                                        .borrow_mut()
-                                        .record_down(owner.scale.get(), &input);
+                                    if !is_root {
+                                        owner
+                                            .touches
+                                            .borrow_mut()
+                                            .record_down(owner.key_window_id(), &input);
+                                    }
                                     owner.interaction.long_fired.set(false);
                                     if owner.press_feedback_allowed() {
                                         owner.interaction.state(&owner, state::PRESSED, true)?;
-                                        owner.emit(EventKind::PressDown, owner.press_payload(x, y));
+                                        if mask.contains(EventKind::PressDown) {
+                                            owner.emit(
+                                                EventKind::PressDown,
+                                                owner.press_payload(x, y),
+                                            );
+                                        }
                                     }
                                 }
                                 UIInputAction::Up | UIInputAction::Cancel => {
                                     owner.interaction.state(&owner, state::PRESSED, false)?;
-                                    if owner.press_feedback_allowed() {
+                                    if owner.press_feedback_allowed()
+                                        && mask.contains(EventKind::PressUp)
+                                    {
                                         owner.emit(EventKind::PressUp, owner.press_payload(x, y));
                                     }
                                 }
@@ -410,7 +420,7 @@ impl Interaction {
             }
         }
         let mouse = !blocked
-            && ((is_surface_root && owner.platform.get().os.is_desktop())
+            && (is_surface_root
                 || owner.selectable()
                 || events.contains(EventKind::MouseMove)
                 || events.contains(EventKind::ContextMenu));
@@ -428,7 +438,10 @@ impl Interaction {
                             let wy = input.pointer_window_y();
                             let dx = input.pointer_display_x();
                             let dy = input.pointer_display_y();
-                            owner.touches.borrow_mut().record_pointer((wx, wy));
+                            owner
+                                .touches
+                                .borrow_mut()
+                                .record_pointer_for(owner.key_window_id(), (wx, wy));
                             let mask = owner.interaction.mask();
                             let is_root = owner.id == nsh_core::ROOT_ID
                                 || owner.kind == nsh_core::ViewKind::Modal;
@@ -513,16 +526,27 @@ impl Interaction {
                                             }
                                         }
                                         UIMouseEventButton::Right => {
+                                            let event_time = input.event_time();
                                             if mask.contains(EventKind::ContextMenu) {
-                                                owner.emit(
-                                                    EventKind::ContextMenu,
-                                                    owner.context_menu_payload(x, y),
-                                                );
+                                                if owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
+                                                {
+                                                    owner.emit(
+                                                        EventKind::ContextMenu,
+                                                        owner.context_menu_payload(x, y),
+                                                    );
+                                                }
                                             } else if is_root && desktop {
-                                                if let Some(target) =
-                                                    desktop_right_click_selection_target(
-                                                        &owner, x, y,
-                                                    )?
+                                                if owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
+                                                    && let Some(target) =
+                                                        desktop_right_click_selection_target(
+                                                            &owner, x, y,
+                                                        )?
                                                     && let Some(route) = owner.dispatcher.upgrade()
                                                 {
                                                     route.send(
@@ -536,6 +560,10 @@ impl Interaction {
                                             } else if !desktop
                                                 && owner.selectable()
                                                 && owner.has_selection()
+                                                && owner
+                                                    .touches
+                                                    .borrow_mut()
+                                                    .claim_context_menu(event_time, wx, wy)
                                             {
                                                 owner.selection_menu_show(true)?;
                                             }
@@ -716,9 +744,22 @@ impl Interaction {
                                 let _ = drag.set_drag_result(DragResult::Successful);
                                 if owner.interaction.mask().contains(EventKind::FileDrop) {
                                     let scale = owner.scale.get().max(1.0);
+                                    let surface = owner.key_surface_root();
+                                    let origin = surface
+                                        .native
+                                        .borrow()
+                                        .layout_position_in_window()
+                                        .map(|offset| (offset.x, offset.y))
+                                        .unwrap_or((0, 0));
                                     let page_position = nsh_core::Point::new(
-                                        nsh_core::Points(drag.touch_point_x_to_window() / scale),
-                                        nsh_core::Points(drag.touch_point_y_to_window() / scale),
+                                        nsh_core::Points(
+                                            (drag.touch_point_x_to_window() - origin.0 as f32)
+                                                / scale,
+                                        ),
+                                        nsh_core::Points(
+                                            (drag.touch_point_y_to_window() - origin.1 as f32)
+                                                / scale,
+                                        ),
                                     );
                                     owner.emit(
                                         EventKind::FileDrop,

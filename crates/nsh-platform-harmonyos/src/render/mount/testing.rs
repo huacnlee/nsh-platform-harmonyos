@@ -72,8 +72,7 @@ impl Mounter {
                         .0
                         .downcast_ref::<crate::text::typography::NativeText>()?;
                     let region = text
-                        .selection
-                        .as_ref()
+                        .selection_layout(&self.context.fonts)
                         .and_then(|selection| {
                             selection
                                 .rectangles(selection.clusters(start..end))

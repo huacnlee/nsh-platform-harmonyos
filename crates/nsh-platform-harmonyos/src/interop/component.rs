@@ -15,7 +15,16 @@ use napi_ohos::{
 };
 use nsh_core::{JsonValue, NodeId};
 use nsh_engine::EngineControl;
-use ohos_arkui_binding::{component::built_in_component::Stack, types::advanced::LengthMetricUnit};
+use ohos_arkui_binding::{
+    component::{
+        attribute::{ArkUICommonAttribute, ArkUIEvent},
+        built_in_component::{Stack, Toggle},
+    },
+    types::{
+        advanced::LengthMetricUnit, attribute::ArkUINodeAttributeType as A,
+        event::NodeEventType as E,
+    },
+};
 use rustc_hash::FxHashMap;
 
 use crate::{
@@ -160,11 +169,14 @@ impl Components {
         let (factory, handle, context) = {
             let mut registry = self.0.borrow_mut();
             let factory = registry.factories.get(name).cloned();
+            if factory.is_none() && name == nsh_core::platform::SWITCH_COMPONENT {
+                drop(registry);
+                return Ok(Some(Instance::native_switch(node, control)?));
+            }
             if factory.is_none()
                 && !matches!(
                     name,
                     nsh_core::platform::TAB_BAR_COMPONENT
-                        | nsh_core::platform::SWITCH_COMPONENT
                         | nsh_core::platform::DATE_TIME_PICKER_COMPONENT
                 )
             {
@@ -221,10 +233,12 @@ impl Components {
         let target = NativeAttachment::new(&native)?;
         NativeAttachment::attach(&env, target.id(), &node)?;
         Ok(Some(Instance {
-            target,
             native,
-            retained: Some(retained),
-            registration,
+            kind: InstanceKind::Host {
+                target,
+                retained: Some(retained),
+                registration,
+            },
             disposed: Cell::new(false),
         }))
     }
@@ -278,25 +292,149 @@ impl Drop for RetainedObject {
         }
     }
 }
+struct NativeSwitchState {
+    active: Rc<Cell<bool>>,
+    checked: Rc<Cell<bool>>,
+    disabled: Rc<Cell<bool>>,
+    updating: Rc<Cell<bool>>,
+}
+
+enum InstanceKind {
+    Host {
+        target: NativeAttachment,
+        retained: Option<RetainedObject>,
+        registration: Registration,
+    },
+    NativeSwitch(NativeSwitchState),
+}
+
 pub(crate) struct Instance {
-    target: NativeAttachment,
     pub(crate) native: NativeNode,
-    retained: Option<RetainedObject>,
-    registration: Registration,
+    kind: InstanceKind,
     disposed: Cell<bool>,
 }
 impl Instance {
+    fn native_switch(node_id: NodeId, control: EngineControl) -> Result<Self> {
+        let native = Toggle::new()?.into_node();
+        {
+            let borrowed = native.borrow();
+            borrowed.set_length_metric_unit(LengthMetricUnit::Vp)?;
+            borrowed.set_i32_attribute(A::ToggleValue, 0)?;
+            borrowed.set_bool_attribute(A::Enabled, true)?;
+        }
+        // Standard HarmonyOS ArkUI Switch intrinsic size (36 x 20 vp).
+        control.set_component_size(
+            node_id,
+            nsh_core::Size::new(nsh_core::Points(36.0), nsh_core::Points(20.0)),
+        );
+        let active = Rc::new(Cell::new(true));
+        let checked = Rc::new(Cell::new(false));
+        let disabled = Rc::new(Cell::new(false));
+        let updating = Rc::new(Cell::new(false));
+        let cb_active = active.clone();
+        let cb_checked = checked.clone();
+        let cb_disabled = disabled.clone();
+        let cb_updating = updating.clone();
+        let cb_node = Rc::downgrade(&native);
+        native
+            .borrow_mut()
+            .on_event(E::ToggleOnChange, move |event| {
+                if cb_updating.get() || !cb_active.get() || cb_disabled.get() {
+                    return;
+                }
+                let next = event.i32_value(0).unwrap_or_default() != 0;
+                let controlled = cb_checked.get();
+                if next != controlled {
+                    // Revert the visual state to the controlled value so rejected
+                    // changes stay synchronized; an accepted change updates it in props().
+                    if let Some(toggle) = cb_node.upgrade() {
+                        cb_updating.set(true);
+                        let _ = toggle
+                            .borrow()
+                            .set_i32_attribute(A::ToggleValue, i32::from(controlled));
+                        cb_updating.set(false);
+                    }
+                    control.dispatch_event(
+                        node_id,
+                        nsh_core::EventKind::NativeEvent,
+                        nsh_core::EventPayload::Native {
+                            name: "change".into(),
+                            data: next.into(),
+                        },
+                    );
+                }
+            });
+        Ok(Self {
+            native,
+            kind: InstanceKind::NativeSwitch(NativeSwitchState {
+                active,
+                checked,
+                disabled,
+                updating,
+            }),
+            disposed: Cell::new(false),
+        })
+    }
     fn object(&self) -> napi_ohos::Result<Object<'_>> {
-        self.retained
-            .as_ref()
-            .filter(|_| !self.disposed.get())
-            .ok_or_else(|| napi_ohos::Error::from_reason("native component is disposed"))?
-            .object()
+        match &self.kind {
+            InstanceKind::Host { retained, .. } => retained
+                .as_ref()
+                .filter(|_| !self.disposed.get())
+                .ok_or_else(|| napi_ohos::Error::from_reason("native component is disposed"))?
+                .object(),
+            InstanceKind::NativeSwitch(_) => Err(napi_ohos::Error::from_reason(
+                "native switch has no JS object",
+            )),
+        }
     }
     pub(crate) fn deactivate(&self) {
-        self.registration.context.active.set(false);
+        match &self.kind {
+            InstanceKind::Host { registration, .. } => registration.context.active.set(false),
+            InstanceKind::NativeSwitch(state) => state.active.set(false),
+        }
     }
     pub(crate) fn props(&self, props: Vec<(Arc<str>, Option<JsonValue>)>) -> Result<()> {
+        if let InstanceKind::NativeSwitch(state) = &self.kind {
+            let borrowed = self.native.borrow();
+            for (name, value) in props {
+                match name.as_ref() {
+                    "checked" => {
+                        let next = value.as_ref().and_then(JsonValue::as_bool).unwrap_or(false);
+                        state.checked.set(next);
+                        state.updating.set(true);
+                        let res = borrowed.set_i32_attribute(A::ToggleValue, i32::from(next));
+                        state.updating.set(false);
+                        res?;
+                    }
+                    "disabled" => {
+                        let next = value.as_ref().and_then(JsonValue::as_bool).unwrap_or(false);
+                        state.disabled.set(next);
+                        borrowed.set_bool_attribute(A::Enabled, !next)?;
+                        borrowed.opacity(if next { 0.4 } else { 1.0 })?;
+                    }
+                    "accessibilityLabel" => {
+                        let label = value
+                            .as_ref()
+                            .and_then(JsonValue::as_str)
+                            .unwrap_or_default();
+                        borrowed.set_string_attribute(A::AccessibilityText, label)?;
+                    }
+                    "tint" => {
+                        if let Some(argb) = value
+                            .as_ref()
+                            .and_then(JsonValue::as_str)
+                            .and_then(parse_css_argb)
+                        {
+                            borrowed.set_u32_attribute(A::ToggleSelectedColor, argb)?;
+                        } else {
+                            borrowed.reset_attribute(A::ToggleSelectedColor)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(());
+        }
         let object = self.object()?;
         let update: Option<Function<'_, Vec<NshNativeProperty>, ()>> = object.get("updateProps")?;
         if let Some(update) = update {
@@ -315,6 +453,9 @@ impl Instance {
         Ok(())
     }
     pub(crate) fn command(&self, name: &str, args: &JsonValue) -> Result<()> {
+        if matches!(self.kind, InstanceKind::NativeSwitch(_)) {
+            return Ok(());
+        }
         let object = self.object()?;
         let command: Option<Function<'_, FnArgs<(String, JsonValue)>, ()>> =
             object.get("command")?;
@@ -328,26 +469,93 @@ impl Instance {
         if self.disposed.get() {
             return Ok(());
         }
-        self.target.invalidate()?;
-        if self.native.borrow().is_owned() {
-            self.native.borrow_mut().dispose()?;
-        }
-        // Detachment is committed before calling the host, which may throw.
-        self.disposed.set(true);
-        if let Some(retained) = &self.retained {
-            retained.dispose()?;
+        match &self.kind {
+            InstanceKind::Host {
+                target, retained, ..
+            } => {
+                target.invalidate()?;
+                if self.native.borrow().is_owned() {
+                    self.native.borrow_mut().dispose()?;
+                }
+                // Detachment is committed before calling the host, which may throw.
+                self.disposed.set(true);
+                if let Some(retained) = retained {
+                    retained.dispose()?;
+                }
+            }
+            InstanceKind::NativeSwitch(_) => {
+                if self.native.borrow().is_owned() {
+                    self.native.borrow_mut().dispose()?;
+                }
+                self.disposed.set(true);
+            }
         }
         Ok(())
     }
+}
+
+fn parse_css_argb(raw: &str) -> Option<u32> {
+    let s = raw.trim();
+    if let Some(hex) = s.strip_prefix('#') {
+        return match hex.len() {
+            3 => {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                Some(0xFF00_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
+            }
+            4 => {
+                let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 17;
+                let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 17;
+                let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 17;
+                let a = u8::from_str_radix(&hex[3..4], 16).ok()? * 17;
+                Some(
+                    (u32::from(a) << 24)
+                        | (u32::from(r) << 16)
+                        | (u32::from(g) << 8)
+                        | u32::from(b),
+                )
+            }
+            6 => {
+                let rgb = u32::from_str_radix(hex, 16).ok()?;
+                Some(0xFF00_0000 | rgb)
+            }
+            8 => {
+                // CSS hex is #RRGGBBAA; ArkUI u32 colors are 0xAARRGGBB.
+                let rgba = u32::from_str_radix(hex, 16).ok()?;
+                Some(rgba.rotate_right(8))
+            }
+            _ => None,
+        };
+    }
+    let inner = s
+        .strip_prefix("rgba(")
+        .or_else(|| s.strip_prefix("rgb("))
+        .and_then(|rest| rest.strip_suffix(')'))?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    if parts.len() != 3 && parts.len() != 4 {
+        return None;
+    }
+    let r = parts[0].parse::<f32>().ok()?.round().clamp(0.0, 255.0) as u8;
+    let g = parts[1].parse::<f32>().ok()?.round().clamp(0.0, 255.0) as u8;
+    let b = parts[2].parse::<f32>().ok()?.round().clamp(0.0, 255.0) as u8;
+    let a = if parts.len() == 4 {
+        (parts[3].parse::<f32>().ok()?.clamp(0.0, 1.0) * 255.0).round() as u8
+    } else {
+        255
+    };
+    Some((u32::from(a) << 24) | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b))
 }
 
 impl Drop for Instance {
     fn drop(&mut self) {
         if let Err(error) = self.dispose() {
             if !self.disposed.get() {
-                // The C container still borrows the ArkTS node. Keep both owners
-                // alive permanently when the final native detach retry fails.
-                std::mem::forget((self.retained.take(), self.native.clone()));
+                if let InstanceKind::Host { retained, .. } = &mut self.kind {
+                    // The C container still borrows the ArkTS node. Keep both owners
+                    // alive permanently when the final native detach retry fails.
+                    std::mem::forget((retained.take(), self.native.clone()));
+                }
                 log::error!(
                     "OHOS native component detachment failed; retaining the native container \
                      and ArkTS owner until process exit: {error}"

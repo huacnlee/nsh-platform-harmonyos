@@ -210,6 +210,9 @@ impl Input {
         self.command("select-all", 0, 0);
         Ok(())
     }
+    pub(crate) fn menu_action(&self, action: &str) {
+        self.command(action, 0, 0);
+    }
     pub(crate) fn frame_moved(&self) {
         if !self.closed.get() && self.state.borrow().is_focused() && self.is_ime_cursor_sink() {
             self.command("cursor", 0, 0);
@@ -488,7 +491,7 @@ impl Input {
                 let height = parent.frame.get().height;
                 return height > 0.0
                     && scroll.scale() == 1.0
-                    && top - scroll.current_offset().1 > height * 1.5;
+                    && top - scroll.nsh_offset().1 > height * 1.5;
             }
             node = parent;
         }
@@ -562,7 +565,10 @@ impl Input {
             caret_color: argb(if config.caret_hidden {
                 nsh_core::Color::TRANSPARENT
             } else {
-                config.selection_color.unwrap_or(config.style.color)
+                config
+                    .caret_color
+                    .or(config.selection_color)
+                    .unwrap_or(config.style.color)
             }),
             selection_color: argb(selection),
             editable: config.editable,

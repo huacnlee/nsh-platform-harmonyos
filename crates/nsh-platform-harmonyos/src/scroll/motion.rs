@@ -76,7 +76,57 @@ impl ZoomMotion {
     }
 }
 
+/// Maximum native ArkUI scroll offset along one axis when `content_inset` is
+/// applied as ArkUI `Padding = [top, right, bottom, left]`.
+pub(crate) fn native_max_offset(
+    length: f32,
+    scale: f32,
+    viewport: f32,
+    lead: f32,
+    trail: f32,
+) -> f32 {
+    (length * scale + lead + trail - viewport).max(0.0)
+}
+
+/// Converts an NSH/UIKit-convention offset (`-lead` at rest) to ArkUI's
+/// 0-based native scroll offset, clamped to `[0, native_max_offset]`.
+pub(crate) fn nsh_to_native_offset(
+    offset: f32,
+    length: f32,
+    scale: f32,
+    viewport: f32,
+    lead: f32,
+    trail: f32,
+) -> f32 {
+    let max = native_max_offset(length, scale, viewport, lead, trail);
+    (offset + lead).clamp(0.0, max)
+}
+
+/// Converts ArkUI's 0-based native scroll offset to NSH/UIKit-convention
+/// offset (`-lead` at rest).
+pub(crate) fn native_to_nsh_offset(native: f32, lead: f32) -> f32 {
+    native - lead
+}
+
+/// Keeps a content point under the given viewport position while scale changes,
+/// returning a 0-based native ArkUI scroll offset.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn focal_native_offset(
+    content: f32,
+    viewport_point: f32,
+    scale: f32,
+    length: f32,
+    viewport: f32,
+    lead: f32,
+    trail: f32,
+    centering: f32,
+) -> f32 {
+    let max = native_max_offset(length, scale, viewport, lead, trail);
+    (content * scale + lead + centering - viewport_point).clamp(0.0, max)
+}
+
 /// Keeps a content point under the given viewport position while scale changes.
+#[cfg(test)]
 pub(crate) fn focal_offset(
     content: f32,
     viewport_point: f32,
@@ -84,7 +134,16 @@ pub(crate) fn focal_offset(
     length: f32,
     viewport: f32,
 ) -> f32 {
-    (content * scale - viewport_point).clamp(0.0, (length * scale - viewport).max(0.0))
+    focal_native_offset(
+        content,
+        viewport_point,
+        scale,
+        length,
+        viewport,
+        0.0,
+        0.0,
+        0.0,
+    )
 }
 
 /// Rubber-band zoom past a bound; release animates back to the mounted limits.
@@ -236,6 +295,29 @@ mod tests {
         assert_eq!(focal_offset(90.0, 30.0, 2.0, 400.0, 200.0), 150.0);
         assert_eq!(focal_offset(10.0, 80.0, 1.0, 400.0, 200.0), 0.0);
         assert_eq!(focal_offset(390.0, 30.0, 2.0, 400.0, 200.0), 600.0);
+    }
+
+    #[test]
+    fn content_inset_roundtrips_between_nsh_and_native_offsets() {
+        // Content 400, viewport 200, lead 40, trail 60 => native max = 400 + 100 - 200 = 300.
+        assert_eq!(native_max_offset(400.0, 1.0, 200.0, 40.0, 60.0), 300.0);
+        // Resting NSH offset (-40) maps to native 0, and maps back to -40.
+        let native_start = nsh_to_native_offset(-40.0, 400.0, 1.0, 200.0, 40.0, 60.0);
+        assert_eq!(native_start, 0.0);
+        assert_eq!(native_to_nsh_offset(native_start, 40.0), -40.0);
+        // NSH offset 0 aligns content top with viewport top => native 40.
+        let native_zero = nsh_to_native_offset(0.0, 400.0, 1.0, 200.0, 40.0, 60.0);
+        assert_eq!(native_zero, 40.0);
+        assert_eq!(native_to_nsh_offset(native_zero, 40.0), 0.0);
+        // Overshooting end clamps to native 300 => NSH 260 (400 + 60 - 200).
+        let native_end = nsh_to_native_offset(999.0, 400.0, 1.0, 200.0, 40.0, 60.0);
+        assert_eq!(native_end, 300.0);
+        assert_eq!(native_to_nsh_offset(native_end, 40.0), 260.0);
+        // Focal offset accounts for leading inset and centering.
+        assert_eq!(
+            focal_native_offset(90.0, 30.0, 2.0, 400.0, 200.0, 20.0, 10.0, 0.0),
+            170.0
+        );
     }
 
     #[test]

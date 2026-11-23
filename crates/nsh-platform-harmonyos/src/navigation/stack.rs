@@ -82,11 +82,17 @@ impl Screen {
             A::AccessibilityMode,
             ohos_arkui_binding::types::view::AccessibilityMode::Enabled.into(),
         )?;
-        back.borrow().id("nsh-header-back")?;
+        let back_id = owner.upgrade().map_or_else(
+            || "nsh-header-back".to_owned(),
+            |n| format!("nsh-header-back-{}", n.id),
+        );
+        back.borrow().id(&back_id)?;
         back.borrow().width(44.0)?;
         back.borrow().height(44.0)?;
         title.borrow().set_f32_attribute(A::FontSize, 18.0)?;
         title.borrow().set_i32_attribute(A::TextAlign, 1)?;
+        title.borrow().set_i32_attribute(A::TextMaxLines, 1)?;
+        title.borrow().set_i32_attribute(A::TextOverflow, 2)?;
         title.borrow().height(44.0)?;
         let screen = Rc::new(Self {
             owner,
@@ -879,9 +885,12 @@ pub(crate) fn reconcile<'a>(stacks: impl Iterator<Item = &'a Rc<Node>>) -> Resul
                     .is_some_and(|s| !s.popped.get())
             })
             .collect();
-        let previous_top = screens
+        let previous_top = stack
+            .children
+            .borrow()
             .iter()
-            .find(|node| node.screen.borrow().as_ref().is_some_and(|s| s.is_top()))
+            .filter_map(Weak::upgrade)
+            .find(|node| node.screen.borrow().as_ref().is_some_and(|s| s.top.get()))
             .map(|node| node.id);
         for (index, screen) in screens.iter().enumerate() {
             if let Some(state) = screen.screen.borrow().as_ref() {

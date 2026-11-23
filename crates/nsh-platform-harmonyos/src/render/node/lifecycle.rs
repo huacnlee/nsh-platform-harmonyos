@@ -401,6 +401,14 @@ impl Node {
         if let Some(video) = self.video.borrow().as_ref() {
             callback(|| video.close());
         }
+        if self
+            .key_focus
+            .borrow()
+            .upgrade()
+            .is_some_and(|node| node.id == self.id)
+        {
+            *self.key_focus.borrow_mut() = Weak::new();
+        }
         if let Some(route) = self.dispatcher.upgrade() {
             let mut keyboard = route.keyboard.lock().unwrap();
             if keyboard.focused == Some(self.id) {
@@ -408,6 +416,7 @@ impl Node {
             }
             if keyboard.input == Some(self.id) {
                 keyboard.input = None;
+                keyboard.composing = false;
             }
         }
         if let Some(component) = self.component.borrow().as_ref() {

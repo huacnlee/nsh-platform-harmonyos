@@ -4,7 +4,7 @@ use std::{
     rc::Rc,
 };
 
-use nsh_core::{AccessibilityRole as R, Checked, EventKind};
+use nsh_core::{Checked, EventKind};
 use ohos_arkui_binding::{
     component::{
         attribute::{ArkUICommonAttribute, ArkUIEvent},
@@ -294,7 +294,11 @@ impl Wrapper {
         let spec = owner.accessibility_state.spec.borrow();
         let semantic = owns_semantics(&spec);
         let frame = owner.frame.get();
-        let value = crate::accessibility::value::spoken_value(&spec).unwrap_or_default();
+        let value = crate::accessibility::value::spoken_value_for_locale(
+            &spec,
+            owner.platform.get().locale.as_str(),
+        )
+        .unwrap_or_default();
         let actions: Vec<MenuItem> = if cfg!(feature = "api-26") {
             spec.actions
                 .iter()
@@ -316,7 +320,6 @@ impl Wrapper {
             test_id: owner.interaction.test_id(),
             width: frame.width as f64,
             height: frame.height as f64,
-            hue: 0.0,
             semantic,
             clickable: owner.interaction.mask().contains(EventKind::Press)
                 || spec
@@ -340,8 +343,12 @@ impl Wrapper {
             api23: cfg!(feature = "api-23") && !value.is_empty(),
             api26: !actions.is_empty(),
             value,
-            role: role(spec.role).to_owned(),
-            checked: spec.state.checked.map(|value| value == Checked::True),
+            role: crate::accessibility::value::role_str(spec.role).to_owned(),
+            checked: match spec.state.checked {
+                Some(Checked::True) => Some(true),
+                Some(Checked::False) => Some(false),
+                Some(Checked::Mixed) | None => None,
+            },
             selected: spec.state.selected,
             actions,
             menu: owner.selection_menu(),
@@ -645,23 +652,5 @@ impl Node {
             self.invalidate_scene();
         }
         Ok(())
-    }
-}
-fn role(role: R) -> &'static str {
-    match role {
-        R::None => "",
-        R::Button | R::ImageButton | R::KeyboardKey => "button",
-        R::Checkbox => "checkbox",
-        R::Switch => "switch",
-        R::Radio => "radio",
-        R::Adjustable | R::Scrollbar => "slider",
-        R::Image => "image",
-        R::Link => "link",
-        R::List => "list",
-        R::Grid => "grid",
-        R::Progressbar => "progress",
-        R::Search => "search",
-        R::Menuitem => "menuitem",
-        _ => "text",
     }
 }

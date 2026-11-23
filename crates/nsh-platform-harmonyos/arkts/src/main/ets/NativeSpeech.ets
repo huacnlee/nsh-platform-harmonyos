@@ -96,17 +96,18 @@ export class NativeSpeech {
       if (!live()) {
         return;
       }
-      // The SDK's offline engine accepts zh-CN. Normalize the system's
-      // language/script spelling, and report other requested languages exactly.
       const requested = language || i18n.System.getSystemLanguage();
-      const locale = ["zh", "zh-hans", "zh-hans-cn", "zh-cn"].includes(requested.toLowerCase())
-        ? "zh-CN"
-        : requested;
-      if (locale !== "zh-CN") {
-        session.end("language-not-supported");
+      const lower = requested.toLowerCase();
+      const locale = ["zh", "zh-hans", "zh-hans-cn", "zh-cn"].includes(lower) ? "zh-CN" : requested;
+      let engine: speechRecognizer.SpeechRecognitionEngine;
+      try {
+        engine = await recognizer.default.createEngine({ language: locale, online: 1 });
+      } catch {
+        if (live()) {
+          session.end("language-not-supported");
+        }
         return;
       }
-      const engine = await recognizer.default.createEngine({ language: locale, online: 1 });
       if (!live()) {
         engine.shutdown();
         return;
@@ -116,7 +117,7 @@ export class NativeSpeech {
       if (!live()) {
         return;
       }
-      if (!supported.includes(locale)) {
+      if (supported.length > 0 && !supported.some((s: string) => s.toLowerCase() === locale.toLowerCase())) {
         session.end("language-not-supported");
         return;
       }
@@ -127,11 +128,12 @@ export class NativeSpeech {
           if (!live()) {
             return;
           }
+          const isFinal = Boolean(result.isFinal || result.isLast);
           const text = session.transcript + result.result;
-          if (interim || result.isFinal) {
-            reply({ phase: "result", text, final: result.isLast });
+          if (interim || isFinal) {
+            reply({ phase: "result", text, final: isFinal });
           }
-          if (result.isFinal) {
+          if (isFinal) {
             session.transcript = text;
           }
         },
@@ -211,18 +213,22 @@ export class NativeSpeech {
       return;
     }
     session.stopping = true;
-    if (!session.microphone || !session.engine) {
+    const microphone = session.microphone;
+    const engine = session.engine;
+    if (!microphone || !engine) {
       return;
     }
     try {
-      session.microphone.off("readData");
-      await session.microphone.stop();
-      if (!session.ended) {
-        session.engine?.finish(String(key));
+      microphone.off("readData");
+      await microphone.stop();
+      if (!session.ended && session.engine === engine) {
+        engine.finish(String(key));
       }
     } catch (error) {
-      console.warn(`NSH speech stop: ${error}`);
-      session.end("failed");
+      if (!session.ended) {
+        console.warn(`NSH speech stop: ${error}`);
+        session.end("failed");
+      }
     }
   }
   close(): void {

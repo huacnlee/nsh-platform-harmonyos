@@ -443,6 +443,12 @@ impl Worker {
                                 }
                                 Err(error) => {
                                     log::warn!("shader precompile context: {error}");
+                                    if !gpu_error_reported
+                                        && let Some(route) = route.upgrade()
+                                    {
+                                        gpu_error_reported = true;
+                                        route.send(Message::ShadersUnavailable);
+                                    }
                                     pending_precompiles.clear();
                                     continue;
                                 }
@@ -578,6 +584,7 @@ impl Worker {
                                             && let Some(route) = upgraded.as_deref()
                                         {
                                             gpu_error_reported = true;
+                                            route.send(Message::ShadersUnavailable);
                                             route.send(Message::Error(format!(
                                                 "shader fill context: {error}"
                                             )));
@@ -666,7 +673,15 @@ impl Worker {
                                 let settings = shared.state.lock().unwrap().settings.clone();
                                 check_pixels(&entries, key, settings.pixels())?;
                                 if gpu.is_none() {
-                                    let ctx = TextureContext::new().map_err(|error| error.to_string())?;
+                                    let ctx = TextureContext::new().map_err(|error| {
+                                        if !gpu_error_reported
+                                            && let Some(route) = route.upgrade()
+                                        {
+                                            gpu_error_reported = true;
+                                            route.send(Message::ShadersUnavailable);
+                                        }
+                                        error.to_string()
+                                    })?;
                                     if let Some(p) = precompiler.as_ref() {
                                         ctx.attach_binary_store(p.binary_store());
                                     }
@@ -1170,6 +1185,7 @@ impl Worker {
                             let mut scene_sources = SceneEntries {
                                 entries: &mut entries,
                                 gpu: &mut gpu,
+                                dispatcher: upgraded.as_deref(),
                                 readback_bytes: pre_readback_bytes,
                                 upload_bytes: 0,
                             };
@@ -1962,6 +1978,7 @@ impl Entry {
 struct SceneEntries<'a> {
     entries: &'a mut Entries,
     gpu: &'a mut Option<TextureContext>,
+    dispatcher: Option<&'a Dispatcher>,
     readback_bytes: u64,
     upload_bytes: u64,
 }
@@ -2018,7 +2035,13 @@ impl super::draw::Sources for SceneEntries<'_> {
         };
         let (width, height, effective_scale) = coverage.pixels(scale);
         if self.gpu.is_none() {
-            *self.gpu = Some(TextureContext::new().map_err(|error| error.to_string())?);
+            let ctx = TextureContext::new().map_err(|error| {
+                if let Some(route) = self.dispatcher {
+                    route.send(Message::ShadersUnavailable);
+                }
+                error.to_string()
+            })?;
+            *self.gpu = Some(ctx);
         }
         let gpu = self.gpu.as_ref().unwrap();
         let upload_bytes = &mut self.upload_bytes;

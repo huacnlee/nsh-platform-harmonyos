@@ -118,6 +118,12 @@ impl Video {
         }
         self.ui.frame(size)
     }
+    pub(crate) fn density_changed(&self, scale: f32) -> Result<()> {
+        if self.closed.get() {
+            return Ok(());
+        }
+        self.ui.density_changed(scale)
+    }
     pub(crate) fn close(&self) -> Result<()> {
         if !self.closed.replace(true) {
             // Retain the complete UI owner before the worker may enqueue its final ack.

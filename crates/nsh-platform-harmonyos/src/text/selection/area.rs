@@ -52,8 +52,7 @@ impl SelectionTexts for Texts {
             return 0;
         };
         item.text
-            .selection
-            .as_ref()
+            .selection_layout(&item.node.fonts)
             .and_then(|l| {
                 l.boundary((point.0 - item.content.x, point.1 - item.content.y))
                     .map(|b| l.utf16(b))
@@ -73,7 +72,8 @@ impl Texts {
                 .borrow()
                 .as_ref()
                 .and_then(|t| t.0.clone().downcast::<NativeText>().ok())
-                && text.selection.is_some()
+                && text.can_select()
+                && text.selection_layout(&node.fonts).is_some()
                 && let Some(bounds) = crate::render::composition::geometry::Bounds([
                     content.x,
                     content.y,
@@ -166,13 +166,11 @@ impl Area {
         }
         for (index, range) in ranges {
             let item = &texts.0[index];
-            if let Some(layout) = &item.text.selection {
+            if let Some(layout) = item.text.selection_layout(&item.node.fonts) {
                 let bounds = self.model.bounds().unwrap();
                 let handles = [index == bounds.0.text, index == bounds.1.text];
                 if item.node.selection.handles.replace(handles) != handles {
-                    item.node.native.borrow().mark_dirty(
-                        ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender,
-                    )?;
+                    item.node.invalidate_paint()?;
                 }
                 item.node.selection_set(layout.clusters(range))?;
                 self.members.push(Rc::downgrade(&item.node));

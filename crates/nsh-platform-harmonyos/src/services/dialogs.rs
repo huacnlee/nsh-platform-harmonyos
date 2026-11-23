@@ -7,7 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use napi_ohos::bindgen_prelude::{Function, FunctionRef, JsObjectValue, Object};
+use napi_ohos::bindgen_prelude::{FunctionRef, Object};
 use nsh_core::{DialogButtonStyle, EventKind, EventPayload, PayloadValue};
 
 use crate::{
@@ -18,6 +18,7 @@ use crate::{
 struct Alert {
     request: nsh_core::Dialog,
     active: Rc<Cell<bool>>,
+    programmatic_close: Rc<Cell<bool>>,
     close: RefCell<Option<FunctionRef<(), ()>>>,
     #[cfg(feature = "dev")]
     appeared: Rc<Cell<bool>>,
@@ -89,6 +90,7 @@ impl Dialogs {
         self.alerts.push_back(Alert {
             request,
             active: Rc::new(Cell::new(true)),
+            programmatic_close: Rc::new(Cell::new(false)),
             close: RefCell::default(),
             #[cfg(feature = "dev")]
             appeared: Rc::new(Cell::new(false)),
@@ -196,24 +198,6 @@ impl Dialogs {
             }
             options.set(if request.sheet { "sheets" } else { "buttons" }, buttons)?;
             let active = alert.active.clone();
-            let cancelable = request.cancelable;
-            options.set(
-                "onWillDismiss",
-                env.create_function_from_closure::<Object<'_>, (), _>(
-                    "nshDialogDismiss",
-                    move |ctx| {
-                        // An orphaned window-owned dialog must always be dismissible.
-                        if cancelable || !active.get() {
-                            let action: Object<'_> = ctx.first_arg()?;
-                            let dismiss: Function<'_, (), ()> =
-                                action.get_named_property("dismiss")?;
-                            dismiss.apply(action, ())?;
-                        }
-                        Ok(())
-                    },
-                )?,
-            )?;
-            let active = alert.active.clone();
             let route = self.context.dispatcher.clone();
             let id = request.id;
             options.set(
@@ -230,25 +214,21 @@ impl Dialogs {
                     Ok(())
                 })?,
             )?;
-            let factory = crate::app::entry::ALERT_FACTORY.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|factory| factory.borrow_back(env))
-                    .transpose()
-            })?;
-            if let Some(factory) = factory {
-                options.set("ui", ui)?;
-                options.set("sheet", request.sheet)?;
-                let close = factory.call(options.create_ref()?)?;
-                alert.close.replace(Some(close));
-                return Ok(());
-            }
-            let show: Function<'_, Object<'_>, ()> = ui.get_named_property(if request.sheet {
-                "showActionSheet"
-            } else {
-                "showAlertDialog"
-            })?;
-            show.apply(ui, options)
+            let factory = crate::app::entry::ALERT_FACTORY
+                .with(|slot| {
+                    slot.borrow()
+                        .as_ref()
+                        .map(|factory| factory.borrow_back(env))
+                        .transpose()
+                })?
+                .ok_or_else(|| {
+                    napi_ohos::Error::from_reason("OHOS alert factory not registered")
+                })?;
+            options.set("ui", ui)?;
+            options.set("sheet", request.sheet)?;
+            let close = factory.call(options.create_ref()?)?;
+            alert.close.replace(Some(close));
+            Ok(())
         })?;
         Ok(())
     }
@@ -261,8 +241,13 @@ impl Dialogs {
             return Ok(());
         }
         let front = &self.alerts[0];
+        // Per nsh-core `Command::CloseDialog`: closing programmatically must not report an answer.
+        front.programmatic_close.set(true);
         if let Some(close) = front.close.borrow().as_ref() {
             close.borrow_back(&self.context.env)?.call(())?;
+        } else {
+            self.alerts.pop_front();
+            self.show_next();
         }
         Ok(())
     }
@@ -274,8 +259,10 @@ impl Dialogs {
         {
             return Ok(());
         }
-        self.alerts.pop_front();
-        self.reply(id, index);
+        let alert = self.alerts.pop_front().expect("checked front");
+        if !alert.programmatic_close.get() {
+            self.reply(id, index);
+        }
         self.show_next();
         Ok(())
     }

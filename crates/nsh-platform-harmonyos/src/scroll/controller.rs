@@ -26,7 +26,10 @@ use crate::{
         geometry::Size,
         node::{NativeNode, Node, Result, callback},
     },
-    scroll::motion::{ZoomFrame, ZoomMotion, focal_offset, resisted_scale},
+    scroll::motion::{
+        ZoomFrame, ZoomMotion, focal_native_offset, native_max_offset, native_to_nsh_offset,
+        nsh_to_native_offset, resisted_scale,
+    },
 };
 
 const KEY_SCROLL_PAGE_OVERLAP_VP: f32 = 40.0;
@@ -281,10 +284,16 @@ impl Scroller {
                                 event.component_f32(1).unwrap_or(0.0),
                             );
                             let delta = if horizontal { dx } else { dy };
-                            let offset = if horizontal {
-                                scroll.offset.get().0
+                            let inset = behavior.content_inset;
+                            let lead = if horizontal {
+                                inset.left.0
                             } else {
-                                scroll.offset.get().1
+                                inset.top.0
+                            };
+                            let offset = if horizontal {
+                                native_to_nsh_offset(scroll.offset.get().0, lead)
+                            } else {
+                                native_to_nsh_offset(scroll.offset.get().1, lead)
                             };
                             if scroll.snap_limit.get().is_none()
                                 && let Some(owner) = scroll.owner.upgrade()
@@ -308,14 +317,19 @@ impl Scroller {
                                                 size.height
                                             }),
                                         )
-                                        .map(|p| p.0),
+                                        .map(|p| p.0 + lead),
                                 );
                             }
                             if let Some(limit) = scroll.snap_limit.get() {
-                                let distance = if delta > 0.0 {
-                                    delta.min((limit - offset).max(0.0))
+                                let native_pos = if horizontal {
+                                    scroll.offset.get().0
                                 } else {
-                                    delta.max((limit - offset).min(0.0))
+                                    scroll.offset.get().1
+                                };
+                                let distance = if delta > 0.0 {
+                                    delta.min((limit - native_pos).max(0.0))
+                                } else {
+                                    delta.max((limit - native_pos).min(0.0))
                                 };
                                 event.set_return_f32_pair(
                                     if horizontal { distance } else { dx },
@@ -397,8 +411,10 @@ impl Scroller {
                 cross.borrow().height(size.height)?;
             }
         }
-        let width = if self.behavior.borrow().zooms() {
-            (self.size.get().width * self.zoom.get()).max(size.width)
+        let behavior = self.behavior.borrow();
+        let inset = behavior.content_inset;
+        let width = if behavior.zooms() {
+            (self.size.get().width * self.zoom.get() + inset.left.0 + inset.right.0).max(size.width)
         } else {
             size.width
         };
@@ -407,14 +423,25 @@ impl Scroller {
             self.native_width.set(width);
         }
         self.viewport_size.set(size);
-        let center = if self.behavior.borrow().center_content {
+        let center = if behavior.center_content {
             (
-                (size.width - self.size.get().width * self.zoom.get()).max(0.0) * 0.5,
-                (size.height - self.size.get().height * self.zoom.get()).max(0.0) * 0.5,
+                (size.width
+                    - inset.left.0
+                    - inset.right.0
+                    - self.size.get().width * self.zoom.get())
+                .max(0.0)
+                    * 0.5,
+                (size.height
+                    - inset.top.0
+                    - inset.bottom.0
+                    - self.size.get().height * self.zoom.get())
+                .max(0.0)
+                    * 0.5,
             )
         } else {
             (0.0, 0.0)
         };
+        drop(behavior);
         if self.centering.replace(center) != center {
             self.content
                 .borrow()
@@ -480,10 +507,19 @@ impl Scroller {
         }
         Ok(())
     }
+    /// 0-based scroll offset (matching `NshScrollHandle.scrollX/scrollY` on iOS).
+    /// ArkUI `Scroll` with `Padding = content_inset` already starts at `(0, 0)` at rest.
     pub(crate) fn current_offset(&self) -> (f32, f32) {
+        self.offset.get()
+    }
+    /// NSH/UIKit-convention scroll offset (`-inset.lead` at rest).
+    pub(crate) fn nsh_offset(&self) -> (f32, f32) {
         let (x, y) = self.offset.get();
         let inset = self.behavior.borrow().content_inset;
-        (x + inset.left.0, y + inset.top.0)
+        (
+            native_to_nsh_offset(x, inset.left.0),
+            native_to_nsh_offset(y, inset.top.0),
+        )
     }
     pub(crate) fn current_viewport(&self) -> (f32, f32) {
         let viewport = self.viewport_size.get();
@@ -500,7 +536,7 @@ impl Scroller {
         ((size.width * zoom).max(vw), (size.height * zoom).max(vh))
     }
     pub(crate) fn host_scroll_by(&self, dx: f32, dy: f32, animated: bool) -> Result<()> {
-        let (x, y) = self.offset.get();
+        let (x, y) = self.nsh_offset();
         self.command_to(x + dx, y + dy, animated)
     }
     pub(crate) fn can_key_scroll(&self, horizontal: bool) -> bool {
@@ -524,7 +560,7 @@ impl Scroller {
         horizontal: bool,
     ) -> Result<()> {
         use nsh_core::scroll::KeyMove;
-        let (x, y) = self.offset.get();
+        let (x, y) = self.nsh_offset();
         let viewport = self.viewport_size.get();
         let size = self.size.get();
         let inset = self.behavior.borrow().content_inset;
@@ -534,14 +570,32 @@ impl Scroller {
                 x,
                 viewport.width,
                 -inset.left.0,
-                (size.width * zoom + inset.right.0 - viewport.width).max(-inset.left.0),
+                native_to_nsh_offset(
+                    native_max_offset(
+                        size.width,
+                        zoom,
+                        viewport.width,
+                        inset.left.0,
+                        inset.right.0,
+                    ),
+                    inset.left.0,
+                ),
             )
         } else {
             (
                 y,
                 viewport.height,
                 -inset.top.0,
-                (size.height * zoom + inset.bottom.0 - viewport.height).max(-inset.top.0),
+                native_to_nsh_offset(
+                    native_max_offset(
+                        size.height,
+                        zoom,
+                        viewport.height,
+                        inset.top.0,
+                        inset.bottom.0,
+                    ),
+                    inset.top.0,
+                ),
             )
         };
         let target = match key_move {
@@ -709,18 +763,28 @@ impl Scroller {
     pub(crate) fn command_to(&self, x: f32, y: f32, animated: bool) -> Result<()> {
         self.corrections.set(self.corrections.get().wrapping_add(1));
         self.owed.set((0.0, 0.0));
-        // Native ScrollOffset accepts overscroll positions. Commands, unlike
-        // finger rubber-banding, stay within the content (as on UIKit/Android).
+        // Native ScrollOffset is 0-based (Padding shifts content by inset.lead)
+        // and accepts overscroll positions. Convert NSH coords (`-lead` at rest)
+        // to clamped native coords `[0, native_max]`.
         let size = self.size.get();
         let viewport = self.viewport_size.get();
         let inset = self.behavior.borrow().content_inset;
-        let x = x.clamp(
-            -inset.left.0,
-            (size.width * self.zoom.get() + inset.right.0 - viewport.width).max(-inset.left.0),
+        let zoom = self.zoom.get();
+        let x = nsh_to_native_offset(
+            x,
+            size.width,
+            zoom,
+            viewport.width,
+            inset.left.0,
+            inset.right.0,
         );
-        let y = y.clamp(
-            -inset.top.0,
-            (size.height * self.zoom.get() + inset.bottom.0 - viewport.height).max(-inset.top.0),
+        let y = nsh_to_native_offset(
+            y,
+            size.height,
+            zoom,
+            viewport.height,
+            inset.top.0,
+            inset.bottom.0,
         );
         let animated = animated
             && self
@@ -848,16 +912,34 @@ impl Scroller {
     }
     fn pay_owed(&self, dx: f32, dy: f32) -> Result<()> {
         let before = self.offset.get();
-        self.native
-            .borrow()
-            .set_attribute(A::ScrollBy, [dx, dy].into())?;
+        let zooms = self.behavior.borrow().zooms();
+        if zooms {
+            if dx != 0.0
+                && let Some(cross) = self.cross.borrow().as_ref()
+            {
+                cross
+                    .borrow()
+                    .set_attribute(A::ScrollBy, [dx, 0.0].into())?;
+            }
+            if dy != 0.0 {
+                self.native
+                    .borrow()
+                    .set_attribute(A::ScrollBy, [0.0, dy].into())?;
+            }
+        } else {
+            self.native
+                .borrow()
+                .set_attribute(A::ScrollBy, [dx, dy].into())?;
+        }
         let size = self.size.get();
         let measured = self.measured_size.get();
+        let mut read_after = None;
         if (self.layout_pending.get()
             || size.width > measured.width
             || size.height > measured.height)
             && let Some(after) = self.read_native_offset()?
         {
+            read_after = Some(after);
             let rem_x = before.0 + dx - after.0;
             let rem_y = before.1 + dy - after.1;
             self.owed.set((
@@ -866,10 +948,13 @@ impl Scroller {
             ));
         }
         self.report()?;
-        self.flush_scroll_visuals()?;
+        self.flush_scroll_visuals_with(read_after.or(Some(self.offset.get())))?;
         Ok(())
     }
     pub(crate) fn update_child_culling(&self) -> Result<()> {
+        self.update_child_culling_with(None)
+    }
+    fn update_child_culling_with(&self, known_offset: Option<(f32, f32)>) -> Result<()> {
         let clear_all = |culled: &RefCell<Vec<Weak<Node>>>| -> Result<()> {
             let prev = std::mem::take(&mut *culled.borrow_mut());
             for node in prev.into_iter().filter_map(|w| w.upgrade()) {
@@ -891,9 +976,12 @@ impl Scroller {
         {
             return clear_all(&self.culled_nodes);
         }
-        let offset = self
-            .read_native_offset()?
-            .unwrap_or_else(|| self.offset.get());
+        let offset = match known_offset {
+            Some(offset) => offset,
+            None => self
+                .read_native_offset()?
+                .unwrap_or_else(|| self.offset.get()),
+        };
         self.offset.set(offset);
         let center = self.centering.get();
         let zoom = self.zoom.get().max(0.01);
@@ -984,7 +1072,10 @@ impl Scroller {
         Ok(())
     }
     fn flush_scroll_visuals(&self) -> Result<()> {
-        self.update_child_culling()?;
+        self.flush_scroll_visuals_with(None)
+    }
+    fn flush_scroll_visuals_with(&self, known_offset: Option<(f32, f32)>) -> Result<()> {
+        self.update_child_culling_with(known_offset)?;
         if let Some(owner) = self.owner.upgrade() {
             // ArkUI exports the scrolled pixels; NativeImage's buffer listener
             // wakes their shader consumer. The clipped viewport's composite
@@ -1030,20 +1121,20 @@ impl Scroller {
         if let Some(offset) = self.read_native_offset()? {
             self.offset.set(offset);
             self.pin_sticky()?;
+            let inset = self.behavior.borrow().content_inset;
+            let nsh = (
+                native_to_nsh_offset(offset.0, inset.left.0),
+                native_to_nsh_offset(offset.1, inset.top.0),
+            );
             if let Some(owner) = self.owner.upgrade() {
                 owner.shaders.invalidate_visibility();
                 if owner.scene_active() {
                     owner.invalidate_scene();
                 }
                 if let Some(value) = self.scroll_value.get() {
-                    owner.animator.set(
-                        value,
-                        if self.horizontal.get() {
-                            offset.0
-                        } else {
-                            offset.1
-                        },
-                    )?;
+                    owner
+                        .animator
+                        .set(value, if self.horizontal.get() { nsh.0 } else { nsh.1 })?;
                 }
                 if !self.horizontal.get() && !self.refresh.borrow().is_mounted() {
                     self.pulled((-offset.1).max(0.0))?;
@@ -1082,12 +1173,17 @@ impl Scroller {
             return Ok(());
         };
         self.offset.set(offset);
-        let reported = if let Some((x, y, false)) = self.zoom_offset.get() {
+        let native_reported = if let Some((x, y, false)) = self.zoom_offset.get() {
             (x, y)
         } else {
             let (ox, oy) = self.owed.get();
             (offset.0 + ox, offset.1 + oy)
         };
+        let inset = self.behavior.borrow().content_inset;
+        let reported = (
+            native_to_nsh_offset(native_reported.0, inset.left.0),
+            native_to_nsh_offset(native_reported.1, inset.top.0),
+        );
         self.pin_sticky()?;
         // UIKit/Android report a position change once. ArkUI also reports
         // programmatic moves later in OnDidScroll and again in OnScrollStop;
@@ -1141,7 +1237,7 @@ impl Scroller {
                 )?;
             }
             if !self.horizontal.get() && !self.refresh.borrow().is_mounted() {
-                self.pulled((-reported.1).max(0.0))?;
+                self.pulled((-native_reported.1).max(0.0))?;
             }
             owner.scroll_watchers.scrolled(owner.id);
         }
@@ -1225,12 +1321,20 @@ impl Scroller {
         let vertical = behavior.zooms() || !self.horizontal.get();
         let inset = behavior.content_inset;
         let maximum = (
-            if behavior.zooms() {
-                self.native_width.get() - viewport.width
-            } else {
-                size.width * zoom + inset.left.0 + inset.right.0 - viewport.width
-            },
-            size.height * zoom + inset.top.0 + inset.bottom.0 - viewport.height,
+            native_max_offset(
+                size.width,
+                zoom,
+                viewport.width,
+                inset.left.0,
+                inset.right.0,
+            ),
+            native_max_offset(
+                size.height,
+                zoom,
+                viewport.height,
+                inset.top.0,
+                inset.bottom.0,
+            ),
         );
         let axis = |position, extent, current, maximum, enabled| {
             if enabled {
@@ -1376,7 +1480,7 @@ impl Scroller {
     }
     pub(crate) fn pin_sticky(&self) -> Result<()> {
         let horizontal = self.horizontal.get();
-        let offset = self.offset.get();
+        let offset = self.nsh_offset();
         let owner = self.owner.upgrade();
         for (cell, node) in self.sticky.borrow().iter() {
             if let Some(node) = node.upgrade() {
@@ -1408,28 +1512,52 @@ impl Scroller {
     ) -> Result<()> {
         let behavior = self.behavior.borrow();
         let scale = scale.clamp(behavior.min_zoom, behavior.max_zoom.max(behavior.min_zoom));
+        let inset = behavior.content_inset;
+        let center_content = behavior.center_content;
         drop(behavior);
         let old = self.zoom.get();
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
         let viewport = owner.frame.get();
-        let offset = self.offset.get();
+        let offset = self.nsh_offset();
+        let cur_centering = self.centering.get();
         let (x, y) = center.unwrap_or((
-            (offset.0 + viewport.width * 0.5) / old,
-            (offset.1 + viewport.height * 0.5) / old,
+            (offset.0 + viewport.width * 0.5 - cur_centering.0) / old,
+            (offset.1 + viewport.height * 0.5 - cur_centering.1) / old,
         ));
         let size = self.size.get();
+        let next_centering = if center_content {
+            (
+                (viewport.width - inset.left.0 - inset.right.0 - size.width * scale).max(0.0) * 0.5,
+                (viewport.height - inset.top.0 - inset.bottom.0 - size.height * scale).max(0.0)
+                    * 0.5,
+            )
+        } else {
+            (0.0, 0.0)
+        };
         let to = ZoomFrame {
             scale,
             offset: (
-                focal_offset(x, viewport.width * 0.5, scale, size.width, viewport.width),
-                focal_offset(
+                focal_native_offset(
+                    x,
+                    viewport.width * 0.5,
+                    scale,
+                    size.width,
+                    viewport.width,
+                    inset.left.0,
+                    inset.right.0,
+                    next_centering.0,
+                ),
+                focal_native_offset(
                     y,
                     viewport.height * 0.5,
                     scale,
                     size.height,
                     viewport.height,
+                    inset.top.0,
+                    inset.bottom.0,
+                    next_centering.1,
                 ),
             ),
         };
@@ -1671,7 +1799,7 @@ impl Scroller {
                         if event.event_action_type == G::Accept {
                             scroll.zoom_motion.set(None);
                             scroll.zoom_start.set(scroll.zoom.get());
-                            let offset = scroll.offset.get();
+                            let offset = scroll.nsh_offset();
                             let center = scroll.centering.get();
                             scroll.pinch_focal.set((
                                 (offset.0 + center_x - center.0) / scroll.zoom.get(),
@@ -1684,6 +1812,8 @@ impl Scroller {
                                 .zoom
                                 .get()
                                 .clamp(behavior.min_zoom, behavior.max_zoom.max(behavior.min_zoom));
+                            let inset = behavior.content_inset;
+                            let center_content = behavior.center_content;
                             drop(behavior);
                             if scale == scroll.zoom.get() {
                                 return Ok(());
@@ -1692,23 +1822,47 @@ impl Scroller {
                             let position = scroll.pinch_position.get();
                             let viewport = owner.frame.get();
                             let size = scroll.size.get();
+                            let next_centering = if center_content {
+                                (
+                                    (viewport.width
+                                        - inset.left.0
+                                        - inset.right.0
+                                        - size.width * scale)
+                                        .max(0.0)
+                                        * 0.5,
+                                    (viewport.height
+                                        - inset.top.0
+                                        - inset.bottom.0
+                                        - size.height * scale)
+                                        .max(0.0)
+                                        * 0.5,
+                                )
+                            } else {
+                                (0.0, 0.0)
+                            };
                             scroll.animate_zoom(
                                 ZoomFrame {
                                     scale,
                                     offset: (
-                                        focal_offset(
+                                        focal_native_offset(
                                             focal.0,
                                             position.0,
                                             scale,
                                             size.width,
                                             viewport.width,
+                                            inset.left.0,
+                                            inset.right.0,
+                                            next_centering.0,
                                         ),
-                                        focal_offset(
+                                        focal_native_offset(
                                             focal.1,
                                             position.1,
                                             scale,
                                             size.height,
                                             viewport.height,
+                                            inset.top.0,
+                                            inset.bottom.0,
+                                            next_centering.1,
                                         ),
                                     ),
                                 },
@@ -1723,26 +1877,52 @@ impl Scroller {
                                 behavior.max_zoom.max(behavior.min_zoom),
                                 behavior.bounces_zoom,
                             );
+                            let inset = behavior.content_inset;
+                            let center_content = behavior.center_content;
                             drop(behavior);
                             let size = scroll.size.get();
                             let viewport = owner.frame.get();
                             let focal = scroll.pinch_focal.get();
+                            let next_centering = if center_content {
+                                (
+                                    (viewport.width
+                                        - inset.left.0
+                                        - inset.right.0
+                                        - size.width * scale)
+                                        .max(0.0)
+                                        * 0.5,
+                                    (viewport.height
+                                        - inset.top.0
+                                        - inset.bottom.0
+                                        - size.height * scale)
+                                        .max(0.0)
+                                        * 0.5,
+                                )
+                            } else {
+                                (0.0, 0.0)
+                            };
                             scroll.apply_zoom(ZoomFrame {
                                 scale,
                                 offset: (
-                                    focal_offset(
+                                    focal_native_offset(
                                         focal.0,
                                         center_x,
                                         scale,
                                         size.width,
                                         viewport.width,
+                                        inset.left.0,
+                                        inset.right.0,
+                                        next_centering.0,
                                     ),
-                                    focal_offset(
+                                    focal_native_offset(
                                         focal.1,
                                         center_y,
                                         scale,
                                         size.height,
                                         viewport.height,
+                                        inset.top.0,
+                                        inset.bottom.0,
+                                        next_centering.1,
                                     ),
                                 ),
                             })?;
@@ -1777,7 +1957,7 @@ impl Scroller {
         } else {
             self.queue_report()
         };
-        let visuals = self.flush_scroll_visuals();
+        let visuals = self.flush_scroll_visuals_with(Some(self.offset.get()));
         let observed = if applying {
             // Stop from the replaced driver must not settle between the two
             // native commands. The caller publishes their combined result.
@@ -1813,7 +1993,7 @@ impl Scroller {
         // MomentumEnd / ScrollEnd and no deferred report trails behind rest.
         let report = self.report();
         if let Some(owner) = self.owner.upgrade() {
-            let (x, y) = self.offset.get();
+            let (x, y) = self.nsh_offset();
             let payload = EventPayload::Scroll(Point::new(Points(x), Points(y)));
             if previous == 1 {
                 owner.emit(EventKind::ScrollDragEnd, payload.clone());

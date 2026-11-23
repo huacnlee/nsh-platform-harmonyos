@@ -156,6 +156,7 @@ pub(crate) enum Message {
     Navigation(crate::render::shader::navigation::Event),
     /// The shader thread left frames (`render::shader`).
     Shader,
+    ShadersUnavailable,
     #[cfg(feature = "api-23")]
     AccessibilityEvent(nsh_core::NodeId, ohos_accessibility_binding::EventType),
     HostClosed,
@@ -171,6 +172,11 @@ pub(crate) enum Message {
     CompositeDemand,
     VideoRetired(u64),
     VideoUi(u64, crate::media::video::UiState),
+    WebEvalResult {
+        target_id: u32,
+        key: String,
+        envelope: String,
+    },
     UiTask(u64, Option<Box<dyn std::any::Any + Send>>),
 }
 
@@ -700,6 +706,18 @@ impl State {
                 self.schedule_frame()?;
             }
             Message::CompositeDemand => self.schedule_frame()?,
+            Message::ShadersUnavailable => {
+                if let Some(engine) = &self.engine {
+                    engine.control().shaders_unavailable();
+                }
+            }
+            Message::WebEvalResult {
+                target_id,
+                key,
+                envelope,
+            } => {
+                crate::media::webview::on_eval_result(target_id, &key, &envelope);
+            }
             Message::Reclaim(_)
             | Message::VideoRetired(_)
             | Message::VideoUi(..)
@@ -753,7 +771,15 @@ impl State {
         env
     }
     fn update_environment(&mut self, changes: NshEnvironment) -> Result<()> {
-        let environment = changes.apply(self.environment)?;
+        let mut environment = changes.apply(self.environment)?;
+        let idiom_changed = environment.idiom != self.environment.idiom;
+        if idiom_changed {
+            let os = crate::services::desktop::os_for_idiom(environment.idiom);
+            environment.os = os;
+            if let Some(dispatcher) = self.dispatcher.upgrade() {
+                dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
+            }
+        }
         if environment == self.environment {
             return Ok(());
         }
@@ -898,7 +924,8 @@ impl State {
             let testing = self.testing.take();
             #[cfg(feature = "dev")]
             let closed = self.test_closed.clone();
-            std::thread::spawn(move || {
+            let storage = self.mounter.as_ref().map(|m| m.host.data_directory());
+            defer_engine_drop(storage, move || {
                 drop(engine);
                 #[cfg(feature = "dev")]
                 {
@@ -924,7 +951,8 @@ impl Drop for State {
         if let Some(engine) = self.engine.take() {
             #[cfg(feature = "dev")]
             let testing = self.testing.take();
-            std::thread::spawn(move || {
+            let storage = self.mounter.as_ref().map(|m| m.host.data_directory());
+            defer_engine_drop(storage, move || {
                 drop(engine);
                 #[cfg(feature = "dev")]
                 drop(testing);
@@ -1048,7 +1076,15 @@ impl Runtime {
                 .callee_handled::<false>()
                 .build_callback(move |ctx| {
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut state = ui_state.borrow_mut();
+                        let Ok(mut state) = ui_state.try_borrow_mut() else {
+                            // Re-enqueue on synchronous re-entry instead of panicking.
+                            if let Ok(state) = ui_state.try_borrow()
+                                && let Some(route) = state.dispatcher.upgrade()
+                            {
+                                route.send(ctx.value);
+                            }
+                            return;
+                        };
                         if let Err(error) = state.receive(ctx.value) {
                             state.report(error.to_string());
                             log::error!("OHOS surface: {error}");
@@ -1142,6 +1178,10 @@ impl Runtime {
         );
         let access = Arc::new(access);
         let assets = app.assets.clone();
+        // Wait for any retiring engine using the same host storage/data directory
+        // to finish flushing before opening the new FileStorage/Engine.
+        let host_data_dir = config.host.data_directory();
+        await_engine_drop(Some(&host_data_dir));
         let main_window_options = app.app.main_window().cloned();
         let storage: Option<Arc<dyn nsh_engine::StorageBackend>> =
             config.storage.as_ref().map(|directory| {
@@ -1173,8 +1213,8 @@ impl Runtime {
             limits: config.limits,
             ui_sets: crate::ui_sets(),
             runtime: None,
-            support_dir: None,
-            data_dir: Some(config.host.data_directory()),
+            support_dir: Some(host_data_dir),
+            data_dir: None,
             cache: config.cache.clone(),
             storage,
             clock: Default::default(),
@@ -1496,6 +1536,51 @@ impl Drop for Runtime {
         }
     }
 }
+type PendingEngineDrop = (Option<std::path::PathBuf>, std::thread::JoinHandle<()>);
+
+fn pending_engine_drops() -> &'static std::sync::Mutex<Vec<PendingEngineDrop>> {
+    static DROPS: std::sync::OnceLock<std::sync::Mutex<Vec<PendingEngineDrop>>> =
+        std::sync::OnceLock::new();
+    DROPS.get_or_init(Default::default)
+}
+
+fn await_engine_drop(storage: Option<&std::path::Path>) {
+    let mut handles = Vec::new();
+    {
+        let mut drops = pending_engine_drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut i = 0;
+        while i < drops.len() {
+            let matches = match (storage, drops[i].0.as_deref()) {
+                (Some(a), Some(b)) => a == b,
+                _ => drops[i].1.is_finished(),
+            };
+            if matches {
+                handles.push(drops.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
+fn defer_engine_drop(storage: Option<std::path::PathBuf>, drop_fn: impl FnOnce() + Send + 'static) {
+    let handle = std::thread::Builder::new()
+        .name("nsh-engine-drop".into())
+        .spawn(drop_fn);
+    if let Ok(handle) = handle {
+        let mut drops = pending_engine_drops()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        drops.retain(|(_, h)| !h.is_finished());
+        drops.push((storage, handle));
+    }
+}
+
 fn napi_error(error: crate::render::node::Error) -> napi_ohos::Error {
     napi_ohos::Error::from_reason(error.to_string())
 }

@@ -83,7 +83,9 @@ impl crate::render::node::Node {
 pub(crate) struct Snapshot {
     pub(crate) map: Arc<Keymap>,
     pub(crate) menu: Option<Arc<[nsh_core::desktop::MenuItem]>>,
+    pub(crate) menu_labels: nsh_core::desktop::MenuLabels,
     pub(crate) menu_bar_mode: nsh_core::desktop::MenuBarMode,
+    pub(crate) menu_bar_available: bool,
     pub(crate) menu_bar_revealed: bool,
     pub(crate) quit_on_request: bool,
     pub(crate) desktop: bool,
@@ -97,7 +99,9 @@ impl Default for Snapshot {
         Self {
             map: Default::default(),
             menu: None,
+            menu_labels: Default::default(),
             menu_bar_mode: nsh_core::desktop::MenuBarMode::Shown,
+            menu_bar_available: false,
             menu_bar_revealed: false,
             quit_on_request: true,
             desktop: false,
@@ -364,6 +368,7 @@ impl KeyboardWindow {
             }
             if !repeat
                 && snapshot.desktop
+                && snapshot.menu_bar_available
                 && window == nsh_core::ROOT_ID
                 && stroke.key == Key::F(10)
                 && stroke.modifiers == Modifiers::default()
@@ -432,6 +437,7 @@ impl KeyboardWindow {
             }
             if !repeat
                 && snapshot.desktop
+                && snapshot.menu_bar_available
                 && window == nsh_core::ROOT_ID
                 && snapshot.focused.is_none()
                 && stroke.modifiers
@@ -442,7 +448,7 @@ impl KeyboardWindow {
                 && let Key::Char(ch) = stroke.key
                 && ch.is_ascii_alphabetic()
                 && let Some(menu) = snapshot.menu.as_deref()
-                && crate::services::desktop::menu_bar_has_initial(menu, ch)
+                && crate::services::desktop::menu_bar_has_initial(menu, ch, &snapshot.menu_labels)
             {
                 route.send(crate::app::runtime::Message::DesktopMenuBar(
                     crate::services::desktop::MenuBarKeyAction::OpenInitial(ch),
@@ -543,6 +549,7 @@ impl KeyboardWindow {
         if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.desktop
+                && snapshot.menu_bar_available
                 && !snapshot.composing
                 && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
                 && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())

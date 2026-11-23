@@ -136,7 +136,9 @@ impl State {
             .borrow()
             .iter()
             .filter_map(std::rc::Weak::upgrade)
-            .filter(|child| !child.accessibility_state.spec.borrow().hidden)
+            .filter(|child| {
+                !child.style.borrow().hidden && !child.accessibility_state.spec.borrow().hidden
+            })
             .map(|child| child.accessibility_state.label(&child))
             .filter(|label| !label.is_empty())
             .collect::<Vec<_>>()
@@ -184,7 +186,10 @@ impl State {
             return Ok(());
         }
         let mut text = self.label(owner);
-        if let Some(value) = crate::accessibility::value::spoken_value(&spec) {
+        if let Some(value) = crate::accessibility::value::spoken_value_for_locale(
+            &spec,
+            owner.platform.get().locale.as_str(),
+        ) {
             if !text.is_empty() {
                 text.push_str(", ");
             }
@@ -192,11 +197,9 @@ impl State {
         }
         let previous = self.announced.borrow_mut().replace(text.clone());
         if previous.as_ref().is_some_and(|old| *old != text) && !text.is_empty() {
-            owner.host.accessibility_live(
-                owner.dispatcher.clone(),
-                text,
-                spec.live_region == LiveRegion::Assertive,
-            )?;
+            owner
+                .host
+                .accessibility_live(owner.dispatcher.clone(), text)?;
         }
         Ok(())
     }

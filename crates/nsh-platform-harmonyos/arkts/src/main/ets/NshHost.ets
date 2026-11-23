@@ -78,7 +78,6 @@ interface HostCommandPayload {
   lightContent?: boolean;
   animated?: boolean;
   text?: string;
-  assertive?: boolean;
   announcement?: string;
   elementId?: number;
   windowId?: number;
@@ -154,7 +153,6 @@ interface NshNativeModule {
   nshWebNavigate(targetId: number, url: string): boolean;
   nshWebDownloadAllowed(targetId: number, url: string): boolean;
   nshWebEvent(event: WebEventPayload): boolean;
-  onBackPressIntercept(uiContext: UIContext): boolean;
 }
 
 let cachedNativeModule: NshNativeModule | undefined = undefined;
@@ -461,6 +459,8 @@ class HostSession {
   private readonly tabBars: Set<NativeTabBar> = new Set();
   private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private systemColorMode: number = -1;
+  private lastFontSizeScale: number = 1.0;
+  private lastLanguage: string = "";
   private fontId: string = "";
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
@@ -542,6 +542,9 @@ class HostSession {
         "second-instance",
         JSON.stringify({ args, cwd: "" }),
       );
+      if (args.length === 0) {
+        this.mod.nshDesktopEvent(this.sessionId, "reopen", "{}");
+      }
     } catch {}
   };
 
@@ -598,6 +601,8 @@ class HostSession {
         : "inactive"
       : "background";
     this.systemColorMode = config?.colorMode ?? -1;
+    this.lastFontSizeScale = config?.fontSizeScale ?? 1.0;
+    this.lastLanguage = language;
     this.fontId = config?.fontId ?? "";
     this.sessionId = mod.nshCreateSession(
       {
@@ -609,7 +614,7 @@ class HostSession {
         cacheDir: abilityContext.cacheDir,
         filesDir: abilityContext.filesDir,
         colorMode: this.systemColorMode,
-        fontSizeScale: config?.fontSizeScale ?? 1.0,
+        fontSizeScale: this.lastFontSizeScale,
         language,
         languages: localeDetails.languages,
         timeZone: localeDetails.timeZone,
@@ -633,7 +638,7 @@ class HostSession {
         this.handleHostCommand(command);
       },
       (context: TabBarContext): object =>
-        context.name === "nsh/switch" || context.name === "nsh/date-time-picker"
+        context.name === "nsh/date-time-picker"
           ? new NativeMobileControl(
               uiContext,
               context,
@@ -646,52 +651,68 @@ class HostSession {
         createFrameSource(uiContext, callbacks),
     );
 
-    this.system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
-      this.mod.nshServiceEvent(this.sessionId, key, event),
-    );
-    this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
-    if (this.isDesktop) {
-      this.desktop = new NativeDesktop(
-        uiContext,
-        abilityContext,
-        mainWindow,
-        (kind: string, payload: string): void => {
-          if (!this.closed) {
-            this.mod.nshDesktopEvent(this.sessionId, kind, payload);
-          }
-        },
-        (windowId: number, content: NodeContent, platformWindowId: number): boolean => {
-          if (this.closed) {
-            return false;
-          }
-          try {
-            return this.mod.nshAttachSubWindow(this.sessionId, windowId, content, platformWindowId);
-          } catch (error) {
-            console.error(`[NSH] attachSubWindow(${windowId}) failed: ${String(error)}`);
-            return false;
-          }
-        },
-        (): void => {
-          this.syncWindowMetrics();
-        },
-        (targetId: number, content: FrameNode | null): boolean =>
-          this.runtimeContext.attachNativeNode(targetId, content),
-        (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
+    let system: NativeSystem | null = null;
+    try {
+      system = new NativeSystem(uiContext, abilityContext, (key: number, event: object): void =>
+        this.mod.nshServiceEvent(this.sessionId, key, event),
       );
-      this.runtimeContext.setFocusHandler((componentId: string): boolean =>
-        this.desktop?.requestComponentFocus(componentId) ?? false,
-      );
-      this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
-        this.desktop?.resolveComponentUIContext(componentId),
-      );
+      this.system = system;
+      this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
+      if (this.isDesktop) {
+        this.desktop = new NativeDesktop(
+          uiContext,
+          abilityContext,
+          mainWindow,
+          (kind: string, payload: string): void => {
+            if (!this.closed) {
+              this.mod.nshDesktopEvent(this.sessionId, kind, payload);
+            }
+          },
+          (windowId: number, content: NodeContent, platformWindowId: number): boolean => {
+            if (this.closed) {
+              return false;
+            }
+            try {
+              return this.mod.nshAttachSubWindow(this.sessionId, windowId, content, platformWindowId);
+            } catch (error) {
+              console.error(`[NSH] attachSubWindow(${windowId}) failed: ${String(error)}`);
+              return false;
+            }
+          },
+          (): void => {
+            this.syncWindowMetrics();
+          },
+          (targetId: number, content: FrameNode | null): boolean =>
+            this.runtimeContext.attachNativeNode(targetId, content),
+          (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
+        );
+        this.runtimeContext.setFocusHandler((componentId: string): boolean =>
+          this.desktop?.requestComponentFocus(componentId) ?? false,
+        );
+        this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
+          this.desktop?.resolveComponentUIContext(componentId),
+        );
+        try {
+          abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
+        } catch {}
+      }
+      this.bindWindowListeners();
+      this.subscribeLifecycleListeners();
+      this.subscribeAccessibility();
+      this.syncWindowMetrics();
+    } catch (error) {
+      this.closed = true;
       try {
-        abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);
+        this.desktop?.close();
       } catch {}
+      try {
+        system?.close();
+      } catch {}
+      try {
+        this.mod.nshCloseSession(this.sessionId);
+      } catch {}
+      throw error instanceof Error ? error : new Error(String(error));
     }
-    this.bindWindowListeners();
-    this.subscribeLifecycleListeners();
-    this.subscribeAccessibility();
-    this.syncWindowMetrics();
   }
 
   static bind(uiContext: UIContext): number {
@@ -767,8 +788,14 @@ class HostSession {
       return;
     }
     try {
-      if (this.colorMode === ThemeColorMode.SYSTEM && newConfig.colorMode !== undefined) {
+      if (newConfig.colorMode !== undefined) {
         this.systemColorMode = newConfig.colorMode;
+      }
+      if (newConfig.fontSizeScale !== undefined && newConfig.fontSizeScale > 0) {
+        this.lastFontSizeScale = newConfig.fontSizeScale;
+      }
+      if (newConfig.language !== undefined && newConfig.language.length > 0) {
+        this.lastLanguage = newConfig.language;
       }
       let fontChanged = false;
       if (newConfig.fontId !== undefined && newConfig.fontId !== this.fontId) {
@@ -776,12 +803,13 @@ class HostSession {
         fontChanged = true;
       }
       const localeDetails = readSystemLocaleDetails();
+      const language = this.lastLanguage || i18n.System.getSystemLanguage();
       this.mod.nshUpdateConfig(
         this.sessionId,
         this.systemColorMode,
-        newConfig.fontSizeScale ?? 1.0,
-        newConfig.language ?? "",
-        i18n.isRTL(newConfig.language || i18n.System.getSystemLanguage()),
+        this.lastFontSizeScale,
+        language,
+        i18n.isRTL(language),
         deviceInfo.deviceType,
         Math.round(this.runtimeContext.getUIContext().vp2px(1) * 10000) / 10000,
         localeDetails.languages,
@@ -815,8 +843,12 @@ class HostSession {
     }
     this.desktop?.close();
     this.system.close();
-    this.updateCursor("auto");
-    this.updateSystemBars();
+    try {
+      this.updateCursor("auto");
+    } catch {}
+    try {
+      this.updateSystemBars();
+    } catch {}
 
     if (this.windowStage !== undefined) {
       try {
@@ -1179,7 +1211,7 @@ class HostSession {
       return;
     }
 
-    if (command.kind === "announce" || command.kind === "accessibility-live") {
+    if (command.kind === "accessibility-live") {
       const text = command.text ?? "";
       if (!text) {
         return;
@@ -1213,27 +1245,31 @@ class HostSession {
     if (command.kind === "open-url") {
       const openId = command.openId ?? 0;
       const url = command.url ?? "";
+      const finishOpen = (opened: boolean): void => {
+        if (!this.closed) {
+          try {
+            this.mod.nshOpenUrlResult(this.sessionId, openId, opened);
+          } catch {}
+        }
+      };
       if (!url || !/^[A-Za-z][A-Za-z0-9+.-]*:\S+$/.test(url)) {
-        this.mod.nshOpenUrlResult(this.sessionId, openId, false);
+        finishOpen(false);
         return;
       }
       this.abilityContext
         .openLink(url)
-        .then((): void => {
-          this.mod.nshOpenUrlResult(this.sessionId, openId, true);
-        })
+        .then((): void => finishOpen(true))
         .catch((): void => {
+          if (this.closed) {
+            return;
+          }
           this.abilityContext
             .startAbility({
               action: "ohos.want.action.viewData",
               uri: url,
             })
-            .then((): void => {
-              this.mod.nshOpenUrlResult(this.sessionId, openId, true);
-            })
-            .catch((): void => {
-              this.mod.nshOpenUrlResult(this.sessionId, openId, false);
-            });
+            .then((): void => finishOpen(true))
+            .catch((): void => finishOpen(false));
         });
       return;
     }
@@ -1249,13 +1285,23 @@ class HostSession {
         photoPicker
           .select(options)
           .then((result: photoAccessHelper.PhotoSelectResult): void => {
-            this.deliverPickedUris(pickId, result?.photoUris ?? [], limit, "image");
+            if (!this.closed) {
+              this.deliverPickedUris(pickId, result?.photoUris ?? [], limit, "image");
+            }
           })
           .catch((): void => {
-            this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+            if (!this.closed) {
+              try {
+                this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+              } catch {}
+            }
           });
       } catch {
-        this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+        if (!this.closed) {
+          try {
+            this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+          } catch {}
+        }
       }
       return;
     }
@@ -1273,13 +1319,23 @@ class HostSession {
         documentPicker
           .select(options)
           .then((uris: Array<string>): void => {
-            this.deliverPickedUris(pickId, uris ?? [], limit, "file");
+            if (!this.closed) {
+              this.deliverPickedUris(pickId, uris ?? [], limit, "file");
+            }
           })
           .catch((): void => {
-            this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+            if (!this.closed) {
+              try {
+                this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+              } catch {}
+            }
           });
       } catch {
-        this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+        if (!this.closed) {
+          try {
+            this.mod.nshPickImagesResult(this.sessionId, pickId, []);
+          } catch {}
+        }
       }
     }
   }
@@ -1290,6 +1346,9 @@ class HostSession {
     limit: number,
     prefix: string,
   ): void {
+    if (this.closed) {
+      return;
+    }
     const handles: fs.File[] = [];
     const files: PickedDescriptor[] = [];
     try {
@@ -1297,14 +1356,20 @@ class HostSession {
         try {
           const file = fs.openSync(uris[i], fs.OpenMode.READ_ONLY);
           handles.push(file);
-          const name = decodeURIComponent(uris[i].split("/").pop() ?? `${prefix}_${i}`);
+          const rawName = uris[i].split("/").pop() ?? `${prefix}_${i}`;
+          let name = rawName;
+          try {
+            name = decodeURIComponent(rawName);
+          } catch {}
           files.push({ fd: file.fd, name });
         } catch (error) {
           console.warn(`NSH picked ${prefix}: ${String(error)}`);
         }
       }
       // Rust retains independent descriptors synchronously; bytes are read on its worker.
-      this.mod.nshPickImagesResult(this.sessionId, pickId, files);
+      if (!this.closed) {
+        this.mod.nshPickImagesResult(this.sessionId, pickId, files);
+      }
     } finally {
       for (const file of handles) {
         try {

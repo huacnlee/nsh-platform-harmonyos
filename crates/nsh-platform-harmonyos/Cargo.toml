@@ -40,8 +40,17 @@ api-23 = [
   "ohos-arkui-binding/api-23",
   "dep:ohos-accessibility-binding",
   "ohos-accessibility-binding/api-23",
+  "ohos-audio-binding/api-23",
+  "ohos-avplayer-binding/api-23",
+  "ohos-multi-modal-input-binding/api-23",
 ]
-api-26 = ["api-23", "ohos-arkui-binding/api-26"]
+api-26 = [
+  "api-23",
+  "ohos-arkui-binding/api-26",
+  "ohos-audio-binding/api-26",
+  "ohos-avplayer-binding/api-26",
+  "ohos-multi-modal-input-binding/api-26",
+]
 
 [target.'cfg(target_env = "ohos")'.dependencies]
 nsh-core = { workspace = true, features = ["svg", "shader", "glsl"] }
@@ -71,6 +80,8 @@ ohos-udmf-binding.workspace = true
 ohos-native-window-binding.workspace = true
 ohos-xcomponent-binding.workspace = true
 ohos-avplayer-binding.workspace = true
+ohos-audio-binding.workspace = true
+ohos-multi-modal-input-binding.workspace = true
 glow.workspace = true
 khronos-egl.workspace = true
 ohos-hilog-binding.workspace = true

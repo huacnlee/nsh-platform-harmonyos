@@ -9,9 +9,7 @@ use std::{
     },
 };
 
-use nsh_core::{
-    Accessibility, AccessibilityRole as R, Checked, EventKind, EventPayload, PayloadValue, ViewKind,
-};
+use nsh_core::{Accessibility, Checked, EventKind, EventPayload, PayloadValue, ViewKind};
 use ohos_accessibility_binding::{
     AccessibilityError as E, AccessibleRect, ActionArguments, ActionType as A, ElementInfo,
     ElementInfoList, EventInfo, EventType, FocusMoveDirection, FocusType, ProviderCallbacks,
@@ -30,6 +28,7 @@ static NEXT_INSTANCE: AtomicU64 = AtomicU64::new(1);
 struct Snapshot {
     spec: Accessibility,
     label: String,
+    locale: String,
     bounds: AccessibleRect,
     visible: bool,
     focused: bool,
@@ -106,6 +105,7 @@ impl State {
         self.update_snapshot(
             &spec,
             owner.accessibility_state.label(owner),
+            owner.platform.get().locale.to_string(),
             owner.visible_in_tree(),
         )?;
         drop(spec);
@@ -185,23 +185,37 @@ impl State {
         }
         self.update_bounds(owner)
     }
-    fn update_snapshot(&self, spec: &Accessibility, label: String, visible: bool) -> Result<()> {
+    fn update_snapshot(
+        &self,
+        spec: &Accessibility,
+        label: String,
+        locale: String,
+        visible: bool,
+    ) -> Result<()> {
         let actions = Snapshot::actions(spec)?;
         let mut snapshot = self.snapshot.lock().unwrap();
         snapshot.spec = spec.clone();
         snapshot.label = label;
+        snapshot.locale = locale;
         snapshot.visible = visible;
         snapshot.actions = actions;
         Ok(())
     }
     fn update_bounds(&self, owner: &Node) -> Result<()> {
         let frame = owner.frame.get();
-        // ArkUI applies the host's screen offset when embedding this tree.
+        let origin = owner
+            .native
+            .borrow()
+            .layout_position_in_screen()
+            .ok()
+            .map_or((0, 0), |pos| (pos.x, pos.y));
+        let width = (frame.width * owner.scale.get()).round() as i32;
+        let height = (frame.height * owner.scale.get()).round() as i32;
         self.snapshot.lock().unwrap().bounds = AccessibleRect {
-            left: 0,
-            top: 0,
-            right: (frame.width * owner.scale.get()).round() as i32,
-            bottom: (frame.height * owner.scale.get()).round() as i32,
+            left: origin.0,
+            top: origin.1,
+            right: origin.0.saturating_add(width),
+            bottom: origin.1.saturating_add(height),
         };
         Ok(())
     }
@@ -265,15 +279,14 @@ impl Snapshot {
         Ok(actions)
     }
     fn fill(&self, element: &mut ElementInfo<'_>) -> ohos_accessibility_binding::Result<()> {
-        let component = match self.spec.role {
-            R::Checkbox => "checkbox",
-            R::Switch => "switch",
-            R::Radio => "radio",
-            R::Adjustable | R::Scrollbar => "slider",
-            R::Button | R::ImageButton | R::Option => "button",
-            R::List | R::Listbox => "list",
-            _ => "text",
+        let component = match crate::accessibility::value::role_str(self.spec.role) {
+            "" => "text",
+            role => role,
         };
+        let binary_checked = matches!(
+            self.spec.state.checked,
+            Some(Checked::True | Checked::False)
+        );
         element
             .set_element_id(1)?
             .set_parent_id(0)?
@@ -288,12 +301,12 @@ impl Snapshot {
                     .replace('\0', "\u{fffd}"),
             )?
             .set_contents(
-                &crate::accessibility::value::spoken_value(&self.spec)
+                &crate::accessibility::value::spoken_value_for_locale(&self.spec, &self.locale)
                     .unwrap_or_default()
                     .replace('\0', "\u{fffd}"),
             )?
             .set_screen_rect(self.bounds)?
-            .set_checkable(self.spec.state.checked.is_some())?
+            .set_checkable(binary_checked)?
             .set_checked(self.spec.state.checked == Some(Checked::True))?
             .set_selected(self.spec.state.selected)?
             .set_enabled(!self.spec.state.disabled)?

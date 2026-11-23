@@ -101,7 +101,7 @@ fn classify_native_filters(
 
     for filter in filters.iter().copied().filter(|f| !is_noop_filter(f)) {
         match filter {
-            Filter::Blur(radius) => blur += radius.0.max(0.0),
+            Filter::Blur(radius) => blur = blur.hypot(radius.0.max(0.0)),
             Filter::Opacity(v) => opacity *= v.clamp(0.0, 1.0),
             other => {
                 color_count += 1;
@@ -319,6 +319,16 @@ mod tests {
         assert_eq!(plan.native_backdrop_blur, 10.0);
         assert!(!plan.requires_texture);
         assert!(!plan.requires_scene);
+
+        let chained = ViewStyle {
+            effects: Some(Arc::new(Effects {
+                filters: vec![Filter::Blur(Points(3.0)), Filter::Blur(Points(4.0))],
+                ..Default::default()
+            })),
+            ..ViewStyle::default()
+        };
+        let chained_plan = EffectsPlan::compute(&chained, EffectsContext::default());
+        assert!((chained_plan.native_blur - 5.0).abs() < 1e-5);
     }
 
     #[test]

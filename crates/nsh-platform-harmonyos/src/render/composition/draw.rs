@@ -280,29 +280,13 @@ impl<S: Sources> Renderer<'_, S> {
                         );
                     }
                 }
-                let tint_brush = text
-                    .tint
-                    .and_then(|color| {
-                        ohos_drawing_binding::ColorFilter::blend(
-                            color,
-                            ohos_drawing_binding::BlendMode::SrcIn,
-                        )
-                    })
-                    .map(|cf| {
-                        let mut filter = ohos_drawing_binding::Filter::new();
-                        filter.set_color_filter(Some(&cf));
-                        let mut brush = Brush::new();
-                        brush.set_filter(Some(&filter));
-                        brush
-                    });
-                if let Some(brush) = &tint_brush {
-                    canvas.save_layer(None, Some(brush));
-                }
-                if let Err(error) = text.drawing.lock().expect("text drawing").draw(canvas) {
+                if let Err(error) = text
+                    .drawing
+                    .lock()
+                    .expect("text drawing")
+                    .draw_tinted(canvas, text.tint)
+                {
                     log::warn!("OHOS scene text draw: {error}");
-                }
-                if tint_brush.is_some() {
-                    canvas.restore();
                 }
                 if needs_save {
                     canvas.restore();

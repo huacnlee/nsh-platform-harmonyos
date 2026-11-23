@@ -2,7 +2,6 @@ import { NativeShare } from "./NativeShare";
 import { common, wantConstant } from "@kit.AbilityKit";
 import { fileUri, picker } from "@kit.CoreFileKit";
 import { UIContext } from "@ohos.arkui.UIContext";
-import { NativeAudio } from "./NativeAudio";
 import { NativeAuthSession } from "./NativeAuthSession";
 import { NativeClipboard } from "./NativeClipboard";
 import { NativeNotifications } from "./NativeNotifications";
@@ -25,21 +24,13 @@ export interface SystemReply {
   code?: string;
   phase?: string;
   final?: boolean;
-  durationMs?: number;
-  positionMs?: number;
-  bytes?: number;
-  truncated?: boolean;
-  buffering?: boolean;
 }
 
 export interface SystemRequest {
   op: string;
   paths?: string[];
-  html?: string;
   text?: string;
   uri?: string;
-  asset?: string;
-  hasOnly?: boolean;
   name?: string;
   title?: string;
   body?: string;
@@ -48,11 +39,6 @@ export interface SystemRequest {
   ask?: boolean;
   lang?: string;
   interim?: boolean;
-  volume?: number;
-  rate?: number;
-  looped?: boolean;
-  positionMs?: number;
-  durationMs?: number;
   ephemeral?: boolean;
 }
 export class NativeSystem {
@@ -61,7 +47,6 @@ export class NativeSystem {
   private readonly clipboard: NativeClipboard;
   private readonly notifications: NativeNotifications;
   private readonly speech: NativeSpeech;
-  private readonly audio: NativeAudio;
   private readonly share: NativeShare = new NativeShare();
   private readonly reply: (key: number, event: SystemReply) => void;
   private active: Set<number> = new Set();
@@ -77,7 +62,6 @@ export class NativeSystem {
     this.clipboard = new NativeClipboard(ui);
     this.notifications = new NativeNotifications(context);
     this.speech = new NativeSpeech(context);
-    this.audio = new NativeAudio(context);
     this.reply = reply;
   }
   setColorMode(mode: ThemeColorMode): void {
@@ -95,16 +79,7 @@ export class NativeSystem {
     };
     try {
       if (request.op.startsWith("clipboard-")) {
-        reply(
-          await this.clipboard.execute(
-            key,
-            request.op,
-            request.uri ?? request.text ?? "",
-            request.hasOnly ?? false,
-            () => this.active.has(key),
-            request.html,
-          ),
-        );
+        reply(await this.clipboard.execute(key, request.op, () => this.active.has(key)));
       } else if (request.op === "auth-session-open") {
         this.authSession.open(
           key,
@@ -271,44 +246,6 @@ export class NativeSystem {
           }
         });
         reply({ files: JSON.stringify(paths) } as SystemReply);
-      } else if (request.op === "audio-load") {
-        await this.audio.loadSound(
-          request.count ?? 0,
-          key,
-          request.uri ?? "",
-          request.durationMs ?? 5000,
-          (event: SystemReply) => {
-            reply(event);
-            this.active.delete(key);
-          },
-        );
-        return;
-      } else if (request.op === "audio-play") {
-        this.audio.playSound(request.count ?? 0, request.volume ?? 1, request.rate ?? 1);
-      } else if (request.op === "audio-stop") {
-        this.audio.stopSound(request.count ?? 0);
-      } else if (request.op === "audio-unload") {
-        this.audio.unloadSound(request.count ?? 0);
-      } else if (request.op === "audio-open") {
-        this.audio.openPlayer(key, request, reply);
-        return;
-      } else if (request.op === "audio-preload") {
-        this.audio.preloadPlayer(request.count ?? 0);
-      } else if (request.op === "audio-resume") {
-        this.audio.resumePlayer(request.count ?? 0);
-      } else if (request.op === "audio-pause") {
-        this.audio.pausePlayer(request.count ?? 0);
-      } else if (request.op === "audio-seek") {
-        this.audio.seekPlayer(request.count ?? 0, request.positionMs ?? 0);
-      } else if (request.op === "audio-set") {
-        this.audio.setPlayer(
-          request.count ?? 0,
-          request.volume ?? 1,
-          request.rate ?? 1,
-          request.looped ?? false,
-        );
-      } else if (request.op === "audio-close") {
-        this.audio.closePlayer(request.count ?? 0);
       } else {
         throw new Error(`unknown system operation: ${request.op}`);
       }
@@ -316,7 +253,7 @@ export class NativeSystem {
       reply({
         error: String(error),
         code: "ERR_NSH_HOST_ERROR",
-        phase: request.op.startsWith("speech-") || request.op === "audio-open" ? "end" : undefined,
+        phase: request.op.startsWith("speech-") ? "end" : undefined,
         has: false,
         shown: false,
         permission: "unavailable",
@@ -336,7 +273,6 @@ export class NativeSystem {
     this.speech
       .stop(key, true)
       .catch((error: Error) => console.warn(`NSH speech cancel: ${error}`));
-    this.audio.cancel(key);
   }
   close(): void {
     this.closed = true;
@@ -345,7 +281,6 @@ export class NativeSystem {
     this.clipboard.close();
     this.notifications.close();
     this.speech.close();
-    this.audio.close();
     this.share.close();
   }
 }

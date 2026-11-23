@@ -19,11 +19,7 @@ use napi_ohos::{
     threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
 };
 use nsh_core::{EventKind, EventPayload, PayloadValue};
-#[cfg(feature = "dev")]
-use ohos_pasteboard_binding::Pasteboard;
 use ohos_resource_manager_binding::{RawFile, ResourceManager};
-#[cfg(feature = "dev")]
-use ohos_udmf_binding::{UdmfData, UdmfRecord, UdsPlainText};
 use rustc_hash::FxHashMap;
 
 use crate::app::{
@@ -112,7 +108,6 @@ pub(crate) struct HostCommand {
     pub light_content: Option<bool>,
     pub animated: Option<bool>,
     pub text: Option<String>,
-    pub assertive: Option<bool>,
     pub announcement: Option<String>,
     pub element_id: Option<i64>,
     pub window_id: Option<u32>,
@@ -223,6 +218,10 @@ pub(crate) struct Services {
     desktop_window: Mutex<Option<nsh_core::desktop::WindowState>>,
     desktop_title_bar: Mutex<nsh_core::Edges<nsh_core::Points>>,
     desktop_displays: Mutex<Vec<nsh_core::desktop::Display>>,
+    display_watcher: Mutex<Option<crate::services::desktop::DisplayWatcher>>,
+    sub_window_platform_ids: Mutex<FxHashMap<u32, i32>>,
+    #[cfg(feature = "api-23")]
+    native_pointer_hidden: AtomicBool,
     pub(crate) system: crate::services::system::System,
     command_tsfn: HostCommandCallback,
     next_open_id: AtomicU32,
@@ -612,12 +611,23 @@ impl Services {
         })
     }
 
-    pub(crate) fn accessibility_live(
-        &self,
-        route: Weak<Dispatcher>,
-        text: String,
-        assertive: bool,
-    ) -> Result<()> {
+    pub(crate) fn set_sub_window_platform_id(&self, window_id: u32, platform_window_id: i32) {
+        if platform_window_id > 0 {
+            self.sub_window_platform_ids
+                .lock()
+                .unwrap()
+                .insert(window_id, platform_window_id);
+        }
+    }
+
+    pub(crate) fn remove_sub_window_platform_id(&self, window_id: u32) {
+        self.sub_window_platform_ids
+            .lock()
+            .unwrap()
+            .remove(&window_id);
+    }
+
+    pub(crate) fn accessibility_live(&self, route: Weak<Dispatcher>, text: String) -> Result<()> {
         self.check()?;
         if route
             .upgrade()
@@ -628,18 +638,74 @@ impl Services {
         self.send_host_command(HostCommand {
             kind: "accessibility-live".into(),
             text: Some(text),
-            assertive: Some(assertive),
             ..Default::default()
         })
     }
 
     pub(crate) fn cursor(&self, window_id: Option<u32>, cursor: nsh_core::Cursor) -> Result<()> {
+        #[cfg(feature = "api-23")]
+        if self.try_native_cursor(window_id, cursor) {
+            return Ok(());
+        }
         self.send_host_command(HostCommand {
             kind: "cursor".into(),
             window_id,
             text: Some(cursor.name().into()),
             ..Default::default()
         })
+    }
+
+    #[cfg(feature = "api-23")]
+    fn try_native_cursor(&self, window_id: Option<u32>, cursor: nsh_core::Cursor) -> bool {
+        use ohos_multi_modal_input_binding::{
+            PointerStyle, set_pointer_style, set_pointer_visible,
+        };
+        if cursor == nsh_core::Cursor::None {
+            if set_pointer_visible(false).is_ok() {
+                self.native_pointer_hidden.store(true, Ordering::Release);
+                return true;
+            }
+            return false;
+        }
+        if self.native_pointer_hidden.swap(false, Ordering::AcqRel)
+            && set_pointer_visible(true).is_err()
+        {
+            self.native_pointer_hidden.store(true, Ordering::Release);
+            return false;
+        }
+        let platform_id = match window_id {
+            Some(id) => self
+                .sub_window_platform_ids
+                .lock()
+                .unwrap()
+                .get(&id)
+                .copied(),
+            None => self.window_id().and_then(|id| i32::try_from(id).ok()),
+        };
+        let Some(platform_id) = platform_id.filter(|&id| id > 0) else {
+            return false;
+        };
+        let style = match cursor {
+            nsh_core::Cursor::Auto | nsh_core::Cursor::Default => PointerStyle::Default,
+            nsh_core::Cursor::Pointer => PointerStyle::HandPointing,
+            nsh_core::Cursor::Text => PointerStyle::TextCursor,
+            nsh_core::Cursor::Wait => PointerStyle::Loading,
+            nsh_core::Cursor::Progress => PointerStyle::Running,
+            nsh_core::Cursor::Help => PointerStyle::Help,
+            nsh_core::Cursor::Crosshair => PointerStyle::Cross,
+            nsh_core::Cursor::Move => PointerStyle::Move,
+            nsh_core::Cursor::Grab => PointerStyle::HandOpen,
+            nsh_core::Cursor::Grabbing => PointerStyle::HandGrabbing,
+            nsh_core::Cursor::NotAllowed => PointerStyle::CursorForbid,
+            nsh_core::Cursor::ZoomIn => PointerStyle::ZoomIn,
+            nsh_core::Cursor::ZoomOut => PointerStyle::ZoomOut,
+            nsh_core::Cursor::ColResize => PointerStyle::WestEast,
+            nsh_core::Cursor::RowResize => PointerStyle::NorthSouth,
+            nsh_core::Cursor::NwseResize => PointerStyle::NorthWestSouthEast,
+            nsh_core::Cursor::NeswResize => PointerStyle::NorthEastSouthWest,
+            _ => PointerStyle::Default,
+        };
+        set_pointer_style(platform_id, style).is_ok()
     }
 
     pub(crate) fn haptic(&self, haptic: nsh_core::Haptic) -> Result<()> {
@@ -818,6 +884,12 @@ impl Services {
         environment
             .clone()
             .apply(nsh_engine::Environment::default())?;
+        let is_desktop = environment.idiom.as_deref() == Some("desktop");
+        let initial_displays = if is_desktop {
+            crate::services::desktop::read_native_displays()
+        } else {
+            Vec::new()
+        };
         let (queue, receiver) = mpsc::sync_channel(256);
         let services = Arc::new(Self {
             speech_available: init.speech_available,
@@ -846,7 +918,11 @@ impl Services {
             window_avoid: Mutex::default(),
             desktop_window: Mutex::default(),
             desktop_title_bar: Mutex::default(),
-            desktop_displays: Mutex::default(),
+            desktop_displays: Mutex::new(initial_displays),
+            display_watcher: Mutex::default(),
+            sub_window_platform_ids: Mutex::default(),
+            #[cfg(feature = "api-23")]
+            native_pointer_hidden: AtomicBool::new(false),
             command_tsfn,
             system: Default::default(),
             next_open_id: AtomicU32::new(1),
@@ -854,6 +930,38 @@ impl Services {
             picks: Mutex::default(),
             queue,
         });
+        if is_desktop {
+            let weak_displays = Arc::downgrade(&services);
+            let watcher = crate::services::desktop::DisplayWatcher::start(move || {
+                let Some(host) = weak_displays.upgrade() else {
+                    return;
+                };
+                if host.check().is_err() {
+                    return;
+                }
+                let next = crate::services::desktop::read_native_displays();
+                if next.is_empty() {
+                    return;
+                }
+                let changed = {
+                    let mut cached = host.desktop_displays.lock().unwrap();
+                    if *cached != next {
+                        *cached = next.clone();
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if changed {
+                    host.broadcast(|| {
+                        Message::HostDesktop(crate::services::desktop::DesktopEvent::Displays(
+                            next.clone(),
+                        ))
+                    });
+                }
+            });
+            *services.display_watcher.lock().unwrap() = Some(watcher);
+        }
         let weak = Arc::downgrade(&services);
         thread::Builder::new()
             .name(format!("nsh-ohos-host-{id}"))
@@ -996,6 +1104,12 @@ impl Services {
 
     fn close(&self) {
         if self.active.swap(false, Ordering::AcqRel) {
+            self.display_watcher.lock().unwrap().take();
+            self.sub_window_platform_ids.lock().unwrap().clear();
+            #[cfg(feature = "api-23")]
+            if self.native_pointer_hidden.swap(false, Ordering::AcqRel) {
+                let _ = ohos_multi_modal_input_binding::set_pointer_visible(true);
+            }
             self.keyboard.lock().unwrap().take();
             self.open_urls.lock().unwrap().clear();
             self.picks.lock().unwrap().clear();
@@ -1064,7 +1178,7 @@ impl Services {
         if route.strong_count() == 0 {
             return;
         }
-        let result = write_clipboard_text(&text).map_err(|error| error.to_string());
+        let result = crate::services::clipboard::write_text_sync(&text, None);
         if self.check().is_ok()
             && let Some(route) = route.upgrade()
         {
@@ -1120,11 +1234,32 @@ impl Services {
         id: u32,
         request: nsh_core::picker::Pick,
     ) -> Result<()> {
-        self.check()?;
-        let pick_id = self
+        let reply_empty = |route: &Weak<Dispatcher>| {
+            if let Some(route) = route.upgrade() {
+                route.send(Message::HostEvent(
+                    EventKind::Pick,
+                    EventPayload::Picked {
+                        id,
+                        files: Vec::new(),
+                    },
+                ));
+            }
+        };
+        if let Err(error) = self.check() {
+            reply_empty(&route);
+            return Err(error);
+        }
+        let pick_id = match self
             .next_open_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .map_err(|_| Error::from_reason("picker request IDs exhausted"))?;
+            .map_err(|_| Error::from_reason("picker request IDs exhausted"))
+        {
+            Ok(pick_id) => pick_id,
+            Err(error) => {
+                reply_empty(&route);
+                return Err(error);
+            }
+        };
         let command = match &request {
             nsh_core::picker::Pick::Images(r) => HostCommand {
                 kind: "pick-images".into(),
@@ -1230,32 +1365,6 @@ impl Services {
             .try_send(operation)
             .map_err(|_| Error::from_reason("Ability operation queue is full or closed"))
     }
-}
-
-#[cfg(feature = "dev")]
-fn write_clipboard_text(text: &str) -> Result<()> {
-    if text.contains('\0') {
-        return Err(Error::from_reason("clipboard text must not contain NUL"));
-    }
-    let board = Pasteboard::new();
-    if text.is_empty() {
-        return board
-            .clear()
-            .map_err(|error| Error::from_reason(error.to_string()));
-    }
-    let mut data = UdmfData::try_new().map_err(|error| Error::from_reason(error.to_string()))?;
-    let record = UdmfRecord::try_new().map_err(|error| Error::from_reason(error.to_string()))?;
-    let uds = UdsPlainText::new();
-    uds.set_content(text)
-        .map_err(|error| Error::from_reason(error.to_string()))?;
-    record
-        .add(uds.into())
-        .map_err(|error| Error::from_reason(error.to_string()))?;
-    data.add_record(&record)
-        .map_err(|error| Error::from_reason(error.to_string()))?;
-    board
-        .set_data(&data)
-        .map_err(|error| Error::from_reason(error.to_string()))
 }
 
 pub(crate) fn idiom(device_type: &str) -> &'static str {

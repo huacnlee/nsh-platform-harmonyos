@@ -2,13 +2,9 @@
 
 use std::{
     cell::{Cell, RefCell},
-    rc::{Rc, Weak},
+    rc::Rc,
 };
 
-use napi_ohos::{
-    JsValue,
-    bindgen_prelude::{FnArgs, Function, JsObjectValue, Object, PromiseRaw, Unknown},
-};
 use ohos_arkui_binding::{
     api::{attribute_option::DrawableDescriptor, node_custom_event::NodeCustomEvent},
     common::node_registry,
@@ -77,7 +73,6 @@ impl Drop for NativeFrame {
 enum CaptureState {
     #[default]
     Waiting,
-    Pending,
     Finished,
 }
 
@@ -93,91 +88,12 @@ impl FrameCapture {
         if self.state.get() != CaptureState::Waiting {
             return;
         }
-        self.state.set(CaptureState::Pending);
         if screen_effect {
             *self.animation.borrow_mut() = owner.animator.hold_presented_animation();
         }
-        if let Err(error) = self.request(owner, parent) {
-            log::debug!("OHOS asynchronous root snapshot unavailable: {error}");
-            self.install(owner, parent, None);
-        }
-    }
-
-    fn request(self: &Rc<Self>, owner: &Node, parent: &NativeNode) -> Result<()> {
-        let id = parent.borrow().unique_id()?;
-        let node = Rc::downgrade(
-            &owner
-                .self_ref()
-                .ok_or(crate::render::node::Error::InvalidNode(owner.id))?,
-        );
-        let env = &owner.env;
-        env.run_in_scope(|| {
-            let ui = owner.host.ui_context(env)?;
-            let service: Function<'_, (), Object<'_>> =
-                ui.get_named_property("getComponentSnapshot")?;
-            let service = service.apply(ui, ())?;
-            let get: Function<'_, i32, PromiseRaw<'_, Object<'_>>> =
-                service.get_named_property("getWithUniqueId")?;
-            let capture = get.apply(service, id)?;
-            let success = Rc::downgrade(self);
-            let failure = success.clone();
-            let timeout = success.clone();
-            let timeout_owner = node.clone();
-            let success_owner = node.clone();
-            capture
-                .then(move |ctx| {
-                    Self::complete(&success, &success_owner, || {
-                        PixelMap::from_napi(ctx.env.raw().cast(), ctx.value.raw().cast()).ok()
-                    });
-                    Ok(())
-                })?
-                .catch::<Unknown<'_>, (), _>(move |_| {
-                    Self::complete(&failure, &node, || None);
-                    Ok(())
-                })?;
-            // A suspended or detached SDK snapshot can outlive its request. Give a
-            // still-active root its synchronous fallback if no callback arrives.
-            let handler = env.create_function_from_closure("rootSnapshotDeadline", move |_| {
-                Self::complete(&timeout, &timeout_owner, || None);
-                Ok(())
-            })?;
-            let global = env.get_global()?;
-            type TimerArgs<'env> = FnArgs<(Function<'env, (), ()>, u32)>;
-            let schedule: Function<'_, TimerArgs<'_>, Unknown<'_>> =
-                global.get_named_property("setTimeout")?;
-            schedule.call((handler, 500).into())?;
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    fn complete(
-        capture: &Weak<Self>,
-        node: &Weak<Node>,
-        pixels: impl FnOnce() -> Option<PixelMap>,
-    ) {
-        let (Some(capture), Some(owner)) = (capture.upgrade(), node.upgrade()) else {
-            return;
-        };
-        if capture.state.get() != CaptureState::Pending
-            || !owner.active.get()
-            || owner.host.check().is_err()
-        {
-            return;
-        }
-        callback(|| {
-            capture.install(&owner, &owner.mounted(), pixels());
-            owner.update_wrapper()?;
-            owner.flush_arkui()
-        });
-    }
-
-    fn install(&self, owner: &Node, parent: &NativeNode, pixels: Option<PixelMap>) {
-        let result = match pixels {
-            Some(pixels) => Ok(pixels),
-            None => parent.borrow().snapshot(),
-        };
-        match result
+        match parent
+            .borrow()
+            .snapshot()
             .map_err(crate::render::node::Error::from)
             .and_then(|pixels| NativeFrame::from_pixels(parent, owner, pixels))
         {

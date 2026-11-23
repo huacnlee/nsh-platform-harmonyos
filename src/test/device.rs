@@ -206,9 +206,14 @@ impl Device {
     }
 
     fn remove_forward(&self, node: &str) -> anyhow::Result<()> {
-        let mut command = self.command();
-        command.args(["fport", "rm", node, node]);
-        Commands::output(command, COMMAND_TIMEOUT, None)?;
+        let mut rport = self.command();
+        rport.args(["rport", "rm", node, node]);
+        if Commands::output(rport, COMMAND_TIMEOUT, None).is_ok() {
+            return Ok(());
+        }
+        let mut fport = self.command();
+        fport.args(["fport", "rm", node, node]);
+        Commands::output(fport, COMMAND_TIMEOUT, None)?;
         Ok(())
     }
 }

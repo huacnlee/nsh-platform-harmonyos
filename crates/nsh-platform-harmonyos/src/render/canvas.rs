@@ -174,12 +174,14 @@ impl CanvasView {
         Ok(())
     }
     pub(crate) fn invalidate(&self) -> Result<()> {
-        if self.scheduled.get() {
-            return Ok(());
-        }
         if let Some(owner) = self.owner.upgrade() {
+            let frame = owner.frame.get();
+            let drawable = owner.paint_visible() && frame.width > 0.0 && frame.height > 0.0;
+            if self.scheduled.get() && drawable {
+                return Ok(());
+            }
             owner.invalidate_paint()?;
-            self.scheduled.set(true);
+            self.scheduled.set(drawable);
         }
         Ok(())
     }
@@ -242,17 +244,17 @@ pub(crate) fn replay_offscreen(
     canvas: &Canvas,
     drawing: &Drawing,
     scale: f32,
+    slots: &[AnimationValue],
     images: &[(Arc<str>, Bitmap)],
     fonts: &Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     rtl: bool,
 ) {
     let mut texts = Vec::new();
-    let slots = vec![AnimationValue::Number(0.0); drawing.slots.len()];
     let mut replay = Replay {
         canvas,
         matrix: RefCell::new(Matrix::new()),
         scale,
-        slots: &slots,
+        slots,
         images: ImageLookup::Offscreen(images),
         fonts,
         texts: &mut texts,
@@ -700,16 +702,41 @@ impl Replay<'_> {
         }
     }
     fn shadow(&self) -> Option<ShadowLayer> {
-        (self.state.shadow.0 & 255 != 0)
-            .then(|| {
-                ShadowLayer::new(
-                    self.state.blur,
-                    self.state.offset.0,
-                    self.state.offset.1,
-                    argb(self.state.shadow),
-                )
-            })
-            .flatten()
+        let color = argb(self.state.shadow);
+        let alpha = ((color >> 24) as f32 * self.state.alpha)
+            .round()
+            .clamp(0.0, 255.0) as u32;
+        if alpha == 0 {
+            return None;
+        }
+        let blur = self.state.blur.max(0.0);
+        let (ox, oy) = self.state.offset;
+        if blur <= 0.0 && ox == 0.0 && oy == 0.0 {
+            return None;
+        }
+        // HTML Canvas 2D specifies shadowOffset and shadowBlur in base canvas space
+        // (unaffected by the current CTM). Map them into local space so OH_Drawing's
+        // CTM-affected ShadowLayer lands at the base-space offset and blur radius.
+        let [a, b, c, d, _, _] = self.state.transform.0;
+        let det = a * d - b * c;
+        let (local_ox, local_oy, ctm_scale) = if det.abs() > 1e-6 {
+            (
+                (d * ox - c * oy) / det,
+                (-b * ox + a * oy) / det,
+                det.abs().sqrt(),
+            )
+        } else {
+            (ox, oy, 1.0)
+        };
+        // OH_Drawing_ShadowLayerCreate returns null for blurRadius <= 0.0; use a tiny
+        // positive radius for hard-offset shadows (blur == 0.0 with non-zero offset).
+        let local_blur = if blur > 0.0 {
+            (blur / ctm_scale).max(1e-3)
+        } else {
+            1e-3
+        };
+        let effective = (color & 0x00ff_ffff) | (alpha << 24);
+        ShadowLayer::new(local_blur, local_ox, local_oy, effective)
     }
     fn brush(&self, paint: &Paint) -> Brush {
         let mut brush = Brush::new();
@@ -1306,7 +1333,7 @@ fn blend(value: Composite) -> BlendMode {
         Composite::Luminosity => BlendMode::Luminosity,
     }
 }
-pub(crate) fn sweep_stops(stops: &[(f32, Color)], angle: f32) -> (Vec<u32>, Vec<f32>) {
+fn sweep_stops(stops: &[(f32, Color)], angle: f32) -> (Vec<u32>, Vec<f32>) {
     if stops.is_empty() {
         return (Vec::new(), Vec::new());
     }
@@ -1331,7 +1358,7 @@ pub(crate) fn sweep_stops(stops: &[(f32, Color)], angle: f32) -> (Vec<u32>, Vec<
         rotated.iter().map(|(p, _, _)| *p).collect(),
     )
 }
-pub(crate) fn sample(stops: &[(f32, Color)], t: f32) -> Color {
+fn sample(stops: &[(f32, Color)], t: f32) -> Color {
     if t <= stops[0].0 {
         return stops[0].1;
     }

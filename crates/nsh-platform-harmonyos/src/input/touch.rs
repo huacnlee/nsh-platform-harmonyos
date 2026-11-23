@@ -131,18 +131,28 @@ pub(crate) struct Touches {
     window_resize: Option<WindowResize>,
     pending_window_drag: Option<PendingWindowDrag>,
     mouse_up_targets: Vec<Weak<Node>>,
-    last_pointer: Option<(f32, f32)>,
+    last_pointer: rustc_hash::FxHashMap<nsh_core::NodeId, (f32, f32)>,
     last_tap: Option<LastTap>,
     last_mouse_press: Option<LastTap>,
+    handled_context_menu: Option<(i64, i32, i32)>,
+    down_recorded: bool,
 }
 impl Touches {
-    pub(crate) fn record_pointer(&mut self, point: (f32, f32)) {
+    pub(crate) fn record_pointer_for(&mut self, window_id: nsh_core::NodeId, point: (f32, f32)) {
         if point.0.is_finite() && point.1.is_finite() {
-            self.last_pointer = Some(point);
+            self.last_pointer.insert(window_id, point);
         }
     }
-    pub(crate) fn last_pointer(&self) -> Option<(f32, f32)> {
-        self.last_pointer
+    pub(crate) fn last_pointer_for(&self, window_id: nsh_core::NodeId) -> Option<(f32, f32)> {
+        self.last_pointer.get(&window_id).copied()
+    }
+    pub(crate) fn claim_context_menu(&mut self, event_time_ns: i64, wx: f32, wy: f32) -> bool {
+        let key = (event_time_ns, wx.round() as i32, wy.round() as i32);
+        if self.handled_context_menu == Some(key) {
+            return false;
+        }
+        self.handled_context_menu = Some(key);
+        true
     }
     pub(crate) fn record_mouse_press(&mut self, event_time_ns: i64, window: (f32, f32)) -> u32 {
         advance_clicks(
@@ -153,7 +163,11 @@ impl Touches {
             MOUSE_MULTI_CLICK_DISTANCE_VP,
         )
     }
-    pub(crate) fn record_down(&mut self, scale: f32, input: &ArkUIInputEvent) {
+    pub(crate) fn record_down(&mut self, window_id: nsh_core::NodeId, input: &ArkUIInputEvent) {
+        if matches!(input.action, UIInputAction::Up | UIInputAction::Cancel) {
+            self.down_recorded = false;
+            return;
+        }
         if input.action != UIInputAction::Down || input.pointer_count() != 1 {
             return;
         }
@@ -162,13 +176,17 @@ impl Touches {
             input.pointer_window_x_by_index(0),
             input.pointer_window_y_by_index(0),
         );
-        self.record_pointer(window);
+        self.record_pointer_for(window_id, window);
+        if self.down_recorded {
+            return;
+        }
+        self.down_recorded = true;
         let _ = advance_clicks(
             &mut self.last_tap,
             event_time_ns,
             window,
             TOUCH_MULTI_TAP_MS,
-            TOUCH_MULTI_TAP_DISTANCE_VP * scale.max(1.0),
+            TOUCH_MULTI_TAP_DISTANCE_VP,
         );
     }
     pub(crate) fn clicks(&self) -> u32 {
@@ -178,6 +196,8 @@ impl Touches {
         self.primary = None;
         self.last_tap = None;
         self.last_mouse_press = None;
+        self.handled_context_menu = None;
+        self.down_recorded = false;
         self.window_resize = None;
         self.pending_window_drag = None;
         self.mouse_up_targets.clear();
@@ -231,7 +251,7 @@ impl Touches {
     }
 
     pub(crate) fn input(&mut self, root: &Rc<Node>, input: &ArkUIInputEvent) -> Result<()> {
-        self.record_down(root.scale.get(), input);
+        self.record_down(root.key_window_id(), input);
         self.timestamp = input.event_time() as f64 / 1_000_000.0;
         let phase = match input.action {
             UIInputAction::Down => TouchPhase::Start,
@@ -259,6 +279,9 @@ impl Touches {
         };
         let mut surface = root.clone();
         loop {
+            if surface.kind == nsh_core::ViewKind::Modal {
+                break;
+            }
             let parent = surface.parent_node.borrow().upgrade();
             let Some(parent) = parent else { break };
             surface = parent;

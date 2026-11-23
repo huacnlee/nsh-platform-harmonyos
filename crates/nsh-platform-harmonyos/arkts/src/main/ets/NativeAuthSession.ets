@@ -2,6 +2,7 @@ import { ComponentContent } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import webview from "@ohos.web.webview";
 import { SystemReply } from "./NativeSystem";
+import { acquireIncognitoStore, releaseIncognitoStore } from "./NativeWebViews";
 
 function matchesCallbackScheme(url: string, callbackScheme: string): boolean {
   const scheme = callbackScheme.trim().toLowerCase();
@@ -201,7 +202,7 @@ export class NativeAuthSession {
     try {
       webview.WebviewController.initializeWebEngine();
       if (ephemeral) {
-        webview.WebCookieManager.clearAllCookiesSync(true);
+        acquireIncognitoStore();
       }
     } catch {}
     const controller = new webview.WebviewController();
@@ -299,9 +300,7 @@ export class NativeAuthSession {
       active.settled = true;
       this.current = undefined;
       if (active.ephemeral) {
-        try {
-          webview.WebCookieManager.clearAllCookiesSync(true);
-        } catch {}
+        releaseIncognitoStore();
       }
       this.dismissDialog(active);
     }
@@ -322,10 +321,10 @@ export class NativeAuthSession {
     }
     try {
       session.controller.stop();
-      if (session.ephemeral) {
-        webview.WebCookieManager.clearAllCookiesSync(true);
-      }
     } catch {}
+    if (session.ephemeral) {
+      releaseIncognitoStore();
+    }
     session.reply(event);
   }
 

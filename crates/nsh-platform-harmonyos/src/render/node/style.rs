@@ -17,6 +17,9 @@ impl Node {
         self.decoration.clear_paint_cache();
         self.invalidate_composites();
         self.update_layout_bounds()?;
+        if let Some(video) = self.video.borrow().as_ref() {
+            video.density_changed(self.scale.get())?;
+        }
         self.restore_style()?;
         self.animator.apply_node(self)?;
         self.native

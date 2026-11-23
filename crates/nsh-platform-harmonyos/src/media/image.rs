@@ -599,7 +599,10 @@ pub(crate) struct ImageView {
     blur_radius: Cell<f32>,
     applied_blur: Cell<f32>,
     fade_ms: Cell<f32>,
+    fade_pending: Cell<bool>,
     fade_start: Cell<Option<f64>>,
+    source: RefCell<Option<ImageSource>>,
+    placeholder: RefCell<Option<ImageSource>>,
 }
 impl ImageView {
     pub(crate) fn new(owner: UiWeak<Node>, loader: Arc<Loader>) -> Result<Rc<Self>> {
@@ -626,7 +629,10 @@ impl ImageView {
             blur_radius: Cell::new(0.0),
             applied_blur: Cell::new(0.0),
             fade_ms: Cell::new(0.0),
+            fade_pending: Cell::new(false),
             fade_start: Cell::new(None),
+            source: RefCell::new(None),
+            placeholder: RefCell::new(None),
         });
         let weak = Rc::downgrade(&image);
         image
@@ -642,7 +648,8 @@ impl ImageView {
                     {
                         if image.fade_ms.get() > 0.0 && !owner.platform.get().reduce_motion {
                             image.native.borrow().set_f32_attribute(A::Opacity, 0.0)?;
-                            image.fade_start.set(Some(owner.animator.now()));
+                            image.fade_start.set(None);
+                            image.fade_pending.set(true);
                             owner.animator.track(&owner);
                         }
                         if let Some(data) = image.data.borrow().as_ref() {
@@ -729,22 +736,31 @@ impl ImageView {
         Ok(())
     }
     pub(crate) fn tick(&self, now: f64) -> Result<bool> {
-        let Some(start) = self.fade_start.get() else {
+        if !self.fade_pending.get() {
             return Ok(false);
+        }
+        let start = match self.fade_start.get() {
+            Some(start) => start,
+            None => {
+                self.fade_start.set(Some(now));
+                now
+            }
         };
         let reduced = self
             .owner
             .upgrade()
             .is_none_or(|n| n.platform.get().reduce_motion);
-        let progress = if reduced {
+        let fade_ms = self.fade_ms.get();
+        let progress = if reduced || fade_ms <= 0.0 {
             1.0
         } else {
-            ((now - start) / self.fade_ms.get() as f64).clamp(0.0, 1.0) as f32
+            ((now - start) / fade_ms as f64).clamp(0.0, 1.0) as f32
         };
         self.native
             .borrow()
             .set_f32_attribute(A::Opacity, progress)?;
         if progress >= 1.0 {
+            self.fade_pending.set(false);
             self.fade_start.set(None);
         }
         Ok(progress < 1.0)
@@ -755,12 +771,30 @@ impl ImageView {
         mode: ResizeMode,
         options: ImageOptions,
     ) -> Result<()> {
-        self.cancel();
-        self.fade_start.set(None);
+        let same_sources =
+            *self.source.borrow() == source && *self.placeholder.borrow() == options.placeholder;
         self.fade_ms.set(options.fade_ms.unwrap_or(0.0).max(0.0));
-        self.native.borrow().set_f32_attribute(A::Opacity, 1.0)?;
         self.blur_radius.set(options.blur_radius.0);
         self.sync_blur()?;
+        self.native.borrow().set_i32_attribute(
+            A::ImageObjectFit,
+            match mode {
+                ResizeMode::Contain => 0,   // ARKUI_OBJECT_FIT_CONTAIN
+                ResizeMode::Cover => 1,     // ARKUI_OBJECT_FIT_COVER
+                ResizeMode::Stretch => 3,   // ARKUI_OBJECT_FIT_FILL
+                ResizeMode::ScaleDown => 4, // ARKUI_OBJECT_FIT_SCALE_DOWN
+                ResizeMode::Center => 10,   // ARKUI_OBJECT_FIT_NONE_AND_ALIGN_CENTER
+            },
+        )?;
+        if same_sources {
+            return Ok(());
+        }
+        *self.source.borrow_mut() = source.clone();
+        *self.placeholder.borrow_mut() = options.placeholder.clone();
+        self.cancel();
+        self.fade_pending.set(false);
+        self.fade_start.set(None);
+        self.native.borrow().set_f32_attribute(A::Opacity, 1.0)?;
         let generation = self.generation.get().wrapping_add(1);
         self.generation.set(generation);
         self.primary.set(false);
@@ -780,16 +814,6 @@ impl ImageView {
             self.native.borrow().reset_attribute(A::ImageSrc)?;
             *self.decoded.borrow_mut() = [None, None];
         }
-        self.native.borrow().set_i32_attribute(
-            A::ImageObjectFit,
-            match mode {
-                ResizeMode::Contain => 0,   // ARKUI_OBJECT_FIT_CONTAIN
-                ResizeMode::Cover => 1,     // ARKUI_OBJECT_FIT_COVER
-                ResizeMode::Stretch => 3,   // ARKUI_OBJECT_FIT_FILL
-                ResizeMode::ScaleDown => 4, // ARKUI_OBJECT_FIT_SCALE_DOWN
-                ResizeMode::Center => 10,   // ARKUI_OBJECT_FIT_NONE_AND_ALIGN_CENTER
-            },
-        )?;
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };

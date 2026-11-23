@@ -61,8 +61,6 @@ struct Playback {
     initialized: bool,
     prepared: bool,
     applied_rate: f32,
-    // The current binding exposes no renderer-info or interrupt-mode setter.
-    // Retain the requested session with its player generation for that boundary.
     audio_session: nsh_core::AudioSession,
 }
 pub(super) struct Worker {
@@ -524,6 +522,7 @@ impl Worker {
             return Ok(());
         }
         playback.initialized = true;
+        apply_audio_session(&mut playback.player, playback.audio_session);
         // SAFETY: playback owns its window reference and UI retains the producer
         // through successful synchronous close; release runs on this worker.
         unsafe {
@@ -544,6 +543,7 @@ impl Worker {
         };
         if playback.audio_session != props.audio_session {
             playback.audio_session = props.audio_session;
+            apply_audio_session(&mut playback.player, playback.audio_session);
         }
         playback
             .player
@@ -849,12 +849,54 @@ fn read_source_task(
             return Err(format!("video HTTP status {status}"));
         }
         let directory = host.video_cache_directory().map_err(|e| e.to_string())?;
-        let reader = response.body_mut().with_config().limit(u64::MAX).reader();
+        const MAX_RESTRICTED_VIDEO_BYTES: u64 = 256 << 20;
+        let reader = response
+            .body_mut()
+            .with_config()
+            .limit(MAX_RESTRICTED_VIDEO_BYTES)
+            .reader();
         return SourceFile::copy(&directory, reader, &is_live)
             .map(|file| (Some(file), None))
             .map_err(|e| e.to_string());
     }
     Err("no video response".into())
+}
+fn apply_audio_session(player: &mut AvPlayer, session: nsh_core::AudioSession) {
+    let interrupt = match session {
+        nsh_core::AudioSession::Playback => av::AudioInterruptMode::Independent,
+        nsh_core::AudioSession::Default | nsh_core::AudioSession::MixWithOthers => {
+            av::AudioInterruptMode::Share
+        }
+    };
+    if let Err(error) = player.set_audio_renderer_info(av::AudioStreamUsage::Movie) {
+        log::warn!("Video audio renderer info: {error}");
+    }
+    if let Err(error) = player.set_audio_interrupt_mode(interrupt) {
+        log::warn!("Video audio interrupt mode: {error}");
+    }
+    match ohos_audio_binding::AudioSessionManager::get() {
+        Ok(manager) => {
+            let result = match session {
+                nsh_core::AudioSession::Default => {
+                    if manager.is_activated() {
+                        manager.deactivate()
+                    } else {
+                        Ok(())
+                    }
+                }
+                nsh_core::AudioSession::Playback => {
+                    manager.activate(ohos_audio_binding::AudioSessionConcurrencyMode::Default)
+                }
+                nsh_core::AudioSession::MixWithOthers => {
+                    manager.activate(ohos_audio_binding::AudioSessionConcurrencyMode::MixWithOthers)
+                }
+            };
+            if let Err(error) = result {
+                log::warn!("Video audio session {session:?}: {error}");
+            }
+        }
+        Err(error) => log::warn!("Video AudioSessionManager unavailable: {error}"),
+    }
 }
 fn progress_wait(
     live: bool,
@@ -867,7 +909,7 @@ fn progress_wait(
     if !live || !prepared || !playing || failed {
         return Duration::from_secs(60);
     }
-    Duration::try_from_secs_f32(interval / 1000.0)
+    Duration::try_from_secs_f32(interval.max(16.0) / 1000.0)
         .unwrap_or(Duration::from_secs(60))
         .saturating_sub(elapsed)
 }
@@ -877,8 +919,8 @@ fn validate_props(props: &VideoProps) -> std::result::Result<(), String> {
         || !props.rate.is_finite()
         || props.rate < 0.0
         || !props.progress_interval_ms.is_finite()
-        || props.progress_interval_ms < 16.0
-        || Duration::try_from_secs_f32(props.progress_interval_ms / 1000.0).is_err()
+        || props.progress_interval_ms < 0.0
+        || Duration::try_from_secs_f32(props.progress_interval_ms.max(16.0) / 1000.0).is_err()
     {
         return Err("Invalid API20 video settings".into());
     }
@@ -981,9 +1023,14 @@ mod tests {
     #[test]
     fn invalid_native_settings_are_errors() {
         let mut props = VideoProps::default();
-        for interval in [f32::NAN, f32::INFINITY, f32::MAX, 0.0] {
+        for interval in [f32::NAN, f32::INFINITY, f32::MAX, -1.0] {
             props.progress_interval_ms = interval;
             assert!(validate_props(&props).is_err());
+        }
+        // Small non-negative intervals clamp to 16ms like nsh-core instead of failing.
+        for interval in [0.0, 1.0, 15.9, 16.0, 250.0] {
+            props.progress_interval_ms = interval;
+            assert!(validate_props(&props).is_ok());
         }
         props = VideoProps::default();
         props.volume = f32::NAN;

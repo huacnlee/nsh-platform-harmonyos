@@ -41,14 +41,24 @@ pub(crate) fn configure(owner: &Rc<Node>, old: &Accessibility, new: &Accessibili
         let mut state = AccessibilityState::new()?;
         state.set_disabled(i32::from(new.state.disabled));
         state.set_selected(i32::from(new.state.selected));
-        state.set_checked_state(i32::from(new.state.checked == Some(Checked::True)));
+        // Only set binary checked state for True/False; Checked::Mixed is
+        // conveyed through the localized spoken value so the reader does not
+        // announce "not checked" alongside "mixed".
+        if let Some(checked) = new.state.checked
+            && checked != Checked::Mixed
+        {
+            state.set_checked_state(i32::from(checked == Checked::True));
+        }
         let result = native.set_accessibility_state(&state);
         state.dispose();
         result?;
     }
     if old.value != new.value || old.state != new.state {
         let range = crate::accessibility::value::range_value(new);
-        let spoken = crate::accessibility::value::spoken_value(new);
+        let spoken = crate::accessibility::value::spoken_value_for_locale(
+            new,
+            owner.platform.get().locale.as_str(),
+        );
         if range.is_some() || spoken.is_some() {
             let mut value = AccessibilityValue::new()?;
             if let Some((min, max, current)) = range {

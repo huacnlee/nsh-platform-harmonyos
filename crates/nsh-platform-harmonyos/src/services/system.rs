@@ -1,48 +1,61 @@
 //! System UI requests are scoped to an engine generation. ArkTS owns their
 //! controllers on the window thread; late completions hold only weak routes.
-use std::collections::BTreeMap;
-#[cfg(target_env = "ohos")]
-use std::sync::{
-    Mutex, Weak,
-    atomic::{AtomicU32, Ordering},
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Mutex, Weak,
+        atomic::{AtomicU32, Ordering},
+    },
 };
 
-#[cfg(target_env = "ohos")]
-use nsh_core::Command;
-use nsh_core::EventKind;
-#[cfg(target_env = "ohos")]
-use nsh_core::{EventPayload, PayloadValue};
+use nsh_core::{Command, EventKind, EventPayload};
 
-#[cfg(target_env = "ohos")]
 use crate::app::{
     runtime::{Dispatcher, Message},
     session::{HostCommand, Services},
 };
+pub(crate) use crate::services::system_spec::{PickedHandle, read_picked};
+use crate::services::system_spec::{
+    Request, SystemReply, auth_session_payload, format_ohos_open_filters, format_ohos_save_choices,
+    insert_request, parse_file_request_paths, validate_existing_file_request_path,
+};
 
-struct Request<R> {
-    route: std::sync::Weak<R>,
-    kind: EventKind,
-    id: u32,
-    stream: bool,
-    answer: bool,
-    #[cfg(target_env = "ohos")]
-    paste: Option<(u32, bool)>,
-}
-#[cfg(target_env = "ohos")]
 #[derive(Default)]
 pub(crate) struct System {
     next: AtomicU32,
     requests: Mutex<BTreeMap<u32, Request<Dispatcher>>>,
+    clipboard: crate::services::clipboard::Clipboard,
 }
-#[cfg(target_env = "ohos")]
+
 impl System {
     pub(crate) fn command(
         &self,
-        host: &Services,
+        host: &std::sync::Arc<Services>,
         route: Weak<Dispatcher>,
         command: Command,
     ) -> napi_ohos::Result<()> {
         use nsh_core::{notifications::NotificationCommand as N, speech::SpeechCommand as S};
+        match command {
+            Command::SetClipboardItem(item) => {
+                return self.clipboard.write_text(item.text, item.html);
+            }
+            Command::SetClipboard(text) => {
+                return self.clipboard.write_text(text, None);
+            }
+            Command::SetClipboardImage(uri) => {
+                return self.clipboard.write_image(uri);
+            }
+            Command::ReadClipboard { id, has_only } => {
+                return self.clipboard.read_text(host.clone(), route, id, has_only);
+            }
+            Command::ReadClipboardImage { id, has_only } => {
+                return self.clipboard.read_image(host.clone(), route, id, has_only);
+            }
+            Command::ReadClipboardFiles { id } => {
+                return self.clipboard.read_files(host.clone(), route, id);
+            }
+            _ => {}
+        }
         let (kind, id, stream, data) = match command {
             Command::Notification(command) => {
                 let (id, stream, data) = match command {
@@ -134,8 +147,9 @@ impl System {
                 (EventKind::Speech, id, true, data)
             }
             Command::AuthSession { id, page } => {
-                // One auth session runs at a time per route; drop any prior pending entry.
-                let previous: Vec<u32> = {
+                // One auth session runs at a time per route; cancel any prior pending entry
+                // and deliver a cancellation reply so its JS Promise does not hang.
+                let previous: Vec<(u32, Request<Dispatcher>)> = {
                     let mut requests = self.requests.lock().unwrap();
                     let keys: Vec<u32> = requests
                         .iter()
@@ -144,12 +158,18 @@ impl System {
                                 .then_some(key)
                         })
                         .collect();
-                    for key in &keys {
-                        requests.remove(key);
-                    }
-                    keys
+                    keys.into_iter()
+                        .filter_map(|key| requests.remove(&key).map(|req| (key, req)))
+                        .collect()
                 };
-                for key in previous {
+                for (key, req) in previous {
+                    Self::deliver(
+                        req,
+                        SystemEvent {
+                            phase: Some("cancelled".into()),
+                            ..Default::default()
+                        },
+                    );
                     let _ = host.send_host_command(HostCommand {
                         kind: "system".into(),
                         open_id: Some(key),
@@ -174,7 +194,7 @@ impl System {
                 )
             }
             Command::CloseAuthSession(id) => {
-                let key = {
+                let removed = {
                     let mut requests = self.requests.lock().unwrap();
                     let key = requests.iter().find_map(|(&key, r)| {
                         (r.kind == EventKind::AuthSession
@@ -182,12 +202,16 @@ impl System {
                             && Weak::ptr_eq(&r.route, &route))
                         .then_some(key)
                     });
-                    if let Some(key) = key {
-                        requests.remove(&key);
-                    }
-                    key
+                    key.and_then(|key| requests.remove(&key).map(|req| (key, req)))
                 };
-                if let Some(key) = key {
+                if let Some((key, req)) = removed {
+                    Self::deliver(
+                        req,
+                        SystemEvent {
+                            phase: Some("cancelled".into()),
+                            ..Default::default()
+                        },
+                    );
                     host.send_host_command(HostCommand {
                         kind: "system".into(),
                         open_id: Some(key),
@@ -213,75 +237,11 @@ impl System {
                     ..Default::default()
                 },
             ),
-            Command::SetClipboardItem(item) => (
-                EventKind::Clipboard,
-                0,
-                false,
-                SystemCommand {
-                    op: "clipboard-write".into(),
-                    text: Some(item.text),
-                    html: item.html,
-                    ..Default::default()
-                },
-            ),
-            Command::SetClipboard(text) => (
-                EventKind::Clipboard,
-                0,
-                false,
-                SystemCommand {
-                    op: "clipboard-write".into(),
-                    text: Some(text),
-                    ..Default::default()
-                },
-            ),
-            Command::SetClipboardImage(uri) => (
-                EventKind::Clipboard,
-                0,
-                false,
-                SystemCommand {
-                    op: "clipboard-write-image".into(),
-                    uri: Some(uri),
-                    ..Default::default()
-                },
-            ),
-            Command::ReadClipboard { id, has_only } => (
-                EventKind::Clipboard,
-                id,
-                false,
-                SystemCommand {
-                    op: "clipboard-read".into(),
-                    has_only: Some(has_only),
-                    ..Default::default()
-                },
-            ),
-            Command::ReadClipboardImage { id, has_only } => (
-                EventKind::Clipboard,
-                id,
-                false,
-                SystemCommand {
-                    op: "clipboard-image".into(),
-                    has_only: Some(has_only),
-                    ..Default::default()
-                },
-            ),
-            Command::ReadClipboardFiles { id } => (
-                EventKind::Clipboard,
-                id,
-                false,
-                SystemCommand {
-                    op: "clipboard-files".into(),
-                    ..Default::default()
-                },
-            ),
             _ => return Err(napi_ohos::Error::from_reason("unsupported system command")),
         };
         let answer = !matches!(
             data.op.as_str(),
-            "clipboard-write"
-                | "clipboard-write-image"
-                | "notification-close"
-                | "notification-badge"
-                | "notification-listen"
+            "notification-close" | "notification-badge" | "notification-listen"
         );
         self.submit(
             host,
@@ -299,26 +259,13 @@ impl System {
 
     pub(crate) fn paste_to_input(
         &self,
-        host: &Services,
+        host: &std::sync::Arc<Services>,
         route: Weak<Dispatcher>,
         node_id: u32,
         report_only: bool,
     ) -> napi_ohos::Result<()> {
-        self.submit(
-            host,
-            Request {
-                route,
-                kind: EventKind::Clipboard,
-                id: 0,
-                stream: false,
-                answer: false,
-                paste: Some((node_id, report_only)),
-            },
-            SystemCommand {
-                op: "clipboard-paste".into(),
-                ..Default::default()
-            },
-        )
+        self.clipboard
+            .paste_to_input(host.clone(), route, node_id, report_only)
     }
 
     pub(crate) fn file_request(
@@ -456,267 +403,29 @@ impl System {
         }
     }
 
-    fn stage_audio_temp(
-        host: &Services,
-        prefix: &str,
-        id: u32,
-        hint: &str,
-        bytes: &[u8],
-    ) -> Result<String, String> {
-        let dir = host.cache_directory().join("audio");
-        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let ext = std::path::Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
-            .extension()
-            .and_then(|e| e.to_str())
-            .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
-            .unwrap_or("bin");
-        let mut random = [0u8; 8];
-        let _ = getrandom::fill(&mut random);
-        let path = dir.join(format!(
-            "{prefix}-{id}-{:016x}.{ext}",
-            u64::from_le_bytes(random)
-        ));
-        std::fs::write(&path, bytes).map_err(|e| e.to_string())?;
-        Ok(path.to_string_lossy().into_owned())
-    }
-
-    pub(crate) fn load_sound(
+    pub(crate) fn submit_clipboard_fallback(
         &self,
         host: &Services,
         route: Weak<Dispatcher>,
         id: u32,
-        bytes: nsh_core::image::ImageData,
-        hint: String,
-        max_duration: std::time::Duration,
+        op: &str,
+        paste: Option<(u32, bool)>,
     ) -> napi_ohos::Result<()> {
-        use nsh_core::audio::{AudioError, AudioEvent as E};
-        let path = match Self::stage_audio_temp(host, "sound", id, &hint, &bytes) {
-            Ok(path) => path,
-            Err(message) => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::Audio,
-                        EventPayload::Audio {
-                            id,
-                            event: E::Failed {
-                                error: AudioError::Failed,
-                                message,
-                            },
-                        },
-                    ));
-                }
-                return Ok(());
-            }
-        };
         self.submit(
             host,
             Request {
                 route,
-                kind: EventKind::Audio,
+                kind: EventKind::Clipboard,
                 id,
                 stream: false,
-                answer: true,
-                paste: None,
+                answer: paste.is_none(),
+                paste,
             },
             SystemCommand {
-                op: "audio-load".into(),
-                count: Some(id),
-                uri: Some(path),
-                duration_ms: Some(max_duration.as_secs_f64() * 1000.0),
+                op: op.into(),
                 ..Default::default()
             },
         )
-    }
-
-    pub(crate) fn audio(
-        &self,
-        host: &Services,
-        route: Weak<Dispatcher>,
-        assets: &std::sync::Arc<dyn crate::services::assets::StreamAssets>,
-        command: nsh_core::audio::AudioCommand,
-    ) -> napi_ohos::Result<()> {
-        use nsh_core::audio::{AudioCommand as A, AudioError, AudioEvent as E};
-        match command {
-            A::LoadUrl { id, .. } => {
-                if let Some(route) = route.upgrade() {
-                    route.send(Message::HostEvent(
-                        EventKind::Audio,
-                        EventPayload::Audio {
-                            id,
-                            event: E::Failed {
-                                error: AudioError::NotSupported,
-                                message: "LoadUrl is not supported on native platforms".into(),
-                            },
-                        },
-                    ));
-                }
-                Ok(())
-            }
-            A::Open { id, src, settings } => {
-                // HAP rawfiles go straight to AVPlayer by descriptor. Other asset
-                // providers retain staging and its existing command ordering.
-                let asset = if src.starts_with("asset:/") {
-                    assets.raw_asset(&src)
-                } else {
-                    None
-                };
-                let (uri, temp_file, open_error) =
-                    if asset.is_some() || src.starts_with("http://") || src.starts_with("https://")
-                    {
-                        (src, false, None)
-                    } else if let Some(rest) = src.strip_prefix("file://") {
-                        let path = percent_encoding::percent_decode_str(rest)
-                            .decode_utf8_lossy()
-                            .into_owned();
-                        (path, false, None)
-                    } else if src.starts_with('/') {
-                        (src, false, None)
-                    } else if src.starts_with("asset:/") {
-                        match assets.read(&src).and_then(|bytes| {
-                            Self::stage_audio_temp(host, "player", id, &src, &bytes)
-                        }) {
-                            Ok(path) => (path, true, None),
-                            Err(err) => (String::new(), false, Some(err)),
-                        }
-                    } else {
-                        (
-                            String::new(),
-                            false,
-                            Some(format!("unsupported audio source: {src}")),
-                        )
-                    };
-                self.submit(
-                    host,
-                    Request {
-                        route,
-                        kind: EventKind::Audio,
-                        id,
-                        stream: true,
-                        answer: true,
-                        paste: None,
-                    },
-                    SystemCommand {
-                        op: "audio-open".into(),
-                        count: Some(id),
-                        uri: Some(uri),
-                        asset,
-                        has_only: Some(temp_file),
-                        text: open_error,
-                        volume: Some(f64::from(settings.volume)),
-                        rate: Some(f64::from(settings.rate)),
-                        looped: Some(settings.looped),
-                        ..Default::default()
-                    },
-                )
-            }
-            A::Play { id, volume, rate } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-play".into(),
-                    count: Some(id),
-                    volume: Some(f64::from(volume)),
-                    rate: Some(f64::from(rate)),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Stop { id } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-stop".into(),
-                    count: Some(id),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Unload { id } => {
-                self.requests.lock().unwrap().retain(|_, r| {
-                    !(r.kind == EventKind::Audio && r.id == id && Weak::ptr_eq(&r.route, &route))
-                });
-                host.send_host_command(HostCommand {
-                    kind: "system".into(),
-                    open_id: Some(0),
-                    system: Some(SystemCommand {
-                        op: "audio-unload".into(),
-                        count: Some(id),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            }
-            A::Preload { id } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-preload".into(),
-                    count: Some(id),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Resume { id } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-resume".into(),
-                    count: Some(id),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Pause { id } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-pause".into(),
-                    count: Some(id),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Seek { id, position } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-seek".into(),
-                    count: Some(id),
-                    position_ms: Some(position.as_secs_f64() * 1000.0),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Set { id, settings } => host.send_host_command(HostCommand {
-                kind: "system".into(),
-                open_id: Some(0),
-                system: Some(SystemCommand {
-                    op: "audio-set".into(),
-                    count: Some(id),
-                    volume: Some(f64::from(settings.volume)),
-                    rate: Some(f64::from(settings.rate)),
-                    looped: Some(settings.looped),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            }),
-            A::Close { id } => {
-                self.requests.lock().unwrap().retain(|_, r| {
-                    !(r.kind == EventKind::Audio && r.id == id && Weak::ptr_eq(&r.route, &route))
-                });
-                host.send_host_command(HostCommand {
-                    kind: "system".into(),
-                    open_id: Some(0),
-                    system: Some(SystemCommand {
-                        op: "audio-close".into(),
-                        count: Some(id),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                })
-            }
-            _ => Err(napi_ohos::Error::from_reason("unsupported audio command")),
-        }
     }
 
     fn submit(
@@ -766,6 +475,7 @@ impl System {
         }
         Ok(())
     }
+
     pub(crate) fn complete(&self, key: u32, value: SystemEvent) {
         let request = {
             let mut requests = self.requests.lock().unwrap();
@@ -779,6 +489,7 @@ impl System {
         };
         Self::deliver(request, value);
     }
+
     fn deliver(request: Request<Dispatcher>, value: SystemEvent) {
         let Some(route) = request
             .route
@@ -787,11 +498,12 @@ impl System {
         else {
             return;
         };
+        let reply = value.into_reply();
         if let Some((node_id, report_only)) = request.paste {
-            let text = value.text.unwrap_or_default();
-            let html = value.html.filter(|s| !s.is_empty());
-            let files = value.files.filter(|s| !s.is_empty());
-            let image = value.uri.filter(|s| !s.is_empty());
+            let text = reply.text.unwrap_or_default();
+            let html = reply.html.filter(|s| !s.is_empty());
+            let files = reply.files.filter(|s| !s.is_empty());
+            let image = reply.uri.filter(|s| !s.is_empty());
             if !text.is_empty() || html.is_some() || files.is_some() || image.is_some() {
                 route.send(Message::InputPaste {
                     id: node_id,
@@ -805,86 +517,33 @@ impl System {
             return;
         }
         let payload = if request.kind == EventKind::AuthSession {
-            auth_session_payload(request.id, value)
+            auth_session_payload(request.id, reply)
         } else if request.kind == EventKind::Share {
-            if let Some(message) = value.error {
+            if let Some(message) = reply.error {
                 nsh_core::share::ShareError::failed(message).payload(request.id)
-            } else if value.phase.as_deref() == Some("shared") {
-                nsh_core::share::ShareOutcome::shared(value.text).payload(request.id)
+            } else if reply.phase.as_deref() == Some("shared") {
+                nsh_core::share::ShareOutcome::shared(reply.text).payload(request.id)
             } else {
                 nsh_core::share::ShareOutcome::dismissed().payload(request.id)
             }
         } else if request.kind == EventKind::FileRequest {
-            match value.error {
+            match reply.error {
                 Some(error) => EventPayload::file_failed(request.id, error),
                 None => EventPayload::file_answer(
                     request.id,
-                    parse_file_request_paths(value.files.as_deref()),
+                    parse_file_request_paths(reply.files.as_deref()),
                 ),
-            }
-        } else if request.kind == EventKind::Audio {
-            use nsh_core::audio::{AudioError, AudioEvent as E};
-            use std::time::Duration;
-            let ms = |v: Option<f64>| {
-                v.filter(|d| d.is_finite() && *d >= 0.0)
-                    .map(|d| Duration::from_secs_f64(d / 1000.0))
-            };
-            let event = match value.phase.as_deref() {
-                Some("loaded") => E::Loaded {
-                    duration: ms(value.duration_ms).unwrap_or_default(),
-                    bytes: value.bytes.unwrap_or(0.0).max(0.0) as u64,
-                    truncated: value.truncated.unwrap_or(false),
-                },
-                Some("load") => E::Load {
-                    duration: ms(value.duration_ms).filter(|d| !d.is_zero()),
-                },
-                Some("playing") => E::Playing,
-                Some("paused") => E::Paused,
-                Some("progress") => E::Progress {
-                    position: ms(value.position_ms).unwrap_or_default(),
-                    duration: ms(value.duration_ms).filter(|d| !d.is_zero()),
-                },
-                Some("buffer") => E::Buffer {
-                    buffering: value.buffering.unwrap_or(false),
-                },
-                Some("ended") => E::Ended,
-                Some("failed" | "end") => E::Failed {
-                    error: value
-                        .code
-                        .as_deref()
-                        .and_then(AudioError::from_name)
-                        .unwrap_or(AudioError::Failed),
-                    message: value.error.unwrap_or_default(),
-                },
-                _ => {
-                    if let Some(error) = value.error {
-                        E::Failed {
-                            error: value
-                                .code
-                                .as_deref()
-                                .and_then(AudioError::from_name)
-                                .unwrap_or(AudioError::Failed),
-                            message: error,
-                        }
-                    } else {
-                        return;
-                    }
-                }
-            };
-            EventPayload::Audio {
-                id: request.id,
-                event,
             }
         } else if request.kind == EventKind::Speech {
             use nsh_core::speech::{SpeechError, SpeechEvent as E};
-            let event = match value.phase.as_deref() {
+            let event = match reply.phase.as_deref() {
                 Some("start") => E::Start,
                 Some("result") => E::Result {
-                    text: value.text.clone().unwrap_or_default(),
-                    is_final: value.is_final.unwrap_or(false),
+                    text: reply.text.clone().unwrap_or_default(),
+                    is_final: reply.is_final.unwrap_or(false),
                 },
                 Some("end") => E::End {
-                    error: value.error.as_deref().and_then(SpeechError::from_name),
+                    error: reply.error.as_deref().and_then(SpeechError::from_name),
                 },
                 _ => return,
             };
@@ -893,16 +552,17 @@ impl System {
                 event,
             }
         } else {
-            if let Some(error) = value.error.as_deref() {
+            if let Some(error) = reply.error.as_deref() {
                 route.send(Message::Error(format!("system service: {error}")));
             }
-            let Some(payload) = request.map_payload(value) else {
+            let Some(payload) = request.map_payload(reply) else {
                 return;
             };
             payload
         };
         route.send(Message::HostEvent(request.kind, payload));
     }
+
     pub(crate) fn retire(&self, host: &Services, route: &Weak<Dispatcher>) {
         let retired: Vec<u32> = {
             let mut requests = self.requests.lock().unwrap();
@@ -925,64 +585,14 @@ impl System {
     }
 }
 
-#[cfg(target_env = "ohos")]
-impl<R> Request<R> {
-    fn map_payload(&self, value: SystemEvent) -> Option<EventPayload> {
-        let mut fields = Vec::new();
-        if self.answer {
-            fields.push(("id", PayloadValue::Number(f64::from(self.id))));
-        }
-        // Answer-less notification listeners still deliver press replies.
-        value.append_fields(&mut fields);
-        (!fields.is_empty()).then_some(EventPayload::Map(fields))
-    }
-}
-
-impl<R> Clone for Request<R> {
-    fn clone(&self) -> Self {
-        Self {
-            route: self.route.clone(),
-            kind: self.kind,
-            id: self.id,
-            stream: self.stream,
-            answer: self.answer,
-            #[cfg(target_env = "ohos")]
-            paste: self.paste,
-        }
-    }
-}
-
-fn insert_request<R>(
-    requests: &mut BTreeMap<u32, Request<R>>,
-    key: u32,
-    request: Request<R>,
-    live: impl Fn(&R) -> bool,
-) -> Result<(), String> {
-    requests.retain(|_, old| {
-        !(request.stream
-            && request.kind == EventKind::Notification
-            && old.stream
-            && old.kind == EventKind::Notification)
-            && old.route.upgrade().is_some_and(|route| live(&route))
-    });
-    if requests.len() >= 256 {
-        return Err("too many system requests".into());
-    }
-    requests.insert(key, request);
-    Ok(())
-}
-
 /// Typed SDK request; fields cross N-API directly without a JSON envelope.
-#[cfg_attr(target_env = "ohos", napi_derive_ohos::napi(object))]
+#[napi_derive_ohos::napi(object)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SystemCommand {
     pub op: String,
     pub paths: Option<Vec<String>>,
-    pub html: Option<String>,
     pub text: Option<String>,
     pub uri: Option<String>,
-    pub asset: Option<String>,
-    pub has_only: Option<bool>,
     pub name: Option<String>,
     pub title: Option<String>,
     pub body: Option<String>,
@@ -991,13 +601,9 @@ pub(crate) struct SystemCommand {
     pub ask: Option<bool>,
     pub lang: Option<String>,
     pub interim: Option<bool>,
-    pub volume: Option<f64>,
-    pub rate: Option<f64>,
-    pub looped: Option<bool>,
-    pub position_ms: Option<f64>,
-    pub duration_ms: Option<f64>,
     pub ephemeral: Option<bool>,
 }
+
 impl SystemCommand {
     fn notification_listener(command: nsh_core::notifications::NotificationCommand) -> Self {
         debug_assert!(matches!(
@@ -1012,7 +618,7 @@ impl SystemCommand {
 }
 
 /// Typed completion shared by clipboard, notification and speech services.
-#[cfg_attr(target_env = "ohos", napi_derive_ohos::napi(object))]
+#[napi_derive_ohos::napi(object)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SystemEvent {
     pub permission: Option<String>,
@@ -1029,16 +635,11 @@ pub(crate) struct SystemEvent {
     pub error: Option<String>,
     pub code: Option<String>,
     pub phase: Option<String>,
-    #[cfg_attr(target_env = "ohos", napi(js_name = "final"))]
+    #[napi(js_name = "final")]
     pub is_final: Option<bool>,
-    pub duration_ms: Option<f64>,
-    pub position_ms: Option<f64>,
-    pub bytes: Option<f64>,
-    pub truncated: Option<bool>,
-    pub buffering: Option<bool>,
 }
+
 impl SystemEvent {
-    #[cfg(target_env = "ohos")]
     fn failure(message: &str, code: &str) -> Self {
         Self {
             error: Some(message.into()),
@@ -1047,465 +648,36 @@ impl SystemEvent {
             ..Default::default()
         }
     }
-    #[cfg(target_env = "ohos")]
-    fn append_fields(self, fields: &mut Vec<(&'static str, PayloadValue)>) {
-        for (name, value) in [
-            ("permission", self.permission),
-            ("pressed", self.pressed),
-            ("text", self.text),
-            ("uri", self.uri),
-            ("files", self.files),
-            ("error", self.error),
-            ("code", self.code),
-            ("phase", self.phase),
-        ] {
-            if let Some(value) = value {
-                fields.push((name, PayloadValue::Str(value)));
-            }
-        }
-        for (name, value) in [
-            ("shown", self.shown),
-            ("has", self.has),
-            ("truncated", self.truncated),
-            ("buffering", self.buffering),
-        ] {
-            if let Some(value) = value {
-                fields.push((name, PayloadValue::Bool(value)));
-            }
-        }
-        for (name, value) in [
-            ("width", self.width),
-            ("height", self.height),
-            ("tooLarge", self.too_large),
-            ("durationMs", self.duration_ms),
-            ("positionMs", self.position_ms),
-            ("bytes", self.bytes),
-        ] {
-            if let Some(value) = value {
-                fields.push((name, PayloadValue::Number(value)));
-            }
+
+    fn into_reply(self) -> SystemReply {
+        SystemReply {
+            permission: self.permission,
+            shown: self.shown,
+            pressed: self.pressed,
+            has: self.has,
+            text: self.text,
+            html: self.html,
+            uri: self.uri,
+            width: self.width,
+            height: self.height,
+            too_large: self.too_large,
+            files: self.files,
+            error: self.error,
+            code: self.code,
+            phase: self.phase,
+            is_final: self.is_final,
         }
     }
 }
 
-#[cfg(unix)]
-#[cfg_attr(target_env = "ohos", napi_derive_ohos::napi(object))]
+#[napi_derive_ohos::napi(object)]
 pub(crate) struct PickedDescriptor {
     pub fd: i32,
     pub name: String,
 }
 
-#[cfg(unix)]
-pub(crate) struct PickedHandle {
-    descriptor: std::os::fd::OwnedFd,
-    name: String,
-}
-
-#[cfg(unix)]
 impl PickedDescriptor {
     pub(crate) fn retain(self) -> std::io::Result<PickedHandle> {
-        if self.fd < 0 {
-            return Err(std::io::Error::other("invalid picked descriptor"));
-        }
-        // SAFETY: the SDK keeps its opened file alive until this synchronous call returns.
-        let descriptor =
-            unsafe { std::os::fd::BorrowedFd::borrow_raw(self.fd) }.try_clone_to_owned()?;
-        Ok(PickedHandle {
-            descriptor,
-            name: self.name,
-        })
-    }
-}
-
-#[cfg(unix)]
-pub(crate) fn read_picked(
-    handles: Vec<PickedHandle>,
-    request: &nsh_core::picker::Pick,
-) -> Vec<nsh_core::picker::PickedFile> {
-    use std::{fs::File, io::Read as _};
-    let (limit, max_bytes) = match request {
-        nsh_core::picker::Pick::Images(r) => (r.limit, 64 << 20),
-        nsh_core::picker::Pick::Files(r) => (r.limit, nsh_core::picker::MAX_PICKED_FILE_BYTES),
-    };
-    let raw = handles
-        .into_iter()
-        .take(limit.clamp(1, nsh_core::picker::MAX_PICKED) as usize)
-        .filter_map(|handle| {
-            let file = File::from(handle.descriptor);
-            let metadata = file.metadata().ok();
-            if metadata.as_ref().is_some_and(|m| m.len() > max_bytes) {
-                log::warn!(
-                    "OHOS picked {} is left out: larger than {max_bytes} bytes",
-                    handle.name
-                );
-                return None;
-            }
-            let modified = metadata.and_then(|m| m.modified().ok());
-            let mut bytes = Vec::new();
-            if file.take(max_bytes + 1).read_to_end(&mut bytes).is_err()
-                || bytes.len() as u64 > max_bytes
-            {
-                return None;
-            }
-            let mut picked = match request {
-                nsh_core::picker::Pick::Images(_) => {
-                    nsh_core::picker::PickedFile::new(handle.name, "", bytes.into())
-                }
-                nsh_core::picker::Pick::Files(_) => {
-                    let mut picked = nsh_core::picker::PickedFile::default();
-                    picked.name = handle.name;
-                    picked.data = bytes.into();
-                    picked
-                }
-            };
-            picked.last_modified = modified;
-            Some(picked)
-        })
-        .collect();
-    request.finish(raw)
-}
-
-/// Formats `FileFilter` entries for HarmonyOS `DocumentSelectOptions.fileSuffixFilters`
-/// (`"Description|.ext1,.ext2"`).
-#[allow(dead_code)]
-fn format_ohos_open_filters(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
-    let mut out = Vec::new();
-    for filter in filters {
-        let suffixes: Vec<String> = filter
-            .extensions
-            .iter()
-            .filter(|ext| !ext.is_empty())
-            .map(|ext| format!(".{ext}"))
-            .collect();
-        if suffixes.is_empty() {
-            continue;
-        }
-        let joined = suffixes.join(",");
-        let name = filter.name.replace('|', " ");
-        let trimmed = name.trim();
-        if trimmed.is_empty() {
-            out.push(joined);
-        } else {
-            out.push(format!("{trimmed}|{joined}"));
-        }
-    }
-    out
-}
-
-/// Formats `FileFilter` entries for HarmonyOS `DocumentSaveOptions.fileSuffixChoices`
-/// (one `"Description|.ext"` option per suffix).
-#[allow(dead_code)]
-fn format_ohos_save_choices(filters: &[nsh_core::file_dialog::FileFilter]) -> Vec<String> {
-    let mut out = Vec::new();
-    for filter in filters {
-        let name = filter.name.replace('|', " ");
-        let trimmed = name.trim();
-        for ext in &filter.extensions {
-            if ext.is_empty() {
-                continue;
-            }
-            if trimmed.is_empty() {
-                out.push(format!(".{ext}"));
-            } else {
-                out.push(format!("{trimmed}|.{ext}"));
-            }
-        }
-    }
-    out
-}
-
-/// Validates that a file path passed to `open_path`, `reveal_path`, or `move_to_trash`
-/// is absolute (or already a `file://` URI) and exists on disk when given as a filesystem path.
-#[allow(dead_code)]
-fn validate_existing_file_request_path(path: &std::path::Path) -> Result<(), String> {
-    let raw = path.to_string_lossy();
-    if raw.is_empty() {
-        return Err("path must not be empty".into());
-    }
-    if raw.contains("://") {
-        return Ok(());
-    }
-    if !path.is_absolute() {
-        return Err(format!("path must be absolute: {}", path.display()));
-    }
-    if !path.exists() {
-        return Err(format!("path does not exist: {}", path.display()));
-    }
-    Ok(())
-}
-
-/// Parses the JSON array of chosen paths returned by `NativeSystem.ets` file dialogs.
-#[allow(dead_code)]
-fn parse_file_request_paths(files: Option<&str>) -> Vec<std::path::PathBuf> {
-    let Some(raw) = files.filter(|s| !s.is_empty()) else {
-        return Vec::new();
-    };
-    let Ok(list) = serde_json::from_str::<Vec<String>>(raw) else {
-        return Vec::new();
-    };
-    list.into_iter()
-        .filter(|path| !path.is_empty())
-        .map(std::path::PathBuf::from)
-        .collect()
-}
-
-/// Converts a `NativeAuthSession` reply into the `EventKind::AuthSession` payload.
-#[allow(dead_code)]
-fn auth_session_payload(id: u32, value: SystemEvent) -> nsh_core::EventPayload {
-    use nsh_core::auth_session::{AuthSessionError, AuthSessionOutcome};
-    if let Some(message) = value.error.filter(|s| !s.is_empty()) {
-        let mut error = AuthSessionError::failed(message);
-        error.code = value.code.filter(|s| !s.is_empty());
-        return error.payload(id);
-    }
-    if value.phase.as_deref() == Some("completed")
-        && let Some(url) = value.uri.filter(|s| !s.is_empty())
-    {
-        return AuthSessionOutcome::Completed(url).payload(id);
-    }
-    AuthSessionOutcome::Cancelled.payload(id)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[cfg(target_env = "ohos")]
-    #[test]
-    fn answer_less_notification_listener_delivers_presses_and_skips_empty_replies() {
-        let request = Request::<()> {
-            route: std::sync::Weak::new(),
-            kind: EventKind::Notification,
-            id: 0,
-            stream: true,
-            answer: false,
-            paste: None,
-        };
-        let payload = request.map_payload(SystemEvent {
-            pressed: Some("reminder".into()),
-            ..Default::default()
-        });
-        let Some(EventPayload::Map(fields)) = payload else {
-            panic!("notification press was dropped");
-        };
-        assert!(matches!(
-            fields.as_slice(),
-            [("pressed", PayloadValue::Str(name))] if name == "reminder"
-        ));
-        assert!(request.map_payload(SystemEvent::default()).is_none());
-        let payload = request.map_payload(SystemEvent {
-            error: Some("failed".into()),
-            ..Default::default()
-        });
-        assert!(matches!(payload, Some(EventPayload::Map(_))));
-    }
-    #[cfg(unix)]
-    #[test]
-    fn retained_descriptor_survives_sdk_close_and_keeps_original_name() {
-        use std::{fs::File, os::fd::AsRawFd};
-        let path = std::env::temp_dir().join(format!("nsh-picked-{}", std::process::id()));
-        std::fs::write(&path, b"picked bytes").unwrap();
-        let source = File::open(&path).unwrap();
-        let handle = PickedDescriptor {
-            fd: source.as_raw_fd(),
-            name: "photo.jpg".into(),
-        }
-        .retain()
-        .unwrap();
-        drop(source);
-        std::fs::remove_file(path).unwrap();
-        let files = read_picked(
-            vec![handle],
-            &nsh_core::picker::Pick::Images(Default::default()),
-        );
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, "photo.jpg");
-        assert_eq!(&*files[0].data, b"picked bytes");
-    }
-    #[cfg(unix)]
-    #[test]
-    fn picked_files_preserve_arbitrary_names_and_infer_mime() {
-        use std::{fs::File, os::fd::AsRawFd};
-        let path = std::env::temp_dir().join(format!("nsh-picked-doc-{}", std::process::id()));
-        std::fs::write(&path, b"{\"ok\":true}").unwrap();
-        let source = File::open(&path).unwrap();
-        let handle = PickedDescriptor {
-            fd: source.as_raw_fd(),
-            name: "folder/config.json".into(),
-        }
-        .retain()
-        .unwrap();
-        drop(source);
-        std::fs::remove_file(path).unwrap();
-        let files = read_picked(
-            vec![handle],
-            &nsh_core::picker::Pick::Files(Default::default()),
-        );
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, "config.json");
-        assert_eq!(files[0].mime, "application/json");
-        assert_eq!(&*files[0].data, b"{\"ok\":true}");
-    }
-    #[test]
-    fn three_hundred_notification_listens_replace_the_previous_route() {
-        let owner = std::sync::Arc::new(());
-        let mut requests = BTreeMap::new();
-        for key in 1..=300 {
-            let command = SystemCommand::notification_listener(
-                nsh_core::notifications::NotificationCommand::Listen,
-            );
-            assert_eq!(command.op, "notification-listen");
-            insert_request(
-                &mut requests,
-                key,
-                Request {
-                    route: std::sync::Arc::downgrade(&owner),
-                    kind: EventKind::Notification,
-                    id: 0,
-                    stream: true,
-                    answer: false,
-                    #[cfg(target_env = "ohos")]
-                    paste: None,
-                },
-                |_| true,
-            )
-            .unwrap();
-            assert_eq!(requests.len(), 1);
-            assert!(requests.contains_key(&key));
-        }
-    }
-    #[test]
-    fn replacing_listener_preserves_other_pending_requests() {
-        let owner = std::sync::Arc::new(());
-        let mut requests = BTreeMap::new();
-        for (key, kind, stream) in [
-            (1, EventKind::Speech, true),
-            (2, EventKind::Notification, false),
-            (3, EventKind::Notification, true),
-            (4, EventKind::Notification, true),
-        ] {
-            insert_request(
-                &mut requests,
-                key,
-                Request {
-                    route: std::sync::Arc::downgrade(&owner),
-                    kind,
-                    id: key,
-                    stream,
-                    answer: true,
-                    #[cfg(target_env = "ohos")]
-                    paste: None,
-                },
-                |_| true,
-            )
-            .unwrap();
-        }
-        assert_eq!(requests.keys().copied().collect::<Vec<_>>(), vec![1, 2, 4]);
-    }
-    #[test]
-    fn file_dialog_filters_and_paths_format_for_ohos_picker() {
-        use nsh_core::file_dialog::FileFilter;
-        let filters = [
-            FileFilter::new("Markdown", ["md", "markdown"]),
-            FileFilter::new("", ["txt"]),
-        ];
-        assert_eq!(
-            format_ohos_open_filters(&filters),
-            vec!["Markdown|.md,.markdown", ".txt"]
-        );
-        assert_eq!(
-            format_ohos_save_choices(&filters),
-            vec!["Markdown|.md", "Markdown|.markdown", ".txt"]
-        );
-        assert_eq!(
-            parse_file_request_paths(Some(r#"["/storage/docs/a.md","/storage/docs/b.txt"]"#)),
-            vec![
-                std::path::PathBuf::from("/storage/docs/a.md"),
-                std::path::PathBuf::from("/storage/docs/b.txt"),
-            ]
-        );
-        assert!(parse_file_request_paths(Some("[]")).is_empty());
-        assert!(parse_file_request_paths(None).is_empty());
-    }
-    #[test]
-    fn file_request_path_validation_rejects_relative_and_missing_paths() {
-        let temp_dir = std::env::temp_dir();
-        assert!(validate_existing_file_request_path(&temp_dir).is_ok());
-        assert!(
-            validate_existing_file_request_path(std::path::Path::new(
-                "file://docs/storage/Users/currentUser/Documents/a.txt"
-            ))
-            .is_ok()
-        );
-        assert!(validate_existing_file_request_path(std::path::Path::new("note.md")).is_err());
-        assert!(
-            validate_existing_file_request_path(std::path::Path::new(
-                "/nonexistent-nsh-path-12345/note.md"
-            ))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn auth_session_payload_maps_completed_cancelled_and_error_outcomes() {
-        use nsh_core::{EventPayload, PayloadValue};
-
-        let completed = auth_session_payload(
-            7,
-            SystemEvent {
-                phase: Some("completed".into()),
-                uri: Some("myapp://callback?code=abc".into()),
-                ..Default::default()
-            },
-        );
-        let EventPayload::Map(fields) = completed else {
-            panic!("expected Map payload");
-        };
-        assert!(fields.contains(&("id", PayloadValue::Number(7.0))));
-        assert!(fields.contains(&("url", PayloadValue::Str("myapp://callback?code=abc".into()))));
-
-        let cancelled = auth_session_payload(
-            8,
-            SystemEvent {
-                phase: Some("cancelled".into()),
-                ..Default::default()
-            },
-        );
-        let EventPayload::Map(fields) = cancelled else {
-            panic!("expected Map payload");
-        };
-        assert!(fields.contains(&("id", PayloadValue::Number(8.0))));
-        assert!(fields.contains(&("action", PayloadValue::Str("cancelled".into()))));
-
-        let failed = auth_session_payload(
-            9,
-            SystemEvent {
-                error: Some("dialog failed".into()),
-                ..Default::default()
-            },
-        );
-        let EventPayload::Map(fields) = failed else {
-            panic!("expected Map payload");
-        };
-        assert!(fields.contains(&("id", PayloadValue::Number(9.0))));
-        assert!(fields.contains(&("error", PayloadValue::Str("dialog failed".into()))));
-        assert!(!fields.iter().any(|(key, _)| *key == "code"));
-
-        let unavailable = auth_session_payload(
-            10,
-            SystemEvent {
-                error: Some("no browser".into()),
-                code: Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into()),
-                ..Default::default()
-            },
-        );
-        let EventPayload::Map(fields) = unavailable else {
-            panic!("expected Map payload");
-        };
-        assert!(fields.contains(&("id", PayloadValue::Number(10.0))));
-        assert!(fields.contains(&("error", PayloadValue::Str("no browser".into()))));
-        assert!(fields.contains(&(
-            "code",
-            PayloadValue::Str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into())
-        )));
+        PickedHandle::retain_raw(self.fd, self.name)
     }
 }

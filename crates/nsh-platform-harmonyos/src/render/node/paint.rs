@@ -137,6 +137,7 @@ impl Node {
 
     pub(crate) fn supports_image_color_filter(&self, style: &nsh_core::ViewStyle) -> bool {
         self.image.borrow().is_some()
+            && self.children.borrow().is_empty()
             && style.tint_color.is_none()
             && style.background_color.is_transparent()
             && !style.borders.widths.any(|v| v.0 > 0.0)
@@ -396,7 +397,7 @@ impl Node {
         self.draw_selection(canvas, false);
         if let Some(drawing) = self.text_drawing.borrow().as_ref() {
             let content = self.content.get();
-            let brush = self
+            let tint = self
                 .tint
                 .get()
                 .or_else(|| {
@@ -405,19 +406,7 @@ impl Node {
                         .as_ref()
                         .and_then(|live| live.text_color())
                 })
-                .and_then(|color| {
-                    ohos_drawing_binding::ColorFilter::blend(
-                        argb(color),
-                        ohos_drawing_binding::BlendMode::SrcIn,
-                    )
-                })
-                .map(|color| {
-                    let mut filter = ohos_drawing_binding::Filter::new();
-                    filter.set_color_filter(Some(&color));
-                    let mut brush = ohos_drawing_binding::Brush::new();
-                    brush.set_filter(Some(&filter));
-                    brush
-                });
+                .map(argb);
             let raster_scale = self
                 .raster
                 .borrow()
@@ -437,14 +426,12 @@ impl Node {
                     canvas.scale(scale / raster_scale, scale / raster_scale);
                 }
             }
-            if let Some(brush) = &brush {
-                canvas.save_layer(None, Some(brush));
-            }
-            if let Err(error) = drawing.lock().expect("text drawing").draw(canvas) {
+            if let Err(error) = drawing
+                .lock()
+                .expect("text drawing")
+                .draw_tinted(canvas, tint)
+            {
                 log::warn!("OHOS text draw: {error}");
-            }
-            if brush.is_some() {
-                canvas.restore();
             }
             if needs_save {
                 canvas.restore();

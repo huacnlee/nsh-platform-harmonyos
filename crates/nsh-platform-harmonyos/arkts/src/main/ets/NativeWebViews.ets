@@ -1,4 +1,4 @@
-import { FrameCallback } from "@ohos.arkui.UIContext";
+import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
 import { BuilderNode } from "@ohos.arkui.node";
 import picker from "@ohos.file.picker";
 import webview from "@ohos.web.webview";
@@ -17,7 +17,7 @@ export interface WebSettings {
   userAgent?: string | null;
   injectedJavascript?: string | null;
   documentStartScript: string;
-  downloadDirectory: string;
+  urlSchemes: string[];
 }
 
 export interface WebHeader {
@@ -41,6 +41,31 @@ export interface WebCommand {
 let webEngineInitialized = false;
 let webComponentMounted = false;
 let nextWebNativeTagId = 1;
+let incognitoStoreUsers = 0;
+
+/** Reference-count live incognito WebViews / ephemeral AuthSessions so clearing
+ *  incognito cookies never wipes another concurrently open incognito session. */
+export function acquireIncognitoStore(): void {
+  const prev = incognitoStoreUsers;
+  incognitoStoreUsers += 1;
+  if (prev === 0) {
+    try {
+      webview.WebCookieManager.clearAllCookiesSync(true);
+    } catch {}
+  }
+}
+
+export function releaseIncognitoStore(): void {
+  if (incognitoStoreUsers <= 0) {
+    return;
+  }
+  incognitoStoreUsers -= 1;
+  if (incognitoStoreUsers === 0) {
+    try {
+      webview.WebCookieManager.clearAllCookiesSync(true);
+    } catch {}
+  }
+}
 
 function ensureWebEngineInitialized(): void {
   if (!webEngineInitialized) {
@@ -64,13 +89,27 @@ function clearCookiesIfNeeded(entry: WebEntry): void {
   if (!entry.settings.clearCookies) {
     return;
   }
+  entry.settings.clearCookies = false;
+  if (!entry.settings.sharedCookies) {
+    entry.ensureIncognitoLease();
+    return;
+  }
   try {
-    webview.WebCookieManager.clearAllCookiesSync(!entry.settings.sharedCookies);
-    entry.settings.clearCookies = false;
+    webview.WebCookieManager.clearAllCookiesSync(false);
   } catch (error) {
     entry.emit("error", `Cookie reset failed: ${String(error)}`);
     throw new Error(String(error));
   }
+}
+
+function documentStartScriptRules(schemes: string[]): string[] {
+  const rules: string[] = ["*", "nsh-asset://"];
+  for (const scheme of schemes) {
+    if (scheme.length > 0) {
+      rules.push(`${scheme}://`);
+    }
+  }
+  return rules;
 }
 
 @Observed
@@ -104,7 +143,7 @@ struct WebViewHost {
       .runJavaScriptOnDocumentStart([
         {
           script: this.entry.settings.documentStartScript,
-          scriptRules: ["*", "nsh-asset://"],
+          scriptRules: documentStartScriptRules(this.entry.settings.urlSchemes),
         },
       ])
       .onShowFileSelector((event): boolean => {
@@ -215,11 +254,43 @@ class WebEntry {
   private closed: boolean = false;
   private retired: boolean = false;
   private disposed: boolean = false;
+  private holdsIncognito: boolean = false;
 
   constructor(settings: WebSettings, context: NshRuntimeContext) {
     this.settings = settings;
     this.context = context;
     this.node = new BuilderNode<[WebContentParams]>(context.getUIContext());
+  }
+
+  belongsTo(context: NshRuntimeContext): boolean {
+    return this.context === context;
+  }
+
+  isDisposed(): boolean {
+    return this.disposed;
+  }
+
+  ensureIncognitoLease(): void {
+    if (!this.settings.sharedCookies && !this.holdsIncognito) {
+      this.holdsIncognito = true;
+      acquireIncognitoStore();
+    }
+  }
+
+  private releaseIncognitoLease(): void {
+    if (this.holdsIncognito) {
+      this.holdsIncognito = false;
+      releaseIncognitoStore();
+    }
+  }
+
+  private webId(): string {
+    return `nsh-web-${this.settings.targetId}`;
+  }
+
+  private webUIContext(): UIContext {
+    const id = this.webId();
+    return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.context.getUIContext();
   }
 
   create(): void {
@@ -801,26 +872,48 @@ class WebEntry {
     }
   }
   private click(x: number, y: number): void {
-    this.context
-      .getUIContext()
-      .getFocusController()
-      .requestFocus(`nsh-web-${this.settings.targetId}`);
+    const ui = this.webUIContext();
+    ui.getFocusController().requestFocus(this.webId());
     const time = Math.max(Date.now() * 1000000, this.inputTimestamp + 2000000);
     this.inputTimestamp = time;
-    x = this.context.getUIContext().vp2px(x);
-    y = this.context.getUIContext().vp2px(y);
+    const frame = this.node.getFrameNode();
+    let windowX = x;
+    let windowY = y;
+    let displayX = x;
+    let displayY = y;
+    if (frame) {
+      try {
+        const winPos = frame.getPositionToWindow();
+        windowX = winPos.x + x;
+        windowY = winPos.y + y;
+      } catch {}
+      try {
+        const screenPos = frame.getPositionToScreen();
+        displayX = screenPos.x + x;
+        displayY = screenPos.y + y;
+      } catch {
+        displayX = windowX;
+        displayY = windowY;
+      }
+    }
+    const localPxX = ui.vp2px(x);
+    const localPxY = ui.vp2px(y);
+    const winPxX = ui.vp2px(windowX);
+    const winPxY = ui.vp2px(windowY);
+    const dispPxX = ui.vp2px(displayX);
+    const dispPxY = ui.vp2px(displayY);
     for (const type of [TouchType.Down, TouchType.Up]) {
       const touch: TouchObject = {
         type,
         id: 0,
-        displayX: x,
-        displayY: y,
-        windowX: x,
-        windowY: y,
-        screenX: x,
-        screenY: y,
-        x,
-        y,
+        displayX: dispPxX,
+        displayY: dispPxY,
+        windowX: winPxX,
+        windowY: winPxY,
+        screenX: dispPxX,
+        screenY: dispPxY,
+        x: localPxX,
+        y: localPxY,
       };
       const event: TouchEvent = {
         type,
@@ -965,22 +1058,15 @@ class WebEntry {
       } else if (command.kind === "stop-loading") {
         this.controller.stop();
       } else if (command.kind === "focus") {
-        this.context
-          .getUIContext()
-          .getFocusController()
-          .requestFocus(`nsh-web-${this.settings.targetId}`);
+        this.webUIContext().getFocusController().requestFocus(this.webId());
+      } else if (command.kind === "blur") {
+        this.webUIContext().getFocusController().clearFocus();
       } else if (command.kind === "load") {
         if (command.url != null) {
           clearCookiesIfNeeded(this);
           this.sourceApplied = true;
           this.sourceEpoch = this.epoch;
           this.controller.loadUrl(command.url, command.headers ?? []);
-        }
-      } else if (command.kind === "evaluate") {
-        if (command.script != null) {
-          this.controller.runJavaScript(command.script).catch((error: Error) => {
-            this.emit("error", String(error));
-          });
         }
       }
     } catch (error) {
@@ -993,10 +1079,8 @@ class WebEntry {
       try {
         this.controller.stop();
         this.controller.loadUrl("about:blank");
-        if (!this.settings.sharedCookies) {
-          webview.WebCookieManager.clearAllCookiesSync(true);
-        }
       } catch (_error) {}
+      this.releaseIncognitoLease();
       this.node.dispose();
       this.disposed = true;
       quarantinedWebs.delete(this);
@@ -1077,7 +1161,23 @@ class WebEntry {
 export class NativeWebViews {
   private entries: Map<number, WebEntry> = new Map();
 
+  private retryQuarantined(context: NshRuntimeContext): void {
+    for (const entry of Array.from(quarantinedWebs)) {
+      if (entry.isDisposed()) {
+        quarantinedWebs.delete(entry);
+        continue;
+      }
+      if (!entry.belongsTo(context)) {
+        continue;
+      }
+      try {
+        entry.dispose(context);
+      } catch (_) {}
+    }
+  }
+
   remove(ids: number[], context: NshRuntimeContext): void {
+    this.retryQuarantined(context);
     for (const id of ids) {
       this.entries.get(id)?.dispose(context);
       this.entries.delete(id);
@@ -1085,6 +1185,7 @@ export class NativeWebViews {
   }
 
   update(states: WebSettings[], commands: WebCommand[], context: NshRuntimeContext): void {
+    this.retryQuarantined(context);
     for (const state of states) {
       if (!context.isActive()) {
         throw new Error("NSH SDK session is inactive");
@@ -1110,6 +1211,20 @@ export class NativeWebViews {
       try {
         entry.dispose(context);
         this.entries.delete(id);
+      } catch (error) {
+        failure ??= new Error(String(error));
+      }
+    }
+    for (const entry of Array.from(quarantinedWebs)) {
+      if (entry.isDisposed()) {
+        quarantinedWebs.delete(entry);
+        continue;
+      }
+      if (!entry.belongsTo(context)) {
+        continue;
+      }
+      try {
+        entry.dispose(context);
       } catch (error) {
         failure ??= new Error(String(error));
       }

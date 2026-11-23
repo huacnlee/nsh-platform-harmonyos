@@ -105,7 +105,8 @@ impl Drop for SubWindowMount {
 
 pub(crate) struct Modal {
     owner: Weak<Node>,
-    dialog: RefCell<Dialog>,
+    self_weak: RefCell<Weak<Modal>>,
+    dialog: RefCell<Option<Dialog>>,
     sub_window: RefCell<Option<SubWindowMount>>,
     config: RefCell<ModalConfig>,
     desktop: RefCell<Option<DesktopWindow>>,
@@ -131,15 +132,10 @@ impl Modal {
         self.transition.borrow().is_some()
     }
     pub(crate) fn new(owner: Weak<Node>) -> Result<Rc<Self>> {
-        let dialog = Dialog::new()?;
-        dialog.custom_style(true)?;
-        dialog.custom_animation(true)?;
-        dialog.modal_mode(true)?;
-        dialog.auto_cancel(true)?;
-        dialog.content_alignment(Alignment::Center)?;
         let modal = Rc::new(Self {
             owner,
-            dialog: RefCell::new(dialog),
+            self_weak: RefCell::new(Weak::new()),
+            dialog: RefCell::new(None),
             sub_window: RefCell::default(),
             config: RefCell::new(ModalConfig::default()),
             desktop: RefCell::new(None),
@@ -158,8 +154,21 @@ impl Modal {
             overlay: RefCell::default(),
             on_settled: RefCell::default(),
         });
-        let weak = Rc::downgrade(&modal);
-        modal.dialog.borrow().dismiss_handler(move |reason| {
+        *modal.self_weak.borrow_mut() = Rc::downgrade(&modal);
+        Ok(modal)
+    }
+    fn ensure_dialog(&self) -> Result<()> {
+        if self.dialog.borrow().is_some() {
+            return Ok(());
+        }
+        let dialog = Dialog::new()?;
+        dialog.custom_style(true)?;
+        dialog.custom_animation(true)?;
+        dialog.modal_mode(true)?;
+        dialog.auto_cancel(true)?;
+        dialog.content_alignment(Alignment::Center)?;
+        let weak = self.self_weak.borrow().clone();
+        dialog.dismiss_handler(move |reason| {
             if let Some(modal) = weak.upgrade() {
                 let reason: i32 = reason.into();
                 if reason == 0 {
@@ -177,7 +186,8 @@ impl Modal {
             // Dismissal is always answered from mounted props and animated here.
             true
         })?;
-        Ok(modal)
+        *self.dialog.borrow_mut() = Some(dialog);
+        Ok(())
     }
     pub(crate) fn node_id(&self) -> Option<nsh_core::NodeId> {
         self.owner.upgrade().map(|node| node.id)
@@ -473,6 +483,9 @@ impl Modal {
         if let Some(win) = self.desktop.borrow_mut().as_mut() {
             win.platform_window_id = Some(platform_window_id);
         }
+        owner
+            .host
+            .set_sub_window_platform_id(owner.id, platform_window_id);
         let _ = self.refresh_desktop_layout();
         Ok(true)
     }
@@ -574,6 +587,10 @@ impl Modal {
                     );
                     win.normal_origin =
                         Some((placement.bounds.origin.x.0, placement.bounds.origin.y.0));
+                    if placement.mode == WindowMode::Normal {
+                        win.size = win.normal_size;
+                        win.origin = win.normal_origin;
+                    }
                 }
                 WindowRequest::Center { .. }
                 | WindowRequest::RequestAttention { .. }
@@ -876,6 +893,7 @@ impl Modal {
             SUB_WINDOWS.with(|map| {
                 map.borrow_mut().remove(&key);
             });
+            owner.host.remove_sub_window_platform_id(owner.id);
             // Unmount the native subtree from the SubWindow's NodeContent before
             // ArkTS calls destroyWindow(), preventing dangling native handles.
             self.sub_window.borrow_mut().take();
@@ -937,19 +955,24 @@ impl Modal {
         }
         let presentation = config.presentation;
         let previous = self.config.replace(config);
-        self.dialog.borrow().content_alignment(match presentation {
-            ModalPresentation::FullScreen | ModalPresentation::FormSheet => Alignment::Center,
-            ModalPresentation::PageSheet => Alignment::Bottom,
-        })?;
-        match presentation {
-            ModalPresentation::FullScreen => {
-                self.dialog.borrow().corner_radius(0.0, 0.0, 0.0, 0.0)?;
-            }
-            ModalPresentation::PageSheet => {
-                self.dialog.borrow().corner_radius(16.0, 16.0, 0.0, 0.0)?;
-            }
-            ModalPresentation::FormSheet => {
-                self.dialog.borrow().corner_radius(16.0, 16.0, 16.0, 16.0)?;
+        self.ensure_dialog()?;
+        {
+            let dialog = self.dialog.borrow();
+            let dialog = dialog.as_ref().expect("ensured modal dialog");
+            dialog.content_alignment(match presentation {
+                ModalPresentation::FullScreen | ModalPresentation::FormSheet => Alignment::Center,
+                ModalPresentation::PageSheet => Alignment::Bottom,
+            })?;
+            match presentation {
+                ModalPresentation::FullScreen => {
+                    dialog.corner_radius(0.0, 0.0, 0.0, 0.0)?;
+                }
+                ModalPresentation::PageSheet => {
+                    dialog.corner_radius(16.0, 16.0, 0.0, 0.0)?;
+                }
+                ModalPresentation::FormSheet => {
+                    dialog.corner_radius(16.0, 16.0, 16.0, 16.0)?;
+                }
             }
         }
         self.theme()?;
@@ -984,22 +1007,25 @@ impl Modal {
         if self.is_desktop_window() || self.hosted_in_main.get() {
             return Ok(());
         }
+        self.ensure_dialog()?;
         let config = self.config.borrow();
         let full = config.presentation == ModalPresentation::FullScreen;
+        let dialog = self.dialog.borrow();
+        let dialog = dialog.as_ref().expect("ensured modal dialog");
         // A full-screen modal owns its backdrop and hit-test surface.
         // ArkUI's default modal mask would dim that backdrop a second time.
         // Sheets still need the native mask outside their smaller content bounds.
-        self.dialog.borrow().modal_mode(!full)?;
+        dialog.modal_mode(!full)?;
         // A full-screen surface paints to the keyboard edge. Restore ArkUI's
         // default 16vp spacing when this controller changes back to a sheet.
-        self.dialog.borrow().keyboard_avoid_distance(
+        dialog.keyboard_avoid_distance(
             if full { 0.0 } else { 16.0 },
             ohos_arkui_binding::types::advanced::LengthMetricUnit::Vp,
         )?;
         // `owner.native` paints the sheet's background, rounded corners and slide/fade
         // transition; keep the outer dialog container transparent so no stationary box
         // shows behind an animating sheet.
-        self.dialog.borrow().background_color(0)?;
+        dialog.background_color(0)?;
         Ok(())
     }
     pub(crate) fn schedule_present(&self) {
@@ -1035,8 +1061,12 @@ impl Modal {
         if !was_shown {
             self.show_emitted.set(false);
             self.theme()?;
-            self.dialog.borrow().content_node(&owner.mounted())?;
-            self.dialog.borrow().show()?;
+            {
+                let dialog = self.dialog.borrow();
+                let dialog = dialog.as_ref().expect("ensured modal dialog");
+                dialog.content_node(&owner.mounted())?;
+                dialog.show()?;
+            }
             owner.shaders.modal_shown(&owner, true)?;
             *self.overlay.borrow_mut() = Some(owner.host.overlay(owner.dispatcher.clone())?);
         }
@@ -1319,9 +1349,13 @@ impl Modal {
             self.show_emitted.set(false);
             let was_shown = self.shown.replace(false);
             if was_shown {
-                self.dialog.borrow().close()?;
-                self.overlay.borrow_mut().take();
-                self.dialog.borrow().remove_content()?;
+                if let Some(dialog) = self.dialog.borrow().as_ref() {
+                    dialog.close()?;
+                    self.overlay.borrow_mut().take();
+                    dialog.remove_content()?;
+                } else {
+                    self.overlay.borrow_mut().take();
+                }
                 self.available.set(None);
             }
             if let Some(owner) = self.owner.upgrade() {
@@ -1648,12 +1682,13 @@ impl Drop for Modal {
         } else {
             self.sub_window.get_mut().take();
         }
-        let dialog = self.dialog.get_mut();
-        if self.shown.get() && !is_desktop {
-            let _ = dialog.close();
-        }
-        if let Err(error) = dialog.dispose() {
-            log::warn!("OHOS dialog retirement: {error}");
+        if let Some(mut dialog) = self.dialog.get_mut().take() {
+            if self.shown.get() && !is_desktop {
+                let _ = dialog.close();
+            }
+            if let Err(error) = dialog.dispose() {
+                log::warn!("OHOS dialog retirement: {error}");
+            }
         }
     }
 }

@@ -39,21 +39,6 @@ export class SubWindowPageBridge {
   }
 }
 
-function blurStyleForBackdrop(backdrop: string): BlurStyle {
-  switch (backdrop) {
-    case "window":
-      return BlurStyle.BACKGROUND_THICK;
-    case "sidebar":
-      return BlurStyle.BACKGROUND_REGULAR;
-    case "popover":
-      return BlurStyle.BACKGROUND_THIN;
-    case "hud":
-      return BlurStyle.BACKGROUND_ULTRA_THICK;
-    default:
-      return BlurStyle.NONE;
-  }
-}
-
 @Entry({ routeName: "nshSubWindow" })
 @Component
 struct NshSubWindowPage {
@@ -83,14 +68,15 @@ struct NshSubWindowPage {
   }
 
   build() {
+    // Subwindow backdrop blur is applied natively on the Rust root node; keep
+    // this ArkTS container transparent so blur is never stacked twice.
     WithTheme({ colorMode: this.colorMode }) {
       Stack() {
         ContentSlot(this.content);
       }
       .width("100%")
       .height("100%")
-      .backgroundColor(Color.Transparent)
-      .backgroundBlurStyle(blurStyleForBackdrop(this.backdrop), { colorMode: this.colorMode });
+      .backgroundColor(Color.Transparent);
     };
   }
 }

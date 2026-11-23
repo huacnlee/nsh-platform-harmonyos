@@ -637,7 +637,18 @@ impl State {
                 request.answer(handled);
                 Ok(())
             }
-            message => state.borrow_mut().receive(env, message),
+            message => {
+                if let Ok(mut guard) = state.try_borrow_mut() {
+                    guard.receive(env, message)
+                } else {
+                    if let Ok(guard) = state.try_borrow()
+                        && let Some(queue) = guard.queue.upgrade()
+                    {
+                        queue.call(message, ThreadsafeFunctionCallMode::NonBlocking);
+                    }
+                    Ok(())
+                }
+            }
         }
     }
     fn receive(&mut self, env: Env, message: Message) -> Result<()> {
@@ -953,9 +964,18 @@ impl NshSurface {
                     let constraint = event.layout_constraint_in_measure().ok_or(
                         crate::render::node::Error::Unsupported("missing surface constraints"),
                     )?;
+                    const MAX_BOUNDED: i32 = i32::MAX / 2;
+                    let previous = measured.get();
+                    let bound = |max: i32, fallback: i32| {
+                        if max > 0 && max < MAX_BOUNDED {
+                            max
+                        } else {
+                            fallback.max(0)
+                        }
+                    };
                     let size = (
-                        constraint.max_width().max(0),
-                        constraint.max_height().max(0),
+                        bound(constraint.max_width(), previous.0),
+                        bound(constraint.max_height(), previous.1),
                     );
                     event.set_measured_size(size.0, size.1)?;
                     if measured.replace(size) != size
@@ -1140,17 +1160,16 @@ impl NshSurface {
         let permit = host.reserve_load()?;
         let (token, generation, granted, has_custom_assets) = {
             let mut state = self.state.try_borrow_mut().map_err(reentry)?;
-            #[cfg(feature = "dev")]
-            state.disconnect_dev();
-            if let Some(runtime) = state.phase.runtime() {
-                runtime.close()?;
-            }
             let (granted, has_custom_assets) = {
                 let config = state.config()?;
                 (config.policy.granted.clone(), config.has_custom_assets)
             };
+            // Keep any running app intact until the new bundle is read and validated;
+            // `accept_app` closes the old runtime once the load succeeds.
             let token = state.next_load()?;
-            state.phase = SurfacePhase::Loading { token };
+            if matches!(state.phase, SurfacePhase::Empty) {
+                state.phase = SurfacePhase::Loading { token };
+            }
             (token, state.generation.clone(), granted, has_custom_assets)
         };
         let chunks = crate::app::chunks::ResourceChunks::new(host.clone(), &name);
@@ -1216,16 +1235,18 @@ impl NshSurface {
         let promise = env.spawn_future_with_callback(future, move |env, result| {
             let state = weak.upgrade().ok_or_else(cancelled)?;
             let mut state = state.try_borrow_mut().map_err(reentry)?;
-            if state.generation.load(Ordering::Acquire) != token
-                || !matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
-            {
+            if state.generation.load(Ordering::Acquire) != token {
                 return Err(cancelled());
             }
-            state.phase = SurfacePhase::Empty;
+            if matches!(state.phase, SurfacePhase::Loading { token: active } if active == token) {
+                state.phase = SurfacePhase::Empty;
+            }
             let result = state
                 .check()
                 .and(result)
                 .and_then(|(mut bundle, package_assets)| {
+                    #[cfg(feature = "dev")]
+                    state.disconnect_dev();
                     let config = state.config()?;
                     let is_package = package_assets.is_some();
                     if !is_package {
@@ -1248,11 +1269,11 @@ impl NshSurface {
             }
             result
         });
-        if promise.is_err() {
-            let mut state = self.state.borrow_mut();
-            if matches!(state.phase, SurfacePhase::Loading { token: active } if active == token) {
-                state.phase = SurfacePhase::Empty;
-            }
+        if promise.is_err()
+            && let Ok(mut state) = self.state.try_borrow_mut()
+            && matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
+        {
+            state.phase = SurfacePhase::Empty;
         }
         promise
     }

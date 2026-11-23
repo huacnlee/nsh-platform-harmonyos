@@ -180,6 +180,9 @@ impl Animator {
     pub(crate) fn value(&self, node: u32) -> f32 {
         self.state.borrow().graph.value(node).unwrap_or_default()
     }
+    pub(crate) fn eval(&self, node: u32) -> AnimationValue {
+        self.state.borrow().graph.eval(node)
+    }
     pub(crate) fn settle(&self, node: u32) {
         let started = self.state.borrow_mut().graph.settle(node);
         if started {

@@ -4,7 +4,6 @@ import { ColorMetrics, window } from "@kit.ArkUI";
 import { deviceInfo, emitter } from "@kit.BasicServicesKit";
 import type statusBarManager from "@hms.pcService.statusBarManager";
 import { image } from "@kit.ImageKit";
-import { inputConsumer } from "@kit.InputKit";
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { UIContext } from "@ohos.arkui.UIContext";
 import display from "@ohos.display";
@@ -89,8 +88,6 @@ interface WireCommand {
   click?: number;
   icon?: WireTrayIcon;
   id?: number;
-  preKeys?: number[];
-  finalKey?: number;
 }
 
 interface TrayMenuTarget {
@@ -98,26 +95,11 @@ interface TrayMenuTarget {
   role?: string;
 }
 
-interface RegisteredHotkey {
-  options: inputConsumer.HotkeyOptions;
-  callback: (options: inputConsumer.HotkeyOptions) => void;
-}
-
 interface WireBoundsPayload {
   x: number;
   y: number;
   width: number;
   height: number;
-}
-
-interface WireDisplayPayload {
-  idName: string;
-  name: string;
-  bounds: WireBoundsPayload;
-  visibleBounds?: WireBoundsPayload;
-  primary: boolean;
-  scaleFactor: number;
-  refreshRate?: number;
 }
 
 interface WireWindowStatePayload {
@@ -150,6 +132,7 @@ interface PopupMenuContentParams {
 class MenuBarState {
   items: WireMenuItem[] = [];
   colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  activeIndex: number = -1;
   revision: number = 0;
 }
 
@@ -159,6 +142,7 @@ interface MenuBarContentParams {
 }
 
 interface MenuBarDropdownLease {
+  triggerIndex: number;
   menuContent: ComponentContent<PopupMenuContentParams>;
   opening: Promise<void>;
   retired: boolean;
@@ -187,6 +171,10 @@ interface PopupMenuLease {
 // HarmonyOS `statusBarManager` API limits (`@hms.pcService.statusBarManager.d.ts`).
 const STATUS_BAR_MAX_MENU_ITEMS: number = 20;
 const STATUS_BAR_MAX_HOVER_TIPS_CHARS: number = 128;
+// Distinct from menu bar (`0`) and popup menu generations (`1..TRAY_MENU_GENERATION`).
+const TRAY_MENU_GENERATION: number = 0xffffffff;
+const KEYCODE_DPAD_LEFT: number = 2014;
+const KEYCODE_DPAD_RIGHT: number = 2015;
 
 export function isDesktopDevice(deviceType: string | undefined): boolean {
   const normalized = (deviceType ?? "").trim();
@@ -282,7 +270,16 @@ struct DesktopSubmenuView {
         },
         (_group: WireMenuItem[], groupIndex: number): string => `g:${groupIndex}`,
       );
-    };
+    }.onKeyEvent((event: KeyEvent): void => {
+      if (this.generation !== 0 || event.type !== KeyType.Down) {
+        return;
+      }
+      if (event.keyCode === KEYCODE_DPAD_LEFT) {
+        this.owner?.stepMenuBarDropdown(-1);
+      } else if (event.keyCode === KEYCODE_DPAD_RIGHT) {
+        this.owner?.stepMenuBarDropdown(1);
+      }
+    });
   }
 }
 
@@ -300,20 +297,13 @@ function desktopPopupMenuBuilder(params: PopupMenuContentParams) {
 @Component
 struct DesktopMenuBarTrigger {
   owner?: NativeDesktop;
+  @ObjectLink state!: MenuBarState;
   item: WireMenuItem = { kind: "action" };
   triggerIndex: number = 0;
   @State hovered: boolean = false;
 
   private anchorId(): string {
     return `nsh-menubar-item-${this.triggerIndex}`;
-  }
-
-  private hasSubmenu(): boolean {
-    return (
-      this.item.kind === "submenu" &&
-      this.item.enabled !== false &&
-      (this.item.items?.length ?? 0) > 0
-    );
   }
 
   build() {
@@ -334,22 +324,18 @@ struct DesktopMenuBarTrigger {
     .alignItems(VerticalAlign.Center)
     .enabled(this.item.enabled !== false)
     .backgroundColor(
-      this.hovered && this.item.enabled !== false
+      (this.hovered || this.state.activeIndex === this.triggerIndex) && this.item.enabled !== false
         ? $r("sys.color.interactive_hover")
         : Color.Transparent,
     )
     .onHover((isHover: boolean): void => {
       this.hovered = isHover;
+      if (isHover && this.item.enabled !== false) {
+        this.owner?.hoverMenuBarTrigger(this.triggerIndex, this.item);
+      }
     })
     .onClick((): void => {
-      if (this.item.enabled === false) {
-        return;
-      }
-      if (this.hasSubmenu()) {
-        this.owner?.openMenuBarDropdown(this.anchorId(), this.item.items ?? []);
-      } else if (this.item.kind !== "submenu") {
-        this.owner?.selectMenuItem(0, this.item.id ?? 0, this.item.role);
-      }
+      this.owner?.clickMenuBarTrigger(this.triggerIndex, this.item);
     });
   }
 }
@@ -370,13 +356,14 @@ struct DesktopMenuBarView {
                 if (item.kind !== "separator") {
                   DesktopMenuBarTrigger({
                     owner: this.owner,
+                    state: this.state,
                     item,
                     triggerIndex: index,
                   });
                 }
               },
               (item: WireMenuItem, index: number): string =>
-                `${this.state.revision}:${this.state.colorMode}:${menuItemKey(item, index)}`,
+                `${this.state.colorMode}:${menuItemKey(item, index)}:${item.enabled !== false ? 1 : 0}:${item.items?.length ?? 0}`,
             );
           }
           .height(31)
@@ -584,6 +571,184 @@ async function displayAvailableRectPx(screen: display.Display): Promise<PixelAre
   };
 }
 
+interface WindowChromeState {
+  frameNone: boolean;
+  titleBarHidden: boolean;
+  requestedTitleBarHeight?: number;
+  maximizable: boolean;
+  minimizable: boolean;
+  closable: boolean;
+  transparent: boolean;
+  backdrop: string;
+  backgroundOverridden: boolean;
+}
+
+interface WindowStatusResult {
+  mode: string;
+  minimized: boolean;
+}
+
+function windowStatusToState(status: window.WindowStatusType, currentMode: string): WindowStatusResult {
+  if (status === window.WindowStatusType.FULL_SCREEN) {
+    return { mode: "fullScreen", minimized: false };
+  }
+  if (status === window.WindowStatusType.MAXIMIZE) {
+    return { mode: "maximized", minimized: false };
+  }
+  if (status === window.WindowStatusType.MINIMIZE) {
+    return { mode: currentMode, minimized: true };
+  }
+  return { mode: "normal", minimized: false };
+}
+
+function buildWindowLimits(
+  cmd: WireCommand,
+  scale: number,
+  defaults?: window.WindowLimits,
+): window.WindowLimits | undefined {
+  const limits: window.WindowLimits = {};
+  let hasLimits = false;
+  if (cmd.minSize !== undefined) {
+    if (cmd.minSize !== null) {
+      limits.minWidth = Math.max(1, Math.round(cmd.minSize.width * scale));
+      limits.minHeight = Math.max(1, Math.round(cmd.minSize.height * scale));
+      hasLimits = true;
+    } else if (defaults !== undefined) {
+      limits.minWidth = defaults.minWidth;
+      limits.minHeight = defaults.minHeight;
+      hasLimits = true;
+    }
+  }
+  if (cmd.maxSize !== undefined) {
+    if (cmd.maxSize !== null) {
+      limits.maxWidth = Math.max(1, Math.round(cmd.maxSize.width * scale));
+      limits.maxHeight = Math.max(1, Math.round(cmd.maxSize.height * scale));
+      hasLimits = true;
+    } else if (defaults !== undefined) {
+      limits.maxWidth = defaults.maxWidth;
+      limits.maxHeight = defaults.maxHeight;
+      hasLimits = true;
+    }
+  }
+  return hasLimits ? limits : undefined;
+}
+
+async function setWindowModeHelper(win: window.Window, mode: string): Promise<void> {
+  if (mode === "maximized") {
+    await win.maximize(window.MaximizePresentation.EXIT_IMMERSIVE);
+  } else if (mode === "fullScreen") {
+    await win.maximize(window.MaximizePresentation.ENTER_IMMERSIVE);
+  } else {
+    await win.recover();
+  }
+}
+
+async function applyWindowBoundsHelper(
+  win: window.Window,
+  fallbackUi: UIContext,
+  mode: string,
+  x?: number,
+  y?: number,
+  width?: number,
+  height?: number,
+): Promise<boolean> {
+  const props = win.getWindowProperties();
+  const rect = props.windowRect;
+  const scale = resolveScaleFactor(props.displayId, fallbackUi);
+  const moveX = x !== undefined ? Math.round(x * scale) : rect.left;
+  const moveY = y !== undefined ? Math.round(y * scale) : rect.top;
+  const sizeW = width !== undefined ? Math.max(1, Math.round(width * scale)) : rect.width;
+  const sizeH = height !== undefined ? Math.max(1, Math.round(height * scale)) : rect.height;
+  const move =
+    (x !== undefined || y !== undefined) &&
+    (Math.abs(moveX - rect.left) > 1 || Math.abs(moveY - rect.top) > 1);
+  const resize =
+    (width !== undefined || height !== undefined) &&
+    (Math.abs(sizeW - rect.width) > 1 || Math.abs(sizeH - rect.height) > 1);
+  if (mode !== "normal") {
+    try {
+      await win.recover();
+    } catch {}
+  }
+  if (move) {
+    try {
+      await win.moveWindowTo(moveX, moveY);
+    } catch {}
+  }
+  if (resize) {
+    try {
+      await win.resize(sizeW, sizeH);
+    } catch {}
+  }
+  return move;
+}
+
+function applyTitleBarAndFrameHelper(
+  win: window.Window,
+  cmd: WireCommand,
+  state: WindowChromeState,
+  applyOpaqueBackground: () => void,
+  syncTitleBar: () => void,
+  emitTitleBar: (payload: WireTitleBarPayload) => void,
+): void {
+  // Track `frameNone` and `titleBarHidden` independently (matching Rust `MainWindowState`)
+  // so toggling `frame: none -> default` preserves an explicit `titleBarStyle: hidden`.
+  if (cmd.titleBarStyle !== undefined) {
+    state.titleBarHidden = cmd.titleBarStyle === "hidden";
+  }
+  if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
+    state.requestedTitleBarHeight = cmd.titleBarHeight;
+  }
+  if (cmd.frame === "none") {
+    state.frameNone = true;
+    try {
+      win.setWindowDecorVisible(false);
+    } catch {}
+    try {
+      win.setWindowTitleButtonVisible(false, false, false);
+    } catch {}
+    emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
+    return;
+  }
+  const restoredFrame = cmd.frame === "default" && state.frameNone;
+  if (restoredFrame) {
+    state.frameNone = false;
+    if (state.backgroundOverridden && !state.transparent && state.backdrop === "none") {
+      applyOpaqueBackground();
+    }
+  }
+  if ((cmd.titleBarStyle !== undefined || restoredFrame) && !state.frameNone) {
+    try {
+      win.setWindowDecorVisible(!state.titleBarHidden);
+    } catch {}
+    if (restoredFrame) {
+      try {
+        win.setWindowTitleButtonVisible(state.maximizable, state.minimizable, state.closable);
+      } catch {}
+    }
+    if (state.titleBarHidden) {
+      try {
+        if (state.requestedTitleBarHeight !== undefined) {
+          win.setWindowDecorHeight(clampDecorHeight(state.requestedTitleBarHeight));
+        }
+      } catch {}
+      syncTitleBar();
+    } else {
+      emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
+    }
+  } else if (
+    cmd.titleBarHeight !== undefined &&
+    cmd.titleBarHeight > 0 &&
+    state.titleBarHidden &&
+    !state.frameNone
+  ) {
+    try {
+      win.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
+    } catch {}
+    syncTitleBar();
+  }
+}
+
 class SubWindowHost {
   readonly windowId: number;
   private readonly owner: NativeDesktop;
@@ -613,6 +778,7 @@ class SubWindowHost {
   private initialPosition: string = "auto";
   private parentWindowId?: number;
   private userPositioned: boolean = false;
+  private hiddenByApp: boolean = false;
   private normalBounds?: WireBoundsPayload;
   private lastStateJson: string = "";
   private lastTitleBarJson: string = "";
@@ -653,11 +819,13 @@ class SubWindowHost {
     switch (event) {
       case window.WindowEventType.WINDOW_SHOWN:
         this.visible = true;
+        this.hiddenByApp = false;
         break;
       case window.WindowEventType.WINDOW_ACTIVE:
         this.visible = true;
         this.focused = true;
         this.minimized = false;
+        this.hiddenByApp = false;
         this.hadFocus = true;
         this.flushPendingFocus();
         break;
@@ -985,7 +1153,7 @@ class SubWindowHost {
     this.frameNone = cmd.frame === "none";
     this.transparent = cmd.transparent === true;
     this.backdrop = cmd.backdrop ?? "none";
-    this.titleBarHidden = this.frameNone || cmd.titleBarStyle === "hidden";
+    this.titleBarHidden = cmd.titleBarStyle === "hidden";
     if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
       this.requestedTitleBarHeight = cmd.titleBarHeight;
     }
@@ -1193,18 +1361,9 @@ class SubWindowHost {
   }
 
   private applyWindowStatus(status: window.WindowStatusType): void {
-    if (status === window.WindowStatusType.FULL_SCREEN) {
-      this.mode = "fullScreen";
-      this.minimized = false;
-    } else if (status === window.WindowStatusType.MAXIMIZE) {
-      this.mode = "maximized";
-      this.minimized = false;
-    } else if (status === window.WindowStatusType.MINIMIZE) {
-      this.minimized = true;
-    } else {
-      this.mode = "normal";
-      this.minimized = false;
-    }
+    const next = windowStatusToState(status, this.mode);
+    this.mode = next.mode;
+    this.minimized = next.minimized;
   }
 
   private async applyAttributesInternal(cmd: WireCommand): Promise<void> {
@@ -1243,65 +1402,28 @@ class SubWindowHost {
         await sub.setWindowTitle(cmd.title);
       } catch {}
     }
-    if (cmd.frame === "none") {
-      this.frameNone = true;
-      this.titleBarHidden = true;
-      try {
-        sub.setWindowDecorVisible(false);
-      } catch {}
-      try {
-        sub.setWindowTitleButtonVisible(false, false, false);
-      } catch {}
-      this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-    } else {
-      const restoredFrame = cmd.frame === "default" && this.frameNone;
-      if (restoredFrame) {
-        this.frameNone = false;
-        if (cmd.titleBarStyle === undefined) {
-          this.titleBarHidden = false;
-        }
-        if (this.backgroundOverridden && !this.transparent && this.backdrop === "none") {
-          this.applyOpaqueBackground();
-        }
-      }
-      if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
-        const hidden =
-          cmd.titleBarStyle !== undefined ? cmd.titleBarStyle === "hidden" : this.titleBarHidden;
-        this.titleBarHidden = hidden;
-        if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
-          this.requestedTitleBarHeight = cmd.titleBarHeight;
-        }
-        try {
-          sub.setWindowDecorVisible(!hidden);
-        } catch {}
-        if (restoredFrame) {
-          try {
-            sub.setWindowTitleButtonVisible(this.maximizable, this.minimizable, this.closable);
-          } catch {}
-        }
-        if (hidden) {
-          try {
-            if (this.requestedTitleBarHeight !== undefined) {
-              sub.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
-            }
-          } catch {}
-          this.syncTitleBar();
-        } else {
-          this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-        }
-      } else if (
-        cmd.titleBarHeight !== undefined &&
-        cmd.titleBarHeight > 0 &&
-        this.titleBarHidden &&
-        !this.frameNone
-      ) {
-        this.requestedTitleBarHeight = cmd.titleBarHeight;
-        try {
-          sub.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
-        } catch {}
-        this.syncTitleBar();
-      }
-    }
+    const chromeState: WindowChromeState = {
+      frameNone: this.frameNone,
+      titleBarHidden: this.titleBarHidden,
+      requestedTitleBarHeight: this.requestedTitleBarHeight,
+      maximizable: this.maximizable,
+      minimizable: this.minimizable,
+      closable: this.closable,
+      transparent: this.transparent,
+      backdrop: this.backdrop,
+      backgroundOverridden: this.backgroundOverridden,
+    };
+    applyTitleBarAndFrameHelper(
+      sub,
+      cmd,
+      chromeState,
+      (): void => this.applyOpaqueBackground(),
+      (): void => this.syncTitleBar(),
+      (payload: WireTitleBarPayload): void => this.emitTitleBar(payload),
+    );
+    this.frameNone = chromeState.frameNone;
+    this.titleBarHidden = chromeState.titleBarHidden;
+    this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
 
     if (
       cmd.maximizable !== undefined ||
@@ -1329,31 +1451,8 @@ class SubWindowHost {
         sub.getWindowProperties().displayId,
         this.ui ?? this.owner.mainUiContext(),
       );
-      const limits: window.WindowLimits = {};
-      let hasLimits = false;
-      if (cmd.minSize !== undefined) {
-        if (cmd.minSize !== null) {
-          limits.minWidth = Math.max(1, Math.round(cmd.minSize.width * scale));
-          limits.minHeight = Math.max(1, Math.round(cmd.minSize.height * scale));
-          hasLimits = true;
-        } else if (this.defaultLimits !== undefined) {
-          limits.minWidth = this.defaultLimits.minWidth;
-          limits.minHeight = this.defaultLimits.minHeight;
-          hasLimits = true;
-        }
-      }
-      if (cmd.maxSize !== undefined) {
-        if (cmd.maxSize !== null) {
-          limits.maxWidth = Math.max(1, Math.round(cmd.maxSize.width * scale));
-          limits.maxHeight = Math.max(1, Math.round(cmd.maxSize.height * scale));
-          hasLimits = true;
-        } else if (this.defaultLimits !== undefined) {
-          limits.maxWidth = this.defaultLimits.maxWidth;
-          limits.maxHeight = this.defaultLimits.maxHeight;
-          hasLimits = true;
-        }
-      }
-      if (hasLimits) {
+      const limits = buildWindowLimits(cmd, scale, this.defaultLimits);
+      if (limits !== undefined) {
         try {
           await sub.setWindowLimits(limits);
         } catch {}
@@ -1420,20 +1519,47 @@ class SubWindowHost {
     }
     switch (cmd.action) {
       case "show":
+        this.hiddenByApp = false;
+        if (deviceInfo.sdkApiVersion >= 20) {
+          try {
+            await sub.showWindow({ focusOnShow: false });
+          } catch {
+            try {
+              await sub.showWindow();
+            } catch {}
+          }
+        } else {
+          try {
+            await sub.showWindow();
+          } catch {}
+        }
+        this.syncState();
+        break;
       case "focus":
+        this.hiddenByApp = false;
         try {
           await sub.showWindow();
         } catch {}
         this.syncState();
         break;
       case "hide":
+        this.hiddenByApp = true;
+        try {
+          // Public HarmonyOS window.Window exposes minimize() without a separate hide() API;
+          // hiddenByApp keeps hidden distinct from minimized in state reports to Rust.
+          await sub.minimize();
+        } catch {}
+        this.syncState();
+        break;
       case "minimize":
+        this.hiddenByApp = false;
         try {
           await sub.minimize();
         } catch {}
         this.syncState();
         break;
       case "restore":
+        this.hiddenByApp = false;
         try {
           await sub.restore();
         } catch {
@@ -1457,7 +1583,7 @@ class SubWindowHost {
         break;
       case "setPlacement":
         await this.applyBoundsInternal(cmd.x, cmd.y, cmd.width, cmd.height);
-        if (cmd.mode && cmd.mode !== "normal") {
+        if (cmd.mode !== undefined && (cmd.mode !== "normal" || this.mode !== "normal")) {
           await this.setModeInternal(cmd.mode);
         }
         break;
@@ -1477,13 +1603,7 @@ class SubWindowHost {
       return;
     }
     try {
-      if (mode === "maximized") {
-        await sub.maximize(window.MaximizePresentation.EXIT_IMMERSIVE);
-      } else if (mode === "fullScreen") {
-        await sub.maximize(window.MaximizePresentation.ENTER_IMMERSIVE);
-      } else {
-        await sub.recover();
-      }
+      await setWindowModeHelper(sub, mode);
       this.syncState();
     } catch {}
   }
@@ -1499,36 +1619,17 @@ class SubWindowHost {
       return;
     }
     try {
-      const props = sub.getWindowProperties();
-      const rect = props.windowRect;
-      const scale = resolveScaleFactor(props.displayId, this.ui ?? this.owner.mainUiContext());
-      const moveX = x !== undefined ? Math.round(x * scale) : rect.left;
-      const moveY = y !== undefined ? Math.round(y * scale) : rect.top;
-      const sizeW = width !== undefined ? Math.max(1, Math.round(width * scale)) : rect.width;
-      const sizeH = height !== undefined ? Math.max(1, Math.round(height * scale)) : rect.height;
-      const move =
-        (x !== undefined || y !== undefined) &&
-        (Math.abs(moveX - rect.left) > 1 || Math.abs(moveY - rect.top) > 1);
-      const resize =
-        (width !== undefined || height !== undefined) &&
-        (Math.abs(sizeW - rect.width) > 1 || Math.abs(sizeH - rect.height) > 1);
-      if (move) {
+      const moved = await applyWindowBoundsHelper(
+        sub,
+        this.ui ?? this.owner.mainUiContext(),
+        this.mode,
+        x,
+        y,
+        width,
+        height,
+      );
+      if (moved) {
         this.userPositioned = true;
-      }
-      if (this.mode !== "normal") {
-        try {
-          await sub.recover();
-        } catch {}
-      }
-      if (move) {
-        try {
-          await sub.moveWindowTo(moveX, moveY);
-        } catch {}
-      }
-      if (resize) {
-        try {
-          await sub.resize(sizeW, sizeH);
-        } catch {}
       }
       this.syncState();
     } catch {}
@@ -1704,9 +1805,9 @@ class SubWindowHost {
       }
       const state: WireWindowStatePayload = {
         mode: this.mode,
-        minimized: this.minimized,
-        visible: this.visible && !this.minimized,
-        focused: this.focused && this.visible && !this.minimized,
+        minimized: this.minimized && !this.hiddenByApp,
+        visible: this.visible && !this.minimized && !this.hiddenByApp,
+        focused: this.focused && this.visible && !this.minimized && !this.hiddenByApp,
         bounds,
         contentBounds,
         normalBounds: this.normalBounds ?? bounds,
@@ -1744,7 +1845,6 @@ export class NativeDesktop {
   private backgroundOverridden: boolean = false;
   private titleBarHidden: boolean = false;
   private requestedTitleBarHeight?: number = undefined;
-  private closeOnPress: boolean = true;
   private maximizable: boolean = true;
   private minimizable: boolean = true;
   private closable: boolean = true;
@@ -1766,6 +1866,8 @@ export class NativeDesktop {
   private menuBarNode?: BuilderNode<[MenuBarContentParams]>;
   private menuBarTargetId?: number;
   private menuBarDropdown?: MenuBarDropdownLease;
+  private activeMenuBarIndex: number = -1;
+  private switchingMenuBar: boolean = false;
   private readonly attachNativeNodeCb?: (targetId: number, content: FrameNode | null) => boolean;
   private readonly retireNativeNodeCb?: (targetId: number) => boolean;
   private trayAdded: boolean = false;
@@ -1778,7 +1880,6 @@ export class NativeDesktop {
   private trayQueue: Promise<void> = Promise.resolve();
   private trayRemoveSyncFn?: () => void;
   private trayUnsubscribeFn?: () => void;
-  private hotkeys: Map<number, RegisteredHotkey> = new Map();
 
   private readonly onTrayIconClick = (_event: emitter.EventData): void => {
     if (this.closed) {
@@ -1806,7 +1907,7 @@ export class NativeDesktop {
     }
     this.emit(
       "menu-select",
-      JSON.stringify({ generation: 0, id: target.id, role: target.role }),
+      JSON.stringify({ generation: TRAY_MENU_GENERATION, id: target.id, role: target.role }),
     );
   };
 
@@ -1849,7 +1950,7 @@ export class NativeDesktop {
   };
 
   private readonly onTitleButtonRectChange = (rect: window.TitleButtonRect): void => {
-    if (this.titleBarHidden) {
+    if (!this.frameNone && this.titleBarHidden) {
       this.reportTitleBar(rect);
     }
   };
@@ -1861,12 +1962,6 @@ export class NativeDesktop {
       return Promise.resolve(true);
     }
     return Promise.resolve(false);
-  };
-
-  private readonly onDisplayChange = (_id: number): void => {
-    this.syncDisplays();
-    this.syncWindowState();
-    this.onDisplayMetricsChanged?.();
   };
 
   constructor(
@@ -1905,7 +2000,6 @@ export class NativeDesktop {
       this.defaultLimits = mainWindow.getWindowLimits();
     } catch {}
     this.subscribe();
-    this.syncDisplays();
     this.syncWindowState();
   }
 
@@ -2079,12 +2173,6 @@ export class NativeDesktop {
       case "removeTray":
         this.enqueueRemoveTray();
         break;
-      case "registerGlobalShortcut":
-        this.registerGlobalShortcut(cmd.id ?? 0, cmd.preKeys ?? [], cmd.finalKey ?? 0);
-        break;
-      case "unregisterGlobalShortcut":
-        this.unregisterGlobalShortcut(cmd.id ?? 0);
-        break;
       case "startMoving":
         if (cmd.windowId !== undefined) {
           this.subWindows.get(cmd.windowId)?.startMoving();
@@ -2111,7 +2199,6 @@ export class NativeDesktop {
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
-        this.unregisterAllGlobalShortcuts();
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "restart":
@@ -2119,7 +2206,6 @@ export class NativeDesktop {
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
-        this.unregisterAllGlobalShortcuts();
         try {
           const bundleName = this.abilityContext.abilityInfo?.bundleName ?? "";
           const abilityName = this.abilityContext.abilityInfo?.name ?? "EntryAbility";
@@ -2162,16 +2248,70 @@ export class NativeDesktop {
       return;
     }
     if (generation === 0) {
-      this.closeMenuBarDropdown();
+      this.closeMenuBarDropdown(false);
       this.emit("menu-select", JSON.stringify({ generation: 0, id, role }));
       return;
     }
     this.selectPopupMenuItem(generation, id, role);
   }
 
-  openMenuBarDropdown(anchorId: string, items: WireMenuItem[]): void {
-    this.closeMenuBarDropdown();
+  clickMenuBarTrigger(triggerIndex: number, item: WireMenuItem): void {
+    if (this.closed || item.enabled === false) {
+      return;
+    }
+    if (item.kind === "submenu" && (item.items?.length ?? 0) > 0) {
+      if (this.activeMenuBarIndex === triggerIndex && this.menuBarDropdown !== undefined) {
+        this.closeMenuBarDropdown(true);
+        return;
+      }
+      this.openMenuBarDropdown(triggerIndex, `nsh-menubar-item-${triggerIndex}`, item.items ?? []);
+    } else if (item.kind !== "submenu") {
+      this.selectMenuItem(0, item.id ?? 0, item.role);
+    }
+  }
+
+  hoverMenuBarTrigger(triggerIndex: number, item: WireMenuItem): void {
+    if (
+      this.closed ||
+      this.activeMenuBarIndex < 0 ||
+      this.activeMenuBarIndex === triggerIndex ||
+      item.enabled === false ||
+      item.kind !== "submenu" ||
+      (item.items?.length ?? 0) === 0
+    ) {
+      return;
+    }
+    this.openMenuBarDropdown(triggerIndex, `nsh-menubar-item-${triggerIndex}`, item.items ?? []);
+  }
+
+  stepMenuBarDropdown(delta: number): void {
+    if (this.closed || this.activeMenuBarIndex < 0) {
+      return;
+    }
+    const items = this.menuBarState.items;
+    const count = items.length;
+    if (count === 0) {
+      return;
+    }
+    for (let step = 1; step <= count; step++) {
+      const idx = (this.activeMenuBarIndex + delta * step + count * step) % count;
+      const candidate = items[idx];
+      if (
+        candidate.kind === "submenu" &&
+        candidate.enabled !== false &&
+        (candidate.items?.length ?? 0) > 0
+      ) {
+        if (idx !== this.activeMenuBarIndex) {
+          this.openMenuBarDropdown(idx, `nsh-menubar-item-${idx}`, candidate.items ?? []);
+        }
+        return;
+      }
+    }
+  }
+
+  openMenuBarDropdown(triggerIndex: number, anchorId: string, items: WireMenuItem[]): void {
     if (this.closed || items.length === 0) {
+      this.closeMenuBarDropdown(false);
       return;
     }
     let anchorUniqueId = 0;
@@ -2184,6 +2324,9 @@ export class NativeDesktop {
     } catch {
       return;
     }
+    this.switchingMenuBar = this.menuBarDropdown !== undefined;
+    this.closeMenuBarDropdown(false);
+    this.switchingMenuBar = false;
     const menuContent = new ComponentContent<PopupMenuContentParams>(
       this.ui,
       wrapBuilder(desktopPopupMenuBuilder),
@@ -2196,12 +2339,15 @@ export class NativeDesktop {
       { nestingBuilderSupported: true },
     );
     const lease: MenuBarDropdownLease = {
+      triggerIndex,
       menuContent,
       opening: Promise.resolve(),
       retired: false,
       disappeared: false,
     };
     this.menuBarDropdown = lease;
+    this.activeMenuBarIndex = triggerIndex;
+    this.menuBarState.activeIndex = triggerIndex;
     const options: MenuOptions = {
       placement: Placement.BottomLeft,
       showInSubWindow: true,
@@ -2209,7 +2355,11 @@ export class NativeDesktop {
       backgroundBlurStyleOptions: { colorMode: this.colorMode },
       onDisappear: (): void => {
         lease.disappeared = true;
+        const wasActive = this.menuBarDropdown === lease;
         this.retireMenuBarDropdown(lease);
+        if (wasActive && !this.switchingMenuBar && !this.closed) {
+          this.emit("menu-bar-dismiss", "{}");
+        }
       },
     };
     lease.opening = this.ui
@@ -2218,22 +2368,33 @@ export class NativeDesktop {
     lease.opening.catch((error: Error): void => {
       lease.disappeared = true;
       console.error(`[NSH] desktop menu bar dropdown failed: ${String(error)}`);
+      const wasActive = this.menuBarDropdown === lease;
       this.retireMenuBarDropdown(lease);
+      if (wasActive && !this.switchingMenuBar && !this.closed) {
+        this.emit("menu-bar-dismiss", "{}");
+      }
     });
   }
 
-  private closeMenuBarDropdown(): void {
+  private closeMenuBarDropdown(notifyDismiss: boolean): void {
     const lease = this.menuBarDropdown;
     if (lease === undefined) {
       return;
     }
     this.menuBarDropdown = undefined;
+    this.activeMenuBarIndex = -1;
+    this.menuBarState.activeIndex = -1;
     this.retireMenuBarDropdown(lease);
+    if (notifyDismiss && !this.closed) {
+      this.emit("menu-bar-dismiss", "{}");
+    }
   }
 
   private retireMenuBarDropdown(lease: MenuBarDropdownLease): void {
     if (this.menuBarDropdown === lease) {
       this.menuBarDropdown = undefined;
+      this.activeMenuBarIndex = -1;
+      this.menuBarState.activeIndex = -1;
     }
     if (lease.retired) {
       return;
@@ -2289,7 +2450,6 @@ export class NativeDesktop {
     void this.popupMenus.settled();
     this.closeAllSubWindows();
     this.removeTraySync();
-    this.unregisterAllGlobalShortcuts();
     try {
       this.mainWindow.off("windowRectChange", this.onWindowRectChange);
     } catch {}
@@ -2304,11 +2464,6 @@ export class NativeDesktop {
     } catch {}
     try {
       this.mainWindow.off("windowWillClose", this.onWindowWillClose);
-    } catch {}
-    try {
-      display.off("add", this.onDisplayChange);
-      display.off("remove", this.onDisplayChange);
-      display.off("change", this.onDisplayChange);
     } catch {}
   }
 
@@ -2328,26 +2483,12 @@ export class NativeDesktop {
     try {
       this.mainWindow.on("windowWillClose", this.onWindowWillClose);
     } catch {}
-    try {
-      display.on("add", this.onDisplayChange);
-      display.on("remove", this.onDisplayChange);
-      display.on("change", this.onDisplayChange);
-    } catch {}
   }
 
   private applyWindowStatus(status: window.WindowStatusType): void {
-    if (status === window.WindowStatusType.FULL_SCREEN) {
-      this.mode = "fullScreen";
-      this.minimized = false;
-    } else if (status === window.WindowStatusType.MAXIMIZE) {
-      this.mode = "maximized";
-      this.minimized = false;
-    } else if (status === window.WindowStatusType.MINIMIZE) {
-      this.minimized = true;
-    } else {
-      this.mode = "normal";
-      this.minimized = false;
-    }
+    const next = windowStatusToState(status, this.mode);
+    this.mode = next.mode;
+    this.minimized = next.minimized;
   }
 
   private applyAttributes(cmd: WireCommand): void {
@@ -2378,72 +2519,28 @@ export class NativeDesktop {
         this.applyOpaqueBackground();
       }
     }
-    if (cmd.closeOnPress !== undefined) {
-      this.closeOnPress = cmd.closeOnPress;
-    }
-    if (cmd.frame === "none") {
-      this.frameNone = true;
-      this.titleBarHidden = true;
-      try {
-        this.mainWindow.setWindowDecorVisible(false);
-      } catch {}
-      try {
-        this.mainWindow.setWindowTitleButtonVisible(false, false, false);
-      } catch {}
-      this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-    } else {
-      const restoredFrame = cmd.frame === "default" && this.frameNone;
-      if (restoredFrame) {
-        this.frameNone = false;
-        if (cmd.titleBarStyle === undefined) {
-          this.titleBarHidden = false;
-        }
-        if (this.backgroundOverridden && !this.transparent && this.backdrop === "none") {
-          this.applyOpaqueBackground();
-        }
-      }
-      if ((cmd.titleBarStyle !== undefined || restoredFrame) && !this.frameNone) {
-        const hidden =
-          cmd.titleBarStyle !== undefined ? cmd.titleBarStyle === "hidden" : this.titleBarHidden;
-        this.titleBarHidden = hidden;
-        if (cmd.titleBarHeight !== undefined && cmd.titleBarHeight > 0) {
-          this.requestedTitleBarHeight = cmd.titleBarHeight;
-        }
-        try {
-          this.mainWindow.setWindowDecorVisible(!hidden);
-        } catch {}
-        if (restoredFrame) {
-          try {
-            this.mainWindow.setWindowTitleButtonVisible(
-              this.maximizable,
-              this.minimizable,
-              this.closable,
-            );
-          } catch {}
-        }
-        if (hidden) {
-          try {
-            if (this.requestedTitleBarHeight !== undefined) {
-              this.mainWindow.setWindowDecorHeight(clampDecorHeight(this.requestedTitleBarHeight));
-            }
-          } catch {}
-          this.syncTitleBar();
-        } else {
-          this.emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-        }
-      } else if (
-        cmd.titleBarHeight !== undefined &&
-        cmd.titleBarHeight > 0 &&
-        this.titleBarHidden &&
-        !this.frameNone
-      ) {
-        this.requestedTitleBarHeight = cmd.titleBarHeight;
-        try {
-          this.mainWindow.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
-        } catch {}
-        this.syncTitleBar();
-      }
-    }
+    const chromeState: WindowChromeState = {
+      frameNone: this.frameNone,
+      titleBarHidden: this.titleBarHidden,
+      requestedTitleBarHeight: this.requestedTitleBarHeight,
+      maximizable: this.maximizable,
+      minimizable: this.minimizable,
+      closable: this.closable,
+      transparent: this.transparent,
+      backdrop: this.backdrop,
+      backgroundOverridden: this.backgroundOverridden,
+    };
+    applyTitleBarAndFrameHelper(
+      this.mainWindow,
+      cmd,
+      chromeState,
+      (): void => this.applyOpaqueBackground(),
+      (): void => this.syncTitleBar(),
+      (payload: WireTitleBarPayload): void => this.emitTitleBar(payload),
+    );
+    this.frameNone = chromeState.frameNone;
+    this.titleBarHidden = chromeState.titleBarHidden;
+    this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
 
     if (
       cmd.maximizable !== undefined ||
@@ -2471,31 +2568,12 @@ export class NativeDesktop {
     }
 
     if (cmd.minSize !== undefined || cmd.maxSize !== undefined) {
-      const limits: window.WindowLimits = {};
-      let hasLimits = false;
-      if (cmd.minSize !== undefined) {
-        if (cmd.minSize !== null) {
-          limits.minWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.width)));
-          limits.minHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.minSize.height)));
-          hasLimits = true;
-        } else if (this.defaultLimits !== undefined) {
-          limits.minWidth = this.defaultLimits.minWidth;
-          limits.minHeight = this.defaultLimits.minHeight;
-          hasLimits = true;
-        }
-      }
-      if (cmd.maxSize !== undefined) {
-        if (cmd.maxSize !== null) {
-          limits.maxWidth = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.width)));
-          limits.maxHeight = Math.max(1, Math.round(this.ui.vp2px(cmd.maxSize.height)));
-          hasLimits = true;
-        } else if (this.defaultLimits !== undefined) {
-          limits.maxWidth = this.defaultLimits.maxWidth;
-          limits.maxHeight = this.defaultLimits.maxHeight;
-          hasLimits = true;
-        }
-      }
-      if (hasLimits) {
+      const scale = resolveScaleFactor(
+        this.mainWindow.getWindowProperties().displayId,
+        this.ui,
+      );
+      const limits = buildWindowLimits(cmd, scale, this.defaultLimits);
+      if (limits !== undefined) {
         try {
           this.mainWindow.setWindowLimits(limits).catch((): void => {});
         } catch {}
@@ -2609,7 +2687,6 @@ export class NativeDesktop {
         this.closePopupMenuOnly();
         this.closeAllSubWindows();
         this.removeTraySync();
-        this.unregisterAllGlobalShortcuts();
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "setMode":
@@ -2625,7 +2702,7 @@ export class NativeDesktop {
       case "setPlacement":
         this.enqueueMain(async (): Promise<void> => {
           await this.applyBoundsAsync(cmd.x, cmd.y, cmd.width, cmd.height);
-          if (cmd.mode && cmd.mode !== "normal") {
+          if (cmd.mode !== undefined && (cmd.mode !== "normal" || this.mode !== "normal")) {
             await this.setModeAsync(cmd.mode);
           }
         });
@@ -2644,13 +2721,7 @@ export class NativeDesktop {
 
   private async setModeAsync(mode: string): Promise<void> {
     try {
-      if (mode === "maximized") {
-        await this.mainWindow.maximize(window.MaximizePresentation.EXIT_IMMERSIVE);
-      } else if (mode === "fullScreen") {
-        await this.mainWindow.maximize(window.MaximizePresentation.ENTER_IMMERSIVE);
-      } else {
-        await this.mainWindow.recover();
-      }
+      await setWindowModeHelper(this.mainWindow, mode);
       this.syncWindowState();
     } catch {}
   }
@@ -2670,34 +2741,15 @@ export class NativeDesktop {
     height?: number,
   ): Promise<void> {
     try {
-      const props = this.mainWindow.getWindowProperties();
-      const rect = props.windowRect;
-      const scale = resolveScaleFactor(props.displayId, this.ui);
-      const moveX = x !== undefined ? Math.round(x * scale) : rect.left;
-      const moveY = y !== undefined ? Math.round(y * scale) : rect.top;
-      const sizeW = width !== undefined ? Math.max(1, Math.round(width * scale)) : rect.width;
-      const sizeH = height !== undefined ? Math.max(1, Math.round(height * scale)) : rect.height;
-      const move =
-        (x !== undefined || y !== undefined) &&
-        (Math.abs(moveX - rect.left) > 1 || Math.abs(moveY - rect.top) > 1);
-      const resize =
-        (width !== undefined || height !== undefined) &&
-        (Math.abs(sizeW - rect.width) > 1 || Math.abs(sizeH - rect.height) > 1);
-      if (this.mode !== "normal") {
-        try {
-          await this.mainWindow.recover();
-        } catch {}
-      }
-      if (move) {
-        try {
-          await this.mainWindow.moveWindowTo(moveX, moveY);
-        } catch {}
-      }
-      if (resize) {
-        try {
-          await this.mainWindow.resize(sizeW, sizeH);
-        } catch {}
-      }
+      await applyWindowBoundsHelper(
+        this.mainWindow,
+        this.ui,
+        this.mode,
+        x,
+        y,
+        width,
+        height,
+      );
       this.syncWindowState();
     } catch {}
   }
@@ -2834,7 +2886,7 @@ export class NativeDesktop {
   }
 
   private syncTitleBar(): void {
-    if (!this.titleBarHidden) {
+    if (this.frameNone || !this.titleBarHidden) {
       return;
     }
     try {
@@ -2940,94 +2992,43 @@ export class NativeDesktop {
     } catch {}
   }
 
-  private syncDisplays(): void {
-    if (this.closed) {
-      return;
-    }
-    const buildPayload = async (screens: display.Display[]): Promise<void> => {
-      const out: WireDisplayPayload[] = [];
-      let defaultId = 0;
-      try {
-        defaultId = display.getDefaultDisplaySync().id;
-      } catch {}
-      let hasDefault = false;
-      for (let i = 0; i < screens.length; i++) {
-        if (screens[i].id === defaultId) {
-          hasDefault = true;
-          break;
-        }
-      }
-      for (let i = 0; i < screens.length; i++) {
-        const screen = screens[i];
-        const scale =
-          screen.densityPixels > 0 ? Math.round(screen.densityPixels * 10000) / 10000 : 1.0;
-        const x = (screen.x ?? 0) / scale;
-        const y = (screen.y ?? 0) / scale;
-        const bounds: WireBoundsPayload = {
-          x,
-          y,
-          width: screen.width / scale,
-          height: screen.height / scale,
-        };
-        let visibleBounds: WireBoundsPayload = bounds;
-        try {
-          const area = await screen.getAvailableArea();
-          if (area.width > 0 && area.height > 0) {
-            visibleBounds = {
-              x: x + area.left / scale,
-              y: y + area.top / scale,
-              width: area.width / scale,
-              height: area.height / scale,
-            };
-          }
-        } catch {}
-        const rawName = (screen.name ?? "").trim();
-        const displayLabel =
-          rawName.length > 0 && rawName.toUpperCase() !== "UNKNOWN"
-            ? rawName
-            : screen.id === defaultId
-              ? "Built-in Display"
-              : `Display ${i + 1}`;
-        out.push({
-          idName: `display-${screen.id}`,
-          name: displayLabel,
-          bounds,
-          visibleBounds,
-          primary: hasDefault ? screen.id === defaultId : i === 0,
-          scaleFactor: scale,
-          refreshRate: screen.refreshRate > 0 ? screen.refreshRate : undefined,
-        });
-      }
-      if (!this.closed && out.length > 0) {
-        this.emit("displays", JSON.stringify(out));
-      }
-    };
-    display
-      .getAllDisplays()
-      .then((screens: display.Display[]): Promise<void> => buildPayload(screens))
-      .catch((): void => {
-        try {
-          const screen = display.getDefaultDisplaySync();
-          void buildPayload([screen]);
-        } catch {}
-      });
-  }
-
-  private openMenuBarByIndex(index: number): void {
+  private openMenuBarByIndex(index: number): boolean {
     if (this.closed || index < 0 || index >= this.menuBarState.items.length) {
-      return;
+      return true;
     }
     const item = this.menuBarState.items[index];
     if (item.kind === "separator" || item.enabled === false) {
-      return;
+      return true;
     }
     if (item.kind === "submenu") {
-      if ((item.items?.length ?? 0) > 0) {
-        this.openMenuBarDropdown(`nsh-menubar-item-${index}`, item.items ?? []);
+      if ((item.items?.length ?? 0) === 0) {
+        return true;
       }
-    } else {
-      this.selectMenuItem(0, item.id ?? 0, item.role);
+      const anchorId = `nsh-menubar-item-${index}`;
+      try {
+        if (this.ui.getFrameNodeById(anchorId) === null) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      this.openMenuBarDropdown(index, anchorId, item.items ?? []);
+      return true;
     }
+    this.selectMenuItem(0, item.id ?? 0, item.role);
+    return true;
+  }
+
+  private openMenuBarWhenReady(index: number, revision: number, retries: number): void {
+    if (this.closed || this.menuBarState.revision !== revision) {
+      return;
+    }
+    if (this.openMenuBarByIndex(index) || retries <= 0) {
+      return;
+    }
+    setTimeout((): void => {
+      this.openMenuBarWhenReady(index, revision, retries - 1);
+    }, 16);
   }
 
   private updateMenuBar(
@@ -3040,7 +3041,7 @@ export class NativeDesktop {
       if (targetId === undefined) {
         this.removeMenuBar();
       } else {
-        this.closeMenuBarDropdown();
+        this.closeMenuBarDropdown(false);
         this.menuBarState.items = [];
         this.menuBarState.revision++;
       }
@@ -3053,12 +3054,7 @@ export class NativeDesktop {
       if (openIndex === undefined) {
         return;
       }
-      const revision = this.menuBarState.revision;
-      setTimeout((): void => {
-        if (!this.closed && this.menuBarState.revision === revision) {
-          this.openMenuBarByIndex(openIndex);
-        }
-      }, 0);
+      this.openMenuBarWhenReady(openIndex, this.menuBarState.revision, 3);
     };
     if (this.menuBarNode !== undefined && this.menuBarTargetId === targetId) {
       scheduleOpen();
@@ -3098,7 +3094,7 @@ export class NativeDesktop {
   }
 
   private removeMenuBar(): void {
-    this.closeMenuBarDropdown();
+    this.closeMenuBarDropdown(false);
     const node = this.menuBarNode;
     const targetId = this.menuBarTargetId;
     this.menuBarNode = undefined;
@@ -3279,60 +3275,6 @@ export class NativeDesktop {
         removeAnchor();
       },
     );
-  }
-
-  private registerGlobalShortcut(id: number, preKeys: number[], finalKey: number): void {
-    if (id === 0) {
-      return;
-    }
-    this.unregisterGlobalShortcut(id);
-    if (
-      preKeys.length === 0 ||
-      finalKey === 0 ||
-      !canIUse("SystemCapability.MultimodalInput.Input.InputConsumer")
-    ) {
-      this.emit("global-shortcut-registered", JSON.stringify({ id, registered: false }));
-      return;
-    }
-    const options: inputConsumer.HotkeyOptions = {
-      preKeys,
-      finalKey,
-      isRepeat: false,
-    };
-    const callback = (_event: inputConsumer.HotkeyOptions): void => {
-      if (!this.closed) {
-        this.emit("global-shortcut-trigger", JSON.stringify({ id }));
-      }
-    };
-    try {
-      inputConsumer.on("hotkeyChange", options, callback);
-      this.hotkeys.set(id, { options, callback });
-      this.emit("global-shortcut-registered", JSON.stringify({ id, registered: true }));
-    } catch (error) {
-      console.warn(`[NSH] global shortcut registration failed (id=${id}): ${String(error)}`);
-      this.emit("global-shortcut-registered", JSON.stringify({ id, registered: false }));
-    }
-  }
-
-  private unregisterGlobalShortcut(id: number): void {
-    const entry = this.hotkeys.get(id);
-    if (entry === undefined) {
-      return;
-    }
-    this.hotkeys.delete(id);
-    try {
-      inputConsumer.off("hotkeyChange", entry.options, entry.callback);
-    } catch {}
-  }
-
-  private unregisterAllGlobalShortcuts(): void {
-    const entries = Array.from(this.hotkeys.values());
-    this.hotkeys.clear();
-    for (let i = 0; i < entries.length; i++) {
-      try {
-        inputConsumer.off("hotkeyChange", entries[i].options, entries[i].callback);
-      } catch {}
-    }
   }
 
   private enqueueSetTray(cmd: WireCommand): void {

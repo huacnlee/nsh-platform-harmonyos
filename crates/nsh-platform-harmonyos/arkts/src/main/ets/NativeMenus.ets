@@ -8,21 +8,36 @@ interface FailedMenuRetirement {
   owner: ESObject;
   close: () => Promise<void>;
   dispose: () => void;
+  attempts: number;
 }
 
-// A failed platform close retains its ComponentContent owner and retries on later settlements.
-const failedOwners: Map<ESObject, FailedMenuRetirement> = new Map();
+const MAX_MENU_RETIRE_ATTEMPTS = 3;
+
 export class NativeMenuCleanup {
   private pending: Set<Promise<void>> = new Set();
+  // Instance-scoped retry map with bounded attempts so failed menu closes never leak across sessions.
+  private failedOwners: Map<ESObject, FailedMenuRetirement> = new Map();
+  private disposed: boolean = false;
+
   private retryFailed(): void {
-    failedOwners.forEach((entry: FailedMenuRetirement, owner: ESObject): void => {
-      failedOwners.delete(owner);
+    if (this.disposed) {
+      return;
+    }
+    this.failedOwners.forEach((entry: FailedMenuRetirement, owner: ESObject): void => {
+      this.failedOwners.delete(owner);
       const retryOp = (async (): Promise<void> => {
         try {
           await entry.close();
           entry.dispose();
         } catch (error) {
-          failedOwners.set(owner, entry);
+          entry.attempts += 1;
+          if (!this.disposed && entry.attempts < MAX_MENU_RETIRE_ATTEMPTS) {
+            this.failedOwners.set(owner, entry);
+          } else {
+            try {
+              entry.dispose();
+            } catch {}
+          }
           console.error(`[NSH] menu retirement retry failed: ${String(error)}`);
         }
       })();
@@ -44,9 +59,15 @@ export class NativeMenuCleanup {
         await opening.catch((): void => {});
         await close();
         dispose();
-        failedOwners.delete(owner);
+        this.failedOwners.delete(owner);
       } catch (error) {
-        failedOwners.set(owner, { owner, close, dispose });
+        if (!this.disposed) {
+          this.failedOwners.set(owner, { owner, close, dispose, attempts: 1 });
+        } else {
+          try {
+            dispose();
+          } catch {}
+        }
         console.error(`[NSH] menu retirement failed: ${String(error)}`);
       }
     })();
@@ -54,6 +75,15 @@ export class NativeMenuCleanup {
     operation.finally((): void => {
       this.pending.delete(operation);
     });
+  }
+  dispose(): void {
+    this.disposed = true;
+    this.failedOwners.forEach((entry: FailedMenuRetirement): void => {
+      try {
+        entry.dispose();
+      } catch {}
+    });
+    this.failedOwners.clear();
   }
   async settled(): Promise<void> {
     this.retryFailed();

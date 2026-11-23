@@ -25,8 +25,7 @@ impl Node {
             .as_ref()?
             .0
             .downcast_ref::<NativeText>()?
-            .selection
-            .as_ref()?;
+            .selection_layout(&self.fonts)?;
         Some(f(layout))
     }
     pub(crate) fn selectable(&self) -> bool {
@@ -37,7 +36,7 @@ impl Node {
         else {
             return false;
         };
-        if text.selection.is_none() {
+        if !text.can_select() {
             return false;
         }
         if text.selectable || self.interaction.selectable_view() {
@@ -328,17 +327,20 @@ impl Node {
             x: anchor.0.clamp(-16384.0, 16384.0) as f64,
             y: anchor.1.clamp(-16384.0, 16384.0) as f64,
             items: {
-                let mut items = vec![ViewAction {
-                    kind: "action".into(),
-                    name: "copy".into(),
-                    label: "Copy".into(),
-                }];
-                items.push(ViewAction {
-                    kind: "action".into(),
-                    name: "select-all".into(),
-                    label: "Select All".into(),
-                });
-                items
+                let (copy_label, select_all_label) =
+                    localized_selection_labels(self.platform.get().locale.as_str());
+                vec![
+                    ViewAction {
+                        kind: "action".into(),
+                        name: "copy".into(),
+                        label: copy_label.into(),
+                    },
+                    ViewAction {
+                        kind: "action".into(),
+                        name: "select-all".into(),
+                        label: select_all_label.into(),
+                    },
+                ]
             },
         })
     }
@@ -465,5 +467,22 @@ impl Node {
             }
         }
         canvas.detach_brush();
+    }
+}
+
+fn localized_selection_labels(locale: &str) -> (&'static str, &'static str) {
+    let lang = locale
+        .split(['-', '_'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match lang.as_str() {
+        "zh" => ("复制", "全选"),
+        "ja" => ("コピー", "すべて選択"),
+        "ko" => ("복사", "전체 선택"),
+        "es" => ("Copiar", "Seleccionar todo"),
+        "fr" => ("Copier", "Tout sélectionner"),
+        "de" => ("Kopieren", "Alles auswählen"),
+        _ => ("Copy", "Select All"),
     }
 }

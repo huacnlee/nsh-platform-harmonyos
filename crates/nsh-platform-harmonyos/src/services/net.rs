@@ -184,6 +184,23 @@ struct Task {
     body: Option<Sender<Option<Vec<u8>>>>,
 }
 
+impl Task {
+    fn cancel_inner(&mut self) {
+        self.control.state.lock().expect("control").cancelled = true;
+        self.control.changed.notify_all();
+        // Wakes a body reader waiting for its next chunk.
+        if let Some(body) = self.body.take() {
+            let _ = body.send(None);
+        }
+    }
+}
+
+impl Drop for Task {
+    fn drop(&mut self) {
+        self.cancel_inner();
+    }
+}
+
 impl FetchTask for Task {
     fn send(&mut self, chunk: Vec<u8>) {
         if let Some(body) = &self.body {
@@ -202,13 +219,8 @@ impl FetchTask for Task {
         self.control.changed.notify_all();
     }
 
-    fn cancel(self: Box<Self>) {
-        self.control.state.lock().expect("control").cancelled = true;
-        self.control.changed.notify_all();
-        // Wakes a body reader waiting for its next chunk.
-        if let Some(body) = &self.body {
-            let _ = body.send(None);
-        }
+    fn cancel(mut self: Box<Self>) {
+        self.cancel_inner();
     }
 }
 

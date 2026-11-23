@@ -171,6 +171,7 @@ pub(crate) struct Mounter {
     deferred: Vec<MountItem>,
     uncreated_scroll_content: rustc_hash::FxHashMap<NodeId, Size>,
     dialogs: crate::services::dialogs::Dialogs,
+    audio: crate::services::audio::Audio,
     desktop: crate::services::desktop::DesktopState,
     offscreen_renders: crate::render::canvas_render::OffscreenRenders,
     surface_size: std::cell::Cell<Size>,
@@ -733,8 +734,8 @@ impl Mounter {
         command: nsh_core::desktop::DesktopCommand,
     ) -> Result<()> {
         use crate::services::desktop::{
-            WireCommand, build_tray_icon, global_shortcut_registered_payload, ohos_hotkey,
-            serialize_menu_items, tray_title_text, wire_request,
+            WireCommand, build_tray_icon, global_shortcut_registered_payload, serialize_menu_items,
+            tray_title_text, wire_request,
         };
         use nsh_core::desktop::DesktopCommand;
         if id != nsh_core::ROOT_ID {
@@ -753,6 +754,7 @@ impl Mounter {
                             {
                                 modal.close(false)?;
                             }
+                            self.host.desktop_command(&wire_request(&request))?;
                         } else {
                             self.host.desktop_command(&wire_request(&request))?;
                         }
@@ -763,7 +765,7 @@ impl Mounter {
                         let inset = self.desktop.menu_bar_inset.get();
                         let pos = at
                             .map(|p| (p.x.0, p.y.0 + inset))
-                            .or_else(|| self.touches.borrow().last_pointer());
+                            .or_else(|| self.touches.borrow().last_pointer_for(nsh_core::ROOT_ID));
                         self.host.desktop_command(&WireCommand::PopupMenu {
                             window_id: None,
                             generation,
@@ -782,7 +784,7 @@ impl Mounter {
                     let wire_items = serialize_menu_items(&items, &self.desktop.labels);
                     let pos = at
                         .map(|p| (p.x.0, p.y.0))
-                        .or_else(|| self.touches.borrow().last_pointer());
+                        .or_else(|| self.touches.borrow().last_pointer_for(id));
                     self.host.desktop_command(&WireCommand::PopupMenu {
                         window_id: Some(id),
                         generation,
@@ -861,7 +863,11 @@ impl Mounter {
                 self.sync_menu_bar()?;
             }
             DesktopCommand::SetMenuLabels(labels) => {
-                self.desktop.labels = *labels;
+                let labels = *labels;
+                self.desktop.labels = labels.clone();
+                if let Some(route) = self.dispatcher.upgrade() {
+                    route.keyboard.lock().unwrap().menu_labels = labels;
+                }
                 if self.desktop.menu.is_some() {
                     self.sync_menu_bar()?;
                 }
@@ -871,7 +877,7 @@ impl Mounter {
                 let wire_items = serialize_menu_items(&items, &self.desktop.labels);
                 let pos = at
                     .map(|p| (p.x.0, p.y.0 + self.desktop.menu_bar_inset.get()))
-                    .or_else(|| self.touches.borrow().last_pointer());
+                    .or_else(|| self.touches.borrow().last_pointer_for(nsh_core::ROOT_ID));
                 self.host.desktop_command(&WireCommand::PopupMenu {
                     window_id: None,
                     generation,
@@ -895,22 +901,15 @@ impl Mounter {
                 self.host.desktop_command(&WireCommand::RemoveTray)?;
             }
             DesktopCommand::RegisterGlobalShortcut { id, shortcut } => {
-                if let Some((pre_keys, final_key)) = ohos_hotkey(shortcut) {
-                    self.host
-                        .desktop_command(&WireCommand::RegisterGlobalShortcut {
-                            id,
-                            pre_keys,
-                            final_key,
-                        })?;
-                } else {
-                    let (kind, payload) = global_shortcut_registered_payload(id, false);
-                    self.control
-                        .dispatch_event(nsh_core::ROOT_ID, kind, payload);
-                }
+                let registered =
+                    self.desktop
+                        .register_global_shortcut(id, shortcut, self.dispatcher.clone());
+                let (kind, payload) = global_shortcut_registered_payload(id, registered);
+                self.control
+                    .dispatch_event(nsh_core::ROOT_ID, kind, payload);
             }
             DesktopCommand::UnregisterGlobalShortcut(id) => {
-                self.host
-                    .desktop_command(&WireCommand::UnregisterGlobalShortcut { id })?;
+                self.desktop.unregister_global_shortcut(id);
             }
             DesktopCommand::OpenWindow(_)
             | DesktopCommand::SetQuitMode(_)
@@ -939,6 +938,12 @@ impl Mounter {
         if let Some(parent) = self.mount.parent.upgrade() {
             let idx = parent.borrow().children().len();
             parent.borrow_mut().insert_child(host.clone(), idx)?;
+            let _ = parent
+                .borrow()
+                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure);
+            let _ = parent
+                .borrow()
+                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout);
         }
         let target_id = attachment.id();
         self.desktop.menu_bar_host = Some((host, attachment));
@@ -1051,9 +1056,11 @@ impl Mounter {
             self.desktop.menu_bar_alt_shown,
         );
         drop(main);
+        let available = self.menu_bar_available();
         if let Some(route) = self.dispatcher.upgrade() {
             let mut keyboard = route.keyboard.lock().unwrap();
             keyboard.menu_bar_mode = self.desktop.menu_bar_mode;
+            keyboard.menu_bar_available = available;
             keyboard.menu_bar_revealed =
                 visible && self.desktop.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide;
         }
@@ -1162,7 +1169,10 @@ impl Mounter {
                 id,
                 role,
             } => {
-                if generation != 0 && generation == self.desktop.popup_generation {
+                if generation != 0
+                    && generation != crate::services::desktop::TRAY_MENU_GENERATION
+                    && generation == self.desktop.popup_generation
+                {
                     self.desktop.popup_open = false;
                 } else if generation == 0
                     && self.desktop.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
@@ -1172,6 +1182,22 @@ impl Mounter {
                     self.sync_menu_bar()?;
                 }
                 self.desktop_menu_action(id, role)?;
+            }
+            DesktopEvent::MenuBarDismissed => {
+                if self.desktop.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                    && self.desktop.menu_bar_alt_shown
+                {
+                    self.desktop.menu_bar_alt_shown = false;
+                    self.sync_menu_bar()?;
+                }
+            }
+            DesktopEvent::Reopen => {
+                let target = self.desktop.hosted_main_window.unwrap_or(nsh_core::ROOT_ID);
+                self.control.dispatch_event(
+                    target,
+                    EventKind::Window,
+                    EventPayload::Window(Box::new(WindowEvent::Reopen)),
+                );
             }
             DesktopEvent::MenuClose { generation } => {
                 if generation == self.desktop.popup_generation {
@@ -1267,6 +1293,7 @@ impl Mounter {
                     self.request_desktop_focus_for(parent_id);
                 }
             }
+            // Handled in runtime.rs::State::receive before calling desktop_event.
             DesktopEvent::WindowState(_)
             | DesktopEvent::TitleBar(_)
             | DesktopEvent::Displays(_) => {}
@@ -1341,6 +1368,25 @@ impl Mounter {
                         self.host
                             .desktop_command(&wire_request(&WindowRequest::Minimize))?;
                     }
+                    return Ok(());
+                }
+                MenuRole::Hide => {
+                    if let Some(modal) = self.focused_desktop_modal() {
+                        modal.desktop_request(WindowRequest::Hide)?;
+                    } else {
+                        self.host
+                            .desktop_command(&wire_request(&WindowRequest::Hide))?;
+                    }
+                    return Ok(());
+                }
+                MenuRole::ShowAll => {
+                    for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
+                        if modal.is_desktop_window() {
+                            let _ = modal.desktop_request(WindowRequest::Show);
+                        }
+                    }
+                    self.host
+                        .desktop_command(&wire_request(&WindowRequest::Show))?;
                     return Ok(());
                 }
                 MenuRole::Zoom => {
@@ -1429,9 +1475,7 @@ impl Mounter {
                                 )?;
                                 return Ok(());
                             }
-                            MenuRole::Copy | MenuRole::Cut | MenuRole::Undo | MenuRole::Redo
-                                if node.interaction.mask().contains(EventKind::EditAction) =>
-                            {
+                            MenuRole::Copy | MenuRole::Cut | MenuRole::Undo | MenuRole::Redo => {
                                 let action = match role {
                                     MenuRole::Copy => "copy",
                                     MenuRole::Cut => "cut",
@@ -1439,13 +1483,17 @@ impl Mounter {
                                     MenuRole::Redo => "redo",
                                     _ => unreachable!(),
                                 };
-                                node.emit(
-                                    EventKind::EditAction,
-                                    EventPayload::Map(vec![(
-                                        "action",
-                                        nsh_core::PayloadValue::Str(action.to_owned()),
-                                    )]),
-                                );
+                                if node.interaction.mask().contains(EventKind::EditAction) {
+                                    node.emit(
+                                        EventKind::EditAction,
+                                        EventPayload::Map(vec![(
+                                            "action",
+                                            nsh_core::PayloadValue::Str(action.to_owned()),
+                                        )]),
+                                    );
+                                } else {
+                                    input.menu_action(action);
+                                }
                                 return Ok(());
                             }
                             _ => {}
@@ -1707,6 +1755,11 @@ impl Mounter {
         )));
         Ok(Self {
             dialogs: crate::services::dialogs::Dialogs::new(context.clone()),
+            audio: crate::services::audio::Audio::new(
+                context.host.clone(),
+                context.dispatcher.clone(),
+                context.assets.clone(),
+            ),
             desktop: Default::default(),
             offscreen_renders: Default::default(),
             surface_size: std::cell::Cell::new(size),
@@ -2055,6 +2108,7 @@ impl Mounter {
         // Each frame uses the most recent marker. Batch-local state also keeps
         // an unclosed scope from leaking into a later commit or deferred replay.
         let mut nav_shader_configured = false;
+        let mut replay_deferred = false;
         let mut batch_created_ids: Vec<NodeId> = Vec::new();
         self.batches += 1;
         let items = batch.items.len();
@@ -2256,11 +2310,14 @@ impl Mounter {
                         }
                         Self::attribute(node.inserted(motion.insert_animation()));
                         // This Insert supersedes a removal deferred while the node
-                        // was leaving. Replay its other updates before newer ones.
+                        // was leaving. Replay its other updates after the batch loop
+                        // finishes so we never recursively re-enter apply() mid-batch.
                         self.deferred.retain(
                             |item| !matches!(item, MountItem::Remove { id } if *id == child),
                         );
-                        self.finish_deferred()?;
+                        if !self.deferred.is_empty() {
+                            replay_deferred = true;
+                        }
                     }
                     MountItem::Remove { id } => {
                         if motion.is_created_in_batch(id) {
@@ -2562,9 +2619,15 @@ impl Mounter {
                             scale,
                             format,
                         } => {
+                            let slots: Vec<_> = drawing
+                                .slots
+                                .iter()
+                                .map(|&node| self.animator.eval(node))
+                                .collect();
                             if let Err(failure) = self.offscreen_renders.start(
                                 id,
                                 drawing,
+                                slots,
                                 width,
                                 height,
                                 scale,
@@ -2605,7 +2668,15 @@ impl Mounter {
                         Command::PerfMonitorMode(_) | Command::Orientations(_) => {}
                         Command::Back => self.back_fallback()?,
                         Command::ExitApp => {
-                            log::warn!("OHOS ExitApp: the embedding host owns Ability lifetime")
+                            if self.platform.get().os.is_desktop() {
+                                self.host.desktop_command(
+                                    &crate::services::desktop::WireCommand::Quit,
+                                )?;
+                            } else {
+                                log::warn!(
+                                    "OHOS ExitApp: the embedding host owns Ability lifetime"
+                                );
+                            }
                         }
                         Command::ImageInfo { id, uri } => {
                             self.images
@@ -2672,6 +2743,12 @@ impl Mounter {
                                 if let Some(input) = node.input.borrow().as_ref() {
                                     input.focus(false)?;
                                 }
+                                if let Some(web) = node.web.borrow().as_ref() {
+                                    web.command(Command::Blur)?;
+                                }
+                            }
+                            if let Some(focused) = self.key_focus.borrow().upgrade() {
+                                focused.interaction.command_focus(&focused, false)?;
                             }
                         }
                         Command::Focus | Command::Blur => {
@@ -2759,11 +2836,19 @@ impl Mounter {
                                 crate::media::webview::abort_evaluation(&self.control, id, request);
                             }
                         }
+                        Command::ClearSelection => {
+                            if id == nsh_core::ROOT_ID {
+                                if let Ok(root) = self.node(nsh_core::ROOT_ID) {
+                                    root.clear_text_selection()?;
+                                }
+                            } else if let Ok(node) = self.node(id) {
+                                node.selection_clear()?;
+                            }
+                        }
                         Command::LayoutAnimation(_)
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
-                        | Command::CancelPress
-                        | Command::ClearSelection => {}
+                        | Command::CancelPress => {}
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
                         }
@@ -2789,41 +2874,8 @@ impl Mounter {
                                 nsh_core::PayloadValue::Number(f64::from(id)),
                             )]),
                         ),
-                        Command::Audio(nsh_core::audio::AudioCommand::Load {
-                            id,
-                            bytes,
-                            hint,
-                            max_duration,
-                        }) => {
-                            // Sound.load waits for Loaded before Play or Unload, so
-                            // staging on a worker preserves the command order.
-                            let host = self.host.clone();
-                            let route = self.dispatcher.clone();
-                            std::thread::Builder::new()
-                                .name("nsh-audio-load".into())
-                                .spawn(move || {
-                                    if let Err(error) = host.system.load_sound(
-                                        &host,
-                                        route,
-                                        id,
-                                        bytes,
-                                        hint,
-                                        max_duration,
-                                    ) {
-                                        log::warn!("OHOS sound load failed: {error}");
-                                    }
-                                })
-                                .map_err(|error| {
-                                    napi_ohos::Error::from_reason(error.to_string())
-                                })?;
-                        }
                         Command::Audio(audio) => {
-                            self.host.system.audio(
-                                &self.host,
-                                self.dispatcher.clone(),
-                                &self.assets,
-                                audio,
-                            )?;
+                            self.audio.command(audio)?;
                         }
                         Command::FileRequest { id, request } => {
                             self.host.system.file_request(
@@ -2890,6 +2942,9 @@ impl Mounter {
             if let Ok(node) = self.node(id) {
                 node.batch_created.set(false);
             }
+        }
+        if replay_deferred {
+            Self::attribute(self.finish_deferred());
         }
         Self::attribute(self.reconcile_navigation());
         for node in std::mem::take(&mut *self.deferred_webs.borrow_mut())
@@ -3129,6 +3184,8 @@ impl Mounter {
     pub(crate) fn close(&mut self) -> Result<()> {
         self.scroll_watchers.clear_nodes();
         self.dialogs.clear();
+        self.audio.close();
+        self.desktop.clear_hotkeys();
         self.offscreen_renders.close();
         if self.desktop.popup_open {
             self.desktop.popup_open = false;
@@ -3141,16 +3198,19 @@ impl Mounter {
             || self.desktop.menu_bar_host.is_some()
         {
             self.desktop.menu_bar_inset.set(0.0);
+            let menu_bar_host = self.desktop.menu_bar_host.take();
+            let target_id = menu_bar_host
+                .as_ref()
+                .map(|(_, attachment)| attachment.id());
             let _ = self
                 .host
                 .desktop_command(&crate::services::desktop::WireCommand::SetMenuBar {
                     visible: false,
-                    target_id: None,
+                    target_id,
                     open_index: None,
                     items: Vec::new(),
                 });
-            if let Some((host, attachment)) = self.desktop.menu_bar_host.take() {
-                drop(attachment);
+            if let Some((host, attachment)) = menu_bar_host {
                 if let Some(parent) = self.mount.parent.upgrade() {
                     let index = parent
                         .borrow()
@@ -3161,6 +3221,7 @@ impl Mounter {
                         let _ = parent.borrow_mut().remove_child(index);
                     }
                 }
+                let _ = attachment.invalidate();
             }
         }
         let mut result = self.mount.unmount();

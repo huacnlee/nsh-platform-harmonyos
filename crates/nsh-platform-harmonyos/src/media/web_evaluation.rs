@@ -68,6 +68,7 @@ pub(crate) trait ScriptHost {
 
 struct Pending {
     serial: u64,
+    key: String,
     guard: EvalGuard,
     poll: String,
     cleanup: String,
@@ -118,6 +119,7 @@ impl Evaluations {
             request,
             Pending {
                 serial,
+                key: key.clone(),
                 guard: guard.clone(),
                 poll: script::poll_script(&key),
                 cleanup: script::cleanup_script(&key),
@@ -127,8 +129,23 @@ impl Evaluations {
             request,
             serial,
             guard,
-            &script::start_script(script_source, &key),
+            &push_start_script(script_source, &key),
         );
+    }
+
+    /// Delivers a settled Promise envelope pushed immediately from
+    /// `window.__nshNative.evalResult(key, envelope)`.
+    pub(crate) fn push_result(self: &Rc<Self>, key: &str, raw: &str) {
+        let matched = self
+            .pending
+            .borrow()
+            .iter()
+            .find(|(_, entry)| entry.key == key)
+            .map(|(&request, entry)| (request, entry.serial));
+        let Some((request, serial)) = matched else {
+            return;
+        };
+        self.handle_raw_envelope(request, serial, Some(raw.as_bytes()), false);
     }
 
     pub(crate) fn cancel(&self, request: u32) {
@@ -218,6 +235,94 @@ impl Evaluations {
         self.error(request, code, message);
     }
 
+    fn handle_raw_envelope(
+        self: &Rc<Self>,
+        request: u32,
+        serial: u64,
+        raw: Option<&[u8]>,
+        allow_poll: bool,
+    ) {
+        if !self.active(request, serial) {
+            return;
+        }
+        let Some(bytes) = raw else {
+            self.fail(
+                request,
+                serial,
+                codes::WEBVIEW_SCRIPT,
+                "the page could not run the script",
+            );
+            return;
+        };
+        if bytes.len() > MAX_RAW_BYTES {
+            self.fail(
+                request,
+                serial,
+                codes::QUOTA_EXCEEDED,
+                "the script's result is too large",
+            );
+            return;
+        }
+        let Some(text) = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(decode_arkweb_envelope)
+        else {
+            self.fail(
+                request,
+                serial,
+                codes::WEBVIEW_SCRIPT,
+                "the page gave no answer",
+            );
+            return;
+        };
+        if text.len() > MAX_ENVELOPE_BYTES {
+            self.fail(
+                request,
+                serial,
+                codes::QUOTA_EXCEEDED,
+                "the script's result is too large",
+            );
+            return;
+        }
+        let status = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    .map(str::to_owned)
+            });
+        match status.as_deref() {
+            Some("pending") if allow_poll => {
+                let weak = Rc::downgrade(self);
+                (self.after)(
+                    POLL_INTERVAL,
+                    Box::new(move || {
+                        let Some(state) = weak.upgrade() else {
+                            return;
+                        };
+                        let next = state
+                            .pending
+                            .borrow()
+                            .get(&request)
+                            .filter(|entry| entry.serial == serial)
+                            .map(|entry| (entry.guard.clone(), entry.poll.clone()));
+                        if let Some((guard, poll)) = next {
+                            state.run(request, serial, guard, &poll);
+                        }
+                    }),
+                );
+            }
+            Some("ok" | "error") => self.finish(request, serial, text),
+            _ => self.fail(
+                request,
+                serial,
+                codes::WEBVIEW_SCRIPT,
+                "the page gave no answer",
+            ),
+        }
+    }
+
     fn run(self: &Rc<Self>, request: u32, serial: u64, guard: EvalGuard, source: &str) {
         if !self.active(request, serial) || !guard.is_alive() {
             return;
@@ -239,88 +344,22 @@ impl Evaluations {
                 let Some(state) = state.upgrade() else {
                     return;
                 };
-                if !state.active(request, serial) {
-                    return;
-                }
-                let Some(bytes) = raw else {
-                    state.fail(
-                        request,
-                        serial,
-                        codes::WEBVIEW_SCRIPT,
-                        "the page could not run the script",
-                    );
-                    return;
-                };
-                if bytes.len() > MAX_RAW_BYTES {
-                    state.fail(
-                        request,
-                        serial,
-                        codes::QUOTA_EXCEEDED,
-                        "the script's result is too large",
-                    );
-                    return;
-                }
-                let Some(text) = std::str::from_utf8(bytes)
-                    .ok()
-                    .and_then(decode_arkweb_envelope)
-                else {
-                    state.fail(
-                        request,
-                        serial,
-                        codes::WEBVIEW_SCRIPT,
-                        "the page gave no answer",
-                    );
-                    return;
-                };
-                if text.len() > MAX_ENVELOPE_BYTES {
-                    state.fail(
-                        request,
-                        serial,
-                        codes::QUOTA_EXCEEDED,
-                        "the script's result is too large",
-                    );
-                    return;
-                }
-                let status = serde_json::from_str::<serde_json::Value>(&text)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("status")
-                            .and_then(|status| status.as_str())
-                            .map(str::to_owned)
-                    });
-                match status.as_deref() {
-                    Some("pending") => {
-                        let weak = Rc::downgrade(&state);
-                        (state.after)(
-                            POLL_INTERVAL,
-                            Box::new(move || {
-                                let Some(state) = weak.upgrade() else {
-                                    return;
-                                };
-                                let next = state
-                                    .pending
-                                    .borrow()
-                                    .get(&request)
-                                    .filter(|entry| entry.serial == serial)
-                                    .map(|entry| (entry.guard.clone(), entry.poll.clone()));
-                                if let Some((guard, poll)) = next {
-                                    state.run(request, serial, guard, &poll);
-                                }
-                            }),
-                        );
-                    }
-                    Some("ok" | "error") => state.finish(request, serial, text),
-                    _ => state.fail(
-                        request,
-                        serial,
-                        codes::WEBVIEW_SCRIPT,
-                        "the page gave no answer",
-                    ),
-                }
+                state.handle_raw_envelope(request, serial, raw, true);
             }),
         );
     }
+}
+
+/// Wraps `nsh_core::platform::web_evaluation::start_script` so a pending
+/// Promise immediately pushes its settled envelope through
+/// `window.__nshNative.evalResult(key, envelope)` when available, while
+/// preserving `globalThis[key]` for fallback polling.
+fn push_start_script(source: &str, key: &str) -> String {
+    let inner = script::start_script(source, key);
+    let key_json = serde_json::to_string(key).expect("string");
+    format!(
+        "(()=>{{const __r={inner};const __k={key_json};const __c=globalThis[__k];if(__c&&typeof window!==\"undefined\"&&window.__nshNative&&typeof window.__nshNative.evalResult===\"function\"){{let __v=__c.result;if(__v!==null){{delete globalThis[__k];try{{window.__nshNative.evalResult(__k,String(__v));}}catch(_){{}}}}else{{Object.defineProperty(__c,\"result\",{{configurable:true,get(){{return __v;}},set(v){{__v=v;if(v!==null&&globalThis[__k]===__c){{delete globalThis[__k];try{{window.__nshNative.evalResult(__k,String(v));}}catch(_){{}}}}}}}});}}}}return __r;}})()"
+    )
 }
 
 pub(crate) fn abort_payload(request: u32) -> EventPayload {
@@ -605,5 +644,29 @@ mod tests {
         let replies = h.take_replies();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].0, 2);
+    }
+
+    #[test]
+    fn pushed_promise_result_settles_without_waiting_for_poll() {
+        let h = Harness::new();
+        h.evals.start(10, "Promise.resolve(42)", true);
+        let (start_js, done) = h.web.pop_script();
+        assert!(start_js.contains("__nshNative.evalResult"));
+
+        done(Some(br#""{\"status\":\"pending\"}""#));
+        assert!(h.take_replies().is_empty());
+
+        h.evals
+            .push_result("__nsh_evaluation_4_10_1", r#"{"status":"ok","value":42}"#);
+        let replies = h.take_replies();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].0, 10);
+        assert_eq!(replies[0].1["value"], 42);
+
+        // The scheduled fallback timer becomes a no-op once pushed.
+        if let Some((_, poll_timer)) = h.timers.borrow_mut().pop_front() {
+            poll_timer();
+        }
+        assert!(h.web.calls.borrow().is_empty());
     }
 }

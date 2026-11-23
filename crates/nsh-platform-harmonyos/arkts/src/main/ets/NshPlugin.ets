@@ -25,19 +25,36 @@ export class NshPlugin {
     }
     context.getUIContext();
     let failure: Error | undefined;
-    const runStep = (step: () => void): void => {
+    let editorsFailed = false;
+    let websFailed = false;
+    const runStep = (step: () => void, onError?: () => void): void => {
       try {
         step();
       } catch (error) {
+        onError?.();
         failure ??= error instanceof Error ? error : new Error(String(error));
       }
     };
-    runStep((): void => this.editors.remove(batch.removeEditors, context));
-    runStep((): void => this.webs.remove(batch.removeWebs, context));
-    runStep((): void => this.editors.update(batch.editors, failure ? [] : batch.commands, context));
+    runStep(
+      (): void => this.editors.remove(batch.removeEditors, context),
+      (): void => {
+        editorsFailed = true;
+      },
+    );
+    runStep(
+      (): void => this.webs.remove(batch.removeWebs, context),
+      (): void => {
+        websFailed = true;
+      },
+    );
+    runStep((): void =>
+      this.editors.update(batch.editors, editorsFailed ? [] : batch.commands, context),
+    );
     runStep((): void => this.views.update(batch.views, context));
     runStep((): void => this.views.remove(batch.removeViews, context));
-    runStep((): void => this.webs.update(batch.webs, failure ? [] : batch.webCommands, context));
+    runStep((): void =>
+      this.webs.update(batch.webs, websFailed ? [] : batch.webCommands, context),
+    );
     if (failure) {
       throw failure;
     }

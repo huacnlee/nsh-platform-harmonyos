@@ -53,6 +53,38 @@ pub(crate) fn register_custom_scheme() {
     });
 }
 
+fn register_url_schemes(schemes: &[nsh_core::web_resource::WebUrlScheme]) {
+    let mut added = false;
+    for scheme in schemes {
+        let name = scheme.scheme();
+        if !CustomProtocol::is_protocol_registered(name) {
+            CustomProtocol::add_protocol_with_option(
+                name,
+                CustomProtocolOption::Standard
+                    | CustomProtocolOption::Secure
+                    | CustomProtocolOption::CorsEnabled
+                    | CustomProtocolOption::FetchEnabled,
+            );
+            added = true;
+        }
+    }
+    if added {
+        CustomProtocol::register();
+    }
+}
+
+pub(crate) fn on_eval_result(target_id: u32, key: &str, envelope: &str) {
+    let evals = ROUTES.with(|routes| {
+        routes
+            .borrow()
+            .get(&target_id)
+            .map(|route| route.evaluations.clone())
+    });
+    if let Some(evals) = evals {
+        evals.push_result(key, envelope);
+    }
+}
+
 struct AssetReply(Option<ResourceHandle>);
 
 // SAFETY: ArkWeb owns the underlying `ArkWeb_ResourceHandler` across threads until `finish()`
@@ -509,7 +541,12 @@ impl WebView {
             },
             Command::Blur => {
                 route.run_detached("document.activeElement?.blur();");
-                return Ok(());
+                WebCommand {
+                    target_id,
+                    kind: "blur".into(),
+                    script: None,
+                    ..Default::default()
+                }
             }
             Command::InjectJavaScript(script) => {
                 route.run_detached(&script);
@@ -704,6 +741,9 @@ impl WebView {
         let Some(props) = self.props.borrow().clone() else {
             return Ok(());
         };
+        if !props.url_schemes.is_empty() {
+            register_url_schemes(&props.url_schemes);
+        }
         if !node.access.allows_webviews()
             || matches!(
                 &props.source,
@@ -794,12 +834,11 @@ impl WebView {
             user_agent: props.user_agent.as_deref().map(str::to_owned),
             injected_javascript: props.injected_js.as_deref().map(str::to_owned),
             document_start_script,
-            download_directory: node
-                .host
-                .data_directory()
-                .join("downloads")
-                .display()
-                .to_string(),
+            url_schemes: props
+                .url_schemes
+                .iter()
+                .map(|s| s.scheme().to_owned())
+                .collect(),
         };
         if self.arkts_mounted.get() {
             node.web_update(settings);
@@ -920,6 +959,7 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
         )?;
         let control = node.control.clone();
         let node_id = node.id;
+        let eval_dispatcher = route.dispatcher.clone();
         let proxy = WebProxyBuilder::new(native_tag.to_owned(), "__nshNative".to_owned())
             .add_method("postMessage", move |_tag, args| {
                 if let Some(data) = args.first() {
@@ -928,6 +968,17 @@ pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_o
                         EventKind::Message,
                         EventPayload::Map(vec![("data", PayloadValue::Str(data.clone()))]),
                     );
+                }
+            })
+            .add_method("evalResult", move |_tag, args| {
+                if let (Some(key), Some(envelope)) = (args.first(), args.get(1))
+                    && let Some(dispatcher) = eval_dispatcher.upgrade()
+                {
+                    dispatcher.send(crate::app::runtime::Message::WebEvalResult {
+                        target_id,
+                        key: key.clone(),
+                        envelope: envelope.clone(),
+                    });
                 }
             })
             .build()

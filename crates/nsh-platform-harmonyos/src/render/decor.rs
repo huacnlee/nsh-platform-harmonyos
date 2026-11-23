@@ -485,6 +485,14 @@ fn padding_round_rect(
     ))
 }
 
+fn expand_corner_radius(radius: f32, spread: f32) -> f32 {
+    if radius <= 0.0 {
+        0.0
+    } else {
+        (radius + spread).max(0.0)
+    }
+}
+
 fn border_round_rect(
     style: &ViewStyle,
     size: Size,
@@ -499,9 +507,12 @@ fn border_round_rect(
     }
     let radii = nsh_core::canvas::fit_radii(
         CoreSize::new(Points(w), Points(h)),
-        style
-            .corner_radius
-            .map(|r| Points((r.unwrap_or(style.border_radius).0 + spread).max(0.0))),
+        style.corner_radius.map(|r| {
+            Points(expand_corner_radius(
+                r.unwrap_or(style.border_radius).0,
+                spread,
+            ))
+        }),
     )
     .to_array()
     .map(|r| (r.0, r.0));
@@ -526,9 +537,12 @@ pub(crate) fn border_drawing_round_rect(
     }
     let radii = nsh_core::canvas::fit_radii(
         CoreSize::new(Points(w), Points(h)),
-        style
-            .corner_radius
-            .map(|r| Points((r.unwrap_or(style.border_radius).0 + spread).max(0.0))),
+        style.corner_radius.map(|r| {
+            Points(expand_corner_radius(
+                r.unwrap_or(style.border_radius).0,
+                spread,
+            ))
+        }),
     )
     .to_array()
     .map(|r| r.0);

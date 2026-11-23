@@ -17,11 +17,8 @@ interface Fields {
   minute?: number;
 }
 class ControlSettings {
-  isSwitch: boolean = false;
-  checked: boolean = false;
   disabled: boolean = false;
   label: string = "";
-  tint: ResourceColor = $r("sys.color.comp_background_emphasize");
   colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   mode: string = "date";
   value?: Fields;
@@ -29,10 +26,8 @@ class ControlSettings {
   maximum?: Fields;
   interval: number = 1;
   text: string = "";
-  toggle: (value: boolean) => void;
   open: () => void;
-  constructor(toggle: (value: boolean) => void, open: () => void) {
-    this.toggle = toggle;
+  constructor(open: () => void) {
     this.open = open;
   }
 }
@@ -114,29 +109,19 @@ function display(mode: string, value: Date): string {
 @Builder
 function mobileControl(s: ControlSettings) {
   WithTheme({ colorMode: s.colorMode }) {
-    if (s.isSwitch) {
-      Toggle({ type: ToggleType.Switch, isOn: s.checked })
-        .selectedColor(s.tint)
-        .switchPointColor($r("sys.color.icon_on_primary"))
-        .opacity(s.disabled ? $r("sys.float.interactive_disable") : 1)
-        .enabled(!s.disabled)
-        .accessibilityText(s.label)
-        .onChange(s.toggle);
-    } else {
-      Button(s.text, { type: ButtonType.ROUNDED_RECTANGLE })
-        .controlSize(ControlSize.SMALL)
-        .buttonStyle(ButtonStyleMode.NORMAL)
-        .fontSize($r("sys.float.Body_S"))
-        .fontWeight(FontWeight.Regular)
-        .fontColor($r("sys.color.font_primary"))
-        .backgroundColor($r("sys.color.comp_background_tertiary"))
-        .borderRadius($r("sys.float.corner_radius_level4"))
-        .padding({ left: 10, right: 10, top: 4, bottom: 4 })
-        .opacity(s.disabled ? $r("sys.float.interactive_disable") : 1)
-        .enabled(!s.disabled)
-        .accessibilityText(s.label)
-        .onClick(s.open);
-    }
+    Button(s.text, { type: ButtonType.ROUNDED_RECTANGLE })
+      .controlSize(ControlSize.SMALL)
+      .buttonStyle(ButtonStyleMode.NORMAL)
+      .fontSize($r("sys.float.Body_S"))
+      .fontWeight(FontWeight.Regular)
+      .fontColor($r("sys.color.font_primary"))
+      .backgroundColor($r("sys.color.comp_background_tertiary"))
+      .borderRadius($r("sys.float.corner_radius_level4"))
+      .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+      .opacity(s.disabled ? $r("sys.float.interactive_disable") : 1)
+      .enabled(!s.disabled)
+      .accessibilityText(s.label)
+      .onClick(s.open);
   };
 }
 
@@ -146,7 +131,6 @@ export class NativeMobileControl {
   private readonly ui: UIContext;
   private readonly context: TabBarContext;
   private settings: ControlSettings;
-  private controlledChecked: boolean = false;
   private closed: boolean = false;
   private presenting: boolean = false;
   private hasMeasured: boolean = false;
@@ -165,32 +149,19 @@ export class NativeMobileControl {
     this.hostWindow = hostWindow;
     this.ui = ui;
     this.context = context;
-    this.settings = new ControlSettings(
-      (checked: boolean): void => {
-        if (!this.closed && !this.settings.disabled && checked !== this.settings.checked) {
-          this.settings.checked = checked;
-          this.context.valueChanged(checked);
-        }
-      },
-      (): void => this.pick(),
-    );
-    this.settings.isSwitch = context.name === "nsh/switch";
+    this.settings = new ControlSettings((): void => this.pick());
     this.settings.colorMode = colorMode;
     this.builder = new BuilderNode<[ControlSettings]>(ui);
     this.builder.build(wrapBuilder(mobileControl), this.settings);
     this.node = this.builder.getFrameNode()!;
-    if (this.settings.isSwitch) {
-      this.measure();
-    } else {
-      // Avoid measuring a placeholder date when initial updateProps arrives in the same mount batch.
-      Promise.resolve().then((): void => {
-        if (!this.closed && !this.hasMeasured) {
-          this.settings.text = display(this.settings.mode, date(this.settings.value));
-          this.builder.update(this.settings);
-          this.measure();
-        }
-      });
-    }
+    // Avoid measuring a placeholder date when initial updateProps arrives in the same mount batch.
+    Promise.resolve().then((): void => {
+      if (!this.closed && !this.hasMeasured) {
+        this.settings.text = display(this.settings.mode, date(this.settings.value));
+        this.builder.update(this.settings);
+        this.measure();
+      }
+    });
     this.mounted.add(this);
   }
   private measure(): void {
@@ -234,22 +205,17 @@ export class NativeMobileControl {
     }
     invalidateLocaleCache();
     this.builder.updateConfiguration();
-    if (!this.settings.isSwitch) {
-      const next = this.cloneSettings();
-      next.text = display(next.mode, date(next.value));
-      this.settings = next;
-      this.builder.update(next);
-    }
+    const next = this.cloneSettings();
+    next.text = display(next.mode, date(next.value));
+    this.settings = next;
+    this.builder.update(next);
     this.measure();
   }
   private cloneSettings(): ControlSettings {
     const old = this.settings;
-    const s = new ControlSettings(old.toggle, old.open);
-    s.isSwitch = old.isSwitch;
-    s.checked = this.controlledChecked;
+    const s = new ControlSettings(old.open);
     s.disabled = old.disabled;
     s.label = old.label;
-    s.tint = old.tint;
     s.colorMode = old.colorMode;
     s.mode = old.mode;
     s.value = old.value;
@@ -267,20 +233,11 @@ export class NativeMobileControl {
     const s = this.cloneSettings();
     for (const c of changes) {
       switch (c.name) {
-        case "checked":
-          s.checked = !c.removed && c.value === true;
-          break;
         case "disabled":
           s.disabled = !c.removed && c.value === true;
           break;
         case "accessibilityLabel":
           s.label = c.removed || c.value == null ? "" : (c.value as string);
-          break;
-        case "tint":
-          s.tint =
-            c.removed || c.value == null
-              ? $r("sys.color.comp_background_emphasize")
-              : (c.value as string);
           break;
         case "mode":
           s.mode = c.removed ? "date" : (c.value as string);
@@ -294,18 +251,17 @@ export class NativeMobileControl {
         case "max":
           s.maximum = c.removed ? undefined : (c.value as Fields);
           break;
-        case "minuteInterval":
-          s.interval = c.removed ? 1 : (c.value as number);
+        case "minuteInterval": {
+          const raw = c.removed ? 1 : Number(c.value);
+          s.interval = Number.isFinite(raw) && raw >= 1 ? Math.min(60, Math.floor(raw)) : 1;
           break;
+        }
       }
     }
-    this.controlledChecked = s.checked;
-    if (!s.isSwitch) {
-      s.text = display(s.mode, date(s.value));
-    }
+    s.text = display(s.mode, date(s.value));
     this.settings = s;
     this.builder.update(s);
-    if (!s.isSwitch && (!this.hasMeasured || s.text !== previousText)) {
+    if (!this.hasMeasured || s.text !== previousText) {
       this.measure();
     }
   }
@@ -327,7 +283,20 @@ export class NativeMobileControl {
         return;
       }
       if (mode !== "date") {
-        picked.setMinutes(Math.round(picked.getMinutes() / s.interval) * s.interval);
+        const interval = Number.isFinite(s.interval) && s.interval >= 1 ? Math.floor(s.interval) : 1;
+        const rawMinutes = picked.getMinutes();
+        let snapped = Math.round(rawMinutes / interval) * interval;
+        // Clamp within [0, 59] when rounding at 23:55 would otherwise roll over to the next day.
+        if (snapped >= 60) {
+          if (picked.getHours() === 23) {
+            snapped = Math.floor(59 / interval) * interval;
+            picked.setMinutes(snapped);
+          } else {
+            picked.setMinutes(snapped);
+          }
+        } else {
+          picked.setMinutes(snapped);
+        }
       }
       const chosen = clampDate(picked, start, end);
       const fields: Fields = {};

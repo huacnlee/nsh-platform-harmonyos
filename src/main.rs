@@ -113,8 +113,20 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<Options> {
         ..Options::default()
     };
     let mut args = args.into_iter();
+    let mut end_of_options = false;
     while let Some(raw_arg) = args.next() {
-        if raw_arg == "--" {
+        if !end_of_options && raw_arg == "--" {
+            end_of_options = true;
+            continue;
+        }
+        if end_of_options {
+            if options.command.is_empty() {
+                options.command = text_arg(raw_arg, "command")?;
+            } else if options.app.is_none() {
+                options.app = Some(raw_arg.into());
+            } else {
+                bail!("unexpected argument {raw_arg:?}\n\n{USAGE}");
+            }
             continue;
         }
         let (flag_str, mut inline): (Option<String>, Option<OsString>) = match raw_arg.to_str() {
@@ -678,7 +690,10 @@ fn install(
         .output()
         .context("running hdc")?;
     let text = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() || text.contains("fail") || text.contains("[Fail]") {
+    if !output.status.success()
+        || text.contains("[Fail]")
+        || !text.contains("install bundle successfully")
+    {
         bail!(
             "hdc could not install {}: {}{}",
             hap.display(),
@@ -757,6 +772,12 @@ fn dev(
         clear_dev_forward(&hdc, device, port);
         return Err(err);
     }
+    let cleanup_hdc = hdc.clone();
+    let cleanup_device = device.map(str::to_owned);
+    let _ = ctrlc::set_handler(move || {
+        clear_dev_forward(&cleanup_hdc, cleanup_device.as_deref(), port);
+        std::process::exit(130);
+    });
     let mut server = Command::new(nsh());
     server
         .arg("dev")
@@ -1000,6 +1021,10 @@ mod tests {
         let dev = parse(args("dev examples/counter --port 8791")).unwrap();
         assert_eq!(dev.command, "dev");
         assert_eq!(dev.port, Some(8791));
+
+        let dashed_app = parse(args("package -- --weird-app")).unwrap();
+        assert_eq!(dashed_app.command, "package");
+        assert_eq!(dashed_app.app, Some("--weird-app".into()));
     }
 
     #[test]

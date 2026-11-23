@@ -82,10 +82,12 @@ ohos-resource-manager-binding = { version = "0.3.6", default-features = false, f
 ohos-vsync-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
 ohos-web-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
 ohos-window-manager-binding = { version = "0.1.2", default-features = false, features = ["input", "api-20"] }
-ohos-image-native-binding = { version = "0.0.8", default-features = false }
+ohos-image-native-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-pasteboard-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-udmf-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
 ohos-avplayer-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
+ohos-audio-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9", default-features = false, features = ["api-20"] }
+ohos-multi-modal-input-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9", default-features = false, features = ["api-20"] }
 ohos-xcomponent-binding = { version = "0.6", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
 ohos-native-window-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
@@ -105,6 +107,23 @@ nsh-engine = { git = "https://github.com/longbridge/nsh", branch = "main" }
 nsh-testing = { git = "https://github.com/longbridge/nsh", branch = "main" }
 nsh-bundler = { git = "https://github.com/longbridge/nsh", branch = "main" }
 nsh-dev = { git = "https://github.com/longbridge/nsh", branch = "main" }
+# Native bindings PR #214 (ohos-rs/ohos-native-bindings): display listeners,
+# UDMF pixel_map/file_uri, pasteboard observer/has_type_str, AVPlayer audio/speed,
+# ArkUI focus clear, Web CookieManager, plus new audio & multi-modal-input crates.
+ohos-accessibility-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-arkui-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-arkui-input-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-avplayer-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-display-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-drawing-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-image-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-image-native-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-native-buffer-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-native-window-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-pasteboard-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-udmf-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-web-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
+ohos-xcomponent-binding = { git = "https://github.com/ohos-rs/ohos-native-bindings.git", rev = "73b6bf1818d1e57d29d36157ee24b1961b359fd9" }
 
 [profile.release]
 opt-level = 3

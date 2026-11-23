@@ -199,50 +199,11 @@ export class NativeClipboard {
       });
     }
   }
-  async execute(
-    key: number,
-    op: string,
-    text: string,
-    hasOnly: boolean,
-    live: () => boolean,
-    html?: string,
-  ): Promise<ClipboardReply> {
+  async execute(key: number, op: string, live: () => boolean): Promise<ClipboardReply> {
     if (this.closed) {
       throw new Error("clipboard owner is closed");
     }
     const board = pasteboard.getSystemPasteboard();
-    if (op === "clipboard-write") {
-      if (html !== undefined) {
-        const formats: Record<string, pasteboard.ValueType> = {};
-        formats[pasteboard.MIMETYPE_TEXT_PLAIN] = text;
-        formats[pasteboard.MIMETYPE_TEXT_HTML] = html;
-        await board.setData(pasteboard.createData(formats));
-      } else {
-        await board.setData(pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, text));
-      }
-      return {};
-    }
-    if (op === "clipboard-write-image") {
-      const comma = text.indexOf(",");
-      if (
-        !text.startsWith("data:image/") ||
-        comma < 0 ||
-        !text.substring(0, comma).endsWith(";base64")
-      ) {
-        throw new Error("invalid image data URI");
-      }
-      const bytes = new util.Base64Helper().decodeSync(text.substring(comma + 1));
-      const source = image.createImageSource(bytes.buffer);
-      let pixels: image.PixelMap | undefined;
-      try {
-        pixels = await source.createPixelMap();
-        await board.setData(pasteboard.createData(pasteboard.MIMETYPE_PIXELMAP, pixels));
-      } finally {
-        pixels?.release();
-        source.release();
-      }
-      return {};
-    }
     const type =
       op === "clipboard-image"
         ? pasteboard.MIMETYPE_PIXELMAP
@@ -250,8 +211,8 @@ export class NativeClipboard {
           ? pasteboard.MIMETYPE_TEXT_URI
           : pasteboard.MIMETYPE_TEXT_PLAIN;
     const has = op === "clipboard-paste" ? board.hasDataSync() : board.hasDataType(type);
-    if (hasOnly || !has) {
-      return { has };
+    if (!has) {
+      return { has: false };
     }
     let reply: ClipboardReply = { has: false };
     let failure: Error | undefined;

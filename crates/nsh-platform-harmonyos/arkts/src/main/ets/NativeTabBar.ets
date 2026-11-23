@@ -24,8 +24,10 @@ class TabSettings {
   hidden: boolean = false;
   tint?: string;
   colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
+  readonly controller: TabsController;
   change: (index: number) => void;
-  constructor(change: (index: number) => void) {
+  constructor(controller: TabsController, change: (index: number) => void) {
+    this.controller = controller;
     this.change = change;
   }
 }
@@ -106,7 +108,8 @@ function tabBarItem(item: TabItem, index: number, settings: TabSettings) {
     }
   }
   .width("100%")
-  .height(56)
+  .constraintSize({ minHeight: 56 })
+  .padding({ top: 4, bottom: 4 })
   .justifyContent(FlexAlign.Center)
   .alignItems(HorizontalAlign.Center)
   .accessibilityText(
@@ -117,12 +120,17 @@ function tabBarItem(item: TabItem, index: number, settings: TabSettings) {
 @Builder
 function tabBar(settings: TabSettings) {
   WithTheme({ colorMode: settings.colorMode }) {
-    Tabs({ barPosition: BarPosition.End, index: settings.selected }) {
-      ForEach(settings.items, (item: TabItem, index: number) => {
-        TabContent() {
-          Column()
-        }.tabBar(tabBarItem(item, index, settings));
-      })
+    Tabs({ barPosition: BarPosition.End, index: settings.selected, controller: settings.controller }) {
+      ForEach(
+        settings.items,
+        (item: TabItem, index: number) => {
+          TabContent() {
+            Column()
+          }.tabBar(tabBarItem(item, index, settings));
+        },
+        (item: TabItem, index: number): string =>
+          `${index}:${item.title}:${item.icon ?? ""}:${item.badge ?? ""}`,
+      )
     }
     .barMode(BarMode.Fixed)
     .barHeight(56)
@@ -139,6 +147,7 @@ function tabBar(settings: TabSettings) {
 export class NativeTabBar {
   readonly node: FrameNode;
   private readonly builder: BuilderNode<[TabSettings]>;
+  private readonly controller: TabsController = new TabsController();
   private readonly context: TabBarContext;
   private readonly mounted?: Set<NativeTabBar>;
   private settings: TabSettings;
@@ -151,7 +160,7 @@ export class NativeTabBar {
   ) {
     this.context = context;
     this.mounted = mounted;
-    this.settings = new TabSettings((index: number) => {
+    this.settings = new TabSettings(this.controller, (index: number) => {
       if (!this.closed && index !== this.settings.selected) {
         this.settings.selected = index;
         this.builder.update(this.cloneSettings());
@@ -166,7 +175,7 @@ export class NativeTabBar {
     context.height(56);
   }
   private cloneSettings(): TabSettings {
-    const next = new TabSettings(this.settings.change);
+    const next = new TabSettings(this.controller, this.settings.change);
     next.items = this.settings.items;
     next.selected = this.settings.selected;
     next.hidden = this.settings.hidden;
@@ -210,8 +219,14 @@ export class NativeTabBar {
           break;
       }
     }
+    const prevSelected = this.settings.selected;
     this.settings = next;
     this.builder.update(next);
+    if (next.selected !== prevSelected) {
+      try {
+        this.controller.changeIndex(next.selected);
+      } catch {}
+    }
     this.context.height(next.hidden ? 0 : 56);
   }
   dispose(): void {

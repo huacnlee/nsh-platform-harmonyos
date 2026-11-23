@@ -11,6 +11,7 @@ use std::sync::{
 
 use nsh_core::{
     EventKind, EventPayload,
+    animation::AnimationValue,
     canvas::{
         Drawing,
         render::{ImageFormat, RenderFailure},
@@ -35,6 +36,7 @@ use crate::{
 struct PendingRender {
     spec: RenderSpec,
     drawing: Arc<Drawing>,
+    slots: Vec<AnimationValue>,
     rtl: bool,
     uris: Vec<Arc<str>>,
     loaded: Vec<Option<Arc<Data>>>,
@@ -54,6 +56,7 @@ impl OffscreenRenders {
         &mut self,
         id: u32,
         drawing: Arc<Drawing>,
+        slots: Vec<AnimationValue>,
         width: u32,
         height: u32,
         scale: f32,
@@ -67,7 +70,7 @@ impl OffscreenRenders {
         let spec = validate_request(width, height, scale, format)?;
         let uris = unique_image_uris(&drawing);
         if uris.is_empty() {
-            self.spawn(id, spec, drawing, rtl, Vec::new(), fonts, dispatcher);
+            self.spawn(id, spec, drawing, slots, rtl, Vec::new(), fonts, dispatcher);
             return Ok(());
         }
         let count = uris.len();
@@ -80,6 +83,7 @@ impl OffscreenRenders {
             PendingRender {
                 spec,
                 drawing,
+                slots,
                 rtl,
                 uris,
                 loaded: vec![None; count],
@@ -124,6 +128,7 @@ impl OffscreenRenders {
                 id,
                 entry.spec,
                 entry.drawing,
+                entry.slots,
                 entry.rtl,
                 images,
                 fonts,
@@ -149,6 +154,7 @@ impl OffscreenRenders {
         id: u32,
         spec: RenderSpec,
         drawing: Arc<Drawing>,
+        slots: Vec<AnimationValue>,
         rtl: bool,
         images: Vec<(Arc<str>, Arc<Data>)>,
         fonts: &Arc<Mutex<Fonts>>,
@@ -163,7 +169,8 @@ impl OffscreenRenders {
                 if cancelled.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = render_and_encode(spec, &drawing, rtl, &images, &fonts, &cancelled);
+                let result =
+                    render_and_encode(spec, &drawing, &slots, rtl, &images, &fonts, &cancelled);
                 if !cancelled.load(Ordering::Relaxed)
                     && let Some(dispatcher) = dispatcher.upgrade()
                 {
@@ -194,6 +201,7 @@ fn map_image_error(error: ImageNativeError) -> RenderFailure {
 fn render_and_encode(
     spec: RenderSpec,
     drawing: &Drawing,
+    slots: &[AnimationValue],
     rtl: bool,
     loaded_images: &[(Arc<str>, Arc<Data>)],
     fonts: &Arc<Mutex<Fonts>>,
@@ -222,6 +230,7 @@ fn render_and_encode(
         &canvas,
         drawing,
         spec.scale,
+        slots,
         &bound_images,
         fonts,
         rtl,

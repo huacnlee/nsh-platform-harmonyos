@@ -465,10 +465,13 @@ function editorContent(params: EditorContentParams) {
 
 // Failed retirement cannot release a BuilderNode still borrowed by native code.
 const quarantinedEditors: Set<EditorEntry> = new Set();
-let activeEditor: EditorEntry | undefined;
+// Track the active editor per NshRuntimeContext so separate windows/surfaces never blur each other.
+const activeEditorsByContext: Map<NshRuntimeContext, EditorEntry> = new Map();
 
 export function syncActiveEditorImeCursor(): void {
-  activeEditor?.refreshImeCursor();
+  for (const entry of activeEditorsByContext.values()) {
+    entry.refreshImeCursor();
+  }
 }
 
 interface EditMenuParams {
@@ -598,6 +601,10 @@ struct EditMenuView {
       .onTouch((event: TouchEvent): void => {
         if (event.type === TouchType.Down) {
           this.entry.markMenuInteraction();
+        } else if (event.type === TouchType.Cancel) {
+          this.entry.clearMenuInteraction();
+        } else if (event.type === TouchType.Up) {
+          this.entry.scheduleClearMenuInteraction();
         }
       })
       .onAreaChange((_old: Area, area: Area): void => {
@@ -683,6 +690,9 @@ class EditorEntry {
   private editMenuContent?: ComponentContent<EditMenuParams>;
   private editMenuUi?: UIContext;
   private menuInteracting: boolean = false;
+  private menuInteractTimer: number = -1;
+  private undoStack: string[] = [];
+  private redoStack: string[] = [];
   private imeCursorKey: string = "";
   private consumedPasteKey: boolean = false;
   private rustText: string = "";
@@ -1054,6 +1064,7 @@ class EditorEntry {
       next = this.text.slice(0, at) + text.slice(common);
     }
     if (this.text !== next) {
+      this.pushUndoState(this.text);
       this.text = next;
       this.emit("change", next);
     }
@@ -1319,14 +1330,62 @@ class EditorEntry {
         .catch((): void => {});
     } catch {}
   }
+  private pushUndoState(snapshot: string): void {
+    if (this.undoStack.length > 0 && this.undoStack[this.undoStack.length - 1] === snapshot) {
+      return;
+    }
+    this.undoStack.push(snapshot);
+    if (this.undoStack.length > 64) {
+      this.undoStack.shift();
+    }
+    this.redoStack.length = 0;
+  }
+  private applyProgrammaticText(next: string, caret: number): void {
+    const clamped = Math.max(0, Math.min(next.length, caret));
+    this.selStart = clamped;
+    this.selEnd = clamped;
+    this.text = next;
+    this.emit("change", next);
+    this.selection(clamped, clamped);
+    this.refresh();
+    try {
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(clamped, clamped);
+      } else {
+        this.line.setTextSelection(clamped, clamped);
+      }
+    } catch {}
+  }
   markMenuInteraction(): void {
+    if (this.menuInteractTimer >= 0) {
+      clearTimeout(this.menuInteractTimer);
+      this.menuInteractTimer = -1;
+    }
     this.menuInteracting = true;
+  }
+  clearMenuInteraction(): void {
+    if (this.menuInteractTimer >= 0) {
+      clearTimeout(this.menuInteractTimer);
+      this.menuInteractTimer = -1;
+    }
+    this.menuInteracting = false;
+  }
+  scheduleClearMenuInteraction(): void {
+    if (this.menuInteractTimer >= 0) {
+      clearTimeout(this.menuInteractTimer);
+    }
+    // Clear shortly after TouchType.Up so drag-out releases cannot leave the
+    // editor unable to blur while still absorbing the press-induced blur.
+    this.menuInteractTimer = setTimeout((): void => {
+      this.menuInteractTimer = -1;
+      this.menuInteracting = false;
+    }, 60);
   }
   blurFromOther(): void {
     if (!this.focused || this.closed) {
       return;
     }
-    this.menuInteracting = false;
+    this.clearMenuInteraction();
     this.emit("blur");
   }
   emit(
@@ -1351,16 +1410,17 @@ class EditorEntry {
       return;
     }
     if (kind === "blur" && this.menuInteracting) {
-      this.menuInteracting = false;
+      this.clearMenuInteraction();
       this.requestEditorFocus();
       return;
     }
     if (kind === "focus") {
-      this.menuInteracting = false;
-      if (activeEditor && activeEditor !== this) {
-        activeEditor.blurFromOther();
+      this.clearMenuInteraction();
+      const previous = activeEditorsByContext.get(this.context);
+      if (previous && previous !== this) {
+        previous.blurFromOther();
       }
-      activeEditor = this;
+      activeEditorsByContext.set(this.context, this);
       this.focused = true;
       this.imeCursorKey = "";
       if (this.isSink() && this.preview.length === 0) {
@@ -1369,8 +1429,8 @@ class EditorEntry {
       this.caretIndex = -1;
       this.scheduleSize();
     } else if (kind === "blur") {
-      if (activeEditor === this) {
-        activeEditor = undefined;
+      if (activeEditorsByContext.get(this.context) === this) {
+        activeEditorsByContext.delete(this.context);
       }
       this.focused = false;
       this.imeCursorKey = "";
@@ -1511,6 +1571,45 @@ class EditorEntry {
         this.imeCursorKey = "";
         this.scheduleSize();
       }
+    } else if (command.kind === "copy" || command.kind === "cut") {
+      if (this.isSink()) {
+        this.emit("edit-action", command.kind);
+        return;
+      }
+      const start = Math.min(this.text.length, this.selStart);
+      const end = Math.min(this.text.length, Math.max(start, this.selEnd));
+      if (end > start && !this.settings.secure) {
+        const selected = this.text.slice(start, end);
+        try {
+          const data = pasteboard.createData(pasteboard.MIMETYPE_TEXT_PLAIN, selected);
+          pasteboard.getSystemPasteboard().setDataSync(data);
+        } catch {}
+        if (command.kind === "cut" && this.canEdit()) {
+          this.pushUndoState(this.text);
+          const next = this.text.slice(0, start) + this.text.slice(end);
+          this.applyProgrammaticText(next, start);
+        }
+      }
+    } else if (command.kind === "undo") {
+      if (this.isSink()) {
+        this.emit("edit-action", "undo");
+        return;
+      }
+      if (this.canEdit() && this.undoStack.length > 0) {
+        const previous = this.undoStack.pop()!;
+        this.redoStack.push(this.text);
+        this.applyProgrammaticText(previous, previous.length);
+      }
+    } else if (command.kind === "redo") {
+      if (this.isSink()) {
+        this.emit("edit-action", "redo");
+        return;
+      }
+      if (this.canEdit() && this.redoStack.length > 0) {
+        const next = this.redoStack.pop()!;
+        this.undoStack.push(this.text);
+        this.applyProgrammaticText(next, next.length);
+      }
     } else if (command.kind === "open-edit-menu") {
       this.openEditMenu(command.x, command.y, command.width, command.height, command.actions ?? []);
     } else if (command.kind === "close-edit-menu") {
@@ -1563,6 +1662,7 @@ class EditorEntry {
       this.updating = false;
     }
     if (this.text !== next) {
+      this.pushUndoState(this.text);
       this.text = next;
       this.emit("change", next);
     }
@@ -1611,6 +1711,7 @@ class EditorEntry {
       this.updating = false;
     }
     if (this.text !== next) {
+      this.pushUndoState(this.text);
       this.text = next;
       this.emit("change", next);
     }
@@ -1618,7 +1719,7 @@ class EditorEntry {
     this.refresh();
   }
   chooseEditAction(action: string): void {
-    this.menuInteracting = false;
+    this.clearMenuInteraction();
     if (!this.focused) {
       this.requestEditorFocus();
     }
@@ -1744,8 +1845,9 @@ class EditorEntry {
     if (this.disposed) {
       return;
     }
-    if (activeEditor === this) {
-      activeEditor = undefined;
+    this.clearMenuInteraction();
+    if (activeEditorsByContext.get(this.context) === this) {
+      activeEditorsByContext.delete(this.context);
     }
     this.closed = true;
     try {
@@ -1764,6 +1866,14 @@ class EditorEntry {
       quarantinedEditors.add(this);
       throw new Error(`Native editor retirement failed: ${String(error)}`);
     }
+  }
+}
+
+function retryQuarantinedEditors(context: NshRuntimeContext): void {
+  for (const entry of Array.from(quarantinedEditors)) {
+    try {
+      entry.dispose(context);
+    } catch {}
   }
 }
 
@@ -1821,6 +1931,7 @@ export class NativeEditors {
   }
   private entries: Map<number, EditorEntry> = new Map();
   remove(ids: number[], context: NshRuntimeContext): void {
+    retryQuarantinedEditors(context);
     for (const id of ids) {
       this.pending.delete(id);
       this.entries.get(id)?.dispose(context);
@@ -1828,6 +1939,7 @@ export class NativeEditors {
     }
   }
   update(states: EditorSettings[], commands: EditorCommand[], context: NshRuntimeContext): void {
+    retryQuarantinedEditors(context);
     for (const state of states) {
       if (!context.isActive()) {
         throw new Error("NSH SDK session is inactive");
@@ -1850,6 +1962,8 @@ export class NativeEditors {
   }
   dispose(context: NshRuntimeContext): void {
     this.pending.clear();
+    activeEditorsByContext.delete(context);
+    retryQuarantinedEditors(context);
     let failure: Error | undefined;
     for (const id of Array.from(this.entries.keys())) {
       const entry = this.entries.get(id)!;
