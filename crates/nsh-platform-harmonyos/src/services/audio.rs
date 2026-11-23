@@ -820,6 +820,27 @@ impl AudioWorker {
                 set_file_path_source(&mut owned.player, Path::new(&decoded))
             } else if src.starts_with('/') {
                 set_file_path_source(&mut owned.player, Path::new(&src))
+            } else if src.starts_with("data:") {
+                decode_audio_data_uri(&src)
+                    .and_then(|bytes| {
+                        TempAudioFile::from_bytes(
+                            &self.host.cache_directory(),
+                            "player",
+                            id,
+                            &src,
+                            &bytes,
+                        )
+                        .map_err(|e| e.to_string())
+                    })
+                    .and_then(|temp| {
+                        let (file, len) = temp.open_read().map_err(|e| e.to_string())?;
+                        owned
+                            .player
+                            .set_fd(file.as_fd(), 0, len)
+                            .map_err(|e| e.to_string())?;
+                        staged_temp = Some(temp);
+                        Ok(())
+                    })
             } else if src.starts_with("asset:/") {
                 if let Some(file_result) = self.assets.open_file(&src) {
                     file_result.and_then(|file| set_opened_file_source(&mut owned.player, &file))
@@ -1186,6 +1207,24 @@ impl AudioWorker {
             player.release_player();
         }
     }
+}
+
+fn decode_audio_data_uri(uri: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let Some((header, payload)) = uri.split_once(',') else {
+        return Err("invalid audio data URI".into());
+    };
+    let bytes = if header.ends_with(";base64") {
+        base64::engine::general_purpose::STANDARD
+            .decode(payload)
+            .map_err(|e| format!("invalid base64 audio data URI: {e}"))?
+    } else {
+        percent_encoding::percent_decode_str(payload).collect()
+    };
+    if bytes.is_empty() {
+        return Err("empty audio data URI".into());
+    }
+    Ok(bytes)
 }
 
 fn set_file_path_source(player: &mut AvPlayer, path: &Path) -> Result<(), String> {

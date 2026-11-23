@@ -209,6 +209,8 @@ fn write_image_sync(uri: &str) -> Result<(), String> {
     }
     let source = ImageSource::create_from_data(&decoded).map_err(|e| format!("{e:?}"))?;
     let mut opts = DecodingOptions::new().map_err(|e| format!("{e:?}"))?;
+    opts.set_pixel_format(ohos_image_native_binding::types::PixelFormat::Rgba8888)
+        .map_err(|e| format!("{e:?}"))?;
     let pixel_map = source
         .create_pixelmap(&mut opts)
         .map_err(|e| format!("{e:?}"))?;
@@ -229,7 +231,11 @@ fn route_live(route: &Weak<Dispatcher>) -> Option<Arc<Dispatcher>> {
 }
 
 fn has_type_any(board: &Pasteboard, utd: &str, mime: &str) -> bool {
-    board.has_type_str(utd).unwrap_or(false) || board.has_type_str(mime).unwrap_or(false)
+    board.has_type_str(utd).unwrap_or(false)
+        || board.has_type_str(mime).unwrap_or(false)
+        || board
+            .mime_types()
+            .is_ok_and(|types| types.iter().any(|t| t == utd || t == mime))
 }
 
 fn read_board_data(board: &Pasteboard) -> Result<UdmfData, ()> {

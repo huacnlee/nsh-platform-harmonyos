@@ -139,6 +139,10 @@ impl HdcNative {
     }
 
     fn geometry(&self) -> Geometry {
+        if let Ok(geometry) = self.read_geometry() {
+            *self.geometry.lock().unwrap_or_else(|e| e.into_inner()) = geometry;
+            return geometry;
+        }
         *self.geometry.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -249,8 +253,15 @@ impl Native for HdcNative {
         options: nsh_testing::DragOptions,
     ) -> Result<(), String> {
         nsh_testing::agent::refuse_custom_drag("drag", options)?;
-        let (x, y) = self.geometry().point(from);
-        let (end_x, end_y) = self.geometry().point(to);
+        let geometry = self.geometry();
+        let (x, y) = geometry.point(from);
+        let (end_x, end_y) = geometry.point(to);
+        let min_x = geometry.pixels[0] as i32;
+        let min_y = geometry.pixels[1] as i32;
+        let max_x = (geometry.pixels[0] + geometry.pixels[2]).saturating_sub(1) as i32;
+        let max_y = (geometry.pixels[1] + geometry.pixels[3]).saturating_sub(1) as i32;
+        let (x, y) = (x.clamp(min_x, max_x), y.clamp(min_y, max_y));
+        let (end_x, end_y) = (end_x.clamp(min_x, max_x), end_y.clamp(min_y, max_y));
         let result = self.shell(&[
             "uinput",
             "-T",
@@ -469,8 +480,8 @@ fn dialog_button_point(tree: &serde_json::Value, label: &str) -> Result<[i32; 2]
         }
         let dialog_root = matches!(
             attrs["type"].as_str(),
-            Some("Dialog" | "AlertDialog" | "ActionSheet")
-        );
+            Some("Dialog" | "AlertDialog" | "ActionSheet" | "SheetPage" | "SheetWrapper")
+        ) || attrs["id"].as_str() == Some("nsh-native-sheet");
         let dialog = dialog || dialog_root;
         if dialog
             && !dialog_root
@@ -524,6 +535,18 @@ mod dialog_tests {
         let tree = json!({"children": [button("[0,0][20,20]"),
             {"attributes": {"type": "Dialog"}, "children": [button("[120,600][520,760]")]}]});
         assert_eq!(dialog_button_point(&tree, "关闭全部").unwrap(), [320, 680]);
+        let sheet_tree = json!({"children": [button("[0,0][20,20]"),
+            {"attributes": {"type": "SheetPage"}, "children": [button("[120,600][520,760]")]}]});
+        assert_eq!(
+            dialog_button_point(&sheet_tree, "关闭全部").unwrap(),
+            [320, 680]
+        );
+        let tagged_sheet = json!({"children": [button("[0,0][20,20]"),
+            {"attributes": {"type": "Column", "id": "nsh-native-sheet"}, "children": [button("[120,600][520,760]")]}]});
+        assert_eq!(
+            dialog_button_point(&tagged_sheet, "关闭全部").unwrap(),
+            [320, 680]
+        );
     }
     #[test]
     fn rejects_hidden_ambiguous_or_invalid_targets() {

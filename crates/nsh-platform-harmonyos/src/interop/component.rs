@@ -342,7 +342,11 @@ impl Instance {
                 if cb_updating.get() || !cb_active.get() || cb_disabled.get() {
                     return;
                 }
-                let next = event.i32_value(0).unwrap_or_default() != 0;
+                let next = event
+                    .component_i32(0)
+                    .or_else(|| event.i32_value(0))
+                    .unwrap_or_default()
+                    != 0;
                 let controlled = cb_checked.get();
                 if next != controlled {
                     // Revert the visual state to the controlled value so rejected

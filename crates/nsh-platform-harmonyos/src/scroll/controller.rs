@@ -1774,11 +1774,8 @@ impl Scroller {
             self.wrapper.borrow().remove_gesture(&gesture)?;
         }
         if wants {
-            let distance = self
-                .owner
-                .upgrade()
-                .map_or(5.0, |owner| 5.0 * owner.scale.get() as f64);
-            let gesture = Gesture::create_pinch_gesture(2, distance)?;
+            // Pass 0.0 to use ArkUI's built-in system default pinch threshold.
+            let gesture = Gesture::create_pinch_gesture(2, 0.0)?;
             let weak = Rc::downgrade(self);
             gesture.on_gesture(G::Accept | G::Update | G::End | G::Cancel, move |event| {
                 callback(|| {

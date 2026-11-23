@@ -436,6 +436,11 @@ impl Touches {
                         Some(false) => *failed = true,
                         Some(true) => {
                             block(&node, true)?;
+                            let mut ancestor = Some(node.clone());
+                            while let Some(current) = ancestor {
+                                self.suppressed_presses.push(current.id);
+                                ancestor = current.parent_node.borrow().upgrade();
+                            }
                             self.activated = Some(Rc::downgrade(&node));
                             activated = Some(node.id);
                             break;

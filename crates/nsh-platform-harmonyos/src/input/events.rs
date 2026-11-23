@@ -24,6 +24,7 @@ use ohos_arkui_binding::{
         event::NodeEventType as E,
         gesture_direction::GestureDirection,
         gesture_event::GestureEventAction,
+        gesture_priority::GesturePriority,
         view::{AccessibilityMode, HitTestMode},
     },
 };
@@ -781,12 +782,12 @@ impl Interaction {
                 native.off_event(E::OnDrop)?;
             }
         }
+        // 0 delegates to ArkUI's built-in system default long-press duration.
         let delay = self
             .props
             .borrow()
             .long_press_delay
-            .unwrap_or(500.0)
-            .clamp(1.0, i32::MAX as f32) as u32;
+            .map_or(0, |ms| ms.clamp(1.0, i32::MAX as f32) as u32);
         let wants_long = !blocked
             && (owner.selectable()
                 || events.contains(EventKind::LongPress)
@@ -831,6 +832,7 @@ impl Interaction {
         let window_control_changed = old_props.window_control != props.window_control;
         let focusable_changed = old_props.focusable != props.focusable
             || old_props.accessibility.state.disabled != props.accessibility.state.disabled;
+        let long_press_delay_changed = old_props.long_press_delay != props.long_press_delay;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -891,7 +893,7 @@ impl Interaction {
         self.apply_opacity(owner)?;
         if pointer_changed {
             self.pointer_internal(owner, self.inherited_block.get(), true)?;
-        } else if window_control_changed || focusable_changed {
+        } else if window_control_changed || focusable_changed || long_press_delay_changed {
             self.events(owner, self.events.get())?;
         }
         if selection_changed {
@@ -1013,13 +1015,18 @@ impl Interaction {
                 continue;
             }
             let gesture = match kind {
-                0 => Gesture::create_pan_gesture(
-                    1,
-                    GestureDirection::All,
-                    10.0 * owner.scale.get() as f64,
-                )?,
-                1 => Gesture::create_pinch_gesture(2, 5.0 * owner.scale.get() as f64)?,
-                _ => Gesture::create_rotation_gesture(2, 1.0)?,
+                0 => {
+                    let direction = match (values.pan_x.is_some(), values.pan_y.is_some()) {
+                        (true, true) => GestureDirection::All,
+                        (true, false) => GestureDirection::Horizontal,
+                        (false, true) => GestureDirection::Vertical,
+                        (false, false) => GestureDirection::None,
+                    };
+                    // Pass 0.0 to use ArkUI's built-in system default threshold.
+                    Gesture::create_pan_gesture(1, direction, 0.0)?
+                }
+                1 => Gesture::create_pinch_gesture(2, 0.0)?,
+                _ => Gesture::create_rotation_gesture(2, 0.0)?,
             };
             let weak = Rc::downgrade(owner);
             gesture.on_gesture(
@@ -1142,10 +1149,15 @@ impl Interaction {
                     })
                 },
             )?;
+            let priority = if kind == 0 {
+                Some(GesturePriority::Normal)
+            } else {
+                None
+            };
             owner
                 .native
                 .borrow()
-                .add_gesture_ref(&gesture, None, None)?;
+                .add_gesture_ref(&gesture, priority, None)?;
             self.gestures.borrow_mut().push(gesture);
         }
         Ok(())

@@ -186,6 +186,7 @@ function nativeAlert(content: AlertContent) {
           .clip(true);
         }
       }
+      .id("nsh-native-sheet")
       .width("100%")
       .padding({
         left: $r("sys.float.padding_level8"),
