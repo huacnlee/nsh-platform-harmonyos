@@ -352,6 +352,12 @@ impl Interaction {
                                     }
                                 }
                                 UIInputAction::Up | UIInputAction::Cancel => {
+                                    if !is_root {
+                                        owner
+                                            .touches
+                                            .borrow_mut()
+                                            .record_down(owner.key_window_id(), &input);
+                                    }
                                     owner.interaction.state(&owner, state::PRESSED, false)?;
                                     if owner.press_feedback_allowed()
                                         && mask.contains(EventKind::PressUp)

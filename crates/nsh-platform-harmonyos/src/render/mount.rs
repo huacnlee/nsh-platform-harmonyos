@@ -2108,11 +2108,14 @@ impl Mounter {
         // Each frame uses the most recent marker. Batch-local state also keeps
         // an unclosed scope from leaking into a later commit or deferred replay.
         let mut nav_shader_configured = false;
-        let mut replay_deferred = false;
         let mut batch_created_ids: Vec<NodeId> = Vec::new();
         self.batches += 1;
         let items = batch.items.len();
-        for (at, item) in batch.items.into_iter().enumerate() {
+        let mut queue: std::collections::VecDeque<MountItem> = batch.items.into();
+        let mut at = 0usize;
+        while let Some(item) = queue.pop_front() {
+            let item_index = at;
+            at += 1;
             if Self::deferred_node(&item)
                 .is_some_and(|id| motion.allows_defer(id) && self.frozen(id))
             {
@@ -2310,13 +2313,32 @@ impl Mounter {
                         }
                         Self::attribute(node.inserted(motion.insert_animation()));
                         // This Insert supersedes a removal deferred while the node
-                        // was leaving. Replay its other updates after the batch loop
-                        // finishes so we never recursively re-enter apply() mid-batch.
-                        self.deferred.retain(
-                            |item| !matches!(item, MountItem::Remove { id } if *id == child),
-                        );
-                        if !self.deferred.is_empty() {
-                            replay_deferred = true;
+                        // was leaving. Prepend any newly unfrozen deferred updates to
+                        // the front of the current batch queue so they run in
+                        // chronological order strictly before newer same-batch items
+                        // without recursively re-entering apply().
+                        let mut still_deferred = Vec::new();
+                        let mut unfrozen = Vec::new();
+                        for deferred_item in std::mem::take(&mut self.deferred) {
+                            if matches!(deferred_item, MountItem::Remove { id } if id == child) {
+                                continue;
+                            }
+                            let id =
+                                Self::deferred_node(&deferred_item).expect("deferred view update");
+                            if let Ok(target) = self.node(id) {
+                                if target.pending_delete.get() {
+                                    continue;
+                                }
+                                if self.frozen(id) {
+                                    still_deferred.push(deferred_item);
+                                } else {
+                                    unfrozen.push(deferred_item);
+                                }
+                            }
+                        }
+                        self.deferred = still_deferred;
+                        for deferred_item in unfrozen.into_iter().rev() {
+                            queue.push_front(deferred_item);
                         }
                     }
                     MountItem::Remove { id } => {
@@ -2933,7 +2955,7 @@ impl Mounter {
                 // items (including updates after a stale node) still apply.
                 log::warn!(
                     target: "nsh::mount",
-                    "skipped mount item: batch={} item={at}/{items}: {error}",
+                    "skipped mount item: batch={} item={item_index}/{items}: {error}",
                     self.batches
                 );
             }
@@ -2942,9 +2964,6 @@ impl Mounter {
             if let Ok(node) = self.node(id) {
                 node.batch_created.set(false);
             }
-        }
-        if replay_deferred {
-            Self::attribute(self.finish_deferred());
         }
         Self::attribute(self.reconcile_navigation());
         for node in std::mem::take(&mut *self.deferred_webs.borrow_mut())

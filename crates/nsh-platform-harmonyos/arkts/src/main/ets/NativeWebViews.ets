@@ -313,7 +313,25 @@ class WebEntry {
     this.sdkBusy = true;
     try {
       this.wasWarmMount = webComponentMounted;
+      if (!webEngineInitialized && this.settings.urlSchemes.length > 0) {
+        try {
+          const customSchemes: Array<webview.WebCustomScheme> = [];
+          for (const scheme of this.settings.urlSchemes) {
+            if (scheme.length > 0) {
+              customSchemes.push({
+                schemeName: scheme,
+                isSupportCORS: true,
+                isSupportFetch: true,
+              });
+            }
+          }
+          if (customSchemes.length > 0) {
+            webview.WebviewController.customizeSchemes(customSchemes);
+          }
+        } catch {}
+      }
       ensureWebEngineInitialized();
+      this.ensureIncognitoLease();
       this.node.build(wrapBuilder(webContent), { entry: this }, { nestingBuilderSupported: true });
       if (this.closed || !this.context.isActive()) {
         throw new Error("WebView creation was cancelled");

@@ -357,8 +357,10 @@ impl Evaluations {
 fn push_start_script(source: &str, key: &str) -> String {
     let inner = script::start_script(source, key);
     let key_json = serde_json::to_string(key).expect("string");
+    // Keep `globalThis[__k]` intact when pushing so a concurrent 25ms fallback
+    // `poll_script` never sees a deleted slot before the async IPC arrives.
     format!(
-        "(()=>{{const __r={inner};const __k={key_json};const __c=globalThis[__k];if(__c&&typeof window!==\"undefined\"&&window.__nshNative&&typeof window.__nshNative.evalResult===\"function\"){{let __v=__c.result;if(__v!==null){{delete globalThis[__k];try{{window.__nshNative.evalResult(__k,String(__v));}}catch(_){{}}}}else{{Object.defineProperty(__c,\"result\",{{configurable:true,get(){{return __v;}},set(v){{__v=v;if(v!==null&&globalThis[__k]===__c){{delete globalThis[__k];try{{window.__nshNative.evalResult(__k,String(v));}}catch(_){{}}}}}}}});}}}}return __r;}})()"
+        "(()=>{{const __r={inner};const __k={key_json};const __c=globalThis[__k];if(__c&&typeof window!==\"undefined\"&&window.__nshNative&&typeof window.__nshNative.evalResult===\"function\"){{let __v=__c.result;if(__v!==null){{try{{window.__nshNative.evalResult(__k,String(__v));}}catch(_){{}}}}else{{Object.defineProperty(__c,\"result\",{{configurable:true,get(){{return __v;}},set(v){{__v=v;if(v!==null&&globalThis[__k]===__c){{try{{window.__nshNative.evalResult(__k,String(v));}}catch(_){{}}}}}}}});}}}}return __r;}})()"
     )
 }
 

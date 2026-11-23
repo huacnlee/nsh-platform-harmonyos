@@ -3,7 +3,10 @@
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use nsh_core::{Command, EventKind, EventPayload, PayloadValue, WebProps, WebSource};
@@ -39,6 +42,7 @@ const SCHEME: &str = "nsh-asset";
 const BRIDGE: &str = "window.nsh = window.nsh || { postMessage: function (data) { window.__nshNative.postMessage(String(data)); } };";
 
 static SCHEME_REGISTERED: OnceLock<()> = OnceLock::new();
+static ARKWEB_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn register_custom_scheme() {
     SCHEME_REGISTERED.get_or_init(|| {
@@ -54,10 +58,17 @@ pub(crate) fn register_custom_scheme() {
 }
 
 fn register_url_schemes(schemes: &[nsh_core::web_resource::WebUrlScheme]) {
+    let initialized = ARKWEB_INITIALIZED.load(Ordering::Acquire);
     let mut added = false;
     for scheme in schemes {
         let name = scheme.scheme();
         if !CustomProtocol::is_protocol_registered(name) {
+            if initialized {
+                log::warn!(
+                    "OHOS WebView custom scheme `{name}` cannot be registered after ArkWeb initialization"
+                );
+                continue;
+            }
             CustomProtocol::add_protocol_with_option(
                 name,
                 CustomProtocolOption::Standard
@@ -1046,17 +1057,13 @@ fn install_asset_protocol(
             "ArkWeb rejected the custom protocol handler for this WebView tag",
         ));
     }
+    ARKWEB_INITIALIZED.store(true, Ordering::Release);
     for scheme in url_schemes {
         let name = scheme.scheme();
         if !CustomProtocol::is_protocol_registered(name) {
-            CustomProtocol::add_protocol_with_option(
-                name,
-                CustomProtocolOption::Standard
-                    | CustomProtocolOption::Secure
-                    | CustomProtocolOption::CorsEnabled
-                    | CustomProtocolOption::FetchEnabled,
+            log::warn!(
+                "OHOS WebView custom scheme `{name}` was not registered before ArkWeb initialization"
             );
-            CustomProtocol::register();
         }
         let scheme_handler = CustomProtocolHandler::new();
         let scheme_clone = scheme.clone();
@@ -1079,7 +1086,19 @@ fn install_asset_protocol(
             scheme_clone.handle(req);
             true
         });
-        let _ = Web::new(native_tag.to_owned()).custom_protocol(name.to_owned(), scheme_handler);
+        match Web::new(native_tag.to_owned()).custom_protocol(name.to_owned(), scheme_handler) {
+            Ok(true) => {}
+            Ok(false) => {
+                log::warn!(
+                    "ArkWeb rejected custom protocol handler for scheme `{name}` on tag `{native_tag}`"
+                );
+            }
+            Err(error) => {
+                log::warn!(
+                    "Failed to bind ArkWeb custom protocol `{name}` on tag `{native_tag}`: {error}"
+                );
+            }
+        }
     }
     Ok(())
 }

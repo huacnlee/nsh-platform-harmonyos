@@ -1,5 +1,5 @@
 //! Per-surface native audio service powered by `ohos-avplayer-binding` (`AvPlayer`)
-//! for short `Sound` effects (polyphonic, up to 32 voices) and streaming `AudioPlayer`s.
+//! for short `Sound` effects (polyphonic, up to 8 voices) and streaming `AudioPlayer`s.
 
 use std::{
     cell::RefCell,
@@ -29,7 +29,7 @@ use crate::{
     services::assets::StreamAssets,
 };
 
-const MAX_VOICES: usize = 32;
+const MAX_VOICES: usize = 8;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
@@ -85,8 +85,9 @@ impl TempAudioFile {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
+        let temp = Self(path);
         io::copy(&mut reader, &mut file)?;
-        Ok(Self(path))
+        Ok(temp)
     }
 }
 
@@ -178,30 +179,42 @@ unsafe extern "C" fn on_av_error(
 }
 
 struct OwnedAvPlayer {
-    player: AvPlayer,
-    _callbacks: Box<AvCallbacks>,
+    player: std::mem::ManuallyDrop<AvPlayer>,
+    callbacks: std::mem::ManuallyDrop<Box<AvCallbacks>>,
+    closed: bool,
 }
 
 impl OwnedAvPlayer {
     fn new(tx: mpsc::Sender<WorkerEvent>, target: Target) -> Result<Self, String> {
-        let mut player = AvPlayer::new().map_err(|e| e.to_string())?;
-        let mut callbacks = Box::new(AvCallbacks { tx, target });
-        let ptr = (&mut *callbacks as *mut AvCallbacks).cast::<c_void>();
-        // SAFETY: `OwnedAvPlayer::close` clears callbacks before dropping `callbacks`.
+        let callbacks = Box::new(AvCallbacks { tx, target });
+        let player = AvPlayer::new().map_err(|e| e.to_string())?;
+        let mut owned = Self {
+            player: std::mem::ManuallyDrop::new(player),
+            callbacks: std::mem::ManuallyDrop::new(callbacks),
+            closed: false,
+        };
+        // The boxed allocation has a stable heap address while owned by `Self`;
+        // `Drop` / `close_inner` tears down the native player via `close_sync`
+        // before freeing `callbacks`, and leaks both if `close_sync` fails.
+        let ptr = (&mut **owned.callbacks as *mut AvCallbacks).cast::<c_void>();
+        // SAFETY: `ptr` points to `owned.callbacks` which outlives any native callbacks.
         unsafe {
-            player
+            owned
+                .player
                 .set_info_callback(Some(on_av_info), ptr)
                 .map_err(|e| e.to_string())?;
-            player
+            owned
+                .player
                 .set_error_callback(Some(on_av_error), ptr)
                 .map_err(|e| e.to_string())?;
         }
-        let _ = player.set_audio_renderer_info(AudioStreamUsage::Music);
-        let _ = player.set_audio_interrupt_mode(AudioInterruptMode::Share);
-        Ok(Self {
-            player,
-            _callbacks: callbacks,
-        })
+        let _ = owned
+            .player
+            .set_audio_renderer_info(AudioStreamUsage::Music);
+        let _ = owned
+            .player
+            .set_audio_interrupt_mode(AudioInterruptMode::Share);
+        Ok(owned)
     }
 
     fn open_file(
@@ -218,11 +231,36 @@ impl OwnedAvPlayer {
         Ok(av)
     }
 
-    fn close(mut self) {
-        if let Err(err) = self.player.close_sync() {
-            log::warn!("OHOS audio AVPlayer close failed: {err}");
-            std::mem::forget(self);
+    fn close_inner(&mut self) {
+        if self.closed {
+            return;
         }
+        self.closed = true;
+        match self.player.close_sync() {
+            Ok(()) => {
+                // SAFETY: `close_sync` synchronously stopped the native AVPlayer and drained
+                // callbacks, so dropping `player` and then `callbacks` is safe.
+                unsafe {
+                    std::mem::ManuallyDrop::drop(&mut self.player);
+                    std::mem::ManuallyDrop::drop(&mut self.callbacks);
+                }
+            }
+            Err(err) => {
+                // Keep both handle and callback box alive if C teardown failed so late
+                // native callbacks can never dereference freed memory.
+                log::warn!("OHOS audio AVPlayer close failed: {err}");
+            }
+        }
+    }
+
+    fn close(mut self) {
+        self.close_inner();
+    }
+}
+
+impl Drop for OwnedAvPlayer {
+    fn drop(&mut self) {
+        self.close_inner();
     }
 }
 
@@ -452,10 +490,13 @@ impl AudioWorker {
             }
             AudioCommand::Preload { id } => self.ensure_player(id),
             AudioCommand::Resume { id } => {
+                let next_gen = self.next_gen + 1;
                 let Some(p) = self.players.get_mut(&id) else {
                     return;
                 };
                 if p.failed {
+                    self.next_gen = next_gen;
+                    p.generation = next_gen;
                     p.failed = false;
                     p.release();
                 }
@@ -803,6 +844,11 @@ impl AudioWorker {
                 }
             }
             AvNotice::State(s) if s == av::STATE_PLAYING as i32 => {
+                if !p.wants_play {
+                    let _ = p.av.as_mut().unwrap().player.pause();
+                    p.playing = false;
+                    return;
+                }
                 p.playing = true;
                 p.last_progress = Instant::now();
                 p.apply_settings();

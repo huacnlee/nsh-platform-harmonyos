@@ -88,7 +88,7 @@ impl NativeText {
                     return None;
                 }
                 let (mut paragraph, _backgrounds, _decorations, _fonts) =
-                    build_typography(&self.source, &self.alignments, self.scale, fonts);
+                    build_typography(&self.source, &self.alignments, fonts);
                 paragraph.layout(self.layout_width);
                 let layout = crate::text::selection::layout::Layout::new(
                     self.text.clone(),
@@ -197,7 +197,6 @@ type BuiltTypography = (
 fn build_typography(
     text: &AttributedText,
     alignments: &AttachmentAlignments,
-    scale: f32,
     fonts_arc: &Arc<Mutex<super::fonts::Fonts>>,
 ) -> BuiltTypography {
     let rtl = text.writing_direction.unwrap_or(text.rtl);
@@ -293,10 +292,11 @@ fn build_typography(
             },
         );
         if let Some(shadow) = text.shadow {
-            // Convert CSS blur radius to Rosen sigma using the shared density-aware helper.
-            let sigma = f64::from(crate::render::composition::geometry::native_blur_value(
+            // Paragraph painting runs under `canvas.scale(scale, scale)`, so shadow blur
+            // stays in logical points using the CSS `text-shadow` sigma (`radius * 0.5`).
+            let sigma = f64::from(crate::render::composition::geometry::shadow_blur_sigma(
                 shadow.radius.0,
-                scale,
+                1.0,
             ));
             style.add_shadow(&ohos_drawing_binding::TextShadow::new(
                 argb(shadow.color),
@@ -655,7 +655,7 @@ impl TextEngine for OhosTextEngine {
     ) -> Prepared {
         let rtl = text.writing_direction.unwrap_or(text.rtl);
         let (native, backgrounds, decorations, font_data) =
-            build_typography(text, alignments, self.scale(), &self.fonts);
+            build_typography(text, alignments, &self.fonts);
         let shared_text: Arc<str> = Arc::from(text.text.as_str());
         Prepared {
             paragraph: RefCell::new(Arc::new(Mutex::new(Paragraph {

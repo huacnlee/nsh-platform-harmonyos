@@ -27,9 +27,11 @@ use crate::app::{
 
 const MAX_IMAGE_BYTES: usize = 48 * 1024 * 1024;
 const UTD_PLAIN_TEXT: &str = "general.plain-text";
+const UTD_HTML: &str = "general.html";
 const UTD_PIXEL_MAP: &str = "openharmony.pixel-map";
 const UTD_FILE_URI: &str = "general.file-uri";
 const MIME_TEXT_PLAIN: &str = "text/plain";
+const MIME_TEXT_HTML: &str = "text/html";
 const MIME_PIXEL_MAP: &str = "pixelMap";
 const MIME_TEXT_URI: &str = "text/uri";
 
@@ -102,7 +104,8 @@ impl Clipboard {
                 "clipboard-read",
                 None,
                 |board, d| {
-                    let has = has_type_any(board, UTD_PLAIN_TEXT, MIME_TEXT_PLAIN);
+                    let has = has_type_any(board, UTD_PLAIN_TEXT, MIME_TEXT_PLAIN)
+                        || has_type_any(board, UTD_HTML, MIME_TEXT_HTML);
                     if has_only || !has {
                         send_has(d, id, has);
                         return false;
@@ -425,11 +428,19 @@ fn pack_pixelmap_png(pixel_map: &PixelMap) -> Result<PackedPng, String> {
                     height,
                 });
             }
-            Err(_) if attempt < 2 && capacity < max_buf => {
-                capacity = capacity.saturating_mul(2).min(max_buf);
+            Err(e) => {
+                // `IMAGE_TOO_LARGE` (7600103), `IMAGE_ALLOC_FAILED` (7600301), and
+                // `IMAGE_ENCODE_FAILED` (7800301) can indicate an undersized output buffer;
+                // other codes (e.g. bad parameter / unsupported MIME) should fail immediately.
+                let retryable = matches!(e.code, 7600103 | 7600301 | 7800301);
+                if retryable && attempt < 2 && capacity < max_buf {
+                    capacity = capacity.saturating_mul(2).min(max_buf);
+                } else if retryable && (e.code == 7600103 || capacity >= max_buf) {
+                    return Ok(PackedPng::TooLarge(max_buf));
+                } else {
+                    return Err(format!("{e:?}"));
+                }
             }
-            Err(_) if capacity >= max_buf => return Ok(PackedPng::TooLarge(max_buf)),
-            Err(e) => return Err(format!("{e:?}")),
         }
     }
     Ok(PackedPng::TooLarge(max_buf))

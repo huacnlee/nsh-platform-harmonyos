@@ -136,6 +136,7 @@ pub(crate) struct Touches {
     last_mouse_press: Option<LastTap>,
     handled_context_menu: Option<(i64, i32, i32)>,
     down_recorded: bool,
+    last_down_time_ns: Option<i64>,
 }
 impl Touches {
     pub(crate) fn record_pointer_for(&mut self, window_id: nsh_core::NodeId, point: (f32, f32)) {
@@ -177,10 +178,15 @@ impl Touches {
             input.pointer_window_y_by_index(0),
         );
         self.record_pointer_for(window_id, window);
-        if self.down_recorded {
+        // Deduplicate a single Down event bubbling across child -> root, while
+        // still advancing if an earlier Up/Cancel was consumed by a native child.
+        if self.down_recorded
+            && (event_time_ns == 0 || self.last_down_time_ns == Some(event_time_ns))
+        {
             return;
         }
         self.down_recorded = true;
+        self.last_down_time_ns = Some(event_time_ns);
         let _ = advance_clicks(
             &mut self.last_tap,
             event_time_ns,
@@ -198,6 +204,7 @@ impl Touches {
         self.last_mouse_press = None;
         self.handled_context_menu = None;
         self.down_recorded = false;
+        self.last_down_time_ns = None;
         self.window_resize = None;
         self.pending_window_drag = None;
         self.mouse_up_targets.clear();

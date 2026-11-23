@@ -642,6 +642,26 @@ impl Services {
         })
     }
 
+    pub(crate) fn is_native_pointer_hidden(&self) -> bool {
+        #[cfg(feature = "api-23")]
+        {
+            self.native_pointer_hidden.load(Ordering::Acquire)
+        }
+        #[cfg(not(feature = "api-23"))]
+        {
+            false
+        }
+    }
+
+    #[cfg(feature = "api-23")]
+    fn restore_native_pointer_visible(&self) {
+        if self.native_pointer_hidden.swap(false, Ordering::AcqRel)
+            && ohos_multi_modal_input_binding::set_pointer_visible(true).is_err()
+        {
+            self.native_pointer_hidden.store(true, Ordering::Release);
+        }
+    }
+
     pub(crate) fn cursor(&self, window_id: Option<u32>, cursor: nsh_core::Cursor) -> Result<()> {
         #[cfg(feature = "api-23")]
         if self.try_native_cursor(window_id, cursor) {
@@ -1079,9 +1099,12 @@ impl Services {
             .lifecycle
             .as_deref()
             .is_some_and(|state| state != "active")
-            && let Some(keyboard) = self.keyboard.lock().unwrap().as_ref()
         {
-            keyboard.clear();
+            #[cfg(feature = "api-23")]
+            self.restore_native_pointer_visible();
+            if let Some(keyboard) = self.keyboard.lock().unwrap().as_ref() {
+                keyboard.clear();
+            }
         }
         let mut environment = self.environment.lock().unwrap();
         let snapshot = environment

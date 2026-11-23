@@ -104,7 +104,10 @@ pub(crate) fn native_blur_value(css_radius: f32, scale: f32) -> f32 {
 /// CSS `drop-shadow` / `box-shadow` blur radius to Gaussian sigma (`radius * scale * 0.5`),
 /// matching W3C shadow blur and upstream Android/Apple/Windows implementations.
 pub(crate) fn shadow_blur_sigma(radius: f32, scale: f32) -> f32 {
-    radius.max(0.0) * scale * 0.5
+    if !radius.is_finite() || !scale.is_finite() || radius <= 0.0 || scale <= 0.0 {
+        return 0.0;
+    }
+    radius * scale * 0.5
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

@@ -124,7 +124,9 @@ impl State {
                     .map(|(_, cursor)| cursor);
                 explicit.or(entry.pointer_auto).unwrap_or(Cursor::Auto)
             };
-            if entry.applied != cursor {
+            if entry.applied != cursor
+                || (cursor != Cursor::None && owner.host.is_native_pointer_hidden())
+            {
                 entry.applied = cursor;
                 Some(cursor)
             } else {

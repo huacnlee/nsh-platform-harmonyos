@@ -162,6 +162,7 @@ function authSessionBuilder(params: AuthSessionViewParams) {
 interface ActiveAuthSession {
   key: number;
   ephemeral: boolean;
+  holdsIncognito: boolean;
   controller: webview.WebviewController;
   view?: ComponentContent<AuthSessionViewParams>;
   opening: boolean;
@@ -199,47 +200,63 @@ export class NativeAuthSession {
     if (this.current !== undefined) {
       this.finishSession(this.current, { phase: "cancelled" } as SystemReply);
     }
+    let holdsIncognito = false;
     try {
       webview.WebviewController.initializeWebEngine();
-      if (ephemeral) {
-        acquireIncognitoStore();
-      }
     } catch {}
-    const controller = new webview.WebviewController();
-    const state = new AuthSessionUiState(url);
-    const session: ActiveAuthSession = {
-      key,
-      ephemeral,
-      controller,
-      opening: true,
-      mounted: false,
-      closing: false,
-      settled: false,
-      reply,
-    };
+    if (ephemeral) {
+      acquireIncognitoStore();
+      holdsIncognito = true;
+    }
+    let controller: webview.WebviewController;
+    let state: AuthSessionUiState;
+    let session: ActiveAuthSession;
+    let view: ComponentContent<AuthSessionViewParams>;
+    try {
+      controller = new webview.WebviewController();
+      state = new AuthSessionUiState(url);
+      session = {
+        key,
+        ephemeral,
+        holdsIncognito,
+        controller,
+        opening: true,
+        mounted: false,
+        closing: false,
+        settled: false,
+        reply,
+      };
+      const params: AuthSessionViewParams = {
+        url,
+        callbackScheme,
+        ephemeral,
+        colorMode: this.colorMode,
+        controller,
+        state,
+        onComplete: (callbackUrl: string): void => {
+          this.finishSession(session, { phase: "completed", uri: callbackUrl } as SystemReply);
+        },
+        onCancel: (): void => {
+          this.finishSession(session, { phase: "cancelled" } as SystemReply);
+        },
+      };
+      view = new ComponentContent<AuthSessionViewParams>(
+        this.ui,
+        wrapBuilder(authSessionBuilder),
+        params,
+        { nestingBuilderSupported: true },
+      );
+      session.view = view;
+    } catch (error) {
+      if (holdsIncognito) {
+        releaseIncognitoStore();
+      }
+      reply({
+        error: `openAuthSession: failed to create sign-in view: ${String(error)}`,
+      } as SystemReply);
+      return;
+    }
     this.current = session;
-
-    const params: AuthSessionViewParams = {
-      url,
-      callbackScheme,
-      ephemeral,
-      colorMode: this.colorMode,
-      controller,
-      state,
-      onComplete: (callbackUrl: string): void => {
-        this.finishSession(session, { phase: "completed", uri: callbackUrl } as SystemReply);
-      },
-      onCancel: (): void => {
-        this.finishSession(session, { phase: "cancelled" } as SystemReply);
-      },
-    };
-    const view = new ComponentContent<AuthSessionViewParams>(
-      this.ui,
-      wrapBuilder(authSessionBuilder),
-      params,
-      { nestingBuilderSupported: true },
-    );
-    session.view = view;
 
     try {
       this.ui
@@ -299,7 +316,8 @@ export class NativeAuthSession {
       const active = this.current;
       active.settled = true;
       this.current = undefined;
-      if (active.ephemeral) {
+      if (active.holdsIncognito) {
+        active.holdsIncognito = false;
         releaseIncognitoStore();
       }
       this.dismissDialog(active);
@@ -322,7 +340,8 @@ export class NativeAuthSession {
     try {
       session.controller.stop();
     } catch {}
-    if (session.ephemeral) {
+    if (session.holdsIncognito) {
+      session.holdsIncognito = false;
       releaseIncognitoStore();
     }
     session.reply(event);

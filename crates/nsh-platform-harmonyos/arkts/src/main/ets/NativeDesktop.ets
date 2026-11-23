@@ -688,9 +688,8 @@ function applyTitleBarAndFrameHelper(
   cmd: WireCommand,
   state: WindowChromeState,
   applyOpaqueBackground: () => void,
-  syncTitleBar: () => void,
   emitTitleBar: (payload: WireTitleBarPayload) => void,
-): void {
+): boolean {
   // Track `frameNone` and `titleBarHidden` independently (matching Rust `MainWindowState`)
   // so toggling `frame: none -> default` preserves an explicit `titleBarStyle: hidden`.
   if (cmd.titleBarStyle !== undefined) {
@@ -708,7 +707,7 @@ function applyTitleBarAndFrameHelper(
       win.setWindowTitleButtonVisible(false, false, false);
     } catch {}
     emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
-    return;
+    return false;
   }
   const restoredFrame = cmd.frame === "default" && state.frameNone;
   if (restoredFrame) {
@@ -732,7 +731,7 @@ function applyTitleBarAndFrameHelper(
           win.setWindowDecorHeight(clampDecorHeight(state.requestedTitleBarHeight));
         }
       } catch {}
-      syncTitleBar();
+      return true;
     } else {
       emitTitleBar({ top: 0, right: 0, bottom: 0, left: 0 });
     }
@@ -745,8 +744,9 @@ function applyTitleBarAndFrameHelper(
     try {
       win.setWindowDecorHeight(clampDecorHeight(cmd.titleBarHeight));
     } catch {}
-    syncTitleBar();
+    return true;
   }
+  return false;
 }
 
 class SubWindowHost {
@@ -1413,17 +1413,19 @@ class SubWindowHost {
       backdrop: this.backdrop,
       backgroundOverridden: this.backgroundOverridden,
     };
-    applyTitleBarAndFrameHelper(
+    const needsTitleBarSync = applyTitleBarAndFrameHelper(
       sub,
       cmd,
       chromeState,
       (): void => this.applyOpaqueBackground(),
-      (): void => this.syncTitleBar(),
       (payload: WireTitleBarPayload): void => this.emitTitleBar(payload),
     );
     this.frameNone = chromeState.frameNone;
     this.titleBarHidden = chromeState.titleBarHidden;
     this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
+    if (needsTitleBarSync) {
+      this.syncTitleBar();
+    }
 
     if (
       cmd.maximizable !== undefined ||
@@ -2530,17 +2532,19 @@ export class NativeDesktop {
       backdrop: this.backdrop,
       backgroundOverridden: this.backgroundOverridden,
     };
-    applyTitleBarAndFrameHelper(
+    const needsTitleBarSync = applyTitleBarAndFrameHelper(
       this.mainWindow,
       cmd,
       chromeState,
       (): void => this.applyOpaqueBackground(),
-      (): void => this.syncTitleBar(),
       (payload: WireTitleBarPayload): void => this.emitTitleBar(payload),
     );
     this.frameNone = chromeState.frameNone;
     this.titleBarHidden = chromeState.titleBarHidden;
     this.requestedTitleBarHeight = chromeState.requestedTitleBarHeight;
+    if (needsTitleBarSync) {
+      this.syncTitleBar();
+    }
 
     if (
       cmd.maximizable !== undefined ||
