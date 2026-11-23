@@ -126,72 +126,14 @@ fn workspace_patches(workspace_manifest: &str) -> String {
     out
 }
 
-/// The `[patch]` sections of the generated workspace in `workspace`, merged with
-/// any platform-specific (non-`nsh-*`) patches required by this backend.
+/// The `[patch]` sections of the generated workspace in `workspace`, or the
+/// backend's own revision of NSH when it has none.
 fn patches_of(workspace: &Path) -> String {
-    let app_patches = fs::read_to_string(workspace.join("Cargo.toml"))
+    fs::read_to_string(workspace.join("Cargo.toml"))
         .ok()
         .map(|m| workspace_patches(&m))
-        .filter(|p| !p.is_empty());
-    match app_patches {
-        Some(patches) => merge_platform_patches(&patches, crate::embedded::NSH_PATCH),
-        None => crate::embedded::NSH_PATCH.to_owned(),
-    }
-}
-
-fn merge_platform_patches(app_patches: &str, backend_patches: &str) -> String {
-    let mut extras = Vec::new();
-    let mut in_crates_io = false;
-    for line in backend_patches.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_crates_io = trimmed == "[patch.crates-io]";
-            continue;
-        }
-        if !in_crates_io || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        let Some((name, _)) = trimmed.split_once('=') else {
-            continue;
-        };
-        let name = name.trim();
-        if name.starts_with("nsh-") {
-            continue;
-        }
-        let already = app_patches.lines().any(|existing| {
-            existing
-                .trim()
-                .split_once('=')
-                .is_some_and(|(k, _)| k.trim() == name)
-        });
-        if !already {
-            extras.push(trimmed.to_owned());
-        }
-    }
-    if extras.is_empty() {
-        return app_patches.to_owned();
-    }
-    let mut out = String::new();
-    let mut inserted = false;
-    for line in app_patches.lines() {
-        out.push_str(line);
-        out.push('\n');
-        if line.trim() == "[patch.crates-io]" {
-            for extra in &extras {
-                out.push_str(extra);
-                out.push('\n');
-            }
-            inserted = true;
-        }
-    }
-    if !inserted {
-        out.push_str("\n[patch.crates-io]\n");
-        for extra in &extras {
-            out.push_str(extra);
-            out.push('\n');
-        }
-    }
-    out
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned())
 }
 
 /// Writes the runner crate in `dir` for `app`.
