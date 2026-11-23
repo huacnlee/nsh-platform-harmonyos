@@ -1,33 +1,20 @@
-//! Per-surface native audio service powered by `ohos-audio-binding` (`AudioRenderer`)
-//! for low-latency polyphonic PCM short sounds and `ohos-avplayer-binding` (`AvPlayer`)
-//! for compressed sound effects and streaming audio players.
-//!
-//! Owned directly by [`crate::render::mount::Mounter`], isolating sound/player IDs
-//! per surface and guaranteeing deterministic teardown of native streams, players,
-//! and staged temp files on `close()` / `Drop`.
+//! Per-surface native audio service powered by `ohos-avplayer-binding` (`AvPlayer`)
+//! for short `Sound` effects (polyphonic, up to 32 voices) and streaming `AudioPlayer`s.
 
 use std::{
     cell::RefCell,
     ffi::{CStr, CString, c_void},
     fs::{File, OpenOptions},
-    io::{self, Read, Seek, Write},
+    io::{self, Read},
     os::{fd::AsFd, unix::fs::OpenOptionsExt},
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, Weak, atomic::Ordering, mpsc},
     time::{Duration, Instant},
 };
 
 use nsh_core::{
     EventKind, EventPayload,
     audio::{AudioCommand, AudioError, AudioEvent, PlayerSettings},
-};
-use ohos_audio_binding::{
-    AudioDataCallbackResult, AudioRenderer, AudioStreamBuilder, EncodingType, InterruptMode,
-    LatencyMode, SampleFormat, StreamUsage,
 };
 use ohos_avplayer_binding::{
     self as av, AudioInterruptMode, AudioStreamUsage, AvPlayer, InfoField, InfoRef, SeekMode,
@@ -39,53 +26,41 @@ use crate::{
         runtime::{Dispatcher, Message},
         session::Services,
     },
-    services::{
-        assets::StreamAssets,
-        audio_spec::{
-            MAX_VOICES, MIXER_SAMPLE_RATE, MixerState, clamp_av_rate, estimate_pcm_bytes, parse_wav,
-        },
-    },
+    services::assets::StreamAssets,
 };
 
+const MAX_VOICES: usize = 32;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
-const RENDERER_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Owned temporary file in the Ability audio cache, removed on drop.
-struct TempAudioFile {
-    path: PathBuf,
+fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
+    if v.is_finite() { v.clamp(lo, hi) } else { 1.0 }
 }
 
-impl TempAudioFile {
-    fn from_bytes(
-        cache_dir: &Path,
-        prefix: &str,
-        id: u32,
-        hint: &str,
-        bytes: &[u8],
-    ) -> io::Result<Self> {
-        let dir = cache_dir.join("audio");
-        std::fs::create_dir_all(&dir)?;
-        let ext = Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
-            .extension()
-            .and_then(|e| e.to_str())
-            .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
-            .unwrap_or("bin");
-        let mut random = [0u8; 8];
-        let _ = getrandom::fill(&mut random);
-        let path = dir.join(format!(
-            "{prefix}-{id}-{:016x}.{ext}",
-            u64::from_le_bytes(random)
+fn emit_to(route: &Weak<Dispatcher>, id: u32, event: AudioEvent) {
+    if let Some(d) = route.upgrade().filter(|d| d.live.load(Ordering::Acquire)) {
+        d.send(Message::HostEvent(
+            EventKind::Audio,
+            EventPayload::Audio { id, event },
         ));
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)?;
-        file.write_all(bytes)?;
-        Ok(Self { path })
     }
+}
 
-    fn from_reader(
+fn set_opened_file(player: &mut AvPlayer, file: &File) -> Result<(), String> {
+    let len = i64::try_from(file.metadata().map_err(|e| e.to_string())?.len())
+        .map_err(|_| "audio file exceeds i64 size".to_owned())?;
+    if len <= 0 {
+        return Err("audio file is empty".into());
+    }
+    player
+        .set_fd(file.as_fd(), 0, len)
+        .map_err(|e| e.to_string())
+}
+
+/// Owned temporary file in the Ability audio cache, removed on drop.
+struct TempAudioFile(PathBuf);
+
+impl TempAudioFile {
+    fn create(
         cache_dir: &Path,
         prefix: &str,
         id: u32,
@@ -110,43 +85,25 @@ impl TempAudioFile {
             .create_new(true)
             .mode(0o600)
             .open(&path)?;
-        let mut buf = [0u8; 64 << 10];
-        loop {
-            let n = reader.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            file.write_all(&buf[..n])?;
-        }
-        file.rewind()?;
-        Ok(Self { path })
-    }
-
-    fn open_read(&self) -> io::Result<(File, i64)> {
-        let file = File::open(&self.path)?;
-        let len = i64::try_from(file.metadata()?.len())
-            .map_err(|_| io::Error::other("audio file exceeds i64 size"))?;
-        if len <= 0 {
-            return Err(io::Error::other("audio file is empty"));
-        }
-        Ok((file, len))
+        io::copy(&mut reader, &mut file)?;
+        Ok(Self(path))
     }
 }
 
 impl Drop for TempAudioFile {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 #[derive(Clone, Copy)]
-enum NoticeTarget {
-    SoundProbe { sound_id: u32, generation: u64 },
-    SoundVoice { voice_id: u64 },
-    Player { player_id: u32, generation: u64 },
+enum Target {
+    Probe(u32, u64),
+    Voice(u64),
+    Player(u32, u64),
 }
 
-enum AvNoticeKind {
+enum AvNotice {
     State(i32),
     SeekDone(i32),
     Buffering(i32),
@@ -155,16 +112,13 @@ enum AvNoticeKind {
 
 enum WorkerEvent {
     Command(AudioCommand),
-    AvNotice {
-        target: NoticeTarget,
-        kind: AvNoticeKind,
-    },
+    Notice(Target, AvNotice),
     Shutdown,
 }
 
 struct AvCallbacks {
     tx: mpsc::Sender<WorkerEvent>,
-    target: NoticeTarget,
+    target: Target,
 }
 
 unsafe extern "C" fn on_av_info(
@@ -182,8 +136,8 @@ unsafe extern "C" fn on_av_info(
             av::INFO_STATE_CHANGE => body
                 .as_ref()
                 .and_then(|b| b.int(InfoField::State))
-                .map(AvNoticeKind::State),
-            av::INFO_SEEK_DONE => Some(AvNoticeKind::SeekDone(
+                .map(AvNotice::State),
+            av::INFO_SEEK_DONE => Some(AvNotice::SeekDone(
                 body.as_ref()
                     .and_then(|b| b.int(InfoField::SeekPosition))
                     .unwrap_or(-1),
@@ -191,14 +145,11 @@ unsafe extern "C" fn on_av_info(
             av::INFO_BUFFERING => body
                 .as_ref()
                 .and_then(|b| b.int(InfoField::BufferingType))
-                .map(AvNoticeKind::Buffering),
+                .map(AvNotice::Buffering),
             _ => None,
         };
-        if let Some(kind) = notice {
-            let _ = cb.tx.send(WorkerEvent::AvNotice {
-                target: cb.target,
-                kind,
-            });
+        if let Some(n) = notice {
+            let _ = cb.tx.send(WorkerEvent::Notice(cb.target, n));
         }
     }));
 }
@@ -220,10 +171,9 @@ unsafe extern "C" fn on_av_error(
                 .to_string_lossy()
                 .into_owned()
         };
-        let _ = cb.tx.send(WorkerEvent::AvNotice {
-            target: cb.target,
-            kind: AvNoticeKind::Error(text),
-        });
+        let _ = cb
+            .tx
+            .send(WorkerEvent::Notice(cb.target, AvNotice::Error(text)));
     }));
 }
 
@@ -233,7 +183,7 @@ struct OwnedAvPlayer {
 }
 
 impl OwnedAvPlayer {
-    fn new(tx: mpsc::Sender<WorkerEvent>, target: NoticeTarget) -> Result<Self, String> {
+    fn new(tx: mpsc::Sender<WorkerEvent>, target: Target) -> Result<Self, String> {
         let mut player = AvPlayer::new().map_err(|e| e.to_string())?;
         let mut callbacks = Box::new(AvCallbacks { tx, target });
         let ptr = (&mut *callbacks as *mut AvCallbacks).cast::<c_void>();
@@ -254,15 +204,29 @@ impl OwnedAvPlayer {
         })
     }
 
+    fn open_file(
+        tx: mpsc::Sender<WorkerEvent>,
+        target: Target,
+        path: &Path,
+    ) -> Result<Self, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let mut av = Self::new(tx, target)?;
+        if let Err(err) = set_opened_file(&mut av.player, &file) {
+            av.close();
+            return Err(err);
+        }
+        Ok(av)
+    }
+
     fn close(mut self) {
-        if let Err(error) = self.player.close_sync() {
-            log::warn!("OHOS audio AVPlayer close failed: {error}");
+        if let Err(err) = self.player.close_sync() {
+            log::warn!("OHOS audio AVPlayer close failed: {err}");
             std::mem::forget(self);
         }
     }
 }
 
-struct CompressedSound {
+struct SoundEntry {
     generation: u64,
     file: Arc<TempAudioFile>,
     max_duration: Duration,
@@ -271,7 +235,7 @@ struct CompressedSound {
     probe: Option<OwnedAvPlayer>,
 }
 
-struct CompressedVoice {
+struct SoundVoice {
     voice_id: u64,
     sound_id: u32,
     volume: f32,
@@ -297,41 +261,41 @@ struct ManagedPlayer {
 }
 
 impl ManagedPlayer {
-    fn is_http(&self) -> bool {
-        self.src.starts_with("http://") || self.src.starts_with("https://")
-    }
-
     fn duration(&mut self) -> Option<Duration> {
-        if !self.prepared {
-            return None;
-        }
-        self.av
-            .as_mut()
-            .and_then(|owned| owned.player.duration().ok())
-            .filter(|&ms| ms > 0)
+        self.prepared
+            .then(|| {
+                self.av
+                    .as_mut()?
+                    .player
+                    .duration()
+                    .ok()
+                    .filter(|&ms| ms > 0)
+            })
+            .flatten()
             .map(|ms| Duration::from_millis(ms as u64))
     }
 
     fn apply_settings(&mut self) {
-        let Some(owned) = self.av.as_mut() else {
+        let Some(av) = self.av.as_mut().filter(|_| self.prepared) else {
             return;
         };
-        if !self.prepared {
-            return;
-        }
-        let v = if self.settings.volume.is_finite() {
-            self.settings.volume.clamp(0.0, 1.0)
-        } else {
-            1.0
-        };
-        let _ = owned.player.volume(v, v);
-        let _ = owned.player.looping(self.settings.looped);
-        let _ = owned
-            .player
-            .playback_rate(clamp_av_rate(self.settings.rate));
+        let v = clamp(self.settings.volume, 0.0, 1.0);
+        let _ = av.player.volume(v, v);
+        let _ = av.player.looping(self.settings.looped);
+        let _ = av.player.playback_rate(clamp(self.settings.rate, 0.5, 2.0));
     }
 
-    fn release_player(&mut self) {
+    fn seek_clamped(&mut self, target_ms: i32) {
+        let clamped = match self.duration() {
+            Some(d) => target_ms.min((d.as_millis() as i64).min(i64::from(i32::MAX)) as i32),
+            None => target_ms,
+        };
+        if let Some(av) = self.av.as_mut() {
+            let _ = av.player.seek(clamped, SeekMode::Closest);
+        }
+    }
+
+    fn release(&mut self) {
         self.prepared = false;
         if let Some(av) = self.av.take() {
             av.close();
@@ -345,99 +309,71 @@ struct AudioWorker {
     assets: Arc<dyn StreamAssets>,
     tx: mpsc::Sender<WorkerEvent>,
     rx: mpsc::Receiver<WorkerEvent>,
-    mixer: Arc<Mutex<MixerState>>,
-    renderer: Option<AudioRenderer>,
-    renderer_running: bool,
-    renderer_idle_since: Option<Instant>,
-    next_generation: u64,
+    next_gen: u64,
     next_voice_id: u64,
-    compressed_sounds: FxHashMap<u32, CompressedSound>,
-    compressed_voices: Vec<CompressedVoice>,
+    sounds: FxHashMap<u32, SoundEntry>,
+    voices: Vec<SoundVoice>,
     players: FxHashMap<u32, ManagedPlayer>,
 }
 
 impl AudioWorker {
     fn emit(&self, id: u32, event: AudioEvent) {
-        if let Some(route) = self
-            .route
-            .upgrade()
-            .filter(|d| d.live.load(Ordering::Acquire))
-        {
-            route.send(Message::HostEvent(
-                EventKind::Audio,
-                EventPayload::Audio { id, event },
-            ));
-        }
+        emit_to(&self.route, id, event);
+    }
+
+    fn fail(&self, id: u32, error: AudioError, message: impl Into<String>) {
+        self.emit(
+            id,
+            AudioEvent::Failed {
+                error,
+                message: message.into(),
+            },
+        );
     }
 
     fn run(mut self) {
         loop {
-            let timeout = self.next_timeout();
-            match self.rx.recv_timeout(timeout) {
+            match self.rx.recv_timeout(self.next_timeout()) {
                 Ok(WorkerEvent::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Ok(WorkerEvent::Command(cmd)) => self.handle_command(cmd),
-                Ok(WorkerEvent::AvNotice { target, kind }) => self.handle_av_notice(target, kind),
+                Ok(WorkerEvent::Notice(Target::Probe(id, g), n)) => self.on_probe(id, g, n),
+                Ok(WorkerEvent::Notice(Target::Voice(id), n)) => self.on_voice(id, n),
+                Ok(WorkerEvent::Notice(Target::Player(id, g), n)) => self.on_player(id, g, n),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
             self.tick();
         }
-        self.shutdown();
+        for v in self.voices.drain(..) {
+            v.av.close();
+        }
+        for (_, mut s) in self.sounds.drain() {
+            if let Some(p) = s.probe.take() {
+                p.close();
+            }
+        }
+        for (_, mut p) in self.players.drain() {
+            p.release();
+        }
     }
 
     fn next_timeout(&self) -> Duration {
-        let mut wait = Duration::from_secs(60);
-        if self.renderer_running {
-            wait = wait.min(Duration::from_millis(100));
-        }
         let now = Instant::now();
-        for voice in &self.compressed_voices {
-            if let Some(deadline) = voice.deadline {
-                wait = wait.min(deadline.saturating_duration_since(now));
-            }
+        let mut wait = Duration::from_secs(60);
+        for d in self.voices.iter().filter_map(|v| v.deadline) {
+            wait = wait.min(d.saturating_duration_since(now));
         }
-        for player in self.players.values() {
-            if player.playing && player.prepared {
-                let elapsed = now.saturating_duration_since(player.last_progress);
-                wait = wait.min(PROGRESS_INTERVAL.saturating_sub(elapsed));
-            }
+        for p in self.players.values().filter(|p| p.playing && p.prepared) {
+            wait = wait.min(
+                PROGRESS_INTERVAL.saturating_sub(now.saturating_duration_since(p.last_progress)),
+            );
         }
         wait
     }
 
     fn tick(&mut self) {
         let now = Instant::now();
-        // Auto-pause the OHAudio renderer after a short silent tail so we don't
-        // hold hardware audio output open indefinitely between sound effects.
-        if self.renderer_running {
-            let active = self.mixer.lock().unwrap().has_active_voices();
-            if active {
-                self.renderer_idle_since = None;
-            } else {
-                let idle_since = *self.renderer_idle_since.get_or_insert(now);
-                if now.saturating_duration_since(idle_since) >= RENDERER_IDLE_TIMEOUT {
-                    if let Some(renderer) = self.renderer.as_mut() {
-                        let _ = renderer.pause();
-                    }
-                    self.renderer_running = false;
-                    self.renderer_idle_since = None;
-                }
-            }
-        }
-        // Stop any truncated compressed voices that reached their max_duration.
-        let mut i = 0;
-        while i < self.compressed_voices.len() {
-            if self.compressed_voices[i]
-                .deadline
-                .is_some_and(|deadline| now >= deadline)
-            {
-                let voice = self.compressed_voices.remove(i);
-                voice.av.close();
-            } else {
-                i += 1;
-            }
-        }
-        // Emit periodic progress for playing streaming players.
-        let ids: Vec<u32> = self
+        self.drop_voices(|v| v.deadline.is_some_and(|d| now >= d));
+        let due: Vec<u32> = self
             .players
             .iter()
             .filter_map(|(&id, p)| {
@@ -447,50 +383,35 @@ impl AudioWorker {
                     .then_some(id)
             })
             .collect();
-        for id in ids {
-            self.emit_player_progress(id, now);
+        for id in due {
+            if let Some(p) = self.players.get_mut(&id).filter(|p| p.prepared) {
+                p.last_progress = now;
+                let ms =
+                    p.av.as_mut()
+                        .and_then(|a| a.player.current_time().ok())
+                        .unwrap_or(0)
+                        .max(0);
+                let duration = p.duration();
+                self.emit(
+                    id,
+                    AudioEvent::Progress {
+                        position: Duration::from_millis(ms as u64),
+                        duration,
+                    },
+                );
+            }
         }
     }
 
-    fn ensure_renderer_started(&mut self) -> Result<(), String> {
-        if self.renderer.is_none() {
-            let mixer = self.mixer.clone();
-            let mut builder = AudioStreamBuilder::new_renderer().map_err(|e| e.to_string())?;
-            builder
-                .sampling_rate(MIXER_SAMPLE_RATE as i32)
-                .map_err(|e| e.to_string())?
-                .channel_count(2)
-                .map_err(|e| e.to_string())?
-                .sample_format(SampleFormat::S16Le)
-                .map_err(|e| e.to_string())?
-                .encoding_type(EncodingType::Raw)
-                .map_err(|e| e.to_string())?
-                .latency_mode(LatencyMode::Fast)
-                .map_err(|e| e.to_string())?
-                .usage(StreamUsage::Music)
-                .map_err(|e| e.to_string())?
-                .interrupt_mode(InterruptMode::Share)
-                .map_err(|e| e.to_string())?
-                .write_data_callback(move |buf| {
-                    if let Ok(mut guard) = mixer.lock() {
-                        guard.mix_into_s16le(buf);
-                    } else {
-                        buf.fill(0);
-                    }
-                    AudioDataCallbackResult::Valid
-                })
-                .map_err(|e| e.to_string())?;
-            let renderer = builder.build().map_err(|e| e.to_string())?;
-            self.renderer = Some(renderer);
+    fn drop_voices(&mut self, mut pred: impl FnMut(&SoundVoice) -> bool) {
+        let mut i = 0;
+        while i < self.voices.len() {
+            if pred(&self.voices[i]) {
+                self.voices.remove(i).av.close();
+            } else {
+                i += 1;
+            }
         }
-        if !self.renderer_running
-            && let Some(renderer) = self.renderer.as_mut()
-        {
-            renderer.start().map_err(|e| e.to_string())?;
-            self.renderer_running = true;
-            self.renderer_idle_since = None;
-        }
-        Ok(())
     }
 
     fn handle_command(&mut self, command: AudioCommand) {
@@ -502,64 +423,20 @@ impl AudioWorker {
                 max_duration,
             } => {
                 self.unload_sound(id);
-                if let Some(pcm) = parse_wav(&bytes, max_duration) {
-                    let duration = pcm.duration;
-                    let mem_bytes = pcm.bytes;
-                    let truncated = pcm.truncated;
-                    self.mixer.lock().unwrap().insert_sound(id, pcm);
-                    self.emit(
-                        id,
-                        AudioEvent::Loaded {
-                            duration,
-                            bytes: mem_bytes,
-                            truncated,
-                        },
-                    );
-                    return;
-                }
-                self.load_compressed_sound(id, &bytes, &hint, max_duration);
-            }
-            AudioCommand::LoadUrl { id, .. } => {
-                self.emit(
-                    id,
-                    AudioEvent::Failed {
-                        error: AudioError::NotSupported,
-                        message: "LoadUrl is not supported on native platforms".into(),
-                    },
-                );
-            }
-            AudioCommand::Play { id, volume, rate } => {
-                let played_pcm = self.mixer.lock().unwrap().play(id, volume, rate);
-                if played_pcm {
-                    if let Err(error) = self.ensure_renderer_started() {
-                        log::warn!("OHOS audio renderer start failed: {error}");
-                    }
-                    return;
-                }
-                self.play_compressed_sound(id, volume, rate);
-            }
-            AudioCommand::Stop { id } => {
-                self.mixer.lock().unwrap().stop_sound(id);
-                let mut i = 0;
-                while i < self.compressed_voices.len() {
-                    if self.compressed_voices[i].sound_id == id {
-                        let voice = self.compressed_voices.remove(i);
-                        voice.av.close();
-                    } else {
-                        i += 1;
-                    }
+                if let Err((err, msg)) = self.load_sound(id, &bytes, &hint, max_duration) {
+                    self.fail(id, err, msg);
                 }
             }
-            AudioCommand::Unload { id } => {
-                self.unload_sound(id);
-            }
+            AudioCommand::Play { id, volume, rate } => self.play_sound(id, volume, rate),
+            AudioCommand::Stop { id } => self.drop_voices(|v| v.sound_id == id),
+            AudioCommand::Unload { id } => self.unload_sound(id),
             AudioCommand::Open { id, src, settings } => {
                 self.close_player(id);
-                self.next_generation += 1;
+                self.next_gen += 1;
                 self.players.insert(
                     id,
                     ManagedPlayer {
-                        generation: self.next_generation,
+                        generation: self.next_gen,
                         src,
                         settings,
                         temp_file: None,
@@ -573,168 +450,95 @@ impl AudioWorker {
                     },
                 );
             }
-            AudioCommand::Preload { id } => {
-                self.ensure_player(id);
-            }
+            AudioCommand::Preload { id } => self.ensure_player(id),
             AudioCommand::Resume { id } => {
-                let needs_ensure = if let Some(player) = self.players.get_mut(&id) {
-                    if player.failed {
-                        player.failed = false;
-                        player.release_player();
-                    }
-                    if player.playing {
-                        return;
-                    }
-                    player.wants_play = true;
-                    if player.prepared
-                        && let Some(av) = player.av.as_mut()
-                    {
-                        if let Err(err) = av.player.play() {
-                            self.fail_player(id, err.to_string());
-                        }
-                        false
-                    } else {
-                        true
+                let Some(p) = self.players.get_mut(&id) else {
+                    return;
+                };
+                if p.failed {
+                    p.failed = false;
+                    p.release();
+                }
+                if p.playing {
+                    return;
+                }
+                p.wants_play = true;
+                if p.prepared
+                    && let Some(av) = p.av.as_mut()
+                {
+                    if let Err(err) = av.player.play() {
+                        self.fail_player(id, err.to_string());
                     }
                 } else {
-                    false
-                };
-                if needs_ensure {
                     self.ensure_player(id);
                 }
             }
             AudioCommand::Pause { id } => {
-                if let Some(player) = self.players.get_mut(&id) {
-                    let was = player.playing || player.wants_play;
-                    player.wants_play = false;
-                    if player.playing
-                        && let Some(av) = player.av.as_mut()
+                if let Some(p) = self.players.get_mut(&id) {
+                    let was = p.playing || p.wants_play;
+                    p.wants_play = false;
+                    if p.playing
+                        && let Some(av) = p.av.as_mut()
                     {
-                        player.playing = false;
                         let _ = av.player.pause();
-                        self.emit(id, AudioEvent::Paused);
-                    } else if was {
-                        player.playing = false;
+                    }
+                    p.playing = false;
+                    if was {
                         self.emit(id, AudioEvent::Paused);
                     }
                 }
             }
             AudioCommand::Seek { id, position } => {
-                let target_ms = (position.as_secs_f64() * 1000.0)
+                let ms = (position.as_secs_f64() * 1000.0)
                     .clamp(0.0, f64::from(i32::MAX))
                     .round() as i32;
-                let Some(player) = self.players.get_mut(&id) else {
-                    return;
-                };
-                if !player.prepared {
-                    player.pending_seek_ms = Some(target_ms);
-                    return;
-                }
-                let clamped = match player.duration() {
-                    Some(dur) => {
-                        target_ms.min((dur.as_millis() as i64).min(i64::from(i32::MAX)) as i32)
+                if let Some(p) = self.players.get_mut(&id) {
+                    if p.prepared {
+                        p.seek_clamped(ms);
+                    } else {
+                        p.pending_seek_ms = Some(ms);
                     }
-                    None => target_ms,
-                };
-                if let Some(av) = player.av.as_mut() {
-                    let _ = av.player.seek(clamped, SeekMode::Closest);
                 }
             }
             AudioCommand::Set { id, settings } => {
-                if let Some(player) = self.players.get_mut(&id) {
-                    player.settings = settings;
-                    player.apply_settings();
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.settings = settings;
+                    p.apply_settings();
                 }
             }
-            AudioCommand::Close { id } => {
-                self.close_player(id);
-            }
+            AudioCommand::Close { id } => self.close_player(id),
             _ => {}
         }
     }
 
     fn unload_sound(&mut self, id: u32) {
-        self.mixer.lock().unwrap().unload_sound(id);
-        let mut i = 0;
-        while i < self.compressed_voices.len() {
-            if self.compressed_voices[i].sound_id == id {
-                let voice = self.compressed_voices.remove(i);
-                voice.av.close();
-            } else {
-                i += 1;
-            }
-        }
-        if let Some(mut entry) = self.compressed_sounds.remove(&id)
+        self.drop_voices(|v| v.sound_id == id);
+        if let Some(mut entry) = self.sounds.remove(&id)
             && let Some(probe) = entry.probe.take()
         {
             probe.close();
         }
     }
 
-    fn load_compressed_sound(&mut self, id: u32, bytes: &[u8], hint: &str, max_duration: Duration) {
-        let file =
-            match TempAudioFile::from_bytes(&self.host.cache_directory(), "sound", id, hint, bytes)
-            {
-                Ok(file) => Arc::new(file),
-                Err(error) => {
-                    self.emit(
-                        id,
-                        AudioEvent::Failed {
-                            error: AudioError::Failed,
-                            message: error.to_string(),
-                        },
-                    );
-                    return;
-                }
-            };
-        let (opened, len) = match file.open_read() {
-            Ok(pair) => pair,
-            Err(error) => {
-                self.emit(
-                    id,
-                    AudioEvent::Failed {
-                        error: AudioError::Decode,
-                        message: error.to_string(),
-                    },
-                );
-                return;
-            }
-        };
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        let mut probe = match OwnedAvPlayer::new(
-            self.tx.clone(),
-            NoticeTarget::SoundProbe {
-                sound_id: id,
-                generation,
-            },
-        ) {
-            Ok(p) => p,
-            Err(message) => {
-                self.emit(
-                    id,
-                    AudioEvent::Failed {
-                        error: AudioError::Decode,
-                        message,
-                    },
-                );
-                return;
-            }
-        };
-        if let Err(err) = probe.player.set_fd(opened.as_fd(), 0, len) {
-            probe.close();
-            self.emit(
-                id,
-                AudioEvent::Failed {
-                    error: AudioError::Decode,
-                    message: err.to_string(),
-                },
-            );
-            return;
-        }
-        self.compressed_sounds.insert(
+    fn load_sound(
+        &mut self,
+        id: u32,
+        mut bytes: &[u8],
+        hint: &str,
+        max_duration: Duration,
+    ) -> Result<(), (AudioError, String)> {
+        let file = Arc::new(
+            TempAudioFile::create(&self.host.cache_directory(), "sound", id, hint, &mut bytes)
+                .map_err(|e| (AudioError::Failed, e.to_string()))?,
+        );
+        self.next_gen += 1;
+        let generation = self.next_gen;
+        let probe =
+            OwnedAvPlayer::open_file(self.tx.clone(), Target::Probe(id, generation), &file.0)
+                .map_err(|msg| (AudioError::Decode, msg))?;
+        self.sounds.insert(
             id,
-            CompressedSound {
+            SoundEntry {
                 generation,
                 file,
                 max_duration,
@@ -743,40 +547,28 @@ impl AudioWorker {
                 probe: Some(probe),
             },
         );
+        Ok(())
     }
 
-    fn play_compressed_sound(&mut self, id: u32, volume: f32, rate: f32) {
-        let Some(entry) = self.compressed_sounds.get(&id).filter(|e| e.loaded) else {
+    fn play_sound(&mut self, id: u32, volume: f32, rate: f32) {
+        let Some(entry) = self.sounds.get(&id).filter(|e| e.loaded) else {
             return;
         };
-        let file = entry.file.clone();
-        let max_duration = entry.truncate_after;
-        let Ok((opened, len)) = file.open_read() else {
-            return;
-        };
-        if self.compressed_voices.len() >= MAX_VOICES {
-            let oldest = self.compressed_voices.remove(0);
-            oldest.av.close();
+        let (file, max_duration) = (entry.file.clone(), entry.truncate_after);
+        if self.voices.len() >= MAX_VOICES {
+            self.voices.remove(0).av.close();
         }
         self.next_voice_id += 1;
         let voice_id = self.next_voice_id;
-        let Ok(mut av) = OwnedAvPlayer::new(self.tx.clone(), NoticeTarget::SoundVoice { voice_id })
+        let Ok(av) = OwnedAvPlayer::open_file(self.tx.clone(), Target::Voice(voice_id), &file.0)
         else {
             return;
         };
-        if av.player.set_fd(opened.as_fd(), 0, len).is_err() {
-            av.close();
-            return;
-        }
-        self.compressed_voices.push(CompressedVoice {
+        self.voices.push(SoundVoice {
             voice_id,
             sound_id: id,
-            volume: if volume.is_finite() {
-                volume.clamp(0.0, 1.0)
-            } else {
-                1.0
-            },
-            rate: clamp_av_rate(rate),
+            volume: clamp(volume, 0.0, 1.0),
+            rate: clamp(rate, 0.5, 2.0),
             deadline: None,
             max_duration,
             _file: file,
@@ -785,435 +577,299 @@ impl AudioWorker {
     }
 
     fn ensure_player(&mut self, id: u32) {
-        let (src, generation) = {
-            let Some(player) = self.players.get(&id) else {
-                return;
-            };
-            if player.av.is_some() || player.failed {
-                return;
-            }
-            (player.src.clone(), player.generation)
-        };
-        let mut owned = match OwnedAvPlayer::new(
-            self.tx.clone(),
-            NoticeTarget::Player {
-                player_id: id,
-                generation,
-            },
-        ) {
-            Ok(av) => av,
-            Err(message) => {
-                self.fail_player(id, message);
-                return;
-            }
-        };
-        let mut staged_temp: Option<TempAudioFile> = None;
-        let source_result: Result<(), String> =
-            if src.starts_with("http://") || src.starts_with("https://") {
-                CString::new(src.as_str())
-                    .map_err(|_| "invalid audio URL".into())
-                    .and_then(|url| owned.player.set_url(&url).map_err(|e| e.to_string()))
-            } else if let Some(rest) = src.strip_prefix("file://") {
-                let decoded = percent_encoding::percent_decode_str(rest)
-                    .decode_utf8_lossy()
-                    .into_owned();
-                set_file_path_source(&mut owned.player, Path::new(&decoded))
-            } else if src.starts_with('/') {
-                set_file_path_source(&mut owned.player, Path::new(&src))
-            } else if src.starts_with("data:") {
-                decode_audio_data_uri(&src)
-                    .and_then(|bytes| {
-                        TempAudioFile::from_bytes(
-                            &self.host.cache_directory(),
-                            "player",
-                            id,
-                            &src,
-                            &bytes,
-                        )
-                        .map_err(|e| e.to_string())
-                    })
-                    .and_then(|temp| {
-                        let (file, len) = temp.open_read().map_err(|e| e.to_string())?;
-                        owned
-                            .player
-                            .set_fd(file.as_fd(), 0, len)
-                            .map_err(|e| e.to_string())?;
-                        staged_temp = Some(temp);
-                        Ok(())
-                    })
-            } else if src.starts_with("asset:/") {
-                if let Some(file_result) = self.assets.open_file(&src) {
-                    file_result.and_then(|file| set_opened_file_source(&mut owned.player, &file))
-                } else {
-                    self.assets
-                        .reader(&src)
-                        .and_then(|reader| {
-                            TempAudioFile::from_reader(
-                                &self.host.cache_directory(),
-                                "player",
-                                id,
-                                &src,
-                                reader,
-                            )
-                            .map_err(|e| e.to_string())
-                        })
-                        .and_then(|temp| {
-                            let (file, len) = temp.open_read().map_err(|e| e.to_string())?;
-                            owned
-                                .player
-                                .set_fd(file.as_fd(), 0, len)
-                                .map_err(|e| e.to_string())?;
-                            staged_temp = Some(temp);
-                            Ok(())
-                        })
-                }
-            } else {
-                Err(format!("unsupported audio source: {src}"))
-            };
-
-        if let Err(message) = source_result {
-            owned.close();
-            self.fail_player(id, message);
+        let Some((src, g)) = self
+            .players
+            .get(&id)
+            .filter(|p| p.av.is_none() && !p.failed)
+            .map(|p| (p.src.clone(), p.generation))
+        else {
             return;
-        }
-        if let Some(player) = self.players.get_mut(&id) {
-            player.temp_file = staged_temp;
-            player.av = Some(owned);
-        } else {
-            owned.close();
+        };
+        match self.open_player_source(id, &src, Target::Player(id, g)) {
+            Ok((av, temp)) => {
+                if let Some(p) = self.players.get_mut(&id) {
+                    p.temp_file = temp;
+                    p.av = Some(av);
+                } else {
+                    av.close();
+                }
+            }
+            Err(msg) => self.fail_player(id, msg),
         }
     }
 
+    fn open_player_source(
+        &self,
+        id: u32,
+        src: &str,
+        target: Target,
+    ) -> Result<(OwnedAvPlayer, Option<TempAudioFile>), String> {
+        let stage =
+            |reader: &mut dyn Read| -> Result<(OwnedAvPlayer, Option<TempAudioFile>), String> {
+                let temp =
+                    TempAudioFile::create(&self.host.cache_directory(), "player", id, src, reader)
+                        .map_err(|e| e.to_string())?;
+                Ok((
+                    OwnedAvPlayer::open_file(self.tx.clone(), target, &temp.0)?,
+                    Some(temp),
+                ))
+            };
+        if src.starts_with("data:") {
+            let bytes = decode_audio_data_uri(src)?;
+            return stage(&mut &bytes[..]);
+        }
+        if src.starts_with("asset:/") {
+            if let Some(file_res) = self.assets.open_file(src) {
+                let file = file_res?;
+                let mut av = OwnedAvPlayer::new(self.tx.clone(), target)?;
+                if let Err(err) = set_opened_file(&mut av.player, &file) {
+                    av.close();
+                    return Err(err);
+                }
+                return Ok((av, None));
+            }
+            let mut reader = self.assets.reader(src)?;
+            return stage(&mut reader);
+        }
+        if let Some(rest) = src.strip_prefix("file://") {
+            let decoded = percent_encoding::percent_decode_str(rest).decode_utf8_lossy();
+            return Ok((
+                OwnedAvPlayer::open_file(self.tx.clone(), target, Path::new(decoded.as_ref()))?,
+                None,
+            ));
+        }
+        if src.starts_with('/') {
+            return Ok((
+                OwnedAvPlayer::open_file(self.tx.clone(), target, Path::new(src))?,
+                None,
+            ));
+        }
+        if src.starts_with("http://") || src.starts_with("https://") {
+            let mut av = OwnedAvPlayer::new(self.tx.clone(), target)?;
+            let url = CString::new(src).map_err(|_| "invalid audio URL".to_owned())?;
+            if let Err(err) = av.player.set_url(&url) {
+                av.close();
+                return Err(err.to_string());
+            }
+            return Ok((av, None));
+        }
+        Err(format!("unsupported audio source: {src}"))
+    }
+
     fn fail_player(&mut self, id: u32, message: String) {
-        let Some(player) = self.players.get_mut(&id) else {
+        let Some(p) = self.players.get_mut(&id).filter(|p| !p.failed) else {
             return;
         };
-        if player.failed {
-            return;
-        }
-        let error = if player.is_http() {
+        let error = if p.src.starts_with("http://") || p.src.starts_with("https://") {
             AudioError::Network
         } else {
             AudioError::Decode
         };
-        player.failed = true;
-        player.wants_play = false;
-        player.playing = false;
-        player.release_player();
-        self.emit(id, AudioEvent::Failed { error, message });
+        p.failed = true;
+        p.wants_play = false;
+        p.playing = false;
+        p.release();
+        self.fail(id, error, message);
     }
 
     fn close_player(&mut self, id: u32) {
-        if let Some(mut player) = self.players.remove(&id) {
-            player.wants_play = false;
-            player.playing = false;
-            player.release_player();
+        if let Some(mut p) = self.players.remove(&id) {
+            p.wants_play = false;
+            p.playing = false;
+            p.release();
         }
     }
 
-    fn emit_player_progress(&mut self, id: u32, now: Instant) {
-        let Some(player) = self.players.get_mut(&id) else {
+    fn on_probe(&mut self, id: u32, generation: u64, kind: AvNotice) {
+        let Some(entry) = self
+            .sounds
+            .get_mut(&id)
+            .filter(|e| e.generation == generation)
+        else {
             return;
         };
-        if !player.prepared {
+        match kind {
+            AvNotice::State(s) if s == av::STATE_INITIALIZED as i32 => {
+                if let Some(probe) = entry.probe.as_mut()
+                    && let Err(err) = probe.player.prepare()
+                {
+                    self.unload_sound(id);
+                    self.fail(id, AudioError::Decode, err.to_string());
+                }
+            }
+            AvNotice::State(s) if s == av::STATE_PREPARED as i32 => {
+                let ms = entry
+                    .probe
+                    .as_mut()
+                    .and_then(|p| p.player.duration().ok())
+                    .unwrap_or(0)
+                    .max(0) as u64;
+                if let Some(probe) = entry.probe.take() {
+                    probe.close();
+                }
+                let raw = Duration::from_millis(ms);
+                let truncated = !entry.max_duration.is_zero() && raw > entry.max_duration;
+                let kept = if truncated { entry.max_duration } else { raw };
+                entry.loaded = true;
+                entry.truncate_after = truncated.then_some(kept);
+                let bytes =
+                    ((kept.as_secs_f64() * 44_100.0).floor().max(0.0) as u64).saturating_mul(4);
+                self.emit(
+                    id,
+                    AudioEvent::Loaded {
+                        duration: kept,
+                        bytes,
+                        truncated,
+                    },
+                );
+            }
+            AvNotice::Error(msg) => {
+                self.unload_sound(id);
+                self.fail(id, AudioError::Decode, msg);
+            }
+            _ => {}
+        }
+    }
+
+    fn on_voice(&mut self, voice_id: u64, kind: AvNotice) {
+        let Some(idx) = self.voices.iter().position(|v| v.voice_id == voice_id) else {
             return;
-        }
-        player.last_progress = now;
-        let pos_ms = player
-            .av
-            .as_mut()
-            .and_then(|av| av.player.current_time().ok())
-            .unwrap_or(0)
-            .max(0);
-        let duration = player.duration();
-        self.emit(
-            id,
-            AudioEvent::Progress {
-                position: Duration::from_millis(pos_ms as u64),
-                duration,
-            },
-        );
-    }
-
-    fn handle_av_notice(&mut self, target: NoticeTarget, kind: AvNoticeKind) {
-        match target {
-            NoticeTarget::SoundProbe {
-                sound_id,
-                generation,
-            } => {
-                let Some(entry) = self
-                    .compressed_sounds
-                    .get_mut(&sound_id)
-                    .filter(|e| e.generation == generation)
-                else {
-                    return;
-                };
-                match kind {
-                    AvNoticeKind::State(state) if state == av::STATE_INITIALIZED as i32 => {
-                        if let Some(probe) = entry.probe.as_mut()
-                            && let Err(err) = probe.player.prepare()
-                        {
-                            self.unload_sound(sound_id);
-                            self.emit(
-                                sound_id,
-                                AudioEvent::Failed {
-                                    error: AudioError::Decode,
-                                    message: err.to_string(),
-                                },
-                            );
-                        }
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_PREPARED as i32 => {
-                        let duration_ms = entry
-                            .probe
-                            .as_mut()
-                            .and_then(|p| p.player.duration().ok())
-                            .unwrap_or(0)
-                            .max(0) as u64;
-                        if let Some(probe) = entry.probe.take() {
-                            probe.close();
-                        }
-                        let raw_dur = Duration::from_millis(duration_ms);
-                        let max_dur = entry.max_duration;
-                        let truncated = !max_dur.is_zero() && raw_dur > max_dur;
-                        let kept = if truncated { max_dur } else { raw_dur };
-                        entry.loaded = true;
-                        entry.truncate_after = truncated.then_some(kept);
-                        let bytes = estimate_pcm_bytes(kept, 44_100);
-                        self.emit(
-                            sound_id,
-                            AudioEvent::Loaded {
-                                duration: kept,
-                                bytes,
-                                truncated,
-                            },
+        };
+        let close = match kind {
+            AvNotice::State(s) if s == av::STATE_INITIALIZED as i32 => {
+                self.voices[idx].av.player.prepare().is_err()
+            }
+            AvNotice::State(s) if s == av::STATE_PREPARED as i32 => {
+                let v = &mut self.voices[idx];
+                let _ = v.av.player.volume(v.volume, v.volume);
+                let _ = v.av.player.playback_rate(v.rate);
+                if v.av.player.play().is_err() {
+                    true
+                } else {
+                    if let Some(d) = v.max_duration {
+                        v.deadline = Some(
+                            Instant::now()
+                                + Duration::from_secs_f64(
+                                    d.as_secs_f64() / f64::from(v.rate.max(0.25)),
+                                ),
                         );
                     }
-                    AvNoticeKind::Error(message) => {
-                        self.unload_sound(sound_id);
-                        self.emit(
-                            sound_id,
-                            AudioEvent::Failed {
-                                error: AudioError::Decode,
-                                message,
-                            },
-                        );
-                    }
-                    _ => {}
+                    false
                 }
             }
-            NoticeTarget::SoundVoice { voice_id } => {
-                let Some(idx) = self
-                    .compressed_voices
-                    .iter()
-                    .position(|v| v.voice_id == voice_id)
-                else {
-                    return;
-                };
-                match kind {
-                    AvNoticeKind::State(state) if state == av::STATE_INITIALIZED as i32 => {
-                        if self.compressed_voices[idx].av.player.prepare().is_err() {
-                            let voice = self.compressed_voices.remove(idx);
-                            voice.av.close();
-                        }
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_PREPARED as i32 => {
-                        let voice = &mut self.compressed_voices[idx];
-                        let _ = voice.av.player.volume(voice.volume, voice.volume);
-                        let _ = voice.av.player.playback_rate(voice.rate);
-                        if voice.av.player.play().is_err() {
-                            let voice = self.compressed_voices.remove(idx);
-                            voice.av.close();
-                        } else if let Some(max_dur) = voice.max_duration {
-                            let wall = Duration::from_secs_f64(
-                                max_dur.as_secs_f64() / f64::from(voice.rate.max(0.25)),
-                            );
-                            voice.deadline = Some(Instant::now() + wall);
-                        }
-                    }
-                    AvNoticeKind::State(state)
-                        if state == av::STATE_COMPLETED as i32
-                            || state == av::STATE_STOPPED as i32
-                            || state == av::STATE_RELEASED as i32 =>
-                    {
-                        let voice = self.compressed_voices.remove(idx);
-                        voice.av.close();
-                    }
-                    AvNoticeKind::Error(_) => {
-                        let voice = self.compressed_voices.remove(idx);
-                        voice.av.close();
-                    }
-                    _ => {}
-                }
+            AvNotice::State(s)
+                if s == av::STATE_COMPLETED as i32
+                    || s == av::STATE_STOPPED as i32
+                    || s == av::STATE_RELEASED as i32 =>
+            {
+                true
             }
-            NoticeTarget::Player {
-                player_id,
-                generation,
-            } => {
-                let valid = self
-                    .players
-                    .get(&player_id)
-                    .is_some_and(|p| p.generation == generation && p.av.is_some());
-                if !valid {
-                    return;
-                }
-                match kind {
-                    AvNoticeKind::State(state) if state == av::STATE_INITIALIZED as i32 => {
-                        if let Some(player) = self.players.get_mut(&player_id)
-                            && let Some(av) = player.av.as_mut()
-                            && let Err(err) = av.player.prepare()
-                        {
-                            self.fail_player(player_id, err.to_string());
-                        }
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_PREPARED as i32 => {
-                        let (duration, pending_seek, wants_play) = {
-                            let player = self.players.get_mut(&player_id).unwrap();
-                            player.prepared = true;
-                            player.apply_settings();
-                            (
-                                player.duration(),
-                                player.pending_seek_ms.take(),
-                                player.wants_play,
-                            )
-                        };
-                        self.emit(player_id, AudioEvent::Load { duration });
-                        if let Some(target_ms) = pending_seek
-                            && let Some(player) = self.players.get_mut(&player_id)
-                        {
-                            let clamped = match duration {
-                                Some(d) => target_ms
-                                    .min((d.as_millis() as i64).min(i64::from(i32::MAX)) as i32),
-                                None => target_ms,
-                            };
-                            if let Some(av) = player.av.as_mut() {
-                                let _ = av.player.seek(clamped, SeekMode::Closest);
-                            }
-                        }
-                        if wants_play
-                            && let Some(player) = self.players.get_mut(&player_id)
-                            && let Some(av) = player.av.as_mut()
-                            && let Err(err) = av.player.play()
-                        {
-                            self.fail_player(player_id, err.to_string());
-                        }
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_PLAYING as i32 => {
-                        if let Some(player) = self.players.get_mut(&player_id) {
-                            player.playing = true;
-                            player.last_progress = Instant::now();
-                            player.apply_settings();
-                        }
-                        self.emit(player_id, AudioEvent::Playing);
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_PAUSED as i32 => {
-                        let emit_paused = if let Some(player) = self.players.get_mut(&player_id) {
-                            let was = player.playing;
-                            player.playing = false;
-                            was
-                        } else {
-                            false
-                        };
-                        if emit_paused {
-                            self.emit(player_id, AudioEvent::Paused);
-                        }
-                    }
-                    AvNoticeKind::State(state) if state == av::STATE_COMPLETED as i32 => {
-                        let (looped, duration) = {
-                            let player = self.players.get_mut(&player_id).unwrap();
-                            if player.settings.looped {
-                                return;
-                            }
-                            player.playing = false;
-                            player.wants_play = false;
-                            (false, player.duration())
-                        };
-                        if !looped {
-                            if let Some(d) = duration {
-                                self.emit(
-                                    player_id,
-                                    AudioEvent::Progress {
-                                        position: d,
-                                        duration: Some(d),
-                                    },
-                                );
-                            }
-                            self.emit(player_id, AudioEvent::Ended);
-                        }
-                    }
-                    AvNoticeKind::SeekDone(pos_ms) => {
-                        let (pos, duration) = {
-                            let player = self.players.get_mut(&player_id).unwrap();
-                            if !player.prepared {
-                                return;
-                            }
-                            let ms = if pos_ms >= 0 {
-                                pos_ms
-                            } else {
-                                player
-                                    .av
-                                    .as_mut()
-                                    .and_then(|av| av.player.current_time().ok())
-                                    .unwrap_or(0)
-                                    .max(0)
-                            };
-                            (Duration::from_millis(ms as u64), player.duration())
-                        };
-                        self.emit(
-                            player_id,
-                            AudioEvent::Progress {
-                                position: pos,
-                                duration,
-                            },
-                        );
-                    }
-                    AvNoticeKind::Buffering(kind)
-                        if kind == av::BUFFERING_START as i32
-                            || kind == av::BUFFERING_END as i32 =>
-                    {
-                        self.emit(
-                            player_id,
-                            AudioEvent::Buffer {
-                                buffering: kind == av::BUFFERING_START as i32,
-                            },
-                        );
-                    }
-                    AvNoticeKind::Buffering(_) => {}
-                    AvNoticeKind::Error(message) => {
-                        self.fail_player(player_id, message);
-                    }
-                    _ => {}
-                }
-            }
+            AvNotice::Error(_) => true,
+            _ => false,
+        };
+        if close {
+            self.voices.remove(idx).av.close();
         }
     }
 
-    fn shutdown(&mut self) {
-        self.mixer.lock().unwrap().clear();
-        if let Some(mut renderer) = self.renderer.take() {
-            let _ = renderer.stop();
-            let _ = renderer.close();
-        }
-        self.renderer_running = false;
-        for voice in self.compressed_voices.drain(..) {
-            voice.av.close();
-        }
-        for (_, mut entry) in self.compressed_sounds.drain() {
-            if let Some(probe) = entry.probe.take() {
-                probe.close();
+    fn on_player(&mut self, id: u32, generation: u64, kind: AvNotice) {
+        let Some(p) = self
+            .players
+            .get_mut(&id)
+            .filter(|p| p.generation == generation && p.av.is_some())
+        else {
+            return;
+        };
+        match kind {
+            AvNotice::State(s) if s == av::STATE_INITIALIZED as i32 => {
+                if let Err(err) = p.av.as_mut().unwrap().player.prepare() {
+                    self.fail_player(id, err.to_string());
+                }
             }
-        }
-        for (_, mut player) in self.players.drain() {
-            player.release_player();
+            AvNotice::State(s) if s == av::STATE_PREPARED as i32 => {
+                p.prepared = true;
+                p.apply_settings();
+                let duration = p.duration();
+                if let Some(ms) = p.pending_seek_ms.take() {
+                    p.seek_clamped(ms);
+                }
+                let play_err = p
+                    .wants_play
+                    .then(|| p.av.as_mut().unwrap().player.play().err())
+                    .flatten();
+                self.emit(id, AudioEvent::Load { duration });
+                if let Some(err) = play_err {
+                    self.fail_player(id, err.to_string());
+                }
+            }
+            AvNotice::State(s) if s == av::STATE_PLAYING as i32 => {
+                p.playing = true;
+                p.last_progress = Instant::now();
+                p.apply_settings();
+                self.emit(id, AudioEvent::Playing);
+            }
+            AvNotice::State(s) if s == av::STATE_PAUSED as i32 => {
+                if std::mem::replace(&mut p.playing, false) {
+                    self.emit(id, AudioEvent::Paused);
+                }
+            }
+            AvNotice::State(s) if s == av::STATE_COMPLETED as i32 => {
+                if p.settings.looped {
+                    return;
+                }
+                p.playing = false;
+                p.wants_play = false;
+                if let Some(d) = p.duration() {
+                    self.emit(
+                        id,
+                        AudioEvent::Progress {
+                            position: d,
+                            duration: Some(d),
+                        },
+                    );
+                }
+                self.emit(id, AudioEvent::Ended);
+            }
+            AvNotice::SeekDone(pos_ms) => {
+                if !p.prepared {
+                    return;
+                }
+                let ms = if pos_ms >= 0 {
+                    pos_ms
+                } else {
+                    p.av.as_mut()
+                        .and_then(|a| a.player.current_time().ok())
+                        .unwrap_or(0)
+                        .max(0)
+                };
+                let duration = p.duration();
+                self.emit(
+                    id,
+                    AudioEvent::Progress {
+                        position: Duration::from_millis(ms as u64),
+                        duration,
+                    },
+                );
+            }
+            AvNotice::Buffering(k)
+                if k == av::BUFFERING_START as i32 || k == av::BUFFERING_END as i32 =>
+            {
+                self.emit(
+                    id,
+                    AudioEvent::Buffer {
+                        buffering: k == av::BUFFERING_START as i32,
+                    },
+                );
+            }
+            AvNotice::Error(msg) => self.fail_player(id, msg),
+            _ => {}
         }
     }
 }
 
 fn decode_audio_data_uri(uri: &str) -> Result<Vec<u8>, String> {
     use base64::Engine as _;
-    let Some((header, payload)) = uri.split_once(',') else {
-        return Err("invalid audio data URI".into());
-    };
+    let (header, payload) = uri.split_once(',').ok_or("invalid audio data URI")?;
     let bytes = if header.ends_with(";base64") {
         base64::engine::general_purpose::STANDARD
             .decode(payload)
@@ -1227,35 +883,13 @@ fn decode_audio_data_uri(uri: &str) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-fn set_file_path_source(player: &mut AvPlayer, path: &Path) -> Result<(), String> {
-    let file = File::open(path).map_err(|e| e.to_string())?;
-    set_opened_file_source(player, &file)
-}
-
-fn set_opened_file_source(player: &mut AvPlayer, file: &File) -> Result<(), String> {
-    let len = i64::try_from(file.metadata().map_err(|e| e.to_string())?.len())
-        .map_err(|_| "audio file exceeds i64 size".to_owned())?;
-    if len <= 0 {
-        return Err("audio file is empty".into());
-    }
-    player
-        .set_fd(file.as_fd(), 0, len)
-        .map_err(|e| e.to_string())
-}
-
-struct RunningAudio {
-    tx: mpsc::Sender<WorkerEvent>,
-    mixer: Arc<Mutex<MixerState>>,
-    closed: AtomicBool,
-}
-
 /// Per-surface audio controller. Lazily spawns one worker thread on first audio
-/// command and cleanly shuts down all streams, players, and temp files on close.
+/// command and tears down all players and staged temp files on close.
 pub(crate) struct Audio {
     host: Arc<Services>,
     route: Weak<Dispatcher>,
     assets: Arc<dyn StreamAssets>,
-    running: RefCell<Option<RunningAudio>>,
+    tx: RefCell<Option<mpsc::Sender<WorkerEvent>>>,
 }
 
 impl Audio {
@@ -1268,81 +902,51 @@ impl Audio {
             host,
             route,
             assets,
-            running: RefCell::new(None),
+            tx: RefCell::new(None),
         }
-    }
-
-    fn ensure_started(&self) -> napi_ohos::Result<()> {
-        if self.running.borrow().is_some() {
-            return Ok(());
-        }
-        let (tx, rx) = mpsc::channel::<WorkerEvent>();
-        let mixer = Arc::new(Mutex::new(MixerState::default()));
-        let worker = AudioWorker {
-            host: self.host.clone(),
-            route: self.route.clone(),
-            assets: self.assets.clone(),
-            tx: tx.clone(),
-            rx,
-            mixer: mixer.clone(),
-            renderer: None,
-            renderer_running: false,
-            renderer_idle_since: None,
-            next_generation: 0,
-            next_voice_id: 0,
-            compressed_sounds: FxHashMap::default(),
-            compressed_voices: Vec::new(),
-            players: FxHashMap::default(),
-        };
-        std::thread::Builder::new()
-            .name("nsh-audio".into())
-            .spawn(move || worker.run())
-            .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
-        *self.running.borrow_mut() = Some(RunningAudio {
-            tx,
-            mixer,
-            closed: AtomicBool::new(false),
-        });
-        Ok(())
     }
 
     pub(crate) fn command(&self, command: AudioCommand) -> napi_ohos::Result<()> {
         if let AudioCommand::LoadUrl { id, .. } = command {
-            if let Some(route) = self
-                .route
-                .upgrade()
-                .filter(|d| d.live.load(Ordering::Acquire))
-            {
-                route.send(Message::HostEvent(
-                    EventKind::Audio,
-                    EventPayload::Audio {
-                        id,
-                        event: AudioEvent::Failed {
-                            error: AudioError::NotSupported,
-                            message: "LoadUrl is not supported on native platforms".into(),
-                        },
-                    },
-                ));
-            }
+            emit_to(
+                &self.route,
+                id,
+                AudioEvent::Failed {
+                    error: AudioError::NotSupported,
+                    message: "LoadUrl is not supported on native platforms".into(),
+                },
+            );
             return Ok(());
         }
-        self.ensure_started()?;
-        if let Some(running) = self.running.borrow().as_ref()
-            && !running.closed.load(Ordering::Acquire)
-        {
-            let _ = running.tx.send(WorkerEvent::Command(command));
+        if self.tx.borrow().is_none() {
+            let (tx, rx) = mpsc::channel();
+            let worker = AudioWorker {
+                host: self.host.clone(),
+                route: self.route.clone(),
+                assets: self.assets.clone(),
+                tx: tx.clone(),
+                rx,
+                next_gen: 0,
+                next_voice_id: 0,
+                sounds: FxHashMap::default(),
+                voices: Vec::new(),
+                players: FxHashMap::default(),
+            };
+            std::thread::Builder::new()
+                .name("nsh-audio".into())
+                .spawn(move || worker.run())
+                .map_err(|e| napi_ohos::Error::from_reason(e.to_string()))?;
+            *self.tx.borrow_mut() = Some(tx);
+        }
+        if let Some(tx) = self.tx.borrow().as_ref() {
+            let _ = tx.send(WorkerEvent::Command(command));
         }
         Ok(())
     }
 
     pub(crate) fn close(&self) {
-        if let Some(running) = self.running.borrow_mut().take() {
-            running.closed.store(true, Ordering::Release);
-            // Silence PCM mixer immediately on close before worker thread finishes teardown.
-            if let Ok(mut mixer) = running.mixer.lock() {
-                mixer.clear();
-            }
-            let _ = running.tx.send(WorkerEvent::Shutdown);
+        if let Some(tx) = self.tx.borrow_mut().take() {
+            let _ = tx.send(WorkerEvent::Shutdown);
         }
     }
 }

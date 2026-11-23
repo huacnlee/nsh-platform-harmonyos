@@ -1,12 +1,10 @@
 pub(crate) mod chunks;
-pub(crate) mod chunks_spec;
 #[cfg(feature = "dev")]
 pub(crate) mod dev;
 pub(crate) mod entry;
 pub(crate) mod environment;
 pub(crate) mod features;
 pub(crate) mod frame_rate;
-pub(crate) mod frame_rate_spec;
 pub(crate) mod frame_source;
 pub(crate) mod options;
 pub(crate) mod runtime;

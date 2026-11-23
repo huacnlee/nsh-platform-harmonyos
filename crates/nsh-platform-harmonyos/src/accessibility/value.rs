@@ -26,78 +26,72 @@ pub(crate) fn role_str(role: AccessibilityRole) -> &'static str {
     }
 }
 
-struct StateWords {
-    checked: &'static str,
-    not_checked: &'static str,
-    mixed: &'static str,
-    expanded: &'static str,
-    collapsed: &'static str,
-    busy: &'static str,
-}
-
-fn state_words(locale: &str) -> StateWords {
-    let lang = locale
+fn state_words(
+    locale: &str,
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+) {
+    match locale
         .split(['-', '_'])
         .next()
         .unwrap_or("")
-        .to_ascii_lowercase();
-    match lang.as_str() {
-        "zh" => StateWords {
-            checked: "已选中",
-            not_checked: "未选中",
-            mixed: "部分选中",
-            expanded: "已展开",
-            collapsed: "已折叠",
-            busy: "忙碌",
-        },
-        "ja" => StateWords {
-            checked: "選択済み",
-            not_checked: "未選択",
-            mixed: "一部選択",
-            expanded: "展開中",
-            collapsed: "折りたたみ中",
-            busy: "処理中",
-        },
-        "ko" => StateWords {
-            checked: "선택됨",
-            not_checked: "선택 안 됨",
-            mixed: "일부 선택됨",
-            expanded: "펼쳐짐",
-            collapsed: "접힘",
-            busy: "사용 중",
-        },
-        "es" => StateWords {
-            checked: "seleccionado",
-            not_checked: "no seleccionado",
-            mixed: "mixto",
-            expanded: "expandido",
-            collapsed: "contraído",
-            busy: "ocupado",
-        },
-        "fr" => StateWords {
-            checked: "coché",
-            not_checked: "non coché",
-            mixed: "mixte",
-            expanded: "développé",
-            collapsed: "réduit",
-            busy: "occupé",
-        },
-        "de" => StateWords {
-            checked: "aktiviert",
-            not_checked: "nicht aktiviert",
-            mixed: "gemischt",
-            expanded: "erweitert",
-            collapsed: "reduziert",
-            busy: "beschäftigt",
-        },
-        _ => StateWords {
-            checked: "checked",
-            not_checked: "not checked",
-            mixed: "mixed",
-            expanded: "expanded",
-            collapsed: "collapsed",
-            busy: "busy",
-        },
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "zh" => ("已选中", "未选中", "部分选中", "已展开", "已折叠", "忙碌"),
+        "ja" => (
+            "選択済み",
+            "未選択",
+            "一部選択",
+            "展開中",
+            "折りたたみ中",
+            "処理中",
+        ),
+        "ko" => (
+            "선택됨",
+            "선택 안 됨",
+            "일부 선택됨",
+            "펼쳐짐",
+            "접힘",
+            "사용 중",
+        ),
+        "es" => (
+            "seleccionado",
+            "no seleccionado",
+            "mixto",
+            "expandido",
+            "contraído",
+            "ocupado",
+        ),
+        "fr" => (
+            "coché",
+            "non coché",
+            "mixte",
+            "développé",
+            "réduit",
+            "occupé",
+        ),
+        "de" => (
+            "aktiviert",
+            "nicht aktiviert",
+            "gemischt",
+            "erweitert",
+            "reduziert",
+            "beschäftigt",
+        ),
+        _ => (
+            "checked",
+            "not checked",
+            "mixed",
+            "expanded",
+            "collapsed",
+            "busy",
+        ),
     }
 }
 
@@ -125,7 +119,7 @@ pub(crate) fn spoken_value_for_locale(
     accessibility: &Accessibility,
     locale: &str,
 ) -> Option<String> {
-    let words = state_words(locale);
+    let (checked, not_checked, mixed, expanded, collapsed, busy) = state_words(locale);
     let mut parts = Vec::new();
     if let Some(value) = &accessibility.value {
         if let Some(text) = &value.text {
@@ -142,18 +136,18 @@ pub(crate) fn spoken_value_for_locale(
         }
     }
     match accessibility.state.checked {
-        Some(Checked::True) => parts.push(words.checked.into()),
-        Some(Checked::False) => parts.push(words.not_checked.into()),
-        Some(Checked::Mixed) => parts.push(words.mixed.into()),
+        Some(Checked::True) => parts.push(checked.into()),
+        Some(Checked::False) => parts.push(not_checked.into()),
+        Some(Checked::Mixed) => parts.push(mixed.into()),
         None => {}
     }
     match accessibility.state.expanded {
-        Some(true) => parts.push(words.expanded.into()),
-        Some(false) => parts.push(words.collapsed.into()),
+        Some(true) => parts.push(expanded.into()),
+        Some(false) => parts.push(collapsed.into()),
         None => {}
     }
     if accessibility.state.busy {
-        parts.push(words.busy.into());
+        parts.push(busy.into());
     }
     if accessibility.state.has_popup {
         // Use the app's localized popup action, never a built-in control label.
