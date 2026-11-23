@@ -268,6 +268,17 @@ impl Dispatcher {
             log::error!("OHOS UI dispatch failed: {status:?}");
         }
     }
+    pub(crate) fn request_exit_app(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            let status = owner.call(
+                crate::app::surface::Message::ExitApp,
+                ThreadsafeFunctionCallMode::NonBlocking,
+            );
+            if status != Status::Ok {
+                log::error!("OHOS exitApp dispatch failed: {status:?}");
+            }
+        }
+    }
     /// Registers a single-shot UI-thread continuation and returns a `Send` handle
     /// that can complete it from any worker thread. Must be called on the UI thread.
     pub(crate) fn reply<T: Send + 'static>(

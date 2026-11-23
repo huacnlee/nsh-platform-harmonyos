@@ -97,6 +97,7 @@ The slot's size is the app's window: NSH lays the app out at the slot's size and
 | `setEnvironment(changes: NshEnvironment)` | Override locale, font scale, color scheme (`"light"` / `"dark"`), safe-area insets or keyboard height for this surface. Omitted fields keep their current values. |
 | `runApp()` | Run the app written in Rust that is linked into the library; `hasApp` says whether one is. |
 | `loadResource(name: string, sourceMap?: string): Promise<void>` | Run a bundle (`bundle.js` or `bundle.nshc`) from `resources/rawfile/`; app assets are read from `rawfile/assets/`. |
+| `reload(): Promise<void>` | Reload the last `loadResource()` or `runApp()` target in place so downloaded `.nshpkg` updates take effect without a cold start. |
 | `loadSource(source: string, sourceMap?: string)` | Run trusted JS source directly, replacing the running app. |
 | `runPackage(pkg: NshPackage)` | Run a verified signed package, replacing the running app. A package can be run once per `openPackage` call. |
 | `registerComponent(name: string, factory: (id: number) => object)` | Register a [native component](https://github.com/longbridge/nsh/blob/main/website/docs/native-components.md) for this surface. |
@@ -106,6 +107,7 @@ The slot's size is the app's window: NSH lays the app out at the slot's size and
 | `send(name: string, data?: object \| string \| number \| boolean \| null)` | Send an event to the app (`host.on(name, …)`); kept until the app listens, or for the next app when none is running. |
 | `handle(name: string, handler?: ((data: Object \| null, reply: NshHostReply) => void) \| null)` | Handle the app's calls (`host.call`) and posts (`host.post`) for `name` on the UI thread; `null` (or `removeHandler(name)`) removes the handler. Answer once via `reply.resolve(value)` or `reply.reject(message)`. |
 | `setOpenUrlHandler(handler?: ((url: string) => boolean) \| null)` | Intercept URLs the app opens; return `true` if handled by the host, or `false` to let the system open it. |
+| `setExitAppHandler(handler?: (() => void) \| null)` | Handle `BackHandler.exitApp()` on the UI thread (for example calling `UIAbilityContext.terminateSelf()` or dismissing the host page). |
 | `connectDevServer(url: string)` | Development: load from a `nsh dev` server and reload on every change (requires the library built with the feature `dev`). |
 | `disconnectDevServer()` | Disconnect from the dev server while keeping the current app running. |
 | `activate()` | Mark this surface as the active target for the system back gesture when switching between multiple surfaces. |
@@ -171,6 +173,19 @@ surface.setOpenUrlHandler((url: string): boolean => {
   return false;
 });
 ```
+
+## App exit and update reload
+
+`BackHandler.exitApp()` is ignored with a warning by default because an embedded surface does not own the host Ability's lifetime. Standalone runner apps (`template/entry/src/main/ets/pages/Index.ets`) and opt-in hosts can forward it via `setExitAppHandler`:
+
+```ts
+const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
+surface.setExitAppHandler(() => {
+  host?.terminateSelf();
+});
+```
+
+When an app downloads an `.nshpkg` update through `nsh/updates`, `loadResource()` automatically activates the verified update on the next load via `nsh_engine::updates::package_to_run`. To apply a downloaded update without a full process cold start, call `await surface.reload()` (for example from a `nsh/host` message after the app signals that an update is ready).
 
 ## Limits
 

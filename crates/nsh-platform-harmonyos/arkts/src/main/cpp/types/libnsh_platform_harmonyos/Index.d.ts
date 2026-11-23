@@ -698,6 +698,11 @@ export declare class NshSurface {
   ): Promise<void>;
   /** Starts the Rust app linked into this binary (`nsh_platform_harmonyos::app!`). */
   runApp(): void;
+  /**
+   * Reloads the last `loadResource()` or `runApp()` target in place.
+   * For resource bundles, re-checks downloaded `.nshpkg` updates without a process cold start.
+   */
+  reload(): Promise<void>;
   /** Whether this binary was built with a linked Rust app (`runApp()`). */
   get hasApp(): boolean;
   /**
@@ -759,6 +764,11 @@ export declare class NshSurface {
   setOpenUrlHandler(
     handler?: ((url: string) => boolean) | null | undefined,
   ): void;
+  /**
+   * Handles `BackHandler.exitApp()` requests from the running app on the UI thread.
+   * Pass `null` or `undefined` to restore the default embedded behavior (ignore and warn).
+   */
+  setExitAppHandler(handler?: (() => void) | null | undefined): void;
   /**
    * Hands `url`, one the embedding Ability was opened with (its launch `Want.uri`
    * or `onNewWant`), to the running app's `UrlScheme.on("open")` listeners (`nsh`).
