@@ -1,0 +1,17 @@
+[package]
+name = "nsh-example-extensions"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+nsh-core = "0.6"
+
+# HarmonyOS-only runtime extension points (unified with the runner's backend).
+[target.'cfg(target_env = "ohos")'.dependencies]
+nsh-platform-harmonyos = { path = "../../..", default-features = false }
