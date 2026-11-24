@@ -68,6 +68,6 @@ jobs:
       - name: The platform packages a TSX app with the nightly nsh
         run: |
           export OHOS_NDK_HOME=~/ohos-sdk/openharmony
-          cargo install --path . --locked
+          cargo install --path . --locked --force
           nsh -V
           nsh package examples/counter-tsx --target harmonyos --no-hap
