@@ -666,6 +666,11 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
     let module_extras = build_module_extras(&config.harmonyos);
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
+    let bundle_resource = if contents.build.join("bundle.nshc").is_file() {
+        "bundle.nshc"
+    } else {
+        "bundle.js"
+    };
 
     let substitutions = [
         ("{{bundleName}}", json_text(&config.id)),
@@ -680,6 +685,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         ("{{extraModules}}", extra_modules),
         ("{{requestPermissions}}", request_permissions),
         ("{{usesWebView}}", config.webview.to_string()),
+        ("{{bundleResource}}", bundle_resource.to_owned()),
         ("{{abilities}}", abilities),
         ("{{moduleExtras}}", module_extras),
         ("{{entryStrings}}", entry_strings),
@@ -1366,6 +1372,61 @@ mod tests {
             .unwrap();
         assert_eq!(mic["reason"], "$string:nsh_perm_microphone");
         assert_eq!(mic["usedScene"]["when"], "always");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn template_prefers_bytecode_bundle_when_present() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-preboot-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("bundle.js"), "export default 1;").unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+        let config = AppConfig::from_json(
+            &dir.join("app"),
+            &json!({ "name": "Preboot", "id": "com.example.preboot" }),
+        )
+        .unwrap();
+        let out = dir.join("project");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+
+        // Without bundle.nshc, the template falls back to bundle.js.
+        write(&out, &config, &contents).unwrap();
+        let index =
+            fs::read_to_string(join_relative(&out, "entry/src/main/ets/pages/Index.ets")).unwrap();
+        assert!(index.contains("this.surface.loadResource(\"bundle.js\")"));
+        assert!(!index.contains("{{"));
+
+        // When bundle.nshc is present, the template loads precompiled bytecode.
+        fs::write(build.join("bundle.nshc"), b"\x02bytecode").unwrap();
+        write(&out, &config, &contents).unwrap();
+        let index =
+            fs::read_to_string(join_relative(&out, "entry/src/main/ets/pages/Index.ets")).unwrap();
+        assert!(index.contains("this.surface.loadResource(\"bundle.nshc\")"));
+        assert!(
+            join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "rawfile",
+                    "bundle.nshc"
+                ]
+            )
+            .is_file()
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

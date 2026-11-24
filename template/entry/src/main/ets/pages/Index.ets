@@ -29,7 +29,7 @@ struct Index {
     } else if (this.surface.hasApp) {
       this.surface.runApp();
     } else {
-      this.surface.loadResource("bundle.js");
+      this.surface.loadResource("{{bundleResource}}");
     }
     if ({{usesWebView}}) {
       prepareWebEngine();

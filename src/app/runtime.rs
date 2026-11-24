@@ -15,10 +15,14 @@ use nsh_engine::{Engine, EngineConfig, Environment, MountSink, Os};
 use ohos_vsync_binding::Vsync;
 
 use crate::{
-    app::{environment::NshEnvironment, options::Config},
+    app::{
+        environment::NshEnvironment,
+        options::Config,
+        preboot::{FlushGuard, MountGate},
+    },
     render::{
-        geometry::Size,
-        mount::Mounter,
+        geometry::{Size, WindowRect, full_window_matches},
+        mount::{Mounter, window_avoid_environment},
         node::{NativeNode, Result},
     },
     text::typography::OhosTextEngine,
@@ -329,15 +333,28 @@ impl Dispatcher {
         }))
     }
 }
-struct Sink(
-    Arc<Dispatcher>,
-    Option<Arc<crate::app::chunks::ResourceChunks>>,
-);
+struct Sink {
+    gate: Arc<MountGate<Arc<Dispatcher>>>,
+    chunks: Option<Arc<crate::app::chunks::ResourceChunks>>,
+    control: Arc<std::sync::Mutex<Option<nsh_engine::EngineControl>>>,
+}
 impl MountSink for Sink {
     fn load_chunk(&self, id: &str) -> bool {
-        self.1
-            .as_ref()
-            .is_some_and(|chunks| chunks.load(id, Arc::downgrade(&self.0)))
+        let Some(chunks) = &self.chunks else {
+            return false;
+        };
+        self.gate.on_load_chunk(
+            id,
+            |id| {
+                let control = self
+                    .control
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                control.is_some_and(|control| chunks.load_to_control(id, control))
+            },
+            |dispatcher, id| chunks.load(id, Arc::downgrade(dispatcher)),
+        )
     }
     fn submit(&self, mut batch: MountBatch) {
         // Native paragraphs belong to the engine. As on Linux, the UI receives
@@ -351,17 +368,23 @@ impl MountSink for Sink {
                 *layout = nsh_core::TextLayout(text.native.clone());
             }
         }
-        self.0.send(Message::Batch(batch));
+        self.gate.on_submit(batch, |dispatcher, batch| {
+            dispatcher.send(Message::Batch(batch))
+        });
     }
     fn report_error(&self, message: &str) {
-        self.0.send(Message::Error(message.into()));
+        self.gate.on_error(message.into(), |dispatcher, error| {
+            dispatcher.send(Message::Error(error))
+        });
     }
     fn request_frame(&self) {
-        self.0.send(Message::EngineFrameRequested);
+        self.gate
+            .on_request_frame(|dispatcher| dispatcher.send(Message::EngineFrameRequested));
     }
     #[cfg(feature = "dev")]
     fn hot_update_failed(&self) {
-        self.0.send(Message::HotFailed);
+        self.gate
+            .on_hot_failed(|dispatcher| dispatcher.send(Message::HotFailed));
     }
 }
 
@@ -648,38 +671,7 @@ impl State {
                 }
             }
             Message::Batch(batch) => {
-                #[cfg(feature = "dev")]
-                if let Some(testing) = &self.testing {
-                    // Scene queries also run on this UI thread, after the
-                    // native batch below finishes. No batch clone is needed.
-                    testing.model.apply(&batch);
-                }
-                let mounter = self
-                    .mounter
-                    .as_mut()
-                    .expect("running surface has a mounter");
-                let first_batch = mounter.batch_count() == 0;
-                let result = mounter.apply(batch);
-                if first_batch && self.environment.os.is_desktop() && result.is_ok() {
-                    mounter.request_desktop_focus();
-                }
-                self.retire()?;
-                if let Err(error) = result {
-                    #[cfg(feature = "dev")]
-                    if let Some(testing) = &self.testing {
-                        testing.model.error(error.to_string());
-                    }
-                    if matches!(error, crate::render::node::Error::Tree(_)) {
-                        // Root creation is the only fatal mount item. Stale
-                        // references and detach failures are logged by the mounter.
-                        if let Err(cleanup) = self.close() {
-                            log::error!("OHOS failed-generation cleanup: {cleanup}");
-                        }
-                        return Err(error);
-                    }
-                    log::warn!("OHOS mount resource skipped: {error}");
-                }
-                self.request_frame()?;
+                self.apply_batch(batch)?;
             }
             Message::Error(error) => {
                 self.report(error);
@@ -725,6 +717,41 @@ impl State {
             | Message::HostClosed => unreachable!(),
         }
         self.update_back();
+        Ok(())
+    }
+    fn apply_batch(&mut self, batch: MountBatch) -> Result<()> {
+        #[cfg(feature = "dev")]
+        if let Some(testing) = &self.testing {
+            // Scene queries also run on this UI thread, after the
+            // native batch below finishes. No batch clone is needed.
+            testing.model.apply(&batch);
+        }
+        let mounter = self
+            .mounter
+            .as_mut()
+            .expect("running surface has a mounter");
+        let first_batch = mounter.batch_count() == 0;
+        let result = mounter.apply(batch);
+        if first_batch && self.environment.os.is_desktop() && result.is_ok() {
+            mounter.request_desktop_focus();
+        }
+        self.retire()?;
+        if let Err(error) = result {
+            #[cfg(feature = "dev")]
+            if let Some(testing) = &self.testing {
+                testing.model.error(error.to_string());
+            }
+            if matches!(error, crate::render::node::Error::Tree(_)) {
+                // Root creation is the only fatal mount item. Stale
+                // references and detach failures are logged by the mounter.
+                if let Err(cleanup) = self.close() {
+                    log::error!("OHOS failed-generation cleanup: {cleanup}");
+                }
+                return Err(error);
+            }
+            log::warn!("OHOS mount resource skipped: {error}");
+        }
+        self.request_frame()?;
         Ok(())
     }
     fn is_active(&self) -> bool {
@@ -1004,136 +1031,43 @@ impl App {
         }
     }
 }
-impl Runtime {
+/// A running NSH engine created without requiring `UIContext` or `Mounter`.
+/// Shared by both preboot (`NshPreload`) and direct `Runtime::start`.
+pub(crate) struct BootedEngine {
+    engine: Option<Engine>,
+    gate: Arc<MountGate<Arc<Dispatcher>>>,
+    environment: Environment,
+    size: Size,
+    size_px: (i32, i32),
+    text_scale: Arc<std::sync::atomic::AtomicU32>,
+    fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
+    access: Arc<nsh_engine::Access>,
+    assets: Arc<dyn crate::services::assets::StreamAssets>,
+    chunks: Option<Arc<crate::app::chunks::ResourceChunks>>,
+    main_window_options: Option<nsh_core::desktop::MainWindowOptions>,
+    main_window_launch: Option<crate::services::desktop::WireCommand>,
+    storage_dir: std::path::PathBuf,
+    owner: std::sync::Weak<crate::app::surface::Queue>,
+    #[cfg(feature = "dev")]
+    testing: Option<Arc<crate::app::testing::Session>>,
+    #[cfg(feature = "dev")]
+    reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
+}
+
+impl BootedEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        env: Env,
-        parent: NativeNode,
         app: App,
         size: Size,
+        size_px: (i32, i32),
         config: &Config,
-        components: crate::interop::component::Components,
-        scroll_watchers: crate::scroll::watch::ScrollWatchers,
-        errors: Errors,
+        pending_urls: Vec<String>,
+        gate: Arc<MountGate<Arc<Dispatcher>>>,
+        flush_guard: Option<FlushGuard<Arc<Dispatcher>>>,
+        assume_full_window: bool,
     ) -> napi_ohos::Result<Self> {
         config.host.check()?;
         let scale = config.host.scale()?;
-        let vsync = Arc::new(
-            config
-                .host
-                .window_id()
-                .and_then(|id| Vsync::try_new_for_associated_window(id, "nsh"))
-                .or_else(|| Vsync::try_new("nsh"))
-                .ok_or_else(|| {
-                    napi_ohos::Error::from_reason("failed to create OHOS native VSync")
-                })?,
-        );
-        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone())
-            .map_err(|error| {
-                napi_ohos::Error::from_reason(format!("failed to start VSync rate worker: {error}"))
-            })?;
-        let status = frame_rate.apply_initial();
-        if status != 0 {
-            return Err(napi_ohos::Error::from_reason(format!(
-                "failed to configure OHOS native VSync rate: {status}"
-            )));
-        }
-        // UI and shader demand share this one NativeVSync rate owner.
-        let shader_rate = frame_rate.clone();
-        let state = Rc::new(RefCell::new(State {
-            #[cfg(feature = "dev")]
-            testing: app.testing.clone(),
-            #[cfg(feature = "dev")]
-            test_closed: Arc::default(),
-            parent: Rc::downgrade(&parent),
-            engine: None,
-            mounter: None,
-            dispatcher: Weak::new(),
-            rate_driver: None,
-            phase: None,
-            frame_rate,
-            errors,
-            engine_wanted: false,
-            engine_in_flight: 0,
-            native_demand: super::frame_rate::UiDemand::Idle,
-            laid_out: false,
-            attached: true,
-            visible: true,
-            frame_wanted: false,
-            retiring_dispatcher: None,
-            environment: Environment::default(),
-            #[cfg(feature = "dev")]
-            reload: app.reload,
-            #[cfg(feature = "dev")]
-            hot_version: None,
-        }));
-        let ui_state = state.clone();
-        let wake = env.create_function_from_closure::<(), (), _>("nshCommit", |_| Ok(()))?;
-        let dispatcher = Arc::new(Dispatcher {
-            owner: app.owner,
-            queue: wake
-                .build_threadsafe_function::<Message>()
-                .callee_handled::<false>()
-                .build_callback(move |ctx| {
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let Ok(mut state) = ui_state.try_borrow_mut() else {
-                            // Re-enqueue on synchronous re-entry instead of panicking.
-                            if let Ok(state) = ui_state.try_borrow()
-                                && let Some(route) = state.dispatcher.upgrade()
-                            {
-                                route.send(ctx.value);
-                            }
-                            return;
-                        };
-                        if let Err(error) = state.receive(ctx.value) {
-                            state.report(error.to_string());
-                            log::error!("OHOS surface: {error}");
-                        }
-                    }))
-                    .is_err()
-                    {
-                        log::error!("panic in OHOS runtime TSFN callback");
-                    }
-                    Ok(())
-                })?,
-            wants_back: std::sync::atomic::AtomicBool::new(false),
-            video_fullscreen: std::sync::atomic::AtomicBool::new(false),
-            active: std::sync::atomic::AtomicBool::new(config.host.is_foreground()),
-            manages_status_bar: config.manages_status_bar,
-            status_bar_configured: std::sync::atomic::AtomicBool::new(false),
-            status_bar: std::sync::Mutex::new(None),
-            keyboard: std::sync::Mutex::default(),
-            live: std::sync::atomic::AtomicBool::new(true),
-        });
-        state.borrow_mut().dispatcher = Arc::downgrade(&dispatcher);
-        state.borrow_mut().rate_driver = Some(super::frame_source::RateDriver::new(
-            vsync,
-            shader_rate.clone(),
-            Arc::downgrade(&dispatcher),
-        ));
-        let weak = Rc::downgrade(&state);
-        let rate_driver = state.borrow().rate_driver.as_ref().unwrap().clone();
-        state.borrow_mut().phase = Some(super::frame_source::Phase::new(
-            env,
-            &config.host,
-            rate_driver,
-            move |timestamp| {
-                let Some(state) = weak.upgrade() else {
-                    return Ok(false);
-                };
-                let mut state = state.try_borrow_mut().map_err(reentry)?;
-                match state.step_frame(timestamp) {
-                    Ok(active) => Ok(active),
-                    Err(error) => {
-                        state.report(error.to_string());
-                        if let Some(rate_driver) = &state.rate_driver {
-                            let _ = rate_driver.set_active(false);
-                        }
-                        Ok(false)
-                    }
-                }
-            },
-        )?);
         let environment = Environment {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
@@ -1152,7 +1086,29 @@ impl Runtime {
             window: size.into(),
             ..Environment::default()
         };
-        let environment = config.host.environment().apply(environment)?;
+        let mut environment = config.host.environment().apply(environment)?;
+        // Populate initial safeArea before Frame 1 for full-window surfaces so
+        // the very first layout matches the real window without a Frame-2 jump.
+        let viewport_px = (
+            size.width as f64 * scale as f64,
+            size.height as f64 * scale as f64,
+        );
+        let apply_window_avoid =
+            assume_full_window || full_window_matches(viewport_px, config.host.window_size());
+        if apply_window_avoid && let Some((visual, keyboard)) = config.host.window_areas() {
+            let avoid = window_avoid_environment(
+                WindowRect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: viewport_px.0,
+                    height: viewport_px.1,
+                },
+                scale as f64,
+                visual,
+                keyboard,
+            );
+            environment = avoid.apply(environment)?;
+        }
         let mut environment = config.environment.clone().apply(environment)?;
         let os = crate::services::desktop::os_for_idiom(environment.idiom);
         environment.os = os;
@@ -1164,18 +1120,11 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
-        state.borrow_mut().environment = environment;
         let access = match &app.app {
             nsh_engine::App::Js(bundle) => bundle.policy.access(),
             nsh_engine::App::Rust(_) => nsh_engine::Policy::default().access(),
         };
         let engine_assets: Arc<dyn nsh_engine::Assets> = app.assets.clone();
-        let images = crate::media::image::Loader::new(
-            engine_assets.clone(),
-            access.clone(),
-            Arc::downgrade(&dispatcher),
-        );
         let access = Arc::new(access);
         let assets = app.assets.clone();
         // Wait for any retiring engine using the same host storage/data directory
@@ -1213,7 +1162,7 @@ impl Runtime {
             limits: config.limits,
             ui_sets: crate::ui_sets(),
             runtime: None,
-            support_dir: Some(host_data_dir),
+            support_dir: Some(host_data_dir.clone()),
             data_dir: None,
             cache: config.cache.clone(),
             storage,
@@ -1243,14 +1192,22 @@ impl Runtime {
         let scale = environment.pixel_ratio;
         let text_scale = Arc::new(std::sync::atomic::AtomicU32::new(scale.to_bits()));
         let engine_scale = text_scale.clone();
+        let sink_control = Arc::new(std::sync::Mutex::new(None));
+        let setup_control = sink_control.clone();
+        let chunks = app.chunks.clone();
         // Engine::start_with installs Core's image context from these assets,
         // access policy and disk cache. Its transport also serves SVG/font loads.
         nsh_core::image::loader::set_transport(crate::media::image::transport());
         let engine = Engine::start_with(
             engine_config,
             move || OhosTextEngine::new(engine_scale, engine_fonts),
-            Sink(dispatcher.clone(), app.chunks),
+            Sink {
+                gate: gate.clone(),
+                chunks: app.chunks,
+                control: sink_control,
+            },
             move |control| {
+                *setup_control.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
                 if !initial_displays.is_empty() {
                     control.set_displays(initial_displays);
                 }
@@ -1260,17 +1217,347 @@ impl Runtime {
                 for font in host_fonts {
                     control.register_font(font);
                 }
+                for url in pending_urls {
+                    control.dispatch_event(
+                        nsh_core::ROOT_ID,
+                        nsh_core::EventKind::UrlScheme,
+                        nsh_core::EventPayload::Map(vec![(
+                            nsh_core::url_scheme::URL,
+                            nsh_core::PayloadValue::Str(url),
+                        )]),
+                    );
+                }
+                if let Some(guard) = flush_guard {
+                    control.flush(move |_| {
+                        guard.finish();
+                    });
+                }
             },
         )
         .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
-        images.set_disk_cache(engine.image_cache());
-        let control = engine.control();
         #[cfg(feature = "dev")]
         if let Some(testing) = &app.testing {
-            testing.model.engine_started(control.clone());
+            testing.model.engine_started(engine.control());
         }
+        Ok(Self {
+            engine: Some(engine),
+            gate,
+            environment,
+            size,
+            size_px,
+            text_scale,
+            fonts,
+            access,
+            assets,
+            chunks,
+            main_window_options,
+            main_window_launch,
+            storage_dir: host_data_dir,
+            owner: app.owner,
+            #[cfg(feature = "dev")]
+            testing: app.testing,
+            #[cfg(feature = "dev")]
+            reload: app.reload,
+        })
+    }
+
+    pub(crate) fn size_px(&self) -> (i32, i32) {
+        self.size_px
+    }
+
+    pub(crate) fn set_owner(&mut self, owner: std::sync::Weak<crate::app::surface::Queue>) {
+        self.owner = owner;
+    }
+
+    fn close_unattached(&mut self) {
+        self.gate.close();
+        if let Some(engine) = self.engine.take() {
+            let storage = Some(self.storage_dir.clone());
+            defer_engine_drop(storage, move || drop(engine));
+        }
+    }
+}
+
+impl Drop for BootedEngine {
+    fn drop(&mut self) {
+        if self.engine.is_some() {
+            self.close_unattached();
+        }
+    }
+}
+
+struct UiShell {
+    state: Rc<RefCell<State>>,
+    dispatcher: Arc<Dispatcher>,
+    shader_rate: Arc<crate::app::frame_rate::FrameRate>,
+}
+
+impl Runtime {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn start(
+        env: Env,
+        parent: NativeNode,
+        app: App,
+        size: Size,
+        size_px: (i32, i32),
+        attached: bool,
+        visible: bool,
+        pending_urls: Vec<String>,
+        config: &Config,
+        components: crate::interop::component::Components,
+        scroll_watchers: crate::scroll::watch::ScrollWatchers,
+        errors: Errors,
+    ) -> napi_ohos::Result<Self> {
+        config.host.check()?;
+        let shell = Self::prepare_ui_shell(
+            env,
+            &parent,
+            app.owner.clone(),
+            attached,
+            visible,
+            config,
+            errors,
+            #[cfg(feature = "dev")]
+            app.testing.clone(),
+            #[cfg(feature = "dev")]
+            app.reload.clone(),
+        )?;
+        let gate = MountGate::new_live(shell.dispatcher.clone());
+        let booted =
+            BootedEngine::start(app, size, size_px, config, pending_urls, gate, None, false)?;
+        Self::finish_attach(
+            env,
+            parent,
+            shell,
+            booted,
+            config,
+            components,
+            scroll_watchers,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attach_preboot(
+        env: Env,
+        parent: NativeNode,
+        mut booted: BootedEngine,
+        owner: std::sync::Weak<crate::app::surface::Queue>,
+        attach_size: Option<Size>,
+        attached: bool,
+        visible: bool,
+        config: &Config,
+        components: crate::interop::component::Components,
+        scroll_watchers: crate::scroll::watch::ScrollWatchers,
+        errors: Errors,
+    ) -> napi_ohos::Result<Self> {
+        config.host.check()?;
+        booted.set_owner(owner.clone());
+        let boot_size = booted.size;
+        let shell = Self::prepare_ui_shell(
+            env,
+            &parent,
+            owner,
+            attached,
+            visible,
+            config,
+            errors,
+            #[cfg(feature = "dev")]
+            booted.testing.clone(),
+            #[cfg(feature = "dev")]
+            booted.reload.clone(),
+        )?;
+        let runtime = Self::finish_attach(
+            env,
+            parent,
+            shell,
+            booted,
+            config,
+            components,
+            scroll_watchers,
+            true,
+        )?;
+        if let Some(size) = attach_size
+            && size != boot_size
+        {
+            runtime.resize(size)?;
+        }
+        Ok(runtime)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_ui_shell(
+        env: Env,
+        parent: &NativeNode,
+        owner: std::sync::Weak<crate::app::surface::Queue>,
+        attached: bool,
+        visible: bool,
+        config: &Config,
+        errors: Errors,
+        #[cfg(feature = "dev")] testing: Option<Arc<crate::app::testing::Session>>,
+        #[cfg(feature = "dev")] reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
+    ) -> napi_ohos::Result<UiShell> {
+        config.host.scale()?;
+        let vsync = Arc::new(
+            config
+                .host
+                .window_id()
+                .and_then(|id| Vsync::try_new_for_associated_window(id, "nsh"))
+                .or_else(|| Vsync::try_new("nsh"))
+                .ok_or_else(|| {
+                    napi_ohos::Error::from_reason("failed to create OHOS native VSync")
+                })?,
+        );
+        let frame_rate = crate::app::frame_rate::FrameRate::new(vsync.clone(), config.host.clone())
+            .map_err(|error| {
+                napi_ohos::Error::from_reason(format!("failed to start VSync rate worker: {error}"))
+            })?;
+        let status = frame_rate.apply_initial();
+        if status != 0 {
+            return Err(napi_ohos::Error::from_reason(format!(
+                "failed to configure OHOS native VSync rate: {status}"
+            )));
+        }
+        // UI and shader demand share this one NativeVSync rate owner.
+        let shader_rate = frame_rate.clone();
+        let state = Rc::new(RefCell::new(State {
+            #[cfg(feature = "dev")]
+            testing,
+            #[cfg(feature = "dev")]
+            test_closed: Arc::default(),
+            parent: Rc::downgrade(parent),
+            engine: None,
+            mounter: None,
+            dispatcher: Weak::new(),
+            rate_driver: None,
+            phase: None,
+            frame_rate,
+            errors,
+            engine_wanted: false,
+            engine_in_flight: 0,
+            native_demand: super::frame_rate::UiDemand::Idle,
+            laid_out: false,
+            attached,
+            visible,
+            frame_wanted: false,
+            retiring_dispatcher: None,
+            environment: Environment::default(),
+            #[cfg(feature = "dev")]
+            reload,
+            #[cfg(feature = "dev")]
+            hot_version: None,
+        }));
+        let ui_state = state.clone();
+        let wake = env.create_function_from_closure::<(), (), _>("nshCommit", |_| Ok(()))?;
+        let dispatcher = Arc::new(Dispatcher {
+            owner,
+            queue: wake
+                .build_threadsafe_function::<Message>()
+                .callee_handled::<false>()
+                .build_callback(move |ctx| {
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let Ok(mut state) = ui_state.try_borrow_mut() else {
+                            // Re-enqueue on synchronous re-entry instead of panicking.
+                            if let Ok(state) = ui_state.try_borrow()
+                                && let Some(route) = state.dispatcher.upgrade()
+                            {
+                                route.send(ctx.value);
+                            }
+                            return;
+                        };
+                        if let Err(error) = state.receive(ctx.value) {
+                            state.report(error.to_string());
+                            log::error!("OHOS surface: {error}");
+                        }
+                    }))
+                    .is_err()
+                    {
+                        log::error!("panic in OHOS runtime TSFN callback");
+                    }
+                    Ok(())
+                })?,
+            wants_back: std::sync::atomic::AtomicBool::new(false),
+            video_fullscreen: std::sync::atomic::AtomicBool::new(false),
+            active: std::sync::atomic::AtomicBool::new(
+                attached && visible && config.host.is_foreground(),
+            ),
+            manages_status_bar: config.manages_status_bar,
+            status_bar_configured: std::sync::atomic::AtomicBool::new(false),
+            status_bar: std::sync::Mutex::new(None),
+            keyboard: std::sync::Mutex::default(),
+            live: std::sync::atomic::AtomicBool::new(true),
+        });
+        state.borrow_mut().dispatcher = Arc::downgrade(&dispatcher);
+        state.borrow_mut().rate_driver = Some(super::frame_source::RateDriver::new(
+            vsync,
+            shader_rate.clone(),
+            Arc::downgrade(&dispatcher),
+        ));
+        let weak = Rc::downgrade(&state);
+        let rate_driver = state.borrow().rate_driver.as_ref().unwrap().clone();
+        state.borrow_mut().phase = Some(super::frame_source::Phase::new(
+            env,
+            &config.host,
+            rate_driver,
+            move |timestamp| {
+                let Some(state) = weak.upgrade() else {
+                    return Ok(false);
+                };
+                let mut state = state.try_borrow_mut().map_err(reentry)?;
+                match state.step_frame(timestamp) {
+                    Ok(active) => Ok(active),
+                    Err(error) => {
+                        state.report(error.to_string());
+                        if let Some(rate_driver) = &state.rate_driver {
+                            let _ = rate_driver.set_active(false);
+                        }
+                        Ok(false)
+                    }
+                }
+            },
+        )?);
+        Ok(UiShell {
+            state,
+            dispatcher,
+            shader_rate,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_attach(
+        env: Env,
+        parent: NativeNode,
+        shell: UiShell,
+        mut booted: BootedEngine,
+        config: &Config,
+        components: crate::interop::component::Components,
+        scroll_watchers: crate::scroll::watch::ScrollWatchers,
+        drain_buffered: bool,
+    ) -> napi_ohos::Result<Self> {
+        let UiShell {
+            state,
+            dispatcher,
+            shader_rate,
+        } = shell;
+        let engine = booted
+            .engine
+            .take()
+            .ok_or_else(|| napi_ohos::Error::from_reason("preboot engine already closed"))?;
+        let environment = booted.environment;
+        let size = booted.size;
+        let scale = environment.pixel_ratio;
+        let engine_assets: Arc<dyn nsh_engine::Assets> = booted.assets.clone();
+        let images = crate::media::image::Loader::new(
+            engine_assets,
+            (*booted.access).clone(),
+            Arc::downgrade(&dispatcher),
+        );
+        images.set_disk_cache(engine.image_cache());
+        let control = engine.control();
+        dispatcher.keyboard.lock().unwrap().desktop = environment.os.is_desktop();
+        state.borrow_mut().environment = environment;
         let mut initial_main_window = crate::services::desktop::MainWindowState::default();
-        if let Some(options) = &main_window_options {
+        if let Some(options) = &booted.main_window_options {
             initial_main_window.apply_attributes(&options.attributes);
         }
         let context = Rc::new(crate::render::mount::UiContext {
@@ -1300,22 +1587,22 @@ impl Runtime {
             dispatcher: Arc::downgrade(&dispatcher),
             env,
             scale: std::cell::Cell::new(scale),
-            text_scale,
+            text_scale: booted.text_scale.clone(),
             control: control.clone(),
             animator: crate::render::animation::Animator::new(control, Arc::downgrade(&dispatcher)),
             images,
-            access,
-            assets,
+            access: booted.access.clone(),
+            assets: booted.assets.clone(),
             components,
             touches: RefCell::default(),
             canvas_bytes: Rc::new(Cell::new(0)),
-            fonts,
+            fonts: booted.fonts.clone(),
             platform: Cell::new(environment),
             main_window: RefCell::new(initial_main_window),
             appearance: Cell::new(nsh_core::platform::Appearance::System),
         });
         let mut mounter = Mounter::new(parent, size, context).map_err(napi_error)?;
-        if let Some(launch) = main_window_launch {
+        if let Some(launch) = booted.main_window_launch.take() {
             mounter.note_main_window_launch_applied();
             config.host.desktop_command(&launch)?;
         }
@@ -1328,6 +1615,32 @@ impl Runtime {
         // Keep rollback ownership before registering with the shared session.
         // A rejected route must still close the engine and detach its root.
         config.host.attach(Arc::downgrade(&runtime._dispatcher))?;
+        if drain_buffered && let Some(buffered) = booted.gate.attach(runtime._dispatcher.clone()) {
+            let chunks = booted.chunks.clone();
+            let dispatcher_weak = Arc::downgrade(&runtime._dispatcher);
+            let mut st = runtime.state.try_borrow_mut().map_err(reentry)?;
+            for error in buffered.errors {
+                st.report(error);
+            }
+            if let Some(chunks) = chunks {
+                for id in buffered.pending_chunks {
+                    chunks.load(&id, dispatcher_weak.clone());
+                }
+            }
+            // Apply every buffered MountBatch synchronously before ArkUI builds
+            // Frame 1, so ContentSlot already carries the complete native tree.
+            for batch in buffered.batches {
+                if let Err(error) = st.apply_batch(batch) {
+                    st.report(error.to_string());
+                    return Err(napi_error(error));
+                }
+            }
+            if buffered.frame_requested {
+                st.engine_wanted = true;
+            }
+            st.update_back();
+            st.schedule_frame().map_err(napi_error)?;
+        }
         Ok(runtime)
     }
     #[cfg(feature = "dev")]
@@ -1384,6 +1697,14 @@ impl Runtime {
         }
         let window = size.into();
         let changed = state.environment.window != window;
+        if !changed
+            && state
+                .mounter
+                .as_ref()
+                .is_none_or(|m| m.surface_size() == size)
+        {
+            return Ok(());
+        }
         state.environment.window = window;
         if let Some(mounter) = &state.mounter {
             mounter.resize(size).map_err(napi_error)?;

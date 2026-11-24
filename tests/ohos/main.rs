@@ -62,6 +62,10 @@ mod frame_clock;
 #[path = "../../src/app/chunks.rs"]
 mod chunks;
 
+#[path = "../../src/app/preboot.rs"]
+#[allow(dead_code)]
+mod preboot;
+
 #[path = "../../src/render/transition.rs"]
 #[allow(dead_code)]
 mod transition;

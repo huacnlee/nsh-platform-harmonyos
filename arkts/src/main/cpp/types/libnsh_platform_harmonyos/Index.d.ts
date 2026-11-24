@@ -514,7 +514,7 @@ export declare function nshUpdateConfig(sessionId: number, colorMode: number, fo
 
 export declare function nshUpdateKeyboard(sessionId: number, duration: number): void
 
-export declare function nshUpdateWindow(sessionId: number, platformWindowId: number, visual: Array<AvoidArea>, keyboard: AvoidArea, maxRefreshRate?: number | undefined | null): void
+export declare function nshUpdateWindow(sessionId: number, platformWindowId: number, visual: Array<AvoidArea>, keyboard: AvoidArea, maxRefreshRate?: number | undefined | null, windowWidth?: number | undefined | null, windowHeight?: number | undefined | null): void
 
 export declare function nshViewAction(action: MenuAction): boolean
 

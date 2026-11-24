@@ -83,6 +83,98 @@ impl ResourceChunks {
         }
         true
     }
+    /// Loads a dynamic `import()` chunk directly to `EngineControl` before a
+    /// UI-thread `Dispatcher` is attached (during preboot).
+    pub(crate) fn load_to_control(
+        self: &Arc<Self>,
+        id: &str,
+        control: nsh_engine::EngineControl,
+    ) -> bool {
+        let id = id.to_owned();
+        let loader = self.clone();
+        let permit = match self.host.reserve_load() {
+            Ok(p) => p,
+            Err(e) => {
+                control.chunk_failed(id, e.to_string());
+                return true;
+            }
+        };
+        let failed_id = id.clone();
+        let failed_control = control.clone();
+        let result = Executor::assets().and_then(|pool| {
+            pool.submit(move || {
+                let _permit = permit;
+                match loader.read_chunk(&id) {
+                    Ok(chunk) => control.chunk_loaded(chunk),
+                    Err(error) => control.chunk_failed(id, error),
+                }
+            })
+        });
+        if let Err(error) = result {
+            failed_control.chunk_failed(failed_id, error.to_string());
+        }
+        true
+    }
+}
+
+/// Reads a HAP rawfile entry (`bundle.nshc` or `bundle.js`), preloads its
+/// companion `app.json`, `capabilities.json` and static chunks, and resolves
+/// any newer signed package accepted by `nsh/updater`.
+#[cfg(target_env = "ohos")]
+pub(crate) fn load_resource_bundle(
+    host: &Arc<Services>,
+    chunks: &Arc<ResourceChunks>,
+    name: &str,
+    granted: Option<nsh_engine::Capabilities>,
+    has_custom_assets: bool,
+    is_live: impl Fn() -> bool,
+) -> napi_ohos::Result<(
+    Bundle,
+    Option<Arc<dyn crate::services::assets::StreamAssets>>,
+)> {
+    let cancelled = || napi_ohos::Error::from_reason("surface load was cancelled");
+    if !is_live() {
+        return Err(cancelled());
+    }
+    let bytes = host.resource(name)?;
+    if !is_live() {
+        return Err(cancelled());
+    }
+    let mut bundle = if crate::services::assets::is_bytecode(&bytes) {
+        // SAFETY: HAP raw resources are supplied by the embedding host,
+        // with the same trusted-bytecode contract as its executable code.
+        unsafe { Bundle::bytecode(bytes) }
+    } else {
+        Bundle::source(
+            String::from_utf8(bytes)
+                .map_err(|_| napi_ohos::Error::from_reason("source resource must be UTF-8"))?,
+        )
+    };
+    chunks
+        .preload(&mut bundle)
+        .map_err(napi_ohos::Error::from_reason)?;
+    bundle.policy.granted = granted;
+    let updater = chunks.read_optional("assets/nsh-updater.json");
+    let package = if !has_custom_assets {
+        nsh_engine::updates::package_to_run(&mut bundle, updater, Some(&host.data_directory()))
+    } else {
+        bundle.updater_config = updater.map(Arc::from);
+        None
+    };
+    if let Some(run) = package {
+        match crate::services::assets::AssetDirectory::from_path(&run.assets) {
+            Ok(dir) => {
+                let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
+                    crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
+                );
+                return Ok((run.bundle, Some(assets)));
+            }
+            Err(err) => {
+                log::warn!("cannot set the package's assets, running the app's own: {err}");
+            }
+        }
+    }
+    Ok((bundle, None))
 }
 
 const MAX_CHUNKS: usize = 1024;

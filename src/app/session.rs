@@ -260,6 +260,7 @@ pub(crate) struct Services {
     next_overlay: AtomicU64,
     keyboard: Mutex<Option<crate::input::keyboard::KeyboardWindow>>,
     window_id: AtomicU32,
+    window_size: Mutex<(i32, i32)>,
     window_avoid: Mutex<Option<([AvoidArea; 3], AvoidArea)>>,
     desktop_window: Mutex<Option<nsh_core::desktop::WindowState>>,
     desktop_title_bar: Mutex<nsh_core::Edges<nsh_core::Points>>,
@@ -405,6 +406,7 @@ impl Services {
         id: i32,
         visual: [AvoidArea; 3],
         keyboard: AvoidArea,
+        window_size: Option<(i32, i32)>,
     ) -> Result<()> {
         self.check()?;
         if id <= 0 {
@@ -418,9 +420,16 @@ impl Services {
         }
         self.window_id.store(id as u32, Ordering::Release);
         self.ensure_keyboard(id);
+        if let Some(size) = window_size {
+            *self.window_size.lock().unwrap() = size;
+        }
         *self.window_avoid.lock().unwrap() = Some((visual, keyboard));
         self.broadcast(|| Message::HostWindow(visual, keyboard));
         Ok(())
+    }
+
+    pub(crate) fn window_size(&self) -> (i32, i32) {
+        *self.window_size.lock().unwrap()
     }
 
     pub(crate) fn window_areas(&self) -> Option<([AvoidArea; 3], AvoidArea)> {
@@ -991,6 +1000,7 @@ impl Services {
             next_overlay: AtomicU64::new(1),
             keyboard: Mutex::default(),
             window_id: AtomicU32::new(platform_window_id as u32),
+            window_size: Mutex::new((0, 0)),
             window_avoid: Mutex::default(),
             desktop_window: Mutex::default(),
             desktop_title_bar: Mutex::default(),
@@ -1083,6 +1093,7 @@ impl Services {
         if platform_window_id > 0 {
             services.ensure_keyboard(platform_window_id);
         }
+        crate::text::fonts::Fonts::prewarm();
         UI_SESSIONS.with(|sessions| {
             sessions.borrow_mut().insert(
                 id,

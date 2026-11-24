@@ -238,12 +238,15 @@ pub(crate) fn nsh_update_accessibility(
 }
 
 #[napi]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn nsh_update_window(
     session_id: u32,
     platform_window_id: i32,
     visual: Vec<AvoidArea>,
     keyboard: AvoidArea,
     max_refresh_rate: Option<u32>,
+    window_width: Option<i32>,
+    window_height: Option<i32>,
 ) -> Result<()> {
     if let Ok(host) = crate::app::session::get(session_id) {
         if let Some(hz) = max_refresh_rate {
@@ -254,7 +257,10 @@ pub(crate) fn nsh_update_window(
             visual.get(1).copied().unwrap_or_default(),
             visual.get(2).copied().unwrap_or_default(),
         ];
-        host.update_window(platform_window_id, visual, keyboard)?;
+        let window_size = window_width
+            .zip(window_height)
+            .filter(|&(w, h)| w > 0 && h > 0);
+        host.update_window(platform_window_id, visual, keyboard, window_size)?;
     }
     Ok(())
 }

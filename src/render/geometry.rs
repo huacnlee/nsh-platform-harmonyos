@@ -107,6 +107,31 @@ pub(crate) fn visual_insets(
     insets
 }
 
+/// Whether a surface viewport in physical pixels matches the full host window
+/// (within 2 px rounding tolerance) so initial window avoid areas apply directly
+/// at origin `(0, 0)` before ArkUI's first layout pass reports window position.
+pub(crate) fn full_window_matches(viewport_px: (f64, f64), window_px: (i32, i32)) -> bool {
+    window_px.0 > 0
+        && window_px.1 > 0
+        && (viewport_px.0 - f64::from(window_px.0)).abs() <= 2.0
+        && (viewport_px.1 - f64::from(window_px.1)).abs() <= 2.0
+}
+
+/// Safe-area insets `[top, right, bottom, left]` and keyboard overlap in vp
+/// for `viewport` against the host window's visual and keyboard avoid areas.
+pub(crate) fn window_avoid_insets(
+    viewport: WindowRect,
+    scale: f64,
+    visual: impl IntoIterator<Item = [WindowRect; 4]>,
+    keyboard_bottom: Option<WindowRect>,
+) -> ([f64; 4], f64) {
+    let insets = visual_insets(viewport, visual).map(|edge| edge / scale);
+    let keyboard = keyboard_bottom
+        .and_then(|rect| viewport.intersection(rect))
+        .map_or(0.0, |area| area.height / scale);
+    (insets, keyboard)
+}
+
 /// Projects a local point through the same matrix used for input picking.
 pub(crate) fn page_point(m: &[f64; 16], point: (f32, f32)) -> Option<(f32, f32)> {
     let (x, y) = (point.0 as f64, point.1 as f64);
@@ -146,7 +171,10 @@ pub(crate) fn local_point(matrix: &[f64; 16], point: (f32, f32)) -> Option<(f32,
 
 #[cfg(test)]
 mod tests {
-    use super::{WindowRect, local_point, page_point, visual_insets};
+    use super::{
+        WindowRect, full_window_matches, local_point, page_point, visual_insets,
+        window_avoid_insets,
+    };
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> WindowRect {
         WindowRect {
@@ -275,5 +303,33 @@ mod tests {
         m[5] = 1.0;
         m[15] = -1.0;
         assert_eq!(local_point(&m, (1.0, 2.0)), None);
+    }
+
+    #[test]
+    fn full_window_match_allows_subpixel_rounding_and_rejects_inset_slots() {
+        assert!(full_window_matches((1260.0, 2720.0), (1260, 2720)));
+        assert!(full_window_matches((1259.4, 2720.8), (1260, 2720)));
+        assert!(!full_window_matches((1260.0, 2500.0), (1260, 2720)));
+        assert!(!full_window_matches((1260.0, 2720.0), (0, 0)));
+    }
+
+    #[test]
+    fn window_avoid_insets_scales_visual_edges_and_keyboard_overlap() {
+        let empty = WindowRect::default();
+        let status = [rect(0.0, 0.0, 1080.0, 90.0), empty, empty, empty];
+        let nav = [empty, empty, rect(360.0, 2340.0, 360.0, 60.0), empty];
+        let (safe, keyboard) = window_avoid_insets(
+            rect(0.0, 0.0, 1080.0, 2400.0),
+            3.0,
+            [status, nav],
+            Some(rect(0.0, 1800.0, 1080.0, 600.0)),
+        );
+        assert_eq!(safe, [30.0, 0.0, 20.0, 0.0]);
+        assert_eq!(keyboard, 200.0);
+
+        let (safe, keyboard) =
+            window_avoid_insets(rect(0.0, 0.0, 1080.0, 2400.0), 3.0, [status, nav], None);
+        assert_eq!(safe, [30.0, 0.0, 20.0, 0.0]);
+        assert_eq!(keyboard, 0.0);
     }
 }

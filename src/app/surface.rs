@@ -92,6 +92,85 @@ pub(crate) enum Message {
 type HostHandler = FunctionRef<FnArgs<(serde_json::Value, NshHostReply)>, ()>;
 type OpenUrlHandler = FunctionRef<String, bool>;
 
+/// Bounded cold-start budget for hydrating the initial `MountBatch` onto a
+/// fresh, unattached `NshSurface` before ArkUI renders Frame 1.
+const COLD_START_BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
+
+fn parse_params(
+    params: Option<serde_json::Value>,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    match params {
+        None | Some(serde_json::Value::Null) => Ok(serde_json::Map::new()),
+        Some(serde_json::Value::Object(map)) => Ok(map),
+        Some(_) => Err(Error::from_reason(
+            "params must be a JSON object, null, or undefined",
+        )),
+    }
+}
+
+fn parse_theme_overrides(json: Option<String>) -> Result<Option<nsh_engine::Tokens>> {
+    match json {
+        None => Ok(None),
+        Some(json) => nsh_base::theme_overrides(&json)
+            .map(Some)
+            .map_err(|err| Error::from_reason(format!("invalid theme: {err}"))),
+    }
+}
+
+fn validate_font(data: &[u8]) -> Result<()> {
+    let family = nsh_core::font_family(data).map_err(Error::from_reason)?;
+    if family.is_empty() || family.contains('\0') {
+        return Err(Error::from_reason("font has no valid family name"));
+    }
+    Ok(())
+}
+
+fn dispatch_host_call(
+    env: &Env,
+    mut call: nsh_engine::HostCall,
+    handler: Option<Rc<HostHandler>>,
+) -> Result<()> {
+    if let Some(handler) = handler {
+        let name = call.name().to_owned();
+        let data = call.take_data();
+        let is_post = call.is_post();
+        let call_slot = Arc::new(std::sync::Mutex::new(Some(call)));
+        let reply = NshHostReply {
+            call: call_slot.clone(),
+            is_post,
+        };
+        let callback = handler.borrow_back(env)?;
+        if let Err(error) = callback.call((data, reply).into()) {
+            log::error!("OHOS host handler {name}: {error}");
+            if let Some(call) = call_slot.lock().unwrap().take() {
+                call.reject(error.to_string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dispatch_open_url(
+    env: &Env,
+    request: nsh_engine::OpenUrlRequest,
+    handler: Option<Rc<OpenUrlHandler>>,
+) -> Result<()> {
+    let handled = if let Some(handler) = handler {
+        let callback = handler.borrow_back(env)?;
+        match callback.call(request.url().to_owned()) {
+            Ok(handled) => handled,
+            Err(error) => {
+                log::error!("OHOS openUrl handler: {error}");
+                false
+            }
+        }
+    } else {
+        false
+    };
+    request.answer(handled);
+    Ok(())
+}
+
 /// Reply handle for a `host.call(...)` or `host.post(...)` from the app (`nsh/host`).
 #[napi]
 pub struct NshHostReply {
@@ -526,8 +605,38 @@ impl State {
         app.chunks = chunks;
         self.accept_app(env, app)
     }
-    fn accept_app(&mut self, env: Env, mut app: App) -> Result<()> {
+    fn cold_start_viewport(&self) -> Result<Option<((i32, i32), Size)>> {
+        if self.attached || self.size.0 > 0 || self.size.1 > 0 {
+            return Ok(None);
+        }
+        if !matches!(self.phase, SurfacePhase::Empty) {
+            return Ok(None);
+        }
+        let host = &self.config()?.host;
+        let window_px = host.window_size();
+        if window_px.0 <= 0 || window_px.1 <= 0 {
+            return Ok(None);
+        }
+        let scale = host.scale()?;
+        let width = window_px.0 as f32 / scale;
+        let height = window_px.1 as f32 / scale;
+        if width <= 0.0 || height <= 0.0 || width > 16384.0 || height > 16384.0 {
+            return Ok(None);
+        }
+        Ok(Some((window_px, Size::new(width, height))))
+    }
+    fn accept_app(&mut self, env: Env, app: App) -> Result<()> {
+        self.accept_app_with_budget(env, app, COLD_START_BUDGET, None)
+    }
+    fn accept_app_with_budget(
+        &mut self,
+        env: Env,
+        mut app: App,
+        cold_budget: std::time::Duration,
+        cold_start_at: Option<std::time::Instant>,
+    ) -> Result<()> {
         self.check()?;
+        let cold_viewport = self.cold_start_viewport()?;
         if let Some(runtime) = self.phase.runtime() {
             runtime.close()?;
         }
@@ -538,9 +647,46 @@ impl State {
             app.testing = self.dev.as_ref().and_then(|dev| dev.testing.clone());
         }
         app.grant(granted);
-        self.phase = SurfacePhase::Staged(Box::new(app));
         self.errors.clear();
+        if let Some((window_px, size)) = cold_viewport {
+            return self.start_cold(env, app, window_px, size, cold_budget, cold_start_at);
+        }
+        self.phase = SurfacePhase::Staged(Box::new(app));
         self.start(env)
+    }
+    fn start_cold(
+        &mut self,
+        env: Env,
+        app: App,
+        window_px: (i32, i32),
+        size: Size,
+        budget: std::time::Duration,
+        cold_start_at: Option<std::time::Instant>,
+    ) -> Result<()> {
+        self.check()?;
+        let pending_urls = std::mem::take(&mut self.pending_urls);
+        let gate = crate::app::preboot::MountGate::new_buffering();
+        let flush_guard = crate::app::preboot::FlushGuard::new(gate.clone());
+        let engine_start = std::time::Instant::now();
+        let booted = crate::app::runtime::BootedEngine::start(
+            app,
+            size,
+            window_px,
+            self.config()?,
+            pending_urls,
+            gate.clone(),
+            Some(flush_guard),
+            true,
+        )?;
+        let wait = gate.wait_first_frame(budget);
+        let engine_ms = engine_start.elapsed().as_millis();
+        let total_ms = cold_start_at.map_or(engine_ms, |t| t.elapsed().as_millis());
+        log::info!(
+            "OHOS cold start first-frame: {wait:?} (engine={engine_ms}ms, total={total_ms}ms, window={}x{})",
+            window_px.0,
+            window_px.1,
+        );
+        self.attach_booted(env, booted)
     }
     fn start(&mut self, env: Env) -> Result<()> {
         if !self.attached
@@ -556,6 +702,7 @@ impl State {
         else {
             unreachable!()
         };
+        let pending_urls = std::mem::take(&mut self.pending_urls);
         let config = self.config()?;
         let runtime = Runtime::start(
             env,
@@ -565,13 +712,76 @@ impl State {
                 .clone(),
             *app,
             size,
+            self.size,
+            self.attached,
+            self.visible,
+            pending_urls,
             config,
             self.components.clone(),
             self.scroll_watchers.clone(),
             self.errors.clone(),
         )?;
-        runtime.set_attached(self.attached)?;
-        runtime.set_visible(self.visible)?;
+        self.phase = SurfacePhase::Running(runtime);
+        Ok(())
+    }
+    fn wire_host_handler(
+        queue: &std::sync::Weak<Queue>,
+        channel: &nsh_engine::HostChannel,
+        name: String,
+    ) {
+        let weak = queue.clone();
+        channel.handle(name, move |call| {
+            if let Some(queue) = weak.upgrade() {
+                let status = queue.call(
+                    Message::HostCall(call),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+                if status != Status::Ok {
+                    log::error!("OHOS host call dispatch failed: {status:?}");
+                }
+            }
+        });
+    }
+    fn wire_open_url_handler(queue: &std::sync::Weak<Queue>, channel: &nsh_engine::HostChannel) {
+        let weak = queue.clone();
+        channel.handle_open_url(move |request| {
+            if let Some(queue) = weak.upgrade() {
+                let status = queue.call(
+                    Message::OpenUrl(request),
+                    ThreadsafeFunctionCallMode::NonBlocking,
+                );
+                if status != Status::Ok {
+                    log::error!("OHOS openUrl dispatch failed: {status:?}");
+                }
+            }
+        });
+    }
+    fn attach_booted(&mut self, env: Env, booted: crate::app::runtime::BootedEngine) -> Result<()> {
+        self.check()?;
+        let boot_px = booted.size_px();
+        let attach_size = if self.size.0 > 0 && self.size.1 > 0 {
+            Some(self.logical_size()?)
+        } else {
+            self.size = boot_px;
+            None
+        };
+        let config = self.config()?;
+        let runtime = Runtime::attach_preboot(
+            env,
+            self.viewport
+                .as_ref()
+                .expect("live surface viewport")
+                .clone(),
+            booted,
+            self.queue.clone(),
+            attach_size,
+            self.attached,
+            self.visible,
+            config,
+            self.components.clone(),
+            self.scroll_watchers.clone(),
+            self.errors.clone(),
+        )?;
         for url in std::mem::take(&mut self.pending_urls) {
             runtime.open_url_scheme(url)?;
         }
@@ -599,43 +809,13 @@ impl State {
         // Host code may synchronously send, change params or stop this surface.
         // Keep only the function reference alive across the call into ArkTS.
         match message {
-            Message::HostCall(mut call) => {
+            Message::HostCall(call) => {
                 let handler = state.borrow().host_handlers.get(call.name()).cloned();
-                if let Some(handler) = handler {
-                    let name = call.name().to_owned();
-                    let data = call.take_data();
-                    let is_post = call.is_post();
-                    let call_slot = Arc::new(std::sync::Mutex::new(Some(call)));
-                    let reply = NshHostReply {
-                        call: call_slot.clone(),
-                        is_post,
-                    };
-                    let callback = handler.borrow_back(&env)?;
-                    if let Err(error) = callback.call((data, reply).into()) {
-                        log::error!("OHOS host handler {name}: {error}");
-                        if let Some(call) = call_slot.lock().unwrap().take() {
-                            call.reject(error.to_string());
-                        }
-                    }
-                }
-                Ok(())
+                dispatch_host_call(&env, call, handler)
             }
             Message::OpenUrl(request) => {
                 let handler = state.borrow().open_url_handler.clone();
-                let handled = if let Some(handler) = handler {
-                    let callback = handler.borrow_back(&env)?;
-                    match callback.call(request.url().to_owned()) {
-                        Ok(handled) => handled,
-                        Err(error) => {
-                            log::error!("OHOS openUrl handler: {error}");
-                            false
-                        }
-                    }
-                } else {
-                    false
-                };
-                request.answer(handled);
-                Ok(())
+                dispatch_open_url(&env, request, handler)
             }
             message => {
                 if let Ok(mut guard) = state.try_borrow_mut() {
@@ -1158,8 +1338,9 @@ impl NshSurface {
         let host = self.host()?;
         crate::app::session::resource_name(&name)?;
         let permit = host.reserve_load()?;
-        let (token, generation, granted, has_custom_assets) = {
+        let (token, generation, granted, has_custom_assets, cold_start) = {
             let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+            let cold_start = state.cold_start_viewport()?.is_some();
             let (granted, has_custom_assets) = {
                 let config = state.config()?;
                 (config.policy.granted.clone(), config.has_custom_assets)
@@ -1170,62 +1351,152 @@ impl NshSurface {
             if matches!(state.phase, SurfacePhase::Empty) {
                 state.phase = SurfacePhase::Loading { token };
             }
-            (token, state.generation.clone(), granted, has_custom_assets)
+            (
+                token,
+                state.generation.clone(),
+                granted,
+                has_custom_assets,
+                cold_start,
+            )
         };
         let chunks = crate::app::chunks::ResourceChunks::new(host.clone(), &name);
         let entry_chunks_loader = chunks.clone();
+        if cold_start && let Ok(pool) = crate::services::executor::Executor::assets() {
+            let start = std::time::Instant::now();
+            let slot = crate::app::preboot::ColdReadSlot::new();
+            let worker_slot = slot.clone();
+            let worker_host = host.clone();
+            let worker_chunks = entry_chunks_loader.clone();
+            let worker_name = name.clone();
+            let worker_gen = generation.clone();
+            if let Err(error) = pool.submit(move || {
+                let _permit = permit;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::app::chunks::load_resource_bundle(
+                        &worker_host,
+                        &worker_chunks,
+                        &worker_name,
+                        granted,
+                        has_custom_assets,
+                        || worker_gen.load(Ordering::Acquire) == token,
+                    )
+                }))
+                .unwrap_or_else(|_| Err(Error::from_reason("resource load panicked")));
+                worker_slot.complete(result);
+            }) {
+                if let Ok(mut state) = self.state.try_borrow_mut()
+                    && matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
+                {
+                    state.phase = SurfacePhase::Empty;
+                    state.errors.report(error.clone());
+                }
+                return env.spawn_future_with_callback(
+                    async move { Ok(Err(Error::from_reason(error))) },
+                    |_, outcome| outcome,
+                );
+            }
+            if let Some(result) = slot.wait_timeout(COLD_START_BUDGET) {
+                let remaining = COLD_START_BUDGET.saturating_sub(start.elapsed());
+                let outcome = {
+                    let mut state = self.state.try_borrow_mut().map_err(reentry)?;
+                    if state.generation.load(Ordering::Acquire) != token {
+                        Err(cancelled())
+                    } else {
+                        if matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
+                        {
+                            state.phase = SurfacePhase::Empty;
+                        }
+                        let result =
+                            state
+                                .check()
+                                .and(result)
+                                .and_then(|(mut bundle, package_assets)| {
+                                    #[cfg(feature = "dev")]
+                                    state.disconnect_dev();
+                                    let config = state.config()?;
+                                    let is_package = package_assets.is_some();
+                                    if !is_package {
+                                        bundle.policy.granted = config.policy.granted.clone();
+                                        bundle.source_map = source_map.map(Into::into);
+                                    }
+                                    let mut app = App::new(
+                                        bundle,
+                                        package_assets.unwrap_or_else(|| config.assets.clone()),
+                                    );
+                                    // Downloaded packages run without the resource chunk loader,
+                                    // so their lazy import() chunks are not loaded yet.
+                                    if !is_package {
+                                        app.chunks = Some(chunks);
+                                    }
+                                    state.accept_app_with_budget(*env, app, remaining, Some(start))
+                                });
+                        if let Err(error) = &result {
+                            state.errors.report(error.to_string());
+                        }
+                        result
+                    }
+                };
+                return env
+                    .spawn_future_with_callback(async move { Ok(outcome) }, |_, outcome| outcome);
+            }
+            let weak = Rc::downgrade(&self.state);
+            let future = async move { Ok(slot.into_future().await) };
+            let promise = env.spawn_future_with_callback(future, move |env, result| {
+                let state = weak.upgrade().ok_or_else(cancelled)?;
+                let mut state = state.try_borrow_mut().map_err(reentry)?;
+                if state.generation.load(Ordering::Acquire) != token {
+                    return Err(cancelled());
+                }
+                if matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
+                {
+                    state.phase = SurfacePhase::Empty;
+                }
+                let result = state
+                    .check()
+                    .and(result)
+                    .and_then(|(mut bundle, package_assets)| {
+                        #[cfg(feature = "dev")]
+                        state.disconnect_dev();
+                        let config = state.config()?;
+                        let is_package = package_assets.is_some();
+                        if !is_package {
+                            bundle.policy.granted = config.policy.granted.clone();
+                            bundle.source_map = source_map.map(Into::into);
+                        }
+                        let mut app = App::new(
+                            bundle,
+                            package_assets.unwrap_or_else(|| config.assets.clone()),
+                        );
+                        if !is_package {
+                            app.chunks = Some(chunks);
+                        }
+                        state.accept_app(*env, app)
+                    });
+                if let Err(error) = &result {
+                    state.errors.report(error.to_string());
+                }
+                result
+            });
+            if promise.is_err()
+                && let Ok(mut state) = self.state.try_borrow_mut()
+                && matches!(state.phase, SurfacePhase::Loading { token: active } if active == token)
+            {
+                state.phase = SurfacePhase::Empty;
+            }
+            return promise;
+        }
         let weak = Rc::downgrade(&self.state);
         let future = async move {
             let result = tokio::task::spawn_blocking(move || {
                 let _permit = permit;
-                if generation.load(Ordering::Acquire) != token {
-                    return Err(cancelled());
-                }
-                let bytes = host.resource(&name)?;
-                if generation.load(Ordering::Acquire) != token {
-                    return Err(cancelled());
-                }
-                let mut bundle = if crate::services::assets::is_bytecode(&bytes) {
-                    // SAFETY: HAP raw resources are supplied by the embedding host,
-                    // with the same trusted-bytecode contract as its executable code.
-                    unsafe { Bundle::bytecode(bytes) }
-                } else {
-                    Bundle::source(
-                        String::from_utf8(bytes)
-                            .map_err(|_| Error::from_reason("source resource must be UTF-8"))?,
-                    )
-                };
-                entry_chunks_loader
-                    .preload(&mut bundle)
-                    .map_err(Error::from_reason)?;
-                bundle.policy.granted = granted;
-                let updater = entry_chunks_loader.read_optional("assets/nsh-updater.json");
-                let package = if !has_custom_assets {
-                    nsh_engine::updates::package_to_run(
-                        &mut bundle,
-                        updater,
-                        Some(&host.data_directory()),
-                    )
-                } else {
-                    bundle.updater_config = updater.map(Arc::from);
-                    None
-                };
-                if let Some(run) = package {
-                    match crate::services::assets::AssetDirectory::from_path(&run.assets) {
-                        Ok(dir) => {
-                            let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
-                                crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
-                            );
-                            return Ok((run.bundle, Some(assets)));
-                        }
-                        Err(err) => {
-                            log::warn!(
-                                "cannot set the package's assets, running the app's own: {err}"
-                            );
-                        }
-                    }
-                }
-                Ok((bundle, None))
+                crate::app::chunks::load_resource_bundle(
+                    &host,
+                    &entry_chunks_loader,
+                    &name,
+                    granted,
+                    has_custom_assets,
+                    || generation.load(Ordering::Acquire) == token,
+                )
             })
             .await
             .map_err(|error| Error::from_reason(error.to_string()))
@@ -1366,15 +1637,7 @@ impl NshSurface {
         #[napi(ts_arg_type = "object | null | undefined")] params: Option<serde_json::Value>,
     ) -> Result<()> {
         self.check()?;
-        let map = match params {
-            None | Some(serde_json::Value::Null) => serde_json::Map::new(),
-            Some(serde_json::Value::Object(map)) => map,
-            Some(_) => {
-                return Err(Error::from_reason(
-                    "params must be a JSON object, null, or undefined",
-                ));
-            }
-        };
+        let map = parse_params(params)?;
         let state = self.state.try_borrow().map_err(reentry)?;
         state.config()?.channel.set_params(map);
         Ok(())
@@ -1414,17 +1677,7 @@ impl NshSurface {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
         if let Some(handler) = handler {
             let weak = state.queue.clone();
-            state.config()?.channel.handle(name.clone(), move |call| {
-                if let Some(queue) = weak.upgrade() {
-                    let status = queue.call(
-                        Message::HostCall(call),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                    if status != Status::Ok {
-                        log::error!("OHOS host call dispatch failed: {status:?}");
-                    }
-                }
-            });
+            State::wire_host_handler(&weak, &state.config()?.channel, name.clone());
             state.host_handlers.insert(name, Rc::new(handler));
         } else {
             state.config()?.channel.remove_handler(&name);
@@ -1457,17 +1710,7 @@ impl NshSurface {
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
         if let Some(handler) = handler {
             let weak = state.queue.clone();
-            state.config()?.channel.handle_open_url(move |request| {
-                if let Some(queue) = weak.upgrade() {
-                    let status = queue.call(
-                        Message::OpenUrl(request),
-                        ThreadsafeFunctionCallMode::NonBlocking,
-                    );
-                    if status != Status::Ok {
-                        log::error!("OHOS openUrl dispatch failed: {status:?}");
-                    }
-                }
-            });
+            State::wire_open_url_handler(&weak, &state.config()?.channel);
             state.open_url_handler = Some(Rc::new(handler));
         } else {
             state.config()?.channel.remove_open_url_handler();
@@ -1526,13 +1769,7 @@ impl NshSurface {
     #[napi]
     pub fn set_theme_overrides(&self, json: Option<String>) -> Result<()> {
         self.check()?;
-        let tokens = match json {
-            None => None,
-            Some(json) => Some(
-                nsh_base::theme_overrides(&json)
-                    .map_err(|err| Error::from_reason(format!("invalid theme: {err}")))?,
-            ),
-        };
+        let tokens = parse_theme_overrides(json)?;
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
         if let Some(runtime) = state.phase.runtime() {
             runtime.set_tokens(tokens.clone())?;
@@ -1549,10 +1786,7 @@ impl NshSurface {
     #[napi]
     pub fn register_font(&self, data: napi_ohos::bindgen_prelude::Uint8Array) -> Result<()> {
         self.check()?;
-        let family = nsh_core::font_family(&data).map_err(Error::from_reason)?;
-        if family.is_empty() || family.contains('\0') {
-            return Err(Error::from_reason("font has no valid family name"));
-        }
+        validate_font(&data)?;
         let mut state = self.state.try_borrow_mut().map_err(reentry)?;
         if !nsh_core::keep_font(&mut state.config_mut()?.fonts, &data) {
             return Ok(());

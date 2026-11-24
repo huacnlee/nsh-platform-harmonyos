@@ -140,6 +140,8 @@ interface NshNativeModule {
     visual: AvoidAreaPayload[],
     keyboard: AvoidAreaPayload,
     maxRefreshRate?: number,
+    windowWidth?: number,
+    windowHeight?: number,
   ): void;
   nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void;
   nshPickImagesResult(sessionId: number, pickId: number, files: PickedDescriptor[]): void;
@@ -742,6 +744,7 @@ class HostSession {
     }
     const existing = HostSession.windows.get(windowName);
     if (existing !== undefined) {
+      existing.syncWindowMetrics();
       return existing.sessionId;
     }
     const abilityContext = uiContext.getHostContext() as common.UIAbilityContext | undefined;
@@ -993,6 +996,7 @@ class HostSession {
       safeAvoidArea(this.mainWindow, window.AvoidAreaType.TYPE_NAVIGATION_INDICATOR),
     ];
     const keyboard = safeAvoidArea(this.mainWindow, window.AvoidAreaType.TYPE_KEYBOARD);
+    const size = readWindowSize(this.mainWindow);
     try {
       this.mod.nshUpdateWindow(
         this.sessionId,
@@ -1000,6 +1004,8 @@ class HostSession {
         visual,
         keyboard,
         maximumRefreshRate(this.mainWindow),
+        size.width,
+        size.height,
       );
     } catch {}
   }
@@ -1430,6 +1436,33 @@ nativeHostModule.nshRegisterSessionBinder(
   (uiContext: UIContext): number => HostSession.bind(uiContext),
   showNativeAlert,
 );
+
+interface WindowPixelSize {
+  width: number;
+  height: number;
+}
+
+function readWindowSize(mainWindow: window.Window): WindowPixelSize {
+  let width = 0;
+  let height = 0;
+  try {
+    const rect = mainWindow.getWindowProperties().windowRect;
+    width = rect?.width ?? 0;
+    height = rect?.height ?? 0;
+  } catch {}
+  if (width <= 0 || height <= 0) {
+    try {
+      const displayId = mainWindow.getWindowProperties().displayId;
+      const screen =
+        displayId === undefined
+          ? display.getDefaultDisplaySync()
+          : display.getDisplayByIdSync(displayId);
+      width = screen.width;
+      height = screen.height;
+    } catch {}
+  }
+  return { width, height };
+}
 
 function maximumRefreshRate(mainWindow: window.Window): number {
   const id = mainWindow.getWindowProperties().displayId;

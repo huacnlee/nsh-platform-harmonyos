@@ -45,7 +45,11 @@ Features:
 - **One `NshSurface` per embedded view** (`src/app/`): the host creates `new NshSurface(this.getUIContext())` and places
   `surface.content` (`NodeContent`) inside a standard ArkUI `ContentSlot`. `@nsh/harmonyos` binds each window session
   explicitly from the provided `UIContext` (`UIAbilityContext` and `Window`) in a standard `UIAbility` without a custom
-  base class or process-global context guessing.
+  base class or process-global context guessing. On cold start (`aboutToAppear()` before `ContentSlot` attaches),
+  `NshSurface` uses the window's initial `windowRect` and `avoidArea` metrics, prewarms `Fonts::shared()` on the asset
+  pool, boots the engine behind a `MountGate` with a bounded first-frame wait (`FlushGuard` releases early when no
+  synchronous `mount()` occurs), and synchronously applies the buffered initial `MountBatch`es into `NodeContent` before
+  ArkUI renders Frame 1.
 - **Commits, frames and frame-rate arbitration** (`src/render/`, `src/app/frame_rate.rs`, `src/app/runtime.rs`): the
   engine submits each `MountBatch` through a N-API threadsafe function to the ArkUI UI thread. The surface's
   window-associated `NativeVSync` drives demanded NSH animation frames; its callback posts UI work through

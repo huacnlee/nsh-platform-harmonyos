@@ -50,7 +50,7 @@ struct Index {
     this.surface.setErrorHandler((message: string) => {
       console.error(`nsh: ${message}`);
     });
-    this.surface.loadResource('bundle.js');
+    this.surface.loadResource('bundle.nshc');
   }
 
   aboutToDisappear(): void {
@@ -86,7 +86,7 @@ Column() {
 .height('100%')
 ```
 
-The slot's size is the app's window: NSH lays the app out at the slot's size and relayouts when it resizes. Loading again replaces the running app. The project `nsh package` writes (`template/entry/src/main/ets/pages/Index.ets`) is a complete example.
+The slot's size is the app's window: NSH lays the app out at the slot's size and relayouts when it resizes. Loading again replaces the running app. On cold start (when `loadResource`, `loadSource`, `runPackage` or `runApp` is called from `aboutToAppear()` before `ContentSlot` attaches), `NshSurface` automatically boots against the window's initial size and `safeArea` and hydrates the first `MountBatch` before ArkUI paints Frame 1 — so apps that mount synchronously (for example from `host.params`) appear directly after HarmonyOS's `startWindow` without an intermediate blank frame or extra lifecycle API. Prefer shipping `bundle.nshc` (precompiled QuickJS bytecode) for the fastest startup; apps that defer `mount()` behind an async call or exceed the cold-start budget fall back seamlessly to normal streaming mount. The project `nsh package` writes (`template/entry/src/main/ets/pages/Index.ets`) is a complete example.
 
 ### Overlaying native views
 

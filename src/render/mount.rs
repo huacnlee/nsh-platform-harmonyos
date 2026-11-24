@@ -1697,37 +1697,7 @@ impl Mounter {
             width: frame.width as f64 * scale,
             height: frame.height as f64 * scale,
         };
-        let rect = |rect: crate::app::session::AvoidRect| super::geometry::WindowRect {
-            x: rect.left as f64,
-            y: rect.top as f64,
-            width: rect.width as f64,
-            height: rect.height as f64,
-        };
-        let [top, right, bottom, left] = super::geometry::visual_insets(
-            viewport,
-            visual.into_iter().filter(|area| area.visible).map(|area| {
-                [
-                    rect(area.top_rect),
-                    rect(area.right_rect),
-                    rect(area.bottom_rect),
-                    rect(area.left_rect),
-                ]
-            }),
-        );
-        Ok(crate::app::environment::NshEnvironment {
-            safe_top: Some(top / scale),
-            safe_right: Some(right / scale),
-            safe_bottom: Some(bottom / scale),
-            safe_left: Some(left / scale),
-            keyboard_height: Some(if keyboard.visible {
-                viewport
-                    .intersection(rect(keyboard.bottom_rect))
-                    .map_or(0.0, |area| area.height / scale)
-            } else {
-                0.0
-            }),
-            ..crate::app::environment::NshEnvironment::default()
-        })
+        Ok(window_avoid_environment(viewport, scale, visual, keyboard))
     }
     pub(crate) fn new(
         parent: crate::render::node::NativeNode,
@@ -3139,6 +3109,10 @@ impl Mounter {
         self.desktop.menu_bar_inset.get()
     }
 
+    pub(crate) fn surface_size(&self) -> Size {
+        self.surface_size.get()
+    }
+
     pub(crate) fn resize(&self, size: Size) -> Result<()> {
         self.surface_size.set(size);
         self.apply_surface_size(size)
@@ -3299,5 +3273,42 @@ impl Drop for Mounter {
         if let Err(error) = self.close() {
             log::error!("OHOS detach failed: {error}");
         }
+    }
+}
+
+/// Computes surface-relative safe-area insets and keyboard height from window
+/// avoid areas for any known viewport rectangle in physical pixels.
+pub(crate) fn window_avoid_environment(
+    viewport: super::geometry::WindowRect,
+    scale: f64,
+    visual: [crate::app::session::AvoidArea; 3],
+    keyboard: crate::app::session::AvoidArea,
+) -> crate::app::environment::NshEnvironment {
+    let rect = |rect: crate::app::session::AvoidRect| super::geometry::WindowRect {
+        x: rect.left as f64,
+        y: rect.top as f64,
+        width: rect.width as f64,
+        height: rect.height as f64,
+    };
+    let ([top, right, bottom, left], keyboard_height) = super::geometry::window_avoid_insets(
+        viewport,
+        scale,
+        visual.into_iter().filter(|area| area.visible).map(|area| {
+            [
+                rect(area.top_rect),
+                rect(area.right_rect),
+                rect(area.bottom_rect),
+                rect(area.left_rect),
+            ]
+        }),
+        keyboard.visible.then(|| rect(keyboard.bottom_rect)),
+    );
+    crate::app::environment::NshEnvironment {
+        safe_top: Some(top),
+        safe_right: Some(right),
+        safe_bottom: Some(bottom),
+        safe_left: Some(left),
+        keyboard_height: Some(keyboard_height),
+        ..crate::app::environment::NshEnvironment::default()
     }
 }

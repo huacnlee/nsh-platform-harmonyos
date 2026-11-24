@@ -1,7 +1,10 @@
 //! Process-shared native font collection for the engine and Canvas drawings.
 //! Uses HarmonyOS's global font collection so text follows the active system
 //! theme font, serialized behind one Mutex with retained custom font buffers.
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, Ordering},
+};
 
 use ohos_drawing_binding::FontCollection;
 
@@ -21,6 +24,7 @@ pub(crate) struct Fonts {
 unsafe impl Send for Fonts {}
 
 static SHARED: OnceLock<Arc<Mutex<Fonts>>> = OnceLock::new();
+static PREWARMED: AtomicBool = AtomicBool::new(false);
 
 impl Fonts {
     pub(crate) fn shared() -> Arc<Mutex<Self>> {
@@ -34,6 +38,23 @@ impl Fonts {
                 }))
             })
             .clone()
+    }
+
+    /// Initializes the process-wide drawing font collection off the UI thread
+    /// so the first text measurement does not pay cold collection setup.
+    pub(crate) fn prewarm() {
+        if SHARED.get().is_some() || PREWARMED.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Ok(pool) = crate::services::executor::Executor::assets()
+            && pool
+                .submit(|| {
+                    let _ = Self::shared();
+                })
+                .is_err()
+        {
+            PREWARMED.store(false, Ordering::Release);
+        }
     }
 
     pub(crate) fn on_system_font_changed() {
