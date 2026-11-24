@@ -1,17 +1,15 @@
 name: Release
 
-# Publishes the platform nshm the way an nshm is published (cargo publish,
-# keyword `nshm`, `nsh.json` at the crate's version), with its backend
-# first. Publishes the crates to crates.io: `nsh-platform-harmonyos-core` (the
-# ArkUI backend library), then `nsh-platform-harmonyos` (the platform nshm).
+# Publishes the platform nshm `nsh-platform-harmonyos` to crates.io the way
+# an nshm is published: `cargo publish`, keyword `nshm`, `nsh.json` at the
+# crate's version. The crate is both the CLI and the ArkUI backend library.
 #
 # - Pushing a tag `vX.Y.Z` (the workspace version in Cargo.toml) publishes
 #   that version.
 # - Running it by hand releases the given tag; a dry run packages and
 #   verifies every crate without uploading.
 #
-# A crate whose version is already on crates.io is skipped, so a run that
-# failed half way can be run again.
+# A version already on crates.io is skipped.
 #
 # Needs the `CARGO_REGISTRY_TOKEN` secret.
 
@@ -71,13 +69,12 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          for crate in nsh-platform-harmonyos-core nsh-platform-harmonyos; do
-            status=$(curl -s -o /dev/null -w '%{http_code}' \
-              -A "nsh-platform-harmonyos release (github.com/huacnlee/nsh-platform-harmonyos)" \
-              "https://crates.io/api/v1/crates/$crate/$VERSION")
-            if [[ "$status" == "200" && -z "$DRY_RUN" ]]; then
-              echo "$crate $VERSION is already on crates.io, skipped"
-              continue
-            fi
-            cargo publish -p "$crate" --locked $DRY_RUN
-          done
+          crate=nsh-platform-harmonyos
+          status=$(curl -s -o /dev/null -w '%{http_code}' \
+            -A "nsh-platform-harmonyos release (github.com/huacnlee/nsh-platform-harmonyos)" \
+            "https://crates.io/api/v1/crates/$crate/$VERSION")
+          if [[ "$status" == "200" && -z "$DRY_RUN" ]]; then
+            echo "$crate $VERSION is already on crates.io, skipped"
+            exit 0
+          fi
+          cargo publish -p "$crate" --locked $DRY_RUN

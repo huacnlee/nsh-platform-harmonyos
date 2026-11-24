@@ -2988,25 +2988,11 @@ name = "nsh-platform-harmonyos"
 version = "0.1.1"
 dependencies = [
  "anyhow",
- "ctrlc",
- "image",
- "nsh-base",
- "nsh-core",
- "nsh-dev",
- "nsh-engine",
- "nsh-testing",
- "quick-xml",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nsh-platform-harmonyos-core"
-version = "0.1.1"
-dependencies = [
  "base64 0.22.1",
+ "ctrlc",
  "getrandom 0.3.4",
  "glow",
+ "image",
  "khronos-egl",
  "log",
  "napi-build-ohos",
@@ -3040,6 +3026,7 @@ dependencies = [
  "ohos-window-manager-binding",
  "ohos-xcomponent-binding",
  "percent-encoding",
+ "quick-xml",
  "rustc-hash 2.1.3",
  "serde",
  "serde_json",

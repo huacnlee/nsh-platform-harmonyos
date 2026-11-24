@@ -1,4 +1,5 @@
-//! Embeds the DevEco project template (`template/`) and the ArkTS package
+//! For OHOS, sets up the backend's N-API link. For the computer, embeds the
+//! DevEco project template (`template/`) and the ArkTS package
 //! (`arkts/`) in the program, so an installed
 //! `nsh-platform-harmonyos` writes projects without this repository.
 
@@ -90,6 +91,13 @@ fn pin_git_branch(line: &str, lockfile: &str) -> String {
 }
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("ohos") {
+        // The backend: the OHOS N-API linker setup. khronos-egl with
+        // no-pkg-config leaves the platform library to its host.
+        napi_build_ohos::setup();
+        println!("cargo:rustc-link-lib=EGL");
+        return;
+    }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let repo = manifest.as_path();
     let mut code = String::new();

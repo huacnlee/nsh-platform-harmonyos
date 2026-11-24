@@ -37,7 +37,6 @@ const NSH_CRATES: &[&str] = &[
     "nsh-bundler",
     "nsh-i18n",
     "nsh-updater",
-    "nsh-platform-harmonyos-core",
     "nsh-platform-harmonyos",
     "nsh-platform-android",
     "nsh-platform-apple",

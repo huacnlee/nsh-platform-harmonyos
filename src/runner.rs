@@ -25,10 +25,11 @@ use crate::{
 pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 
 /// The backend this CLI was built with: `NSH_HARMONYOS_SOURCE` (a checkout)
-/// when set, else the checkout it was built in when it is still there, else
-/// this version's tag of the repository.
+/// when set, else this package's own source (the nshm's directory, a
+/// checkout or crates.io's copy) when it is still there, else this version
+/// from crates.io.
 fn backend(dev: bool, api: ApiLevel) -> String {
-    let mut enabled = Vec::new();
+    let mut enabled = vec!["\"backend\""];
     if dev {
         enabled.push("\"dev\"");
     }
@@ -39,29 +40,21 @@ fn backend(dev: bool, api: ApiLevel) -> String {
             _ => unreachable!(),
         });
     }
-    let features = if enabled.is_empty() {
-        String::new()
-    } else {
-        format!(", features = [{}]", enabled.join(", "))
-    };
+    let features = format!(", features = [{}]", enabled.join(", "));
     let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
         .map(PathBuf::from)
         .or_else(|| {
             // This repository: the nshm's directory `nsh` builds it in.
             Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         })
-        .filter(|dir| {
-            join_all(dir, ["crates", "nsh-platform-harmonyos-core", "Cargo.toml"]).is_file()
-        });
+        .filter(|dir| join_all(dir, ["src", "lib.rs"]).is_file());
     match checkout {
         Some(dir) => format!(
-            "{{ package = \"nsh-platform-harmonyos-core\", path = {}{features} }}",
-            toml_string(
-                &join_all(&dir, ["crates", "nsh-platform-harmonyos-core"]).to_string_lossy()
-            )
+            "{{ package = \"nsh-platform-harmonyos\", path = {}{features} }}",
+            toml_string(&dir.to_string_lossy())
         ),
         None => format!(
-            "{{ package = \"nsh-platform-harmonyos-core\", version = \"={}\"{features} }}",
+            "{{ package = \"nsh-platform-harmonyos\", version = \"={}\"{features} }}",
             env!("CARGO_PKG_VERSION")
         ),
     }
@@ -627,7 +620,7 @@ mod tests {
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
         assert!(manifest.contains("crate-type = [\"cdylib\"]"));
         assert!(manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"));
-        assert!(!manifest.contains("features ="));
+        assert!(manifest.contains("features = [\"backend\"]"));
         let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
 
@@ -639,7 +632,7 @@ mod tests {
         )
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
-        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        assert!(dev_manifest.contains("features = [\"backend\", \"dev\"]"));
         let expected_testing = format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
@@ -648,13 +641,13 @@ mod tests {
 
         write(&dir.join("tsx"), App::Tsx, true, ApiLevel::Api23).unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
-        assert!(tsx_manifest.contains("features = [\"dev\", \"api-23\"]"));
+        assert!(tsx_manifest.contains("features = [\"backend\", \"dev\", \"api-23\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
 
         write(&dir.join("tsx-api26"), App::Tsx, false, ApiLevel::Api26).unwrap();
         let api26_manifest = fs::read_to_string(dir.join("tsx-api26").join("Cargo.toml")).unwrap();
-        assert!(api26_manifest.contains("features = [\"api-26\"]"));
+        assert!(api26_manifest.contains("features = [\"backend\", \"api-26\"]"));
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -749,7 +742,7 @@ mod tests {
             manifest.contains("[patch.\"https://github.com/acme/ui\"]"),
             "{manifest}"
         );
-        assert!(!manifest.contains("features = [\"dev\"]"));
+        assert!(!manifest.contains("features = [\"backend\", \"dev\"]"));
         let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
         assert!(
             lib.contains("backend::app!(sets = [app_0::registry, app_1::registry]);"),
@@ -768,7 +761,7 @@ mod tests {
         )
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
-        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        assert!(dev_manifest.contains("features = [\"backend\", \"dev\"]"));
         let expected_testing = format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
@@ -801,7 +794,7 @@ mod tests {
         )
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
-        assert!(dev_manifest.contains("features = [\"dev\"]"));
+        assert!(dev_manifest.contains("features = [\"backend\", \"dev\"]"));
         assert_eq!(
             workspace_patches(&dev_manifest).trim(),
             crate::embedded::NSH_PATCH.trim(),
