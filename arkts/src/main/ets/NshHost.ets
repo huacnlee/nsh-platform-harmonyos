@@ -32,7 +32,7 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
-import { setAbilityWantSink, startAbilityForResult } from "./NativeExtensions";
+import { startAbilityForResult } from "./NativeExtensions";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -158,7 +158,6 @@ interface NshNativeModule {
     code?: number,
     message?: string,
   ): void;
-  nshAbilityWant(kind: string, payload: string): void;
   nshReportHostError(sessionId: number, message: string): void;
   nshAttachNativeNode(targetId: number, content: FrameNode): void;
   nshAttachNativeSubtree(targetId: number, content: FrameNode, slot: NodeContent): void;
@@ -1431,9 +1430,6 @@ nativeHostModule.nshRegisterSessionBinder(
   (uiContext: UIContext): number => HostSession.bind(uiContext),
   showNativeAlert,
 );
-setAbilityWantSink((kind: string, payload: string): void => {
-  nativeHostModule.nshAbilityWant(kind, payload);
-});
 
 function maximumRefreshRate(mainWindow: window.Window): number {
   const id = mainWindow.getWindowProperties().displayId;
