@@ -28,10 +28,10 @@ NSH's `main`, so use the [nightly](https://nsh.dev/docs/installation#installing-
 (`nsh update nightly`). In the app's directory:
 
 ```sh
-nsh add github:huacnlee/nsh-platform-harmonyos
+nsh add nsh-platform-harmonyos
 ```
 
-That adds `"nsh-harmonyos"` to the app's `nsh.json` `"dependencies"` and pins it in `nsh.lock`. Then
+That adds `"nsh-platform-harmonyos"` to the app's `nsh.json` `"dependencies"` and pins it in `nsh.lock`. Then
 `nsh package --target harmonyos` writes a DevEco Studio project (and its HAP, with DevEco's tools), and
 `nsh run --target harmonyos` builds, installs and starts the app on the device `hdc` sees:
 
@@ -147,15 +147,15 @@ relying on it. A bundle packaged in the HAP is part of the app.
 ```
 your app (Rust or TSX)     components, layout, state
 nsh-engine                 one Engine per NshSurface (QuickJS for TSX), on threads of its own
-nsh-platform-harmonyos     the ArkUI backend, a Rust library on N-API:
+nsh-platform-harmonyos-core the ArkUI backend, a Rust library on N-API:
   app/                     NshSurface: engine, sessions, loads, signed packages, the dev server
   render/                  mount batches → ArkUI custom nodes (OH_ArkUI_*), decoration, canvases, shaders, NativeVSync
   text/                    a TextEngine on OH_Drawing_Typography: laid out on the engine thread, drawn on the UI thread
   input/ scroll/           touches, keys, system text inputs, native Scroll and Refresh
   navigation/ media/       stacks, modals, video (AVPlayer), web views (ArkWeb), images
   accessibility/           ArkUI's accessibility providers (api-23, api-26)
-  arkts/                   @nsh/harmonyos: NshHost and the ArkTS side of editors, menus, web views
-nsh-harmonyos (src/)
+arkts/                     @nsh/harmonyos: NshHost and the ArkTS side of editors, menus, web views
+nsh-platform-harmonyos (src/)
   package / run            `$NSH build <app>`, a cdylib runner (the backend + NSH's generated `nsh_rust_app`) built
                            with the NDK into libnsh_platform_harmonyos.so, a DevEco project from template/, hvigor, hdc
 ```

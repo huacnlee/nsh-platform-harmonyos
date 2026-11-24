@@ -25,10 +25,10 @@ NSH 的 Gallery 运行在 OpenHarmony 7.0（API 26）模拟器上。
 [nightly](https://nsh.dev/docs/installation#installing-the-nightly-build) 版的 `nsh`（`nsh update nightly`）。在应用目录里执行：
 
 ```sh
-nsh add github:huacnlee/nsh-platform-harmonyos
+nsh add nsh-platform-harmonyos
 ```
 
-它会把 `"nsh-harmonyos"` 加进应用 `nsh.json` 的 `"dependencies"`，并在 `nsh.lock` 里锁定版本。之后
+它会把 `"nsh-platform-harmonyos"` 加进应用 `nsh.json` 的 `"dependencies"`，并在 `nsh.lock` 里锁定版本。之后
 `nsh package --target harmonyos` 生成 DevEco Studio 工程（装有 DevEco 工具时同时构建 HAP），
 `nsh run --target harmonyos` 构建 HAP，安装到 hdc 连接的设备上并启动：
 
@@ -128,15 +128,15 @@ OpenHarmony NDK 编出来的库，可以直接在华为手机上运行。API 20 
 ```
 应用（Rust 或 TSX）        组件、布局、状态
 nsh-engine                 每个 NshSurface 一个 Engine（TSX 用 QuickJS），运行在独立线程上
-nsh-platform-harmonyos     ArkUI 后端，基于 N-API 的 Rust 库：
+nsh-platform-harmonyos-core ArkUI 后端，基于 N-API 的 Rust 库：
   app/                     NshSurface：引擎、会话、加载、签名包、dev server
   render/                  mount batch → ArkUI 自定义节点（OH_ArkUI_*）、装饰、canvas、shader、NativeVSync
   text/                    基于 OH_Drawing_Typography 的 TextEngine：在引擎线程排版，在 UI 线程绘制
   input/ scroll/           触摸、按键、系统文本输入框、原生 Scroll 和 Refresh
   navigation/ media/       导航栈、模态、视频（AVPlayer）、网页（ArkWeb）、图片
   accessibility/           ArkUI 无障碍 provider（api-23、api-26）
-  arkts/                   @nsh/harmonyos：NshHost，以及编辑器、菜单、网页的 ArkTS 部分
-nsh-harmonyos（src/）
+arkts/                     @nsh/harmonyos：NshHost，以及编辑器、菜单、网页的 ArkTS 部分
+nsh-platform-harmonyos（src/）
   package / run            `$NSH build <app>`；用 NDK 把 cdylib runner（后端 + NSH 生成的 `nsh_rust_app`）编译成
                            libnsh_platform_harmonyos.so；从 template/ 生成 DevEco 工程；调用 hvigor、hdc
 ```

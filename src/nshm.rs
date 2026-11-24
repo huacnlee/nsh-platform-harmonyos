@@ -37,7 +37,7 @@ const NSH_CRATES: &[&str] = &[
     "nsh-bundler",
     "nsh-i18n",
     "nsh-updater",
-    "nsh-harmonyos",
+    "nsh-platform-harmonyos-core",
     "nsh-platform-harmonyos",
     "nsh-platform-android",
     "nsh-platform-apple",
@@ -752,8 +752,8 @@ mod tests {
         let tsx_only = join_all(&nshms, ["acme-ui", "1.0.0"]);
         fs::create_dir_all(&tsx_only).unwrap();
 
-        let platform_only = join_all(&nshms, ["nsh-harmonyos", "0.1.0"]);
-        write_crate(&platform_only, "nsh-harmonyos", None);
+        let platform_only = join_all(&nshms, ["nsh-platform-harmonyos", "0.1.0"]);
+        write_crate(&platform_only, "nsh-platform-harmonyos", None);
 
         fs::write(
             app.join("nsh.json"),
@@ -765,7 +765,7 @@ mod tests {
                 "acme-kit": { "github": "acme/kit", "version": "^1.0" },
                 "local-mod": { "path": "../local-mod", "features": ["scan"] },
                 "acme-ui": { "github": "acme/ui", "version": "^1.0" },
-                "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+                "nsh-platform-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
               }
             }"#,
         )
@@ -803,10 +803,10 @@ mod tests {
                   "module": "nsh-extra"
                 },
                 {
-                  "name": "nsh-harmonyos",
+                  "name": "nsh-platform-harmonyos",
                   "version": "0.1.0",
                   "source": "git+https://github.com/huacnlee/nsh-platform-harmonyos",
-                  "dir": "nsh-harmonyos/0.1.0",
+                  "dir": "nsh-platform-harmonyos/0.1.0",
                   "platform": "harmonyos"
                 }
               ]

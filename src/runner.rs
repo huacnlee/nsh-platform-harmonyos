@@ -50,14 +50,18 @@ fn backend(dev: bool, api: ApiLevel) -> String {
             // This repository: the nshm's directory `nsh` builds it in.
             Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
         })
-        .filter(|dir| join_all(dir, ["crates", "nsh-platform-harmonyos", "Cargo.toml"]).is_file());
+        .filter(|dir| {
+            join_all(dir, ["crates", "nsh-platform-harmonyos-core", "Cargo.toml"]).is_file()
+        });
     match checkout {
         Some(dir) => format!(
-            "{{ package = \"nsh-platform-harmonyos\", path = {}{features} }}",
-            toml_string(&join_all(&dir, ["crates", "nsh-platform-harmonyos"]).to_string_lossy())
+            "{{ package = \"nsh-platform-harmonyos-core\", path = {}{features} }}",
+            toml_string(
+                &join_all(&dir, ["crates", "nsh-platform-harmonyos-core"]).to_string_lossy()
+            )
         ),
         None => format!(
-            "{{ package = \"nsh-platform-harmonyos\", git = \"https://github.com/huacnlee/nsh-platform-harmonyos\", tag = \"v{}\"{features} }}",
+            "{{ package = \"nsh-platform-harmonyos-core\", version = \"={}\"{features} }}",
             env!("CARGO_PKG_VERSION")
         ),
     }

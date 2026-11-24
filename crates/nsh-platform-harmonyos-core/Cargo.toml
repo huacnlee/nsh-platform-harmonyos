@@ -1,5 +1,5 @@
 [package]
-name = "nsh-platform-harmonyos"
+name = "nsh-platform-harmonyos-core"
 description = "A community-maintained NSH platform: runs Native Shell apps on HarmonyOS and OpenHarmony with ArkUI native views."
 version.workspace = true
 edition.workspace = true

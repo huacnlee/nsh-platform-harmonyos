@@ -38,13 +38,13 @@ pub(crate) fn root() -> Option<Root> {
 ///
 /// ```ignore
 /// // An app written in Rust: NSH's generated `nsh_rust_app`.
-/// nsh_platform_harmonyos::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);
+/// nsh_platform_harmonyos_core::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);
 /// // A TSX app, whose bundle the host loads: nsh/base's UI set.
-/// nsh_platform_harmonyos::app!();
+/// nsh_platform_harmonyos_core::app!();
 /// // A TSX app with Rust crates of its own (`nsh.json` `"rust"` without
 /// // `"root"`): nsh/base's UI set, then each crate's (`#[native_module]`'s
 /// // `registry()`), for the bundle the host loads to import.
-/// nsh_platform_harmonyos::app!(sets = [app_0::registry, app_1::registry]);
+/// nsh_platform_harmonyos_core::app!(sets = [app_0::registry, app_1::registry]);
 /// ```
 #[macro_export]
 macro_rules! app {

@@ -2922,23 +2922,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nsh-harmonyos"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "ctrlc",
- "image",
- "nsh-base",
- "nsh-core",
- "nsh-dev",
- "nsh-engine",
- "nsh-testing",
- "quick-xml",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "nsh-i18n"
 version = "0.6.0"
 source = "git+https://github.com/longbridge/nsh?branch=main#f1a9efd4488f368cb24e6fe51dc5ed1f4d1ba24d"
@@ -3002,7 +2985,24 @@ dependencies = [
 
 [[package]]
 name = "nsh-platform-harmonyos"
-version = "0.1.0"
+version = "0.1.1"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "image",
+ "nsh-base",
+ "nsh-core",
+ "nsh-dev",
+ "nsh-engine",
+ "nsh-testing",
+ "quick-xml",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nsh-platform-harmonyos-core"
+version = "0.1.1"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",

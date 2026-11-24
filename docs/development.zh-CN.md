@@ -63,7 +63,7 @@ my-app/
   "version": "1.0.0",
   "build": 1,
   "dependencies": {
-    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+    "nsh-platform-harmonyos": "0.1"
   }
 }
 ```
@@ -121,7 +121,7 @@ my-rust-app/
   "rust": ".",
   "root": "App",
   "dependencies": {
-    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+    "nsh-platform-harmonyos": "0.1"
   }
 }
 ```
@@ -188,7 +188,7 @@ pub fn App() -> impl IntoElement {
   "build": 1,
   "rust": ["./crates/native"],
   "dependencies": {
-    "nsh-harmonyos": { "github": "huacnlee/nsh-platform-harmonyos" }
+    "nsh-platform-harmonyos": "0.1"
   }
 }
 ```

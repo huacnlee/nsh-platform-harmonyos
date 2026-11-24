@@ -862,8 +862,6 @@ fn typedefs(verbose: bool) -> anyhow::Result<()> {
     let target = join_all(
         &repo,
         [
-            "crates",
-            "nsh-platform-harmonyos",
             "arkts",
             "src",
             "main",

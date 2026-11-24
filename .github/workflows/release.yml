@@ -1,7 +1,9 @@
 name: Release
 
-# Publishes the crates to crates.io: `nsh-platform-harmonyos` (the library),
-# then `nsh-harmonyos` (the platform nshm and its runner binary).
+# Publishes the platform nshm the way an nshm is published (cargo publish,
+# keyword `nshm`, `nsh.json` at the crate's version), with its backend
+# first. Publishes the crates to crates.io: `nsh-platform-harmonyos-core` (the
+# ArkUI backend library), then `nsh-platform-harmonyos` (the platform nshm).
 #
 # - Pushing a tag `vX.Y.Z` (the workspace version in Cargo.toml) publishes
 #   that version.
@@ -57,13 +59,19 @@ jobs:
             echo "::error::Tag $TAG does not match the workspace version $version"
             exit 1
           fi
+          # An nshm's `nsh.json` version must be its crate's.
+          nshm=$(sed -n 's/^ *"version": "\(.*\)",*$/\1/p' nsh.json)
+          if [[ "$nshm" != "$version" ]]; then
+            echo "::error::nsh.json version $nshm does not match the crate version $version"
+            exit 1
+          fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          for crate in nsh-platform-harmonyos nsh-harmonyos; do
+          for crate in nsh-platform-harmonyos-core nsh-platform-harmonyos; do
             status=$(curl -s -o /dev/null -w '%{http_code}' \
               -A "nsh-platform-harmonyos release (github.com/huacnlee/nsh-platform-harmonyos)" \
               "https://crates.io/api/v1/crates/$crate/$VERSION")

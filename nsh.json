@@ -1,5 +1,5 @@
 {
-  "name": "nsh-harmonyos",
-  "version": "0.1.0",
+  "name": "nsh-platform-harmonyos",
+  "version": "0.1.1",
   "platform": "harmonyos"
 }

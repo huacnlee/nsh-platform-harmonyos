@@ -1,5 +1,5 @@
 //! Embeds the DevEco project template (`template/`) and the ArkTS package
-//! (`crates/nsh-platform-harmonyos/arkts`) in the program, so an installed
+//! (`arkts/`) in the program, so an installed
 //! `nsh-platform-harmonyos` writes projects without this repository.
 
 use std::{
@@ -95,12 +95,7 @@ fn main() {
     let mut code = String::new();
     for (name, dir) in [
         ("TEMPLATE", repo.join("template")),
-        (
-            "ARKTS",
-            repo.join("crates")
-                .join("nsh-platform-harmonyos")
-                .join("arkts"),
-        ),
+        ("ARKTS", repo.join("arkts")),
     ] {
         println!("cargo:rerun-if-changed={}", dir.display());
         let mut list = Vec::new();

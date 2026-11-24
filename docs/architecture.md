@@ -1,6 +1,6 @@
 # The HarmonyOS backend (ArkUI)
 
-`crates/nsh-platform-harmonyos` renders NSH apps on HarmonyOS / OpenHarmony (API 20+, `arm64-v8a`) with ArkUI custom nodes
+`crates/nsh-platform-harmonyos-core` renders NSH apps on HarmonyOS / OpenHarmony (API 20+, `arm64-v8a`) with ArkUI custom nodes
 and lays text out with native `OH_Drawing_Typography`. Each `NshSurface` owns one `NodeContent`, one engine thread and
 one QuickJS VM. How apps use it: [the README](../README.md), [embedding.md](embedding.md).
 

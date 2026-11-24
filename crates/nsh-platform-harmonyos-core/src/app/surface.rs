@@ -1278,7 +1278,7 @@ impl NshSurface {
         promise
     }
 
-    /// Starts the Rust app linked into this binary (`nsh_platform_harmonyos::app!`).
+    /// Starts the Rust app linked into this binary (`nsh_platform_harmonyos_core::app!`).
     #[napi]
     pub fn run_app(&self, env: Env) -> Result<()> {
         self.check()?;
