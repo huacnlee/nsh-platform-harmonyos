@@ -294,23 +294,25 @@ impl Interaction {
                     .native
                     .borrow_mut()
                     .on_event(E::OnClick, move |event| {
-                        if let Some(owner) = weak.upgrade()
-                            && !owner.interaction.long_fired.replace(false)
-                        {
-                            owner
-                                .control
-                                .set_input_modality(nsh_core::platform::InputModality::Pointer);
-                            if let Some(control) = owner.interaction.window_control() {
-                                callback(|| dispatch_window_control(&owner, control));
-                                return;
-                            }
+                        if let Some(owner) = weak.upgrade() {
                             // OnClick's component payload is physical pixels on
                             // device; touch input below already uses the node's vp.
-                            owner.press(
-                                EventKind::Press,
-                                event.component_f32(0).unwrap_or_default() / owner.scale.get(),
-                                event.component_f32(1).unwrap_or_default() / owner.scale.get(),
-                            );
+                            let scale = owner.scale.get().max(1.0);
+                            let x = event.component_f32(0).unwrap_or_default() / scale;
+                            let y = event.component_f32(1).unwrap_or_default() / scale;
+                            if !owner.hit_within_clip_path(x, y) {
+                                return;
+                            }
+                            if !owner.interaction.long_fired.replace(false) {
+                                owner
+                                    .control
+                                    .set_input_modality(nsh_core::platform::InputModality::Pointer);
+                                if let Some(control) = owner.interaction.window_control() {
+                                    callback(|| dispatch_window_control(&owner, control));
+                                    return;
+                                }
+                                owner.press(EventKind::Press, x, y);
+                            }
                         }
                     });
             } else {
@@ -333,21 +335,25 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade()
                             && let Some(input) = event.input_event()
                         {
-                            if input.action == UIInputAction::Down {
+                            let is_root = owner.id == nsh_core::ROOT_ID
+                                || owner.kind == nsh_core::ViewKind::Modal;
+                            let x = input.pointer_x_by_index(0);
+                            let y = input.pointer_y_by_index(0);
+                            let in_clip = owner.hit_within_clip_path(x, y);
+                            if input.action == UIInputAction::Down && in_clip {
                                 owner
                                     .control
                                     .set_input_modality(nsh_core::platform::InputModality::Pointer);
                             }
-                            let is_root = owner.id == nsh_core::ROOT_ID
-                                || owner.kind == nsh_core::ViewKind::Modal;
                             if is_root {
                                 owner.touches.borrow_mut().input(&owner, &input)?;
                             }
-                            let x = input.pointer_x_by_index(0);
-                            let y = input.pointer_y_by_index(0);
                             let mask = owner.interaction.mask();
                             match input.action {
                                 UIInputAction::Down => {
+                                    if !in_clip {
+                                        return Ok(());
+                                    }
                                     if !is_root {
                                         owner
                                             .touches
@@ -366,14 +372,15 @@ impl Interaction {
                                     }
                                 }
                                 UIInputAction::Up | UIInputAction::Cancel => {
-                                    if !is_root {
+                                    if !is_root && in_clip {
                                         owner
                                             .touches
                                             .borrow_mut()
                                             .record_down(owner.key_window_id(), &input);
                                     }
                                     owner.interaction.state(&owner, state::PRESSED, false)?;
-                                    if owner.press_feedback_allowed()
+                                    if in_clip
+                                        && owner.press_feedback_allowed()
                                         && mask.contains(EventKind::PressUp)
                                     {
                                         owner.emit(EventKind::PressUp, owner.press_payload(x, y));
@@ -455,6 +462,11 @@ impl Interaction {
                         {
                             let x = input.pointer_x();
                             let y = input.pointer_y();
+                            let is_root = owner.id == nsh_core::ROOT_ID
+                                || owner.kind == nsh_core::ViewKind::Modal;
+                            if !is_root && !owner.hit_within_clip_path(x, y) {
+                                return Ok(());
+                            }
                             let wx = input.pointer_window_x();
                             let wy = input.pointer_window_y();
                             let dx = input.pointer_display_x();
@@ -464,8 +476,6 @@ impl Interaction {
                                 .borrow_mut()
                                 .record_pointer_for(owner.key_window_id(), (wx, wy));
                             let mask = owner.interaction.mask();
-                            let is_root = owner.id == nsh_core::ROOT_ID
-                                || owner.kind == nsh_core::ViewKind::Modal;
                             let desktop = owner.platform.get().os.is_desktop();
                             match input.mouse_action() {
                                 UIMouseEventAction::Move => {
@@ -618,6 +628,9 @@ impl Interaction {
                             let mask = owner.interaction.mask();
                             let x = input.pointer_x();
                             let y = input.pointer_y();
+                            if !owner.hit_within_clip_path(x, y) {
+                                return Ok(());
+                            }
                             let action = input.axis_action();
                             let pinch_scale = input.axis_pinch_scale_value() as f32;
                             if mask.contains(EventKind::Pinch)
@@ -824,11 +837,15 @@ impl Interaction {
                         if owner.touches.borrow().selection_dragging(owner.id) {
                             return;
                         }
-                        owner.interaction.long_fired.set(true);
                         // Gesture input snapshots are physical pixels even on VP nodes.
-                        let (x, y) = event.input.map_or((0.0, 0.0), |input| {
-                            (input.x / owner.scale.get(), input.y / owner.scale.get())
-                        });
+                        let scale = owner.scale.get().max(1.0);
+                        let (x, y) = event
+                            .input
+                            .map_or((0.0, 0.0), |input| (input.x / scale, input.y / scale));
+                        if !owner.hit_within_clip_path(x, y) {
+                            return;
+                        }
+                        owner.interaction.long_fired.set(true);
                         owner.press(EventKind::LongPress, x, y);
                         callback(|| {
                             owner.selection_begin(x, y)?;
@@ -1111,12 +1128,22 @@ impl Interaction {
                                     return Ok(());
                                 }
                                 let accept_origin = if accept {
+                                    let scale = owner.scale.get().max(1.0);
+                                    if let Some(input) = event.input
+                                        && !owner.hit_within_clip_path(
+                                            (input.x - pan.offset_x) / scale,
+                                            (input.y - pan.offset_y) / scale,
+                                        )
+                                    {
+                                        owner.interaction.pan_rejected.set(!ended);
+                                        return Ok(());
+                                    }
                                     let origin = event
                                         .input
                                         .map(|i| {
                                             (
-                                                i.window_x - pan.offset_x / owner.scale.get(),
-                                                i.window_y - pan.offset_y / owner.scale.get(),
+                                                i.window_x - pan.offset_x / scale,
+                                                i.window_y - pan.offset_y / scale,
                                             )
                                         })
                                         .or_else(|| {

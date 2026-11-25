@@ -279,4 +279,77 @@ impl Node {
                 .upgrade()
                 .is_none_or(|route| route.keyboard.lock().unwrap().input.is_none())
     }
+
+    fn has_clip_path_in_chain(&self) -> bool {
+        if self.style.borrow().clip_path().is_some() {
+            return true;
+        }
+        if self.id == nsh_core::ROOT_ID || self.kind == ViewKind::Modal {
+            return false;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if node.style.borrow().clip_path().is_some() {
+                return true;
+            }
+            if node.id == nsh_core::ROOT_ID || node.kind == ViewKind::Modal {
+                break;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        false
+    }
+
+    /// Returns whether node-local `(x, y)` in vp falls inside this node's and all ancestors' `clipPath`.
+    pub(crate) fn hit_within_clip_path(&self, x: f32, y: f32) -> bool {
+        if !self.has_clip_path_in_chain() {
+            return true;
+        }
+        let check_node = |node: &Node, px: f32, py: f32| -> bool {
+            let style = node.style.borrow();
+            let Some(clip) = style.clip_path() else {
+                return true;
+            };
+            let frame = node.frame.get();
+            clip.contains(
+                nsh_core::geometry::size(Points(frame.width), Points(frame.height)),
+                nsh_core::geometry::point(Points(px), Points(py)),
+            )
+        };
+        if !check_node(self, x, y) {
+            return false;
+        }
+        if self.id == nsh_core::ROOT_ID || self.kind == ViewKind::Modal {
+            return true;
+        }
+        let Some(first_parent) = self.parent_node.borrow().upgrade() else {
+            return true;
+        };
+        let Ok(matrix) = self.input_to_parent(&first_parent) else {
+            return false;
+        };
+        let Some(mut pt) = crate::render::geometry::page_point(&matrix.0, (x, y)) else {
+            return false;
+        };
+        let mut current = first_parent;
+        loop {
+            if !check_node(&current, pt.0, pt.1) {
+                return false;
+            }
+            if current.id == nsh_core::ROOT_ID || current.kind == ViewKind::Modal {
+                return true;
+            }
+            let Some(next_parent) = current.parent_node.borrow().upgrade() else {
+                return true;
+            };
+            let Ok(matrix) = current.input_to_parent(&next_parent) else {
+                return false;
+            };
+            let Some(mapped) = crate::render::geometry::page_point(&matrix.0, pt) else {
+                return false;
+            };
+            pt = mapped;
+            current = next_parent;
+        }
+    }
 }
