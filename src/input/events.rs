@@ -904,10 +904,12 @@ impl Interaction {
             {
                 native.set_i32_attribute(A::AccessibilityMode, next_mode)?;
             }
-            if old_props.accessibility.hint != props.accessibility.hint {
+            let old_desc = old_props.accessibility.help_text(None);
+            let new_desc = props.accessibility.help_text(None);
+            if old_desc != new_desc {
                 native.set_string_attribute(
                     A::AccessibilityDescription,
-                    props.accessibility.hint.as_deref().unwrap_or_default(),
+                    new_desc.as_deref().unwrap_or_default(),
                 )?;
             }
         }

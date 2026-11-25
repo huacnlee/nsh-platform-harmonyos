@@ -558,7 +558,7 @@ impl Input {
             below_viewport: false,
             accessibility: Some(EditorAccessibility {
                 label: accessibility.label.as_deref().unwrap_or("").to_owned(),
-                hint: accessibility.hint.as_deref().unwrap_or("").to_owned(),
+                hint: accessibility.help_text(None).unwrap_or_default(),
                 hidden: accessibility.hidden,
                 accessible: accessibility.accessible,
                 disabled: accessibility.state.disabled,

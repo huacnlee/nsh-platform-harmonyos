@@ -295,9 +295,8 @@ impl Snapshot {
             .set_accessibility_description(
                 &self
                     .spec
-                    .hint
-                    .as_deref()
-                    .unwrap_or("")
+                    .help_text(None)
+                    .unwrap_or_default()
                     .replace('\0', "\u{fffd}"),
             )?
             .set_contents(

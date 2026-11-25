@@ -339,7 +339,7 @@ impl Wrapper {
             } else {
                 String::new()
             },
-            hint: spec.hint.as_deref().unwrap_or("").to_owned(),
+            hint: spec.help_text(None).unwrap_or_default(),
             api23: cfg!(feature = "api-23") && !value.is_empty(),
             api26: !actions.is_empty(),
             value,
