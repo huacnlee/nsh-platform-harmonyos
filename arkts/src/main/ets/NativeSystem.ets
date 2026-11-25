@@ -9,6 +9,7 @@ import { NativeNotifications } from "./NativeNotifications";
 // The system bridge uses the same typed completion for every service.
 export interface SystemReply {
   has?: boolean;
+  denied?: boolean;
   text?: string;
   html?: string;
   uri?: string;

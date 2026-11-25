@@ -539,6 +539,11 @@ impl System {
                     parse_file_request_paths(value.files.as_deref()),
                 ),
             }
+        } else if request.kind == EventKind::Clipboard {
+            if let Some(error) = value.error.as_deref() {
+                log::warn!("OHOS clipboard request failed: {error}");
+            }
+            clipboard_payload(request.id, value)
         } else if request.kind == EventKind::OpenAppSettings {
             EventPayload::Map(vec![
                 ("id", PayloadValue::Number(f64::from(request.id))),
@@ -624,6 +629,7 @@ pub(crate) struct SystemEvent {
     pub opened: Option<bool>,
     pub pressed: Option<String>,
     pub has: Option<bool>,
+    pub denied: Option<bool>,
     pub text: Option<String>,
     pub html: Option<String>,
     pub uri: Option<String>,
@@ -668,6 +674,7 @@ impl SystemEvent {
         for (name, value) in [
             ("shown", self.shown),
             ("has", self.has),
+            ("denied", self.denied),
             ("opened", self.opened),
         ] {
             if let Some(value) = value {
@@ -861,6 +868,22 @@ pub(crate) fn auth_session_payload(id: u32, value: SystemEvent) -> nsh_core::Eve
         return AuthSessionOutcome::Completed(url).payload(id);
     }
     AuthSessionOutcome::Cancelled.payload(id)
+}
+
+/// Converts a `NativeClipboard` reply into the `EventKind::Clipboard` payload.
+/// User dismissal or read errors resolve as `denied: true` instead of surfacing
+/// as an uncaught host error overlay.
+pub(crate) fn clipboard_payload(id: u32, value: SystemEvent) -> nsh_core::EventPayload {
+    if value.error.is_some() || value.denied == Some(true) {
+        return EventPayload::Map(vec![
+            ("id", PayloadValue::Number(f64::from(id))),
+            ("has", PayloadValue::Bool(false)),
+            ("denied", PayloadValue::Bool(true)),
+        ]);
+    }
+    let mut fields = vec![("id", PayloadValue::Number(f64::from(id)))];
+    value.append_fields(&mut fields);
+    EventPayload::Map(fields)
 }
 
 #[cfg(test)]
@@ -1102,5 +1125,63 @@ mod tests {
             "code",
             PayloadValue::Str("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM".into())
         )));
+    }
+
+    #[test]
+    fn clipboard_payload_maps_cancelled_and_error_replies_to_denied() {
+        let cancelled = clipboard_payload(
+            11,
+            SystemEvent {
+                has: Some(false),
+                denied: Some(true),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = cancelled else {
+            panic!("expected Map payload");
+        };
+        assert_eq!(
+            fields,
+            vec![
+                ("id", PayloadValue::Number(11.0)),
+                ("has", PayloadValue::Bool(false)),
+                ("denied", PayloadValue::Bool(true)),
+            ]
+        );
+
+        let failed = clipboard_payload(
+            12,
+            SystemEvent {
+                error: Some("paste cancelled".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = failed else {
+            panic!("expected Map payload");
+        };
+        assert_eq!(
+            fields,
+            vec![
+                ("id", PayloadValue::Number(12.0)),
+                ("has", PayloadValue::Bool(false)),
+                ("denied", PayloadValue::Bool(true)),
+            ]
+        );
+
+        let ok = clipboard_payload(
+            13,
+            SystemEvent {
+                has: Some(true),
+                text: Some("hello".into()),
+                ..Default::default()
+            },
+        );
+        let EventPayload::Map(fields) = ok else {
+            panic!("expected Map payload");
+        };
+        assert!(fields.contains(&("id", PayloadValue::Number(13.0))));
+        assert!(fields.contains(&("has", PayloadValue::Bool(true))));
+        assert!(fields.contains(&("text", PayloadValue::Str("hello".into()))));
+        assert!(!fields.iter().any(|(key, _)| *key == "denied"));
     }
 }

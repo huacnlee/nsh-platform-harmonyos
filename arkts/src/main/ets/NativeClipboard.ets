@@ -7,6 +7,7 @@ import { UIContext } from "@ohos.arkui.UIContext";
 
 export interface ClipboardReply extends SystemReply {
   has?: boolean;
+  denied?: boolean;
   text?: string;
   html?: string;
   uri?: string;
@@ -14,6 +15,12 @@ export interface ClipboardReply extends SystemReply {
   height?: number;
   tooLarge?: number;
   files?: string;
+}
+
+class PasteCancelledError extends Error {
+  constructor() {
+    super("paste cancelled");
+  }
 }
 
 export interface ExtractedPasteData {
@@ -178,7 +185,7 @@ export class NativeClipboard {
         this.dismiss = (): void => {
           if (!settled) {
             settled = true;
-            reject(new Error("paste cancelled"));
+            reject(new PasteCancelledError());
             finish();
           }
         };
@@ -293,7 +300,11 @@ export class NativeClipboard {
           }
         }
       } catch (error) {
-        failure = new Error(String(error));
+        if (error instanceof PasteCancelledError) {
+          reply = { has: false, denied: true };
+        } else {
+          failure = new Error(String(error));
+        }
       } finally {
         this.reading = undefined;
       }

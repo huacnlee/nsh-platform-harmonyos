@@ -362,6 +362,7 @@ export interface SystemEvent {
   opened?: boolean
   pressed?: string
   has?: boolean
+  denied?: boolean
   text?: string
   html?: string
   uri?: string
