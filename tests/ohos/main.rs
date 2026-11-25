@@ -110,3 +110,7 @@ mod web_downloads;
 #[path = "../../src/extensions.rs"]
 #[allow(dead_code, unreachable_pub)]
 mod extensions;
+
+#[path = "../../src/services/network_monitor.rs"]
+#[allow(dead_code)]
+mod network_monitor;

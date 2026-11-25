@@ -133,8 +133,17 @@ pub(crate) struct UiContext {
     pub(crate) fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
+    pub(crate) text_locale: std::cell::Cell<Option<nsh_core::platform::Locale>>,
     pub(crate) main_window: std::cell::RefCell<crate::services::desktop::MainWindowState>,
     pub(crate) appearance: std::cell::Cell<nsh_core::platform::Appearance>,
+}
+
+impl UiContext {
+    pub(crate) fn spoken_locale(&self) -> nsh_core::platform::Locale {
+        self.text_locale
+            .get()
+            .unwrap_or_else(|| self.platform.get().locale)
+    }
 }
 
 struct BatchGuard(Rc<UiContext>, bool);
@@ -1472,6 +1481,7 @@ impl Mounter {
                                     self.dispatcher.clone(),
                                     input_id,
                                     input.report_paste(),
+                                    input.paste_max_size(),
                                 )?;
                                 return Ok(());
                             }
@@ -2699,7 +2709,6 @@ impl Mounter {
                         | Command::ReadClipboardFiles { .. }
                         | Command::SetClipboard(_)
                         | Command::ReadClipboard { .. }
-                        | Command::Speech(_)
                         | Command::Notification(_)) => {
                             self.host.system.command(
                                 &self.host,
@@ -2841,6 +2850,30 @@ impl Mounter {
                         | Command::SetAppUrl(_)
                         | Command::PushAppUrl(_)
                         | Command::CancelPress => {}
+                        Command::TextLocale(locale) => {
+                            if self.text_locale.replace(Some(locale)) != Some(locale) {
+                                for node in self.nodes.values() {
+                                    node.accessibility_state.on_locale_change(node)?;
+                                }
+                            }
+                        }
+                        Command::OpenAppSettings { id } => {
+                            if let Err(error) = self.host.system.open_app_settings(
+                                &self.host,
+                                self.dispatcher.clone(),
+                                id,
+                            ) {
+                                log::warn!("OHOS open app settings failed: {error}");
+                                self.control.dispatch_event(
+                                    nsh_core::ROOT_ID,
+                                    nsh_core::EventKind::OpenAppSettings,
+                                    nsh_core::EventPayload::Map(vec![
+                                        ("id", nsh_core::PayloadValue::Number(f64::from(id))),
+                                        ("opened", nsh_core::PayloadValue::Bool(false)),
+                                    ]),
+                                );
+                            }
+                        }
                         Command::Haptic(haptic) => {
                             self.host.haptic(haptic)?;
                         }
@@ -3157,6 +3190,7 @@ impl Mounter {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn input_paste(
         &self,
         id: NodeId,
@@ -3164,12 +3198,13 @@ impl Mounter {
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
+        image_too_large: Option<u64>,
         report_only: bool,
     ) -> Result<()> {
         if let Some(node) = self.nodes.get(&id)
             && let Some(input) = node.input.borrow().as_ref()
         {
-            input.complete_paste(text, html, files, image, report_only)?;
+            input.complete_paste(text, html, files, image, image_too_large, report_only)?;
         }
         Ok(())
     }

@@ -68,6 +68,7 @@ pub(super) struct HdcNative {
     server: Arc<DevServer>,
     geometry: Arc<Mutex<Geometry>>,
     error: Arc<Mutex<Option<String>>>,
+    unanswered: Arc<Mutex<Option<String>>>,
 }
 
 impl HdcNative {
@@ -77,6 +78,7 @@ impl HdcNative {
             server,
             geometry: Arc::default(),
             error: Arc::default(),
+            unanswered: Arc::default(),
         }
     }
 
@@ -126,6 +128,19 @@ impl HdcNative {
         }
     }
 
+    fn step(&self, step: TestStep) -> Result<serde_json::Value, String> {
+        let result = self.server.step(step, ASK);
+        if let Err(error) = &result
+            && (error.contains("did not take the step") || error == "the host left")
+        {
+            self.unanswered
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert_with(|| error.clone());
+        }
+        result
+    }
+
     fn query<T: DeserializeOwned>(&self, query: SceneQuery) -> Result<T, String> {
         if self
             .device
@@ -134,7 +149,7 @@ impl HdcNative {
         {
             return Err("test run interrupted".into());
         }
-        let value = self.server.step(TestStep::Scene { query }, ASK)?;
+        let value = self.step(TestStep::Scene { query })?;
         serde_json::from_value(value).map_err(|e| format!("invalid native scene reply: {e}"))
     }
 
@@ -282,15 +297,11 @@ impl Native for HdcNative {
     }
     fn type_text(&self, text: &str) {
         self.track(
-            self.server
-                .step(
-                    TestStep::Type {
-                        selector: String::new(),
-                        text: text.to_owned(),
-                    },
-                    ASK,
-                )
-                .map(drop),
+            self.step(TestStep::Type {
+                selector: String::new(),
+                text: text.to_owned(),
+            })
+            .map(drop),
         );
     }
     fn key(&self, key: Key) {
@@ -300,14 +311,10 @@ impl Native for HdcNative {
             Key::SelectAll => "select-all",
         };
         self.track(
-            self.server
-                .step(
-                    TestStep::PressKey {
-                        keys: name.to_owned(),
-                    },
-                    ASK,
-                )
-                .map(drop),
+            self.step(TestStep::PressKey {
+                keys: name.to_owned(),
+            })
+            .map(drop),
         );
     }
     fn press_keys(&self, keys: &str) -> Result<(), String> {
@@ -319,28 +326,20 @@ impl Native for HdcNative {
         text.and_then(|s| s.parse().ok())
     }
     fn paste(&self, content: &nsh_core::PasteEvent) -> Result<(), String> {
-        self.server
-            .step(
-                TestStep::Paste {
-                    selector: String::new(),
-                    text: content.text.clone(),
-                    html: content.html.clone(),
-                    files: content
-                        .files
-                        .iter()
-                        .map(|f| {
-                            nsh_dev::protocol::TestFile::new(
-                                f.name.clone(),
-                                f.mime.clone(),
-                                f.data.clone(),
-                            )
-                        })
-                        .collect(),
-                    uris: content.uris.clone(),
-                },
-                ASK,
-            )
-            .map(drop)
+        self.step(TestStep::Paste {
+            selector: String::new(),
+            text: content.text.clone(),
+            html: content.html.clone(),
+            files: content
+                .files
+                .iter()
+                .map(|f| {
+                    nsh_dev::protocol::TestFile::new(f.name.clone(), f.mime.clone(), f.data.clone())
+                })
+                .collect(),
+            uris: content.uris.clone(),
+        })
+        .map(drop)
     }
     fn input_text(&self, id: NodeId) -> Option<String> {
         self.track(self.query(SceneQuery::InputText { id }))
@@ -397,12 +396,16 @@ impl Native for HdcNative {
         Err("ERR_NSH_TEST_UNSUPPORTED: a HarmonyOS test fills the device screen".into())
     }
     fn set_dark(&self, dark: bool) -> Result<(), String> {
-        self.server
-            .step(TestStep::SetColorScheme { dark }, ASK)
-            .map(drop)
+        self.step(TestStep::SetColorScheme { dark }).map(drop)
+    }
+    fn take_unanswered(&self) -> Option<String> {
+        self.unanswered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
     fn quit(&self) {
-        self.track(self.server.step(TestStep::Quit, ASK).map(drop));
+        self.track(self.step(TestStep::Quit).map(drop));
     }
 }
 

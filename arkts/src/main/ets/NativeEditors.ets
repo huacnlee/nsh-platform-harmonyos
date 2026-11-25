@@ -26,6 +26,7 @@ export interface EditorSettings {
   editable: boolean;
   autoCorrect: boolean;
   reportPaste: boolean;
+  pasteMaxSize?: number | null;
   editActions?: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
@@ -74,6 +75,7 @@ export interface EditorEventPayload {
   readonly html?: string | null;
   readonly files?: string | null;
   readonly image?: string | null;
+  readonly imageTooLarge?: number | null;
 }
 export interface EditorReceipt {
   accepted: boolean;
@@ -119,6 +121,8 @@ export interface WebEventPayload {
   message?: string;
   code?: number;
   download?: WebDownloadPayload;
+  x?: number;
+  y?: number;
 }
 export interface NshRuntimeContext {
   isActive(): boolean;
@@ -257,6 +261,7 @@ class EditorEvent implements EditorEventPayload {
   readonly html?: string | null;
   readonly files?: string | null;
   readonly image?: string | null;
+  readonly imageTooLarge?: number | null;
   constructor(
     entry: EditorEntry,
     kind: string,
@@ -270,6 +275,7 @@ class EditorEvent implements EditorEventPayload {
     html?: string | null,
     files?: string | null,
     image?: string | null,
+    imageTooLarge?: number | null,
   ) {
     this.kind = kind;
     this.text = text;
@@ -283,6 +289,7 @@ class EditorEvent implements EditorEventPayload {
     this.html = html;
     this.files = files;
     this.image = image;
+    this.imageTooLarge = imageTooLarge;
   }
 }
 
@@ -884,12 +891,25 @@ class EditorEntry {
             this.emit("edit-action", "paste");
             return;
           }
-          extractPasteData(data)
+          extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
             .then((rich: ExtractedPasteData): void => {
               if (this.closed || !this.context.isActive()) {
                 return;
               }
-              this.emit("paste", rich.text, 0, 0, 0, 0, 0, 0, rich.html, rich.files, rich.image);
+              this.emit(
+                "paste",
+                rich.text,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                rich.html,
+                rich.files,
+                rich.image,
+                rich.tooLarge,
+              );
             })
             .catch((): void => {
               this.emit("edit-action", "paste");
@@ -949,7 +969,7 @@ class EditorEntry {
               this.emit("paste", text);
               return;
             }
-            extractPasteData(data)
+            extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
               .then((rich: ExtractedPasteData): void => {
                 if (this.closed || !this.context.isActive()) {
                   return;
@@ -966,6 +986,7 @@ class EditorEntry {
                   rich.html,
                   rich.files,
                   rich.image,
+                  rich.tooLarge,
                 );
               })
               .catch((): void => {
@@ -1400,6 +1421,7 @@ class EditorEntry {
     html?: string | null,
     files?: string | null,
     image?: string | null,
+    imageTooLarge?: number | null,
   ): void {
     if (
       !this.attached ||
@@ -1441,7 +1463,21 @@ class EditorEntry {
     }
     const response = this.context.editorEvent(
       this.settings.targetId,
-      new EditorEvent(this, kind, text, start, end, width, height, x, y, html, files, image),
+      new EditorEvent(
+        this,
+        kind,
+        text,
+        start,
+        end,
+        width,
+        height,
+        x,
+        y,
+        html,
+        files,
+        image,
+        imageTooLarge,
+      ),
     );
     if (response.accepted) {
       this.count = response.count;
@@ -1742,12 +1778,25 @@ class EditorEntry {
               this.emit("edit-action", "paste");
               return;
             }
-            extractPasteData(data)
+            extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
               .then((rich: ExtractedPasteData): void => {
                 if (this.closed || !this.context.isActive()) {
                   return;
                 }
-                this.emit("paste", rich.text, 0, 0, 0, 0, 0, 0, rich.html, rich.files, rich.image);
+                this.emit(
+                  "paste",
+                  rich.text,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  0,
+                  rich.html,
+                  rich.files,
+                  rich.image,
+                  rich.tooLarge,
+                );
                 if (!this.settings.reportPaste && this.canEdit() && rich.text.length > 0) {
                   this.insertText(rich.text);
                 }

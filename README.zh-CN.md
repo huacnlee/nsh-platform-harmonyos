@@ -160,9 +160,9 @@ CLI 写出的是标准的 Stage 模型应用：`EntryAbility` 加载 `pages/Inde
 
 ## 跟进 NSH
 
-这个平台针对 NSH nightly 构建：`Cargo.toml` 的 `[patch.crates-io]` 从 longbridge/nsh 的 `main` 取 NSH 的 crate，`Cargo.lock`
-锁定具体 commit（`cargo update -p nsh-core` 更新到最新；要测试本地仓库，把 patch 指向它）。mount item、文本引擎和事件都是
-NSH 的协议，会随版本增长；新版 NSH 可能加入这个后端还没处理的 mount item，在处理之前会被跳过（`render/mount.rs`）。
+这个平台针对 crates.io 上发布的 NSH `0.7` 系列 crate 构建（如需测试本地 NSH 仓库，可以在 `Cargo.toml` 里临时添加
+`[patch.crates-io]` 指向本地路径）。mount item、文本引擎和事件都是 NSH 的协议，会随版本增长；新版 NSH 可能加入这个后端还没处理的
+mount item，在处理之前会被跳过（`render/mount.rs`）。
 
 ## 开发
 

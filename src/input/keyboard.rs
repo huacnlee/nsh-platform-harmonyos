@@ -210,6 +210,7 @@ impl KeyboardWindow {
                     alt: event.alt,
                     shift: event.shift,
                     cmd: event.cmd,
+                    ..Modifiers::default()
                 }),
                 timestamp: event.timestamp,
                 from_editor: true,
@@ -546,6 +547,23 @@ impl KeyboardWindow {
             }
             false
         });
+        if !shortcut
+            && !captures
+            && action == 1
+            && !route.keyboard.lock().unwrap().composing
+            && let Some(container) = text_capture_container(target)
+            && let Some(text) = crate::input::intercept::typing_text(
+                stroke.as_ref().map(|s| s.key),
+                input.unicode,
+                modifiers,
+                (!input.key_text.is_empty()).then_some(input.key_text),
+            )
+            && let Some(dest_input) = first_enabled_input(&container)
+        {
+            let _ = dest_input.focus(true);
+            let _ = dest_input.insert_text(text);
+            return true;
+        }
         if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
             let snapshot = route.keyboard.lock().unwrap();
             if snapshot.desktop
@@ -571,6 +589,68 @@ fn back(route: &crate::app::runtime::Dispatcher) -> bool {
     } else {
         false
     }
+}
+
+fn text_capture_container(
+    target: &std::rc::Rc<crate::render::node::Node>,
+) -> Option<std::rc::Rc<crate::render::node::Node>> {
+    if target.input.borrow().is_some() {
+        return None;
+    }
+    let mut ancestor = Some(target.clone());
+    while let Some(node) = ancestor {
+        if node.interaction.types_into_input() {
+            return Some(node);
+        }
+        if node
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| !modal.is_main_window_host())
+        {
+            break;
+        }
+        ancestor = node.parent_node.borrow().upgrade();
+    }
+    None
+}
+
+fn first_enabled_input(
+    root: &std::rc::Rc<crate::render::node::Node>,
+) -> Option<std::rc::Rc<crate::input::editor::Input>> {
+    fn visit(
+        node: &std::rc::Rc<crate::render::node::Node>,
+        is_root: bool,
+    ) -> Option<std::rc::Rc<crate::input::editor::Input>> {
+        if !node.visible_in_tree() || node.accessibility_state.spec.borrow().state.disabled {
+            return None;
+        }
+        if !is_root
+            && node
+                .modal
+                .borrow()
+                .as_ref()
+                .is_some_and(|modal| !modal.is_main_window_host())
+        {
+            return None;
+        }
+        if node.kind == nsh_core::ViewKind::Input
+            && let Some(input) = node.input.borrow().as_ref()
+            && input.is_editable()
+        {
+            return Some(input.clone());
+        }
+        let children = node.children.borrow();
+        for weak in children.iter() {
+            if let Some(child) = weak.upgrade()
+                && let Some(found) = visit(&child, false)
+            {
+                return Some(found);
+            }
+        }
+        None
+    }
+    visit(root, true)
 }
 
 /// Root and native dialog boundaries receive bubbling keys only from their own
@@ -657,6 +737,7 @@ impl Held {
             alt: self.has(N::AltLeft, N::AltRight),
             shift: self.has(N::ShiftLeft, N::ShiftRight),
             cmd: self.has(N::MetaLeft, N::MetaRight),
+            ..Modifiers::default()
         }
     }
     fn cancel(&mut self, action: i32) -> bool {

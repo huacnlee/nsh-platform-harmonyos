@@ -236,8 +236,18 @@ fn preload(
         if let Some(id) = manifest.get("id").and_then(serde_json::Value::as_str) {
             bundle.app_id = Some(id.to_owned());
         }
-        if let Some(schemes) = manifest.get("schemes") {
-            bundle.url_schemes = nsh_core::url_scheme::schemes_from_json(schemes);
+        let (links, ignored) = nsh_core::url_scheme::AppLinks::from_json_lenient(&manifest);
+        for what in ignored {
+            log::warn!("app.json: {what}, ignored");
+        }
+        bundle.links = links;
+        if nsh_core::file_type::declares_file_types(&manifest) {
+            let schemes = bundle.links.schemes().to_vec();
+            bundle.links.set_schemes(
+                schemes
+                    .into_iter()
+                    .chain([nsh_core::file_type::FILE_SCHEME.to_owned()]),
+            );
         }
         if let Some(window) = manifest.get("window") {
             bundle.main_window = Some(
@@ -427,7 +437,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(bundle.app_id.as_deref(), Some("com.test.app"));
-            assert_eq!(bundle.url_schemes, vec!["myapp".to_owned()]);
+            assert_eq!(bundle.links.schemes(), &["myapp".to_owned()]);
             assert_eq!(
                 bundle
                     .chunks

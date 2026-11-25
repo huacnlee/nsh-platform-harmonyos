@@ -23,7 +23,7 @@ struct Request<R> {
     id: u32,
     stream: bool,
     answer: bool,
-    paste: Option<(u32, bool)>,
+    paste: Option<(u32, bool, Option<u64>)>,
 }
 
 impl<R> Clone for Request<R> {
@@ -87,13 +87,13 @@ impl System {
         route: Weak<Dispatcher>,
         command: Command,
     ) -> napi_ohos::Result<()> {
-        use nsh_core::{notifications::NotificationCommand as N, speech::SpeechCommand as S};
+        use nsh_core::notifications::NotificationCommand as N;
         match command {
             Command::SetClipboardItem(item) => {
-                return self.clipboard.write_text(item.text, item.html);
+                return self.clipboard.write_text(route, item.text, item.html);
             }
             Command::SetClipboard(text) => {
-                return self.clipboard.write_text(text, None);
+                return self.clipboard.write_text(route, text, None);
             }
             Command::SetClipboardImage(uri) => {
                 return self.clipboard.write_image(uri);
@@ -159,45 +159,6 @@ impl System {
                     }
                 };
                 (EventKind::Notification, id, stream, data)
-            }
-            Command::Speech(command) => {
-                let (id, data) = match command {
-                    S::Start { id, request } => (
-                        id,
-                        SystemCommand {
-                            op: "speech-start".into(),
-                            lang: request.lang,
-                            interim: Some(request.interim),
-                            ..Default::default()
-                        },
-                    ),
-                    S::Stop { id } | S::Abort { id } => {
-                        let key = self.requests.lock().unwrap().iter().find_map(|(&key, r)| {
-                            (r.kind == EventKind::Speech
-                                && r.id == id
-                                && Weak::ptr_eq(&r.route, &route))
-                            .then_some(key)
-                        });
-                        if let Some(key) = key {
-                            let abort = matches!(command, S::Abort { .. });
-                            if abort {
-                                self.requests.lock().unwrap().remove(&key);
-                            }
-                            host.send_host_command(HostCommand {
-                                kind: "system".into(),
-                                open_id: Some(key),
-                                system: Some(SystemCommand {
-                                    op: if abort { "speech-abort" } else { "speech-stop" }.into(),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            })?;
-                        }
-                        return Ok(());
-                    }
-                    _ => return Err(napi_ohos::Error::from_reason("unsupported speech command")),
-                };
-                (EventKind::Speech, id, true, data)
             }
             Command::AuthSession { id, page } => {
                 // One auth session runs at a time per route; cancel any prior pending entry
@@ -310,15 +271,39 @@ impl System {
         )
     }
 
+    pub(crate) fn open_app_settings(
+        &self,
+        host: &Services,
+        route: Weak<Dispatcher>,
+        id: u32,
+    ) -> napi_ohos::Result<()> {
+        self.submit(
+            host,
+            Request {
+                route,
+                kind: EventKind::OpenAppSettings,
+                id,
+                stream: false,
+                answer: true,
+                paste: None,
+            },
+            SystemCommand {
+                op: "open-app-settings".into(),
+                ..Default::default()
+            },
+        )
+    }
+
     pub(crate) fn paste_to_input(
         &self,
         host: &std::sync::Arc<Services>,
         route: Weak<Dispatcher>,
         node_id: u32,
         report_only: bool,
+        paste_max_size: Option<u64>,
     ) -> napi_ohos::Result<()> {
         self.clipboard
-            .paste_to_input(host.clone(), route, node_id, report_only)
+            .paste_to_input(host.clone(), route, node_id, report_only, paste_max_size)
     }
 
     pub(crate) fn file_request(
@@ -419,7 +404,7 @@ impl System {
         route: Weak<Dispatcher>,
         id: u32,
         op: &str,
-        paste: Option<(u32, bool)>,
+        paste: Option<(u32, bool, Option<u64>)>,
     ) -> napi_ohos::Result<()> {
         self.submit(
             host,
@@ -433,6 +418,7 @@ impl System {
             },
             SystemCommand {
                 op: op.into(),
+                max_bytes: paste.and_then(|(_, _, max)| max).map(|m| m as f64),
                 ..Default::default()
             },
         )
@@ -508,18 +494,28 @@ impl System {
         else {
             return;
         };
-        if let Some((node_id, report_only)) = request.paste {
+        if let Some((node_id, report_only, _paste_max_size)) = request.paste {
             let text = value.text.unwrap_or_default();
             let html = value.html.filter(|s| !s.is_empty());
             let files = value.files.filter(|s| !s.is_empty());
             let image = value.uri.filter(|s| !s.is_empty());
-            if !text.is_empty() || html.is_some() || files.is_some() || image.is_some() {
+            let image_too_large = value
+                .too_large
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .map(|v| v.round() as u64);
+            if !text.is_empty()
+                || html.is_some()
+                || files.is_some()
+                || image.is_some()
+                || image_too_large.is_some()
+            {
                 route.send(Message::InputPaste {
                     id: node_id,
                     text,
                     html,
                     files,
                     image,
+                    image_too_large,
                     report_only,
                 });
             }
@@ -543,23 +539,14 @@ impl System {
                     parse_file_request_paths(value.files.as_deref()),
                 ),
             }
-        } else if request.kind == EventKind::Speech {
-            use nsh_core::speech::{SpeechError, SpeechEvent as E};
-            let event = match value.phase.as_deref() {
-                Some("start") => E::Start,
-                Some("result") => E::Result {
-                    text: value.text.clone().unwrap_or_default(),
-                    is_final: value.is_final.unwrap_or(false),
-                },
-                Some("end") => E::End {
-                    error: value.error.as_deref().and_then(SpeechError::from_name),
-                },
-                _ => return,
-            };
-            EventPayload::Speech {
-                id: request.id,
-                event,
-            }
+        } else if request.kind == EventKind::OpenAppSettings {
+            EventPayload::Map(vec![
+                ("id", PayloadValue::Number(f64::from(request.id))),
+                (
+                    "opened",
+                    PayloadValue::Bool(value.error.is_none() && value.opened.unwrap_or(false)),
+                ),
+            ])
         } else {
             if let Some(error) = value.error.as_deref() {
                 route.send(Message::Error(format!("system service: {error}")));
@@ -607,6 +594,7 @@ pub(crate) struct SystemCommand {
     pub body: Option<String>,
     pub silent: Option<bool>,
     pub count: Option<u32>,
+    pub max_bytes: Option<f64>,
     pub ask: Option<bool>,
     pub lang: Option<String>,
     pub interim: Option<bool>,
@@ -627,12 +615,13 @@ impl SystemCommand {
     }
 }
 
-/// Typed completion shared by clipboard, notification and speech services.
+/// Typed completion shared by clipboard, notification and system services.
 #[cfg_attr(target_env = "ohos", napi_derive_ohos::napi(object))]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct SystemEvent {
     pub permission: Option<String>,
     pub shown: Option<bool>,
+    pub opened: Option<bool>,
     pub pressed: Option<String>,
     pub has: Option<bool>,
     pub text: Option<String>,
@@ -676,7 +665,11 @@ impl SystemEvent {
                 fields.push((name, PayloadValue::Str(value)));
             }
         }
-        for (name, value) in [("shown", self.shown), ("has", self.has)] {
+        for (name, value) in [
+            ("shown", self.shown),
+            ("has", self.has),
+            ("opened", self.opened),
+        ] {
             if let Some(value) = value {
                 fields.push((name, PayloadValue::Bool(value)));
             }
@@ -981,7 +974,7 @@ mod tests {
         let owner = std::sync::Arc::new(());
         let mut requests = BTreeMap::new();
         for (key, kind, stream) in [
-            (1, EventKind::Speech, true),
+            (1, EventKind::AuthSession, true),
             (2, EventKind::Notification, false),
             (3, EventKind::Notification, true),
             (4, EventKind::Notification, true),

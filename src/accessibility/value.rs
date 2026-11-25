@@ -21,7 +21,11 @@ pub(crate) fn role_str(role: AccessibilityRole) -> &'static str {
         AccessibilityRole::Grid => "grid",
         AccessibilityRole::Progressbar => "progress",
         AccessibilityRole::Search => "search",
-        AccessibilityRole::Menuitem => "menuitem",
+        AccessibilityRole::Textbox => "textbox",
+        AccessibilityRole::TabPanel => "tabpanel",
+        AccessibilityRole::Menuitem
+        | AccessibilityRole::MenuItemCheckbox
+        | AccessibilityRole::MenuItemRadio => "menuitem",
         _ => "text",
     }
 }
@@ -223,7 +227,11 @@ mod tests {
         assert_eq!(role_str(AccessibilityRole::Grid), "grid");
         assert_eq!(role_str(AccessibilityRole::Progressbar), "progress");
         assert_eq!(role_str(AccessibilityRole::Search), "search");
+        assert_eq!(role_str(AccessibilityRole::Textbox), "textbox");
+        assert_eq!(role_str(AccessibilityRole::TabPanel), "tabpanel");
         assert_eq!(role_str(AccessibilityRole::Menuitem), "menuitem");
+        assert_eq!(role_str(AccessibilityRole::MenuItemCheckbox), "menuitem");
+        assert_eq!(role_str(AccessibilityRole::MenuItemRadio), "menuitem");
         assert_eq!(role_str(AccessibilityRole::Listbox), "list");
         assert_eq!(role_str(AccessibilityRole::Option), "button");
     }

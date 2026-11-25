@@ -183,10 +183,9 @@ existing HarmonyOS project; [docs/architecture.md](docs/architecture.md) describ
 
 ## Following NSH
 
-The platform is built against NSH nightly: `Cargo.toml`'s `[patch.crates-io]` takes NSH's crates from
-longbridge/nsh `main`, and `Cargo.lock` pins the commit (`cargo update -p nsh-core` moves to the latest; point the
-patch at a local checkout to test one). Mount items, the text engine and events are NSH's protocol and grow with
-each release; a new NSH may add mount items this backend skips until it handles them (`render/mount.rs`).
+The platform builds against NSH's released `0.7` crates on crates.io (to test a local NSH checkout, add a
+`[patch.crates-io]` section pointing at it). Mount items, the text engine and events are NSH's protocol and grow
+with each release; a new NSH may add mount items this backend skips until it handles them (`render/mount.rs`).
 
 ## Development
 

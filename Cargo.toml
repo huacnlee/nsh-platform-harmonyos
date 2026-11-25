@@ -155,12 +155,12 @@ missing_docs = "warn"
 unreachable_pub = "deny"
 
 [workspace.dependencies]
-nsh-core = "0.6"
-nsh-engine = { version = "0.6", default-features = false }
-nsh-base = { version = "0.6", default-features = false }
-nsh-package = "0.6"
-nsh-dev = "0.6"
-nsh-testing = { version = "0.6", default-features = false }
+nsh-core = "0.7"
+nsh-engine = { version = "0.7", default-features = false }
+nsh-base = { version = "0.7", default-features = false }
+nsh-package = "0.7"
+nsh-dev = "0.7"
+nsh-testing = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
@@ -207,20 +207,6 @@ ohos-native-window-binding = { version = "0.3.3", default-features = false, feat
 ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
 ohos-vibrator-binding = { version = "0.2.4", default-features = false, features = ["api-20"] }
-
-# NSH nightly: its crates from longbridge/nsh `main`, which `nsh update nightly`
-# installs the CLI of. Cargo.lock pins the commit; `cargo update -p nsh-core`
-# moves to the latest night. The runner of a TSX app takes this section too.
-[patch.crates-io]
-nsh-macros = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-core = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-base = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-package = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-js = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-engine = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-testing = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-bundler = { git = "https://github.com/longbridge/nsh", branch = "main" }
-nsh-dev = { git = "https://github.com/longbridge/nsh", branch = "main" }
 
 [profile.release]
 opt-level = 3

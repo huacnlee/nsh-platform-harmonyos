@@ -51,7 +51,6 @@ interface AvoidAreaPayload {
 }
 
 interface HostInitPayload {
-  speechAvailable: boolean;
   shareAvailable: boolean;
   sdkApiVersion: number;
   deviceType: string;
@@ -626,7 +625,6 @@ class HostSession {
       {
         shareAvailable:
           deviceInfo.sdkApiVersion >= 18 && canIUse("SystemCapability.Collaboration.SystemShare"),
-        speechAvailable: canIUse("SystemCapability.AI.SpeechRecognizer"),
         sdkApiVersion: deviceInfo.sdkApiVersion,
         deviceType: deviceInfo.deviceType ?? "phone",
         cacheDir: abilityContext.cacheDir,

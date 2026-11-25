@@ -10,5 +10,5 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-nsh-core = "0.6"
-nsh-base = "0.6"
+nsh-core = "0.7"
+nsh-base = "0.7"

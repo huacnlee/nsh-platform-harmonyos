@@ -21,6 +21,7 @@ export interface ExtractedPasteData {
   html?: string;
   files?: string;
   image?: string;
+  tooLarge?: number;
 }
 
 async function readRecordMimeText(
@@ -39,7 +40,10 @@ async function readRecordMimeText(
   }
 }
 
-export async function extractPasteData(data: pasteboard.PasteData): Promise<ExtractedPasteData> {
+export async function extractPasteData(
+  data: pasteboard.PasteData,
+  maxBytes?: number,
+): Promise<ExtractedPasteData> {
   let text = "";
   try {
     text = data.getPrimaryText() ?? "";
@@ -83,14 +87,23 @@ export async function extractPasteData(data: pasteboard.PasteData): Promise<Extr
   } catch {}
   const files = uris.length > 0 ? uris.join("\n") : undefined;
   let imgUri: string | undefined;
+  let tooLarge: number | undefined;
+  const limit =
+    maxBytes !== undefined && maxBytes >= 0
+      ? Math.min(maxBytes, 48 * 1024 * 1024)
+      : 48 * 1024 * 1024;
   try {
     const pixels = data.getPrimaryPixelMap();
     if (pixels) {
       const packer = image.createImagePacker();
       try {
         const bytes = await packer.packing(pixels, { format: "image/png", quality: 100 });
-        if (bytes.byteLength > 0 && bytes.byteLength <= 48 * 1024 * 1024) {
-          imgUri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
+        if (bytes.byteLength > 0) {
+          if (bytes.byteLength <= limit) {
+            imgUri = `data:image/png;base64,${new util.Base64Helper().encodeToStringSync(new Uint8Array(bytes))}`;
+          } else {
+            tooLarge = bytes.byteLength;
+          }
         }
       } finally {
         packer.release();
@@ -98,7 +111,7 @@ export async function extractPasteData(data: pasteboard.PasteData): Promise<Extr
       }
     }
   } catch {}
-  return { text, html, files, image: imgUri };
+  return { text, html, files, image: imgUri, tooLarge };
 }
 class PasteRequest {
   constructor(read: () => void) {
@@ -199,7 +212,12 @@ export class NativeClipboard {
       });
     }
   }
-  async execute(key: number, op: string, live: () => boolean): Promise<ClipboardReply> {
+  async execute(
+    key: number,
+    op: string,
+    live: () => boolean,
+    maxBytes?: number,
+  ): Promise<ClipboardReply> {
     if (this.closed) {
       throw new Error("clipboard owner is closed");
     }
@@ -225,17 +243,19 @@ export class NativeClipboard {
         this.reading = key;
         const data = await this.read();
         if (op === "clipboard-paste") {
-          const rich = await extractPasteData(data);
+          const rich = await extractPasteData(data, maxBytes);
           reply = {
             has:
               rich.text.length > 0 ||
               rich.html !== undefined ||
               rich.files !== undefined ||
-              rich.image !== undefined,
+              rich.image !== undefined ||
+              rich.tooLarge !== undefined,
             text: rich.text,
             html: rich.html,
             files: rich.files,
             uri: rich.image,
+            tooLarge: rich.tooLarge,
           };
         } else if (op === "clipboard-read") {
           reply = { has: data.hasType(type), text: data.getPrimaryText() ?? "" };

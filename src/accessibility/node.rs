@@ -18,11 +18,16 @@ pub(crate) fn configure(owner: &Rc<Node>, old: &Accessibility, new: &Accessibili
     if old.role != new.role {
         let role = match new.role {
             R::None => None,
-            R::Button | R::ImageButton | R::KeyboardKey | R::Link | R::Menuitem | R::Option => {
-                Some(K::Button)
-            }
+            R::Button
+            | R::ImageButton
+            | R::KeyboardKey
+            | R::Link
+            | R::Menuitem
+            | R::MenuItemCheckbox
+            | R::MenuItemRadio
+            | R::Option => Some(K::Button),
             R::Image => Some(K::Image),
-            R::Search => Some(K::TextInput),
+            R::Search | R::Textbox => Some(K::TextInput),
             R::Adjustable | R::Scrollbar => Some(K::Slider),
             R::Checkbox | R::Switch => Some(K::Checkbox),
             R::Radio => Some(K::Radio),
@@ -53,32 +58,10 @@ pub(crate) fn configure(owner: &Rc<Node>, old: &Accessibility, new: &Accessibili
         state.dispose();
         result?;
     }
-    if old.value != new.value || old.state != new.state {
-        let range = crate::accessibility::value::range_value(new);
-        let spoken = crate::accessibility::value::spoken_value_for_locale(
-            new,
-            owner.platform.get().locale.as_str(),
-        );
-        if range.is_some() || spoken.is_some() {
-            let mut value = AccessibilityValue::new()?;
-            if let Some((min, max, current)) = range {
-                value.set_min(min);
-                value.set_max(max);
-                value.set_current(current);
-            }
-            let result = (|| {
-                if let Some(text) = spoken {
-                    value.set_text(&text.replace('\0', "\u{fffd}"))?;
-                }
-                native.set_accessibility_value(&value)
-            })();
-            value.dispose();
-            result?;
-        } else {
-            native.reset_attribute(A::AccessibilityValue)?;
-        }
-    }
     drop(native);
+    if old.value != new.value || old.state != new.state {
+        apply_value(owner, new)?;
+    }
     if old.actions != new.actions {
         let actions = new.actions.iter().fold(0, |mask, a| {
             mask | match a.name.as_ref() {
@@ -116,4 +99,30 @@ pub(crate) fn configure(owner: &Rc<Node>, old: &Accessibility, new: &Accessibili
             });
     }
     owner.ensure_wrapper()
+}
+
+pub(crate) fn apply_value(owner: &Node, new: &Accessibility) -> Result<()> {
+    let range = crate::accessibility::value::range_value(new);
+    let spoken =
+        crate::accessibility::value::spoken_value_for_locale(new, owner.spoken_locale().as_str());
+    let native = owner.native.borrow();
+    if range.is_some() || spoken.is_some() {
+        let mut value = AccessibilityValue::new()?;
+        if let Some((min, max, current)) = range {
+            value.set_min(min);
+            value.set_max(max);
+            value.set_current(current);
+        }
+        let result = (|| {
+            if let Some(text) = spoken {
+                value.set_text(&text.replace('\0', "\u{fffd}"))?;
+            }
+            native.set_accessibility_value(&value)
+        })();
+        value.dispose();
+        result?;
+    } else {
+        native.reset_attribute(A::AccessibilityValue)?;
+    }
+    Ok(())
 }

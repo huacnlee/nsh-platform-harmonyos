@@ -5,4 +5,5 @@ pub(crate) mod desktop;
 pub(crate) mod dialogs;
 pub(crate) mod executor;
 pub(crate) mod net;
+pub(crate) mod network_monitor;
 pub(crate) mod system;

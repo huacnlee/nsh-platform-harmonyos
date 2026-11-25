@@ -119,6 +119,7 @@ pub(crate) enum Message {
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
+        image_too_large: Option<u64>,
         report_only: bool,
     },
     DialogResult {
@@ -126,6 +127,7 @@ pub(crate) enum Message {
         index: i32,
     },
     HostEnvironment(NshEnvironment),
+    HostNetwork(nsh_core::platform::Network),
     HostFontsChanged,
     HostWindow(
         [crate::app::session::AvoidArea; 3],
@@ -544,6 +546,7 @@ impl State {
                 html,
                 files,
                 image,
+                image_too_large,
                 report_only,
             } => self.mounter.as_ref().unwrap().input_paste(
                 id,
@@ -551,6 +554,7 @@ impl State {
                 html,
                 files,
                 image,
+                image_too_large,
                 report_only,
             )?,
             Message::ReconcileNavigation => {
@@ -563,6 +567,18 @@ impl State {
                 self.mounter.as_mut().unwrap().dialog_result(id, index)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
+            Message::HostNetwork(network) => {
+                if self.environment.network != network {
+                    self.environment.network = network;
+                    let effective = self.effective_environment(self.environment);
+                    if let Some(engine) = &self.engine {
+                        engine.control().set_environment(effective);
+                    }
+                    if let Some(mounter) = &mut self.mounter {
+                        mounter.environment(effective)?;
+                    }
+                }
+            }
             Message::HostFontsChanged => {
                 self.engine.as_ref().unwrap().control().fonts_changed();
                 self.mounter.as_ref().unwrap().invalidate_canvases()?;
@@ -834,6 +850,7 @@ impl State {
         if idiom_changed {
             let os = crate::services::desktop::os_for_idiom(environment.idiom);
             environment.os = os;
+            environment.app_settings = !os.is_desktop();
             if let Some(dispatcher) = self.dispatcher.upgrade() {
                 dispatcher.keyboard.lock().unwrap().desktop = os.is_desktop();
             }
@@ -1103,13 +1120,13 @@ impl BootedEngine {
             os: Os::Android,
             platform: Some(crate::PLATFORM),
             clipboard_images: Some(true),
+            clipboard_write_result: true,
             canvas_render: true,
             webview_requests: true,
             auth_session: true,
             web_input: true,
             web_evaluate: true,
             notifications: true,
-            speech: config.host.speech_available,
             share: config.host.share_available,
             file_requests: true,
             audio: true,
@@ -1143,6 +1160,8 @@ impl BootedEngine {
         let mut environment = config.environment.clone().apply(environment)?;
         let os = crate::services::desktop::os_for_idiom(environment.idiom);
         environment.os = os;
+        environment.app_settings = !os.is_desktop();
+        environment.network = crate::services::network_monitor::current_network();
         let initial_displays = if os.is_desktop() {
             let (window_state, title_bar, displays) = config.host.desktop_snapshot();
             environment.window_state = window_state;
@@ -1203,7 +1222,6 @@ impl BootedEngine {
             clipboard: None,
             host: config.channel.clone(),
             picker: None,
-            speech: None,
             audio: None,
             windows: None,
             login_item: None,
@@ -1675,6 +1693,7 @@ impl Runtime {
             canvas_bytes: Rc::new(Cell::new(0)),
             fonts: booted.fonts.clone(),
             platform: Cell::new(environment),
+            text_locale: Cell::new(None),
             main_window: RefCell::new(initial_main_window),
             appearance: Cell::new(nsh_core::platform::Appearance::System),
         });
@@ -1692,6 +1711,13 @@ impl Runtime {
         // Keep rollback ownership before registering with the shared session.
         // A rejected route must still close the engine and detach its root.
         config.host.attach(Arc::downgrade(&runtime._dispatcher))?;
+        crate::services::network_monitor::subscribe(Arc::downgrade(&runtime._dispatcher));
+        let latest_network = crate::services::network_monitor::current_network();
+        if runtime.state.borrow().environment.network != latest_network {
+            runtime
+                ._dispatcher
+                .send(Message::HostNetwork(latest_network));
+        }
         if drain_buffered && let Some(buffered) = booted.gate.attach(runtime._dispatcher.clone()) {
             let chunks = booted.chunks.clone();
             let dispatcher_weak = Arc::downgrade(&runtime._dispatcher);

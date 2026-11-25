@@ -32,6 +32,7 @@ pub(crate) struct EditorSettings {
     pub editable: bool,
     pub auto_correct: bool,
     pub report_paste: bool,
+    pub paste_max_size: Option<f64>,
     pub edit_actions: Option<bool>,
     pub scrollbar_visible: bool,
     pub hit_test: u32,
@@ -90,6 +91,7 @@ pub(crate) struct EditorEvent {
     pub html: Option<String>,
     pub files: Option<String>,
     pub image: Option<String>,
+    pub image_too_large: Option<f64>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -188,6 +190,7 @@ pub(crate) struct WebSettings {
     pub load_generation: u32,
     pub java_script_enabled: bool,
     pub scroll_enabled: bool,
+    pub zoomable: bool,
     pub user_agent: Option<String>,
     pub injected_javascript: Option<String>,
     pub document_start_script: String,
@@ -228,6 +231,8 @@ pub(crate) struct WebEvent {
     pub message: Option<String>,
     pub code: Option<i32>,
     pub download: Option<WebDownload>,
+    pub x: Option<f64>,
+    pub y: Option<f64>,
 }
 
 #[napi(object)]

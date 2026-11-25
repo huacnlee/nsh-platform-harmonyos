@@ -107,6 +107,8 @@ const roles: Map<string, AccessibilityRoleType> = new Map([
   ["grid", AccessibilityRoleType.GRID],
   ["progress", AccessibilityRoleType.PROGRESS],
   ["search", AccessibilityRoleType.SEARCH],
+  ["textbox", AccessibilityRoleType.TEXT_INPUT],
+  ["tabpanel", AccessibilityRoleType.TAB_CONTENT],
   ["menuitem", AccessibilityRoleType.MENU_ITEM],
   ["text", AccessibilityRoleType.TEXT],
 ]);

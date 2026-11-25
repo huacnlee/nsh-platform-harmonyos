@@ -63,6 +63,7 @@ export interface EditorEvent {
   html?: string
   files?: string
   image?: string
+  imageTooLarge?: number
 }
 
 export interface EditorKeyEvent {
@@ -103,6 +104,7 @@ export interface EditorSettings {
   editable: boolean
   autoCorrect: boolean
   reportPaste: boolean
+  pasteMaxSize?: number
   editActions?: boolean
   scrollbarVisible: boolean
   hitTest: number
@@ -136,7 +138,6 @@ export interface HostCommand {
 }
 
 export interface HostInit {
-  speechAvailable: boolean
   shareAvailable?: boolean
   sdkApiVersion: number
   deviceType: string
@@ -347,16 +348,18 @@ export interface SystemCommand {
   body?: string
   silent?: boolean
   count?: number
+  maxBytes?: number
   ask?: boolean
   lang?: string
   interim?: boolean
   ephemeral?: boolean
 }
 
-/** Typed completion shared by clipboard, notification and speech services. */
+/** Typed completion shared by clipboard, notification and system services. */
 export interface SystemEvent {
   permission?: string
   shown?: boolean
+  opened?: boolean
   pressed?: string
   has?: boolean
   text?: string
@@ -443,6 +446,8 @@ export interface WebEvent {
   message?: string
   code?: number
   download?: WebDownload
+  x?: number
+  y?: number
 }
 
 export interface WebHeader {
@@ -460,6 +465,7 @@ export interface WebSettings {
   loadGeneration: number
   javaScriptEnabled: boolean
   scrollEnabled: boolean
+  zoomable: boolean
   userAgent?: string
   injectedJavascript?: string
   documentStartScript: string
@@ -608,7 +614,7 @@ export declare class NshSurface {
   * handler. A later load, stop, dispose or Ability teardown cancels this load.
   */
   loadResource(name: string, sourceMap?: string | undefined | null): Promise<void>
-  /** Starts the Rust app linked into this binary (`nsh_platform_harmonyos::app!`). */
+  /** Starts the Rust app linked into this binary (`nsh_platform_harmonyos_core::app!`). */
   runApp(): void
   /** Whether this binary was built with a linked Rust app (`runApp()`). */
   get hasApp(): boolean

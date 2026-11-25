@@ -188,7 +188,7 @@ impl State {
         let mut text = self.label(owner);
         if let Some(value) = crate::accessibility::value::spoken_value_for_locale(
             &spec,
-            owner.platform.get().locale.as_str(),
+            owner.spoken_locale().as_str(),
         ) {
             if !text.is_empty() {
                 text.push_str(", ");
@@ -200,6 +200,17 @@ impl State {
             owner
                 .host
                 .accessibility_live(owner.dispatcher.clone(), text)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn on_locale_change(&self, owner: &Rc<Node>) -> Result<()> {
+        let spec = self.spec.borrow();
+        crate::accessibility::node::apply_value(owner, &spec)?;
+        drop(spec);
+        owner.update_wrapper()?;
+        #[cfg(feature = "api-23")]
+        if owner.accessibility_provider.hides_native_children() {
+            owner.accessibility_provider.configure(owner)?;
         }
         Ok(())
     }

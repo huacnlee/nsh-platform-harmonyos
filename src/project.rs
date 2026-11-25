@@ -34,6 +34,8 @@ pub(crate) struct AppConfig {
     pub(crate) icon: Option<PathBuf>,
     /// `"schemes"`: URL schemes that open the app (`myapp://...`).
     pub(crate) schemes: Vec<String>,
+    /// `"links"`: verified HTTPS domains and paths that open the app (`https://...`).
+    pub(crate) links: Vec<nsh_core::url_scheme::WebLink>,
     /// Explicit `capabilities.speech` opt-in to `ohos.permission.MICROPHONE`.
     pub(crate) speech: bool,
     /// Standalone apps declaring WebView can initialize ArkWeb before accepting input.
@@ -41,34 +43,6 @@ pub(crate) struct AppConfig {
     /// HarmonyOS packaging declarations from `nsh.json` `"harmonyos"` merged
     /// with crates' `[package.metadata.nsh.harmonyos]`.
     pub(crate) harmonyos: HarmonyMeta,
-}
-
-const RESERVED_SCHEMES: &[&str] = &[
-    "http",
-    "https",
-    "ws",
-    "wss",
-    "file",
-    "ftp",
-    "mailto",
-    "tel",
-    "sms",
-    "javascript",
-    "vbscript",
-    "data",
-    "blob",
-    "about",
-    "asset",
-    "content",
-    "intent",
-    "nsh",
-];
-
-fn valid_scheme(scheme: &str) -> bool {
-    let mut chars = scheme.chars();
-    let valid = chars.next().is_some_and(|c| c.is_ascii_alphabetic())
-        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    valid && !RESERVED_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str())
 }
 
 impl AppConfig {
@@ -91,17 +65,9 @@ impl AppConfig {
             Value::String(s) => s.parse().ok(),
             _ => None,
         };
-        let mut schemes = Vec::new();
-        if let Some(list) = json["schemes"].as_array() {
-            for item in list.iter().filter_map(Value::as_str) {
-                if valid_scheme(item) {
-                    let lower = item.to_ascii_lowercase();
-                    if !schemes.contains(&lower) {
-                        schemes.push(lower);
-                    }
-                }
-            }
-        }
+        let app_links = nsh_core::url_scheme::AppLinks::from_json(json);
+        let schemes = app_links.schemes().to_vec();
+        let links = app_links.web().to_vec();
         let speech = json
             .get("capabilities")
             .and_then(|capabilities| capabilities.get("speech"))
@@ -125,6 +91,7 @@ impl AppConfig {
                         .is_some_and(|e| e.eq_ignore_ascii_case("png"))
                 }),
             schemes,
+            links,
             speech,
             webview: json["capabilities"]["webview"].is_object(),
             harmonyos,
@@ -280,6 +247,11 @@ fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (Stri
             used_scene: None,
         },
         Permission {
+            name: "ohos.permission.GET_NETWORK_INFO".to_owned(),
+            reason: None,
+            used_scene: None,
+        },
+        Permission {
             name: "ohos.permission.VIBRATE".to_owned(),
             reason: None,
             used_scene: None,
@@ -357,7 +329,7 @@ fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (Stri
     )
 }
 
-fn ability_skills_value(schemes: &[String]) -> Value {
+fn ability_skills_value(schemes: &[String], links: &[nsh_core::url_scheme::WebLink]) -> Value {
     let mut skills = vec![json!({
         "entities": ["entity.system.home"],
         "actions": ["action.system.home"],
@@ -370,10 +342,47 @@ fn ability_skills_value(schemes: &[String]) -> Value {
             "uris": uris,
         }));
     }
+    if !links.is_empty() {
+        let mut uris = Vec::new();
+        for link in links {
+            if link.paths().is_empty() {
+                uris.push(json!({
+                    "scheme": "https",
+                    "host": link.host(),
+                }));
+            } else {
+                for path in link.paths() {
+                    if let Some(prefix) = path.strip_suffix('*') {
+                        uris.push(json!({
+                            "scheme": "https",
+                            "host": link.host(),
+                            "pathStartWith": prefix,
+                        }));
+                    } else {
+                        uris.push(json!({
+                            "scheme": "https",
+                            "host": link.host(),
+                            "path": path,
+                        }));
+                    }
+                }
+            }
+        }
+        skills.push(json!({
+            "entities": ["entity.system.browsable"],
+            "actions": ["ohos.want.action.viewData"],
+            "domainVerify": true,
+            "uris": uris,
+        }));
+    }
     Value::Array(skills)
 }
 
-fn build_abilities(schemes: &[String], extra: &[Map<String, Value>]) -> String {
+fn build_abilities(
+    schemes: &[String],
+    links: &[nsh_core::url_scheme::WebLink],
+    extra: &[Map<String, Value>],
+) -> String {
     let mut abilities = vec![json!({
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
@@ -382,7 +391,7 @@ fn build_abilities(schemes: &[String], extra: &[Map<String, Value>]) -> String {
         "startWindowIcon": "$media:app_icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
-        "skills": ability_skills_value(schemes),
+        "skills": ability_skills_value(schemes, links),
     })];
     for ability in extra {
         let mut obj = ability.clone();
@@ -662,7 +671,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
 
     let (request_permissions, entry_strings) =
         build_permissions_and_strings(config.speech, &config.harmonyos);
-    let abilities = build_abilities(&config.schemes, &config.harmonyos.abilities);
+    let abilities = build_abilities(&config.schemes, &config.links, &config.harmonyos.abilities);
     let module_extras = build_module_extras(&config.harmonyos);
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
@@ -818,6 +827,10 @@ mod tests {
             "build": 7,
             "icon": "assets/icon.png",
             "schemes": ["MyApp", "https", "my-app.2+x", "myapp"],
+            "links": [
+                { "host": "example.com" },
+                { "host": "shop.example.com", "paths": ["/orders/*", "/checkout"] }
+            ],
             "capabilities": { "speech": false }
         });
         let config = AppConfig::from_json(&app_root, &json).unwrap();
@@ -827,6 +840,9 @@ mod tests {
         assert_eq!(config.build, 7);
         assert_eq!(config.icon, Some(app_root.join("assets").join("icon.png")));
         assert_eq!(config.schemes, vec!["myapp", "my-app.2+x"]);
+        assert_eq!(config.links.len(), 2);
+        assert_eq!(config.links[0].host(), "example.com");
+        assert_eq!(config.links[1].paths(), ["/orders/*", "/checkout"]);
         assert!(!config.speech);
         let bare = AppConfig::from_json(&app_root, &serde_json::json!({})).unwrap();
         assert_eq!(
@@ -950,7 +966,11 @@ mod tests {
             &serde_json::json!({
                 "name": "Counter \"1\"",
                 "id": "com.example.counter",
-                "schemes": ["counterapp"]
+                "schemes": ["counterapp"],
+                "links": [
+                    { "host": "example.com" },
+                    { "host": "*.sub.example.com", "paths": ["/items/*", "/exact"] }
+                ]
             }),
         )
         .unwrap();
@@ -1008,8 +1028,23 @@ mod tests {
         assert!(module.contains("\"default\","), "{module}");
         assert!(!module.contains("ohos.permission.MICROPHONE"), "{module}");
         assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
+        assert!(
+            module.contains("ohos.permission.GET_NETWORK_INFO"),
+            "{module}"
+        );
         assert!(module.contains("ohos.want.action.viewData"), "{module}");
         assert!(module.contains("\"scheme\": \"counterapp\""), "{module}");
+        assert!(module.contains("\"domainVerify\": true"), "{module}");
+        assert!(module.contains("\"host\": \"example.com\""), "{module}");
+        assert!(
+            module.contains("\"host\": \"*.sub.example.com\""),
+            "{module}"
+        );
+        assert!(
+            module.contains("\"pathStartWith\": \"/items/\""),
+            "{module}"
+        );
+        assert!(module.contains("\"path\": \"/exact\""), "{module}");
         assert!(!module.contains("{{"), "{module}");
         assert!(profile.contains("\"signingConfigs\": []"));
         assert!(!profile.contains("{{"), "{profile}");

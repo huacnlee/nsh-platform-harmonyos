@@ -340,8 +340,20 @@ impl Touches {
                     if node.interaction.mask().contains(EventKind::Touch) {
                         path.push(node.id);
                     }
-                    if node.interaction.pan_activation().is_some() {
-                        pans.push((Rc::downgrade(&node), false));
+                    if let Some(activation) = node.interaction.gate_pan_activation() {
+                        let rf = root.frame.get();
+                        if activation.starts_at(
+                            nsh_core::Point::new(
+                                nsh_core::Points(page.0),
+                                nsh_core::Points(page.1),
+                            ),
+                            nsh_core::Size::new(
+                                nsh_core::Points(rf.width),
+                                nsh_core::Points(rf.height),
+                            ),
+                        ) {
+                            pans.push((Rc::downgrade(&node), false));
+                        }
                     }
                     parent = node.parent_node.borrow().upgrade();
                 }
@@ -434,7 +446,7 @@ impl Touches {
                         *failed = true;
                         continue;
                     };
-                    match node.interaction.pan_activation().and_then(|p| {
+                    match node.interaction.gate_pan_activation().and_then(|p| {
                         p.decide(
                             nsh_core::Points(finger.point.page.x.0 - finger.start.0),
                             nsh_core::Points(finger.point.page.y.0 - finger.start.1),
@@ -1144,17 +1156,22 @@ pub(crate) fn hit(
         return Ok(None);
     };
     let frame = root.frame.get();
+    let style = root.style.borrow();
+    let size = nsh_core::geometry::size(
+        nsh_core::Points(frame.width),
+        nsh_core::Points(frame.height),
+    );
+    let pt = nsh_core::geometry::point(nsh_core::Points(x), nsh_core::Points(y));
     let area = nsh_core::input::hit_area(
-        nsh_core::geometry::point(nsh_core::Points(x), nsh_core::Points(y)),
-        nsh_core::geometry::size(
-            nsh_core::Points(frame.width),
-            nsh_core::Points(frame.height),
-        ),
+        pt,
+        size,
         root.interaction.hit_slop(),
         root.overflow.get().map(Into::into),
         root.clips_children(),
         nsh_core::input::laid_out(root.kind, root.id),
-    );
+    )
+    .clipped(style.clip_path(), pt, size);
+    drop(style);
     if pointer != PointerEvents::BoxOnly && area.children {
         let plane = root.input_children_transform()?;
         // Sticky cells are raised above their siblings in the native tree.

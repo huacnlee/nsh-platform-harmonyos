@@ -140,6 +140,14 @@ impl Input {
         input.listen();
         Ok(input)
     }
+    pub(crate) fn is_editable(&self) -> bool {
+        !self.closed.get() && self.config.borrow().editable
+    }
+
+    pub(crate) fn paste_max_size(&self) -> Option<u64> {
+        self.config.borrow().paste_max_size
+    }
+
     fn target_id(&self) -> Option<u32> {
         self.target.borrow().as_ref().map(NativeAttachment::id)
     }
@@ -231,15 +239,22 @@ impl Input {
                     event.html,
                     event.files,
                     event.image,
+                    event
+                        .image_too_large
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| v.round() as u64),
+                    self.config.borrow().paste_max_size,
                 ))),
             ),
             "edit-action" => {
                 if event.text == "paste" {
+                    let config = self.config.borrow();
                     owner.host.system.paste_to_input(
                         &owner.host,
                         owner.dispatcher.clone(),
                         owner.id,
-                        self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report,
+                        config.paste_behavior == nsh_core::PasteBehavior::Report,
+                        config.paste_max_size,
                     )?;
                 } else {
                     owner.emit(
@@ -283,7 +298,7 @@ impl Input {
                 }
             }
             "scroll" => {
-                if self.config.borrow().replaced {
+                if self.config.borrow().report_scroll {
                     let content = self.content.get();
                     owner.control.input_scroll(
                         owner.id,
@@ -574,8 +589,9 @@ impl Input {
             editable: config.editable,
             auto_correct: config.auto_correct,
             report_paste: config.paste_behavior == nsh_core::PasteBehavior::Report,
+            paste_max_size: config.paste_max_size.map(|m| m as f64),
             edit_actions: Some(owner.interaction.mask().contains(EventKind::EditAction)),
-            scrollbar_visible: config.scrollbar_visible && !config.replaced,
+            scrollbar_visible: config.scrollbar_visible,
             hit_test: self.hit_test.get(),
             align: match config.align {
                 TextAlign::Center => 1,
@@ -715,10 +731,18 @@ impl Input {
         html: Option<String>,
         files: Option<String>,
         image: Option<String>,
+        image_too_large: Option<u64>,
         report_only: bool,
     ) -> Result<()> {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
-            let paste = build_paste_event(text.clone(), html, files, image);
+            let paste = build_paste_event(
+                text.clone(),
+                html,
+                files,
+                image,
+                image_too_large,
+                self.config.borrow().paste_max_size,
+            );
             owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
             if !report_only && self.config.borrow().editable && !text.is_empty() {
                 self.insert_text(text)?;
@@ -817,6 +841,8 @@ fn build_paste_event(
     html: Option<String>,
     files: Option<String>,
     image: Option<String>,
+    image_too_large: Option<u64>,
+    paste_max_size: Option<u64>,
 ) -> nsh_core::PasteEvent {
     let mut paste = nsh_core::PasteEvent::new(text);
     paste.html = html.unwrap_or_default();
@@ -837,8 +863,22 @@ fn build_paste_event(
             base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())
             && !bytes.is_empty()
         {
-            paste.files.push(nsh_core::PastedFile::image(bytes));
+            if paste_max_size.is_some_and(|max| bytes.len() as u64 > max) {
+                paste.too_large.push(nsh_core::PastedFile::too_large(
+                    "image.png",
+                    "image/png",
+                    bytes.len() as u64,
+                ));
+            } else {
+                paste.files.push(nsh_core::PastedFile::image(bytes));
+            }
         }
+    } else if let Some(len) = image_too_large.filter(|&len| len > 0) {
+        paste.too_large.push(nsh_core::PastedFile::too_large(
+            "image.png",
+            "image/png",
+            len,
+        ));
     }
     paste
 }

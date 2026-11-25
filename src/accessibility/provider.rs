@@ -105,7 +105,7 @@ impl State {
         self.update_snapshot(
             &spec,
             owner.accessibility_state.label(owner),
-            owner.platform.get().locale.to_string(),
+            owner.spoken_locale().to_string(),
             owner.visible_in_tree(),
         )?;
         drop(spec);

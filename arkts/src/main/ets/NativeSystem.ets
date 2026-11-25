@@ -5,7 +5,6 @@ import { UIContext } from "@ohos.arkui.UIContext";
 import { NativeAuthSession } from "./NativeAuthSession";
 import { NativeClipboard } from "./NativeClipboard";
 import { NativeNotifications } from "./NativeNotifications";
-import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 
 // The system bridge uses the same typed completion for every service.
 export interface SystemReply {
@@ -19,6 +18,7 @@ export interface SystemReply {
   files?: string;
   permission?: string;
   shown?: boolean;
+  opened?: boolean;
   pressed?: string;
   error?: string;
   code?: string;
@@ -36,6 +36,7 @@ export interface SystemRequest {
   body?: string;
   silent?: boolean;
   count?: number;
+  maxBytes?: number;
   ask?: boolean;
   lang?: string;
   interim?: boolean;
@@ -46,7 +47,6 @@ export class NativeSystem {
   private readonly authSession: NativeAuthSession;
   private readonly clipboard: NativeClipboard;
   private readonly notifications: NativeNotifications;
-  private readonly speech: NativeSpeech;
   private readonly share: NativeShare = new NativeShare();
   private readonly reply: (key: number, event: SystemReply) => void;
   private active: Set<number> = new Set();
@@ -61,7 +61,6 @@ export class NativeSystem {
     this.authSession = new NativeAuthSession(ui);
     this.clipboard = new NativeClipboard(ui);
     this.notifications = new NativeNotifications(context);
-    this.speech = new NativeSpeech(context);
     this.reply = reply;
   }
   setColorMode(mode: ThemeColorMode): void {
@@ -79,7 +78,14 @@ export class NativeSystem {
     };
     try {
       if (request.op.startsWith("clipboard-")) {
-        reply(await this.clipboard.execute(key, request.op, () => this.active.has(key)));
+        reply(
+          await this.clipboard.execute(
+            key,
+            request.op,
+            () => this.active.has(key),
+            request.maxBytes,
+          ),
+        );
       } else if (request.op === "auth-session-open") {
         this.authSession.open(
           key,
@@ -128,25 +134,6 @@ export class NativeSystem {
         }
         this.listening = key;
         this.notifications.listen(reply);
-        return;
-      } else if (request.op === "speech-start") {
-        await this.speech.start(
-          key,
-          request.lang,
-          request.interim ?? true,
-          (event: SpeechReply) => {
-            reply(event);
-            if (event.phase === "end") {
-              this.active.delete(key);
-            }
-          },
-        );
-        return;
-      } else if (request.op === "speech-stop" || request.op === "speech-abort") {
-        await this.speech.stop(key, request.op === "speech-abort");
-        if (request.op === "speech-abort") {
-          this.active.delete(key);
-        }
         return;
       } else if (request.op === "file-open-path") {
         const path = request.uri ?? "";
@@ -246,6 +233,20 @@ export class NativeSystem {
           }
         });
         reply({ files: JSON.stringify(paths) } as SystemReply);
+      } else if (request.op === "open-app-settings") {
+        try {
+          await this.context.startAbility({
+            bundleName: "com.huawei.hmos.settings",
+            abilityName: "com.huawei.hmos.settings.MainAbility",
+            uri: "application_info_entry",
+            parameters: {
+              pushParams: this.context.abilityInfo.bundleName,
+            },
+          });
+          reply({ opened: true } as SystemReply);
+        } catch {
+          reply({ opened: false } as SystemReply);
+        }
       } else {
         throw new Error(`unknown system operation: ${request.op}`);
       }
@@ -253,7 +254,6 @@ export class NativeSystem {
       reply({
         error: String(error),
         code: "ERR_NSH_HOST_ERROR",
-        phase: request.op.startsWith("speech-") ? "end" : undefined,
         has: false,
         shown: false,
         permission: "unavailable",
@@ -270,9 +270,6 @@ export class NativeSystem {
       this.notifications.listen();
       this.listening = undefined;
     }
-    this.speech
-      .stop(key, true)
-      .catch((error: Error) => console.warn(`NSH speech cancel: ${error}`));
   }
   close(): void {
     this.closed = true;
@@ -280,7 +277,6 @@ export class NativeSystem {
     this.authSession.closeAll();
     this.clipboard.close();
     this.notifications.close();
-    this.speech.close();
     this.share.close();
   }
 }

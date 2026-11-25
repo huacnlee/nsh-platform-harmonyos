@@ -141,6 +141,7 @@ struct Route {
     node: Weak<Node>,
     dispatcher: std::sync::Weak<Dispatcher>,
     access: Arc<Access>,
+    allow_origin: RefCell<Option<nsh_core::access::WebOrigin>>,
     assets: Arc<dyn StreamAssets>,
     host: Arc<Services>,
     url_schemes: Vec<nsh_core::web_resource::WebUrlScheme>,
@@ -331,6 +332,7 @@ impl WebView {
                 node: node.clone(),
                 dispatcher: owner.dispatcher.clone(),
                 access: owner.access.clone(),
+                allow_origin: RefCell::new(None),
                 assets: owner.assets.clone(),
                 host: owner.host.clone(),
                 url_schemes: Vec::new(),
@@ -417,9 +419,11 @@ impl WebView {
             return Ok(());
         }
         let defer_downloads = props.defer_downloads;
+        let allow_origin = props.allow_origin.clone();
         *self.props.borrow_mut() = Some(props);
         if let Some(route) = self.route_ref.borrow().as_ref() {
             route.defer_downloads.set(defer_downloads);
+            *route.allow_origin.borrow_mut() = allow_origin;
         }
         if let Some(node) = self.node.upgrade() {
             self.sync(&node)?;
@@ -571,16 +575,18 @@ impl WebView {
                 return Ok(());
             }
             Command::Load(load) => {
-                let schemes = self
+                let (schemes, allow_origin) = self
                     .props
                     .borrow()
                     .as_ref()
-                    .map(|p| p.url_schemes.clone())
+                    .map(|p| (p.url_schemes.clone(), p.allow_origin.clone()))
                     .unwrap_or_default();
                 if !node.access.allows_webviews()
                     || (!load.src.starts_with("asset:/")
                         && !has_custom_scheme(&load.src, &schemes)
-                        && !node.access.allows_webview(&load.src))
+                        && !node
+                            .access
+                            .allows_webview_with(&load.src, allow_origin.as_ref()))
                 {
                     node.control.dispatch_event(
                         node.id,
@@ -704,16 +710,23 @@ impl WebView {
         self.evaluations.navigated();
         let attachment = NativeAttachment::new(&self.native)?;
         let id = attachment.id();
-        let (url_schemes, defer_downloads) = self
+        let (url_schemes, defer_downloads, allow_origin) = self
             .props
             .borrow()
             .as_ref()
-            .map(|p| (p.url_schemes.clone(), p.defer_downloads))
+            .map(|p| {
+                (
+                    p.url_schemes.clone(),
+                    p.defer_downloads,
+                    p.allow_origin.clone(),
+                )
+            })
             .unwrap_or_default();
         let entry = Rc::new(Route {
             node: self.node.clone(),
             dispatcher: node.dispatcher.clone(),
             access: node.access.clone(),
+            allow_origin: RefCell::new(allow_origin),
             assets: node.assets.clone(),
             host: node.host.clone(),
             url_schemes,
@@ -761,7 +774,9 @@ impl WebView {
                 WebSource::Uri(uri)
                     if !uri.starts_with("asset:/")
                         && !has_custom_scheme(uri, &props.url_schemes)
-                        && !node.access.allows_webview(uri)
+                        && !node
+                            .access
+                            .allows_webview_with(uri, props.allow_origin.as_ref())
             )
         {
             node.control.dispatch_event(
@@ -842,6 +857,7 @@ impl WebView {
             load_generation: self.load_generation.get().max(1),
             java_script_enabled: props.javascript_enabled,
             scroll_enabled: props.scrollable,
+            zoomable: props.zoomable,
             user_agent: props.user_agent.as_deref().map(str::to_owned),
             injected_javascript: props.injected_js.as_deref().map(str::to_owned),
             document_start_script,
@@ -1118,7 +1134,12 @@ pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> 
         {
             return true;
         }
-        !allows_navigation(&route.access, url, &route.url_schemes)
+        !allows_navigation(
+            &route.access,
+            url,
+            &route.url_schemes,
+            route.allow_origin.borrow().as_ref(),
+        )
     })
 }
 
@@ -1281,6 +1302,34 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                     EventPayload::None,
                 );
             }
+            "press" => {
+                if let (Some(wx), Some(wy)) = (event.x, event.y)
+                    && wx.is_finite()
+                    && wy.is_finite()
+                {
+                    let mut surface = node.clone();
+                    while surface.id != nsh_core::ROOT_ID
+                        && surface.kind != nsh_core::ViewKind::Modal
+                    {
+                        let Some(parent) = surface.parent_node.borrow().upgrade() else {
+                            break;
+                        };
+                        surface = parent;
+                    }
+                    let scale = node.scale.get().max(1.0);
+                    let (origin_x, origin_y) = surface
+                        .native
+                        .borrow()
+                        .layout_position_in_window()
+                        .map(|pos| (pos.x as f32 / scale, pos.y as f32 / scale))
+                        .unwrap_or((0.0, 0.0));
+                    let page = nsh_core::geometry::point(
+                        nsh_core::Points(wx as f32 - origin_x),
+                        nsh_core::Points(wy as f32 - origin_y),
+                    );
+                    node.control.press_on_native(node.id, page);
+                }
+            }
             "download-offer" => {
                 if let Some(download) = event.download {
                     let download_id = download.id.clone();
@@ -1402,6 +1451,7 @@ fn allows_navigation(
     access: &Access,
     url: &str,
     schemes: &[nsh_core::web_resource::WebUrlScheme],
+    allow_origin: Option<&nsh_core::access::WebOrigin>,
 ) -> bool {
     // ArkWeb represents loadData's already-authorized inline HTML as a data
     // URL in onLoadIntercept. It is not an additional network capability.
@@ -1411,7 +1461,7 @@ fn allows_navigation(
             || url.starts_with("data:text/html;")
             || url.starts_with("nsh-asset://app/")
             || has_custom_scheme(url, schemes)))
-        || access.allows_webview(url)
+        || access.allows_webview_with(url, allow_origin)
 }
 
 #[cfg(test)]

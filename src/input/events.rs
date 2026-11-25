@@ -59,7 +59,10 @@ pub(crate) struct Interaction {
     long_fired: Cell<bool>,
     gestures: RefCell<Vec<Gesture>>,
     gesture_values: Cell<GestureValues>,
+    applied_pan_activation: Cell<Option<nsh_core::PanActivation>>,
+    pan_rejected: Cell<bool>,
     gesture_start: Cell<[f32; 4]>,
+    pan_origin: Cell<[f32; 2]>,
 }
 
 impl Default for Interaction {
@@ -93,7 +96,10 @@ impl Default for Interaction {
             long_fired: Cell::new(false),
             gestures: RefCell::default(),
             gesture_values: Cell::default(),
+            applied_pan_activation: Cell::default(),
+            pan_rejected: Cell::new(false),
             gesture_start: Cell::default(),
+            pan_origin: Cell::default(),
         }
     }
 }
@@ -166,8 +172,16 @@ impl Interaction {
     pub(crate) fn pointer_events(&self) -> PointerEvents {
         self.props.borrow().pointer_events
     }
-    pub(crate) fn pan_activation(&self) -> Option<nsh_core::PanActivation> {
-        self.props.borrow().pan_activation
+    pub(crate) fn gate_pan_activation(&self) -> Option<nsh_core::PanActivation> {
+        nsh_core::input::gate_activation(
+            &self.gesture_values.get(),
+            self.mask(),
+            self.props.borrow().pan_activation,
+        )
+    }
+    pub(crate) fn types_into_input(&self) -> bool {
+        let props = self.props.borrow();
+        !props.accessibility.state.disabled && props.key_capture.types_into_input()
     }
     pub(crate) fn key_interest(
         &self,
@@ -839,6 +853,7 @@ impl Interaction {
         let focusable_changed = old_props.focusable != props.focusable
             || old_props.accessibility.state.disabled != props.accessibility.state.disabled;
         let long_press_delay_changed = old_props.long_press_delay != props.long_press_delay;
+        let pan_activation_changed = old_props.pan_activation != props.pan_activation;
         owner.wrapper_semantics_reset();
         {
             let native = owner.native.borrow();
@@ -901,6 +916,9 @@ impl Interaction {
             self.pointer_internal(owner, self.inherited_block.get(), true)?;
         } else if window_control_changed || focusable_changed || long_press_delay_changed {
             self.events(owner, self.events.get())?;
+        }
+        if pan_activation_changed {
+            self.gestures(owner, self.gesture_values.get())?;
         }
         if selection_changed {
             owner.selection_configure()?;
@@ -1004,9 +1022,13 @@ impl Interaction {
             )
     }
     pub(crate) fn gestures(&self, owner: &Rc<Node>, values: GestureValues) -> Result<()> {
-        if self.gesture_values.replace(values) == values {
+        let activation = self.props.borrow().pan_activation;
+        let values_changed = self.gesture_values.replace(values) != values;
+        let activation_changed = self.applied_pan_activation.replace(activation) != activation;
+        if !values_changed && !activation_changed {
             return Ok(());
         }
+        self.pan_rejected.set(false);
         for gesture in self.gestures.borrow_mut().drain(..) {
             owner.native.borrow().remove_gesture(&gesture)?;
             gesture.dispose()?;
@@ -1022,14 +1044,34 @@ impl Interaction {
             }
             let gesture = match kind {
                 0 => {
-                    let direction = match (values.pan_x.is_some(), values.pan_y.is_some()) {
-                        (true, true) => GestureDirection::All,
-                        (true, false) => GestureDirection::Horizontal,
-                        (false, true) => GestureDirection::Vertical,
-                        (false, false) => GestureDirection::None,
+                    let direction = match activation.and_then(|a| a.way()) {
+                        Some(nsh_core::PanDirection::Left) => GestureDirection::Left,
+                        Some(nsh_core::PanDirection::Right) => GestureDirection::Right,
+                        Some(nsh_core::PanDirection::Up) => GestureDirection::Up,
+                        Some(nsh_core::PanDirection::Down) => GestureDirection::Down,
+                        None | Some(_) => match activation.and_then(|a| a.axis()) {
+                            Some(true) => GestureDirection::Horizontal,
+                            Some(false) => GestureDirection::Vertical,
+                            None => match (values.pan_x.is_some(), values.pan_y.is_some()) {
+                                (true, true) => GestureDirection::All,
+                                (true, false) => GestureDirection::Horizontal,
+                                (false, true) => GestureDirection::Vertical,
+                                (false, false) => GestureDirection::None,
+                            },
+                        },
                     };
-                    // Pass 0.0 to use ArkUI's built-in system default threshold.
-                    Gesture::create_pan_gesture(1, direction, 0.0)?
+                    let distance_px = activation
+                        .and_then(|a| {
+                            [a.active_offset_x, a.active_offset_y]
+                                .into_iter()
+                                .flatten()
+                                .map(|p| p.0.abs())
+                                .reduce(f32::min)
+                        })
+                        .map_or(0.0, |vp| {
+                            f64::from(vp) * f64::from(owner.scale.get().max(1.0))
+                        });
+                    Gesture::create_pan_gesture(1, direction, distance_px)?
                 }
                 1 => Gesture::create_pinch_gesture(2, 0.0)?,
                 _ => Gesture::create_rotation_gesture(2, 0.0)?,
@@ -1051,6 +1093,7 @@ impl Interaction {
                             .event_action_type
                             .intersects(GestureEventAction::End | GestureEventAction::Cancel);
                         if accept {
+                            owner.interaction.pan_rejected.set(false);
                             owner.interaction.gesture_start.set([
                                 values.pan_x.map_or(0.0, |id| owner.animator.value(id)),
                                 values.pan_y.map_or(0.0, |id| owner.animator.value(id)),
@@ -1061,6 +1104,69 @@ impl Interaction {
                         let start = owner.interaction.gesture_start.get();
                         match event.event_action_data {
                             GestureData::Pan(pan) => {
+                                if !accept && owner.interaction.pan_rejected.get() {
+                                    if ended {
+                                        owner.interaction.pan_rejected.set(false);
+                                    }
+                                    return Ok(());
+                                }
+                                let accept_origin = if accept {
+                                    let origin = event
+                                        .input
+                                        .map(|i| {
+                                            (
+                                                i.window_x - pan.offset_x / owner.scale.get(),
+                                                i.window_y - pan.offset_y / owner.scale.get(),
+                                            )
+                                        })
+                                        .or_else(|| {
+                                            owner
+                                                .touches
+                                                .borrow()
+                                                .last_pointer_for(owner.key_window_id())
+                                        })
+                                        .unwrap_or((0.0, 0.0));
+                                    let mut surface = owner.clone();
+                                    while surface.id != nsh_core::ROOT_ID
+                                        && surface.kind != nsh_core::ViewKind::Modal
+                                    {
+                                        let Some(parent) = surface.parent_node.borrow().upgrade()
+                                        else {
+                                            break;
+                                        };
+                                        surface = parent;
+                                    }
+                                    let scale = owner.scale.get().max(1.0);
+                                    let surface_origin = surface
+                                        .native
+                                        .borrow()
+                                        .layout_position_in_window()
+                                        .map(|pos| (pos.x as f32 / scale, pos.y as f32 / scale))
+                                        .unwrap_or((0.0, 0.0));
+                                    let sf = surface.frame.get();
+                                    let at = nsh_core::Point::new(
+                                        nsh_core::Points(origin.0 - surface_origin.0),
+                                        nsh_core::Points(origin.1 - surface_origin.1),
+                                    );
+                                    let size = nsh_core::Size::new(
+                                        nsh_core::Points(sf.width),
+                                        nsh_core::Points(sf.height),
+                                    );
+                                    if owner
+                                        .interaction
+                                        .props
+                                        .borrow()
+                                        .pan_activation
+                                        .is_some_and(|a| !a.starts_at(at, size))
+                                    {
+                                        owner.interaction.pan_rejected.set(!ended);
+                                        return Ok(());
+                                    }
+                                    owner.interaction.pan_origin.set([origin.0, origin.1]);
+                                    Some(origin)
+                                } else {
+                                    None
+                                };
                                 if let Some(id) = values.pan_x {
                                     owner
                                         .animator
@@ -1072,6 +1178,16 @@ impl Interaction {
                                         .set(id, start[1] + pan.offset_y / owner.scale.get())?;
                                 }
                                 if accept || ended {
+                                    let origin = if let Some(origin) = accept_origin {
+                                        origin
+                                    } else {
+                                        let saved = owner.interaction.pan_origin.get();
+                                        (saved[0], saved[1])
+                                    };
+                                    let origin = nsh_core::Point::new(
+                                        nsh_core::Points(origin.0),
+                                        nsh_core::Points(origin.1),
+                                    );
                                     let translation = nsh_core::Point::new(
                                         nsh_core::Points(pan.offset_x / owner.scale.get()),
                                         nsh_core::Points(pan.offset_y / owner.scale.get()),
@@ -1092,6 +1208,7 @@ impl Interaction {
                                         },
                                         if event.event_action_type == GestureEventAction::Cancel {
                                             EventPayload::PanCancelled {
+                                                origin,
                                                 translation,
                                                 velocity_x,
                                                 velocity_y,
@@ -1100,6 +1217,7 @@ impl Interaction {
                                             }
                                         } else {
                                             EventPayload::Pan {
+                                                origin,
                                                 translation,
                                                 velocity_x,
                                                 velocity_y,

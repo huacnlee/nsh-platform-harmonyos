@@ -73,12 +73,41 @@ impl Clipboard {
         Ok(())
     }
 
-    pub(crate) fn write_text(&self, text: String, html: Option<String>) -> napi_ohos::Result<()> {
-        self.enqueue(move || {
-            if let Err(e) = write_text_sync(&text, html.as_deref()) {
-                log::warn!("OHOS native clipboard write failed: {e}");
+    pub(crate) fn write_text(
+        &self,
+        route: Weak<Dispatcher>,
+        text: String,
+        html: Option<String>,
+    ) -> napi_ohos::Result<()> {
+        let route_fallback = route.clone();
+        if let Err(error) = self.enqueue(move || {
+            let written = match write_text_sync(&text, html.as_deref()) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!("OHOS native clipboard write failed: {e}");
+                    false
+                }
+            };
+            if let Some(route) = route.upgrade()
+                && route.live.load(Ordering::Acquire)
+            {
+                route.send(Message::HostEvent(
+                    EventKind::ClipboardWrite,
+                    EventPayload::Map(vec![("written", PayloadValue::Bool(written))]),
+                ));
             }
-        })
+        }) {
+            if let Some(route) = route_fallback.upgrade()
+                && route.live.load(Ordering::Acquire)
+            {
+                route.send(Message::HostEvent(
+                    EventKind::ClipboardWrite,
+                    EventPayload::Map(vec![("written", PayloadValue::Bool(false))]),
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn write_image(&self, uri: String) -> napi_ohos::Result<()> {
@@ -226,32 +255,46 @@ impl Clipboard {
         route: Weak<Dispatcher>,
         node_id: u32,
         report_only: bool,
+        paste_max_size: Option<u64>,
     ) -> napi_ohos::Result<()> {
         self.enqueue(move || {
+            let max_bytes = paste_max_size.map_or(MAX_IMAGE_BYTES, |m| {
+                usize::try_from(m)
+                    .unwrap_or(usize::MAX)
+                    .min(MAX_IMAGE_BYTES)
+            });
             read_with_fallback(
                 &host,
                 route,
                 0,
                 "clipboard-paste",
-                Some((node_id, report_only)),
+                Some((node_id, report_only, paste_max_size)),
                 |board, _| board.has_data(),
-                |data, d| {
+                move |data, d| {
                     let text = extract_plain_text(data).unwrap_or_default();
                     let html = extract_html(data);
                     let uris = extract_file_uris(data);
                     let files = (!uris.is_empty()).then(|| uris.join("\n"));
-                    let image =
-                        extract_first_pixelmap(data).and_then(|pm| match pack_pixelmap_png(&pm) {
-                            Ok(PackedPng::Data { uri, .. }) => Some(uri),
-                            _ => None,
-                        });
-                    if !text.is_empty() || html.is_some() || files.is_some() || image.is_some() {
+                    let (image, image_too_large) = match extract_first_pixelmap(data)
+                        .and_then(|pm| pack_pixelmap_png_limited(&pm, max_bytes).ok())
+                    {
+                        Some(PackedPng::Data { uri, .. }) => (Some(uri), None),
+                        Some(PackedPng::TooLarge(len)) if len > 0 => (None, Some(len as u64)),
+                        _ => (None, None),
+                    };
+                    if !text.is_empty()
+                        || html.is_some()
+                        || files.is_some()
+                        || image.is_some()
+                        || image_too_large.is_some()
+                    {
                         d.send(Message::InputPaste {
                             id: node_id,
                             text,
                             html,
                             files,
                             image,
+                            image_too_large,
                             report_only,
                         });
                     }
@@ -323,7 +366,7 @@ fn read_with_fallback(
     route: Weak<Dispatcher>,
     id: u32,
     fallback_op: &str,
-    paste: Option<(u32, bool)>,
+    paste: Option<(u32, bool, Option<u64>)>,
     precheck: impl FnOnce(&Pasteboard, &Dispatcher) -> bool,
     on_data: impl FnOnce(&mut UdmfData, &Dispatcher),
 ) {
@@ -392,6 +435,10 @@ enum PackedPng {
 }
 
 fn pack_pixelmap_png(pixel_map: &PixelMap) -> Result<PackedPng, String> {
+    pack_pixelmap_png_limited(pixel_map, MAX_IMAGE_BYTES)
+}
+
+fn pack_pixelmap_png_limited(pixel_map: &PixelMap, max_bytes: usize) -> Result<PackedPng, String> {
     let info = pixel_map.image_info().map_err(|e| format!("{e:?}"))?;
     let width = info.width().map_err(|e| format!("{e:?}"))?;
     let height = info.height().map_err(|e| format!("{e:?}"))?;
@@ -406,6 +453,7 @@ fn pack_pixelmap_png(pixel_map: &PixelMap) -> Result<PackedPng, String> {
     options.set_quality(100).map_err(|e| format!("{e:?}"))?;
     let mut packer = ImagePacker::new().map_err(|e| format!("{e:?}"))?;
 
+    let limit = max_bytes.min(MAX_IMAGE_BYTES);
     let max_buf = MAX_IMAGE_BYTES + 1;
     let mut capacity = (width as usize)
         .saturating_mul(height as usize)
@@ -419,7 +467,7 @@ fn pack_pixelmap_png(pixel_map: &PixelMap) -> Result<PackedPng, String> {
         }
         out.resize(capacity, 0);
         match packer.pack_to_data_from_pixelmap(&mut options, pixel_map, &mut out) {
-            Ok(written) if written > MAX_IMAGE_BYTES => return Ok(PackedPng::TooLarge(written)),
+            Ok(written) if written > limit => return Ok(PackedPng::TooLarge(written)),
             Ok(written) => {
                 let encoded = base64::engine::general_purpose::STANDARD.encode(&out[..written]);
                 return Ok(PackedPng::Data {

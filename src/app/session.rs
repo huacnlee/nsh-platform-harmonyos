@@ -79,7 +79,6 @@ pub(crate) struct AvoidArea {
 #[napi(object)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInit {
-    pub speech_available: bool,
     pub share_available: Option<bool>,
     pub sdk_api_version: i32,
     pub device_type: String,
@@ -240,7 +239,6 @@ enum Operation {
 type PendingPick = (u32, nsh_core::picker::Pick, Weak<Dispatcher>);
 
 pub(crate) struct Services {
-    pub(crate) speech_available: bool,
     pub(crate) share_available: bool,
     id: u32,
     active: AtomicBool,
@@ -977,7 +975,6 @@ impl Services {
         };
         let (queue, receiver) = mpsc::sync_channel(256);
         let services = Arc::new(Self {
-            speech_available: init.speech_available,
             share_available: init.share_available.unwrap_or(false),
             id,
             active: AtomicBool::new(true),

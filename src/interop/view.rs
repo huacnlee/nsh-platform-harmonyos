@@ -296,7 +296,7 @@ impl Wrapper {
         let frame = owner.frame.get();
         let value = crate::accessibility::value::spoken_value_for_locale(
             &spec,
-            owner.platform.get().locale.as_str(),
+            owner.spoken_locale().as_str(),
         )
         .unwrap_or_default();
         let actions: Vec<MenuItem> = if cfg!(feature = "api-26") {

@@ -28,6 +28,50 @@ pub(crate) fn viewport_px_to_root_vp(point_px: (f32, f32), scale: f32) -> Option
     Some((point_px.0 / scale, point_px.1 / scale))
 }
 
+/// Returns the text a key press would type for `captureKeys="text"`, or `None`
+/// for Space, non-character keys, or Control/Alt/Command-modified chords.
+pub(crate) fn typing_text(
+    key: Option<nsh_core::keymap::Key>,
+    unicode: u32,
+    modifiers: nsh_core::keymap::Modifiers,
+    key_text: Option<&str>,
+) -> Option<String> {
+    if modifiers.ctrl || modifiers.alt || modifiers.cmd {
+        return None;
+    }
+    match key {
+        Some(nsh_core::keymap::Key::Char(' ')) => return None,
+        Some(nsh_core::keymap::Key::Char(_)) | None => {}
+        Some(_) => return None,
+    }
+    if let Some(text) = key_text
+        && !text.is_empty()
+        && text != " "
+        && !text.chars().any(char::is_control)
+    {
+        return Some(text.to_owned());
+    }
+    if unicode != 0
+        && let Some(ch) = char::from_u32(unicode)
+        && !ch.is_control()
+        && ch != ' '
+    {
+        return Some(ch.to_string());
+    }
+    if let Some(nsh_core::keymap::Key::Char(ch)) = key
+        && !ch.is_control()
+        && ch != ' '
+    {
+        let ch = if modifiers.shift && ch.is_ascii_alphabetic() {
+            ch.to_ascii_uppercase()
+        } else {
+            ch
+        };
+        return Some(ch.to_string());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{SurfaceHit, viewport_px_to_root_vp};
@@ -51,5 +95,71 @@ mod tests {
         assert_eq!(viewport_px_to_root_vp((100.0, 200.0), f32::NAN), None);
         assert_eq!(viewport_px_to_root_vp((f32::NAN, 200.0), 2.0), None);
         assert_eq!(viewport_px_to_root_vp((100.0, f32::INFINITY), 2.0), None);
+    }
+
+    #[test]
+    fn typing_text_accepts_printable_keys_and_rejects_space_or_shortcuts() {
+        use super::typing_text;
+        use nsh_core::keymap::{Key, Modifiers};
+
+        assert_eq!(
+            typing_text(Some(Key::Char('a')), 0, Modifiers::default(), None).as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            typing_text(
+                Some(Key::Char('a')),
+                0,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                None
+            )
+            .as_deref(),
+            Some("A")
+        );
+        assert_eq!(
+            typing_text(
+                Some(Key::Char('a')),
+                0,
+                Modifiers {
+                    alt_graph: true,
+                    ..Modifiers::default()
+                },
+                Some("á")
+            )
+            .as_deref(),
+            Some("á")
+        );
+        assert_eq!(
+            typing_text(None, '中' as u32, Modifiers::default(), None).as_deref(),
+            Some("中")
+        );
+        assert_eq!(
+            typing_text(
+                Some(Key::Char(' ')),
+                ' ' as u32,
+                Modifiers::default(),
+                Some(" ")
+            ),
+            None
+        );
+        assert_eq!(
+            typing_text(Some(Key::Enter), 0, Modifiers::default(), Some("\n")),
+            None
+        );
+        assert_eq!(
+            typing_text(
+                Some(Key::Char('a')),
+                0,
+                Modifiers {
+                    ctrl: true,
+                    ..Modifiers::default()
+                },
+                Some("a")
+            ),
+            None
+        );
     }
 }
