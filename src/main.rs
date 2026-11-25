@@ -841,6 +841,7 @@ fn typedefs(verbose: bool) -> anyhow::Result<()> {
         "check",
         "-p",
         "nsh-platform-harmonyos",
+        "--lib",
         "--target",
         sdk::Arch::Arm64.triple(),
     ])
