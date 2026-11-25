@@ -9,6 +9,7 @@ use nsh_core::{
     EdgeInsets, EventKind, EventPayload, Points, ScreenAnimation, ScreenConfig, ViewKind,
 };
 use ohos_arkui_binding::{
+    common::attribute::ArkUINodeAttributeNumber as Number,
     component::{
         attribute::{ArkUICommonAttribute, ArkUIEvent},
         built_in_component::{Custom, Stack, Text},
@@ -90,7 +91,7 @@ impl Screen {
         back.borrow().width(44.0)?;
         back.borrow().height(44.0)?;
         title.borrow().set_f32_attribute(A::FontSize, 18.0)?;
-        title.borrow().set_i32_attribute(A::TextAlign, 1)?;
+        title.borrow().set_i32_attribute(A::TextAlign, 0)?;
         title.borrow().set_i32_attribute(A::TextMaxLines, 1)?;
         title.borrow().set_i32_attribute(A::TextOverflow, 2)?;
         title.borrow().height(44.0)?;
@@ -313,12 +314,35 @@ impl Screen {
                 .map(argb)
                 .unwrap_or_else(|| owner.theme.borrow().color("card", dark))
         })?;
+        if show_native_header && !c.header_transparent && c.header_shadow_visible {
+            let hairline = owner.theme.borrow().color("border", dark);
+            h.set_number_slice_attribute(
+                A::BorderWidth,
+                &[
+                    Number::Float(0.0),
+                    Number::Float(0.0),
+                    Number::Float(0.5),
+                    Number::Float(0.0),
+                ],
+            )?;
+            h.set_number_slice_attribute(A::BorderColor, &[Number::Uint(hairline); 4])?;
+        } else {
+            h.reset_attribute(A::BorderWidth)?;
+            h.reset_attribute(A::BorderColor)?;
+        }
         self.title
             .borrow()
             .set_string_attribute(A::TextContent, c.title.as_deref().unwrap_or(""))?;
         self.title
             .borrow()
             .set_u32_attribute(A::FontColor, c.title_color.map(argb).unwrap_or(fg))?;
+        self.title.borrow().set_i32_attribute(
+            A::TextAlign,
+            match c.title_align {
+                nsh_core::HeaderTitleAlign::Center => 1,
+                _ => 0,
+            },
+        )?;
         self.layout_title(&owner, &c)?;
         self.title
             .borrow()
@@ -375,12 +399,13 @@ impl Screen {
                 right = child.frame.get().width;
             }
         }
-        super::motion::title_bounds(
+        super::motion::title_bounds_aligned(
             owner.frame.get().width,
             self.has_back.get() && config.back_visible,
             left,
             right,
             owner.platform.get().rtl,
+            config.title_align == nsh_core::HeaderTitleAlign::Center,
         )
     }
     fn layout_title(&self, owner: &Node, config: &ScreenConfig) -> Result<()> {
