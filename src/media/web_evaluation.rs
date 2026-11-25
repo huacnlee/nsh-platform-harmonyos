@@ -219,11 +219,15 @@ impl Evaluations {
         }
     }
 
-    fn finish(&self, request: u32, serial: u64, data: String) {
+    fn finish(&self, request: u32, serial: u64, data: String, cleanup_page: bool) {
         if !self.active(request, serial) {
             return;
         }
-        self.pending.borrow_mut().remove(&request);
+        if let Some(entry) = self.pending.borrow_mut().remove(&request)
+            && cleanup_page
+        {
+            self.cleanup(entry);
+        }
         self.reply(request, data);
     }
 
@@ -313,7 +317,7 @@ impl Evaluations {
                     }),
                 );
             }
-            Some("ok" | "error") => self.finish(request, serial, text),
+            Some("ok" | "error") => self.finish(request, serial, text, !allow_poll),
             _ => self.fail(
                 request,
                 serial,
@@ -660,6 +664,9 @@ mod tests {
 
         h.evals
             .push_result("__nsh_evaluation_4_10_1", r#"{"status":"ok","value":42}"#);
+        let (cleanup_js, _) = h.web.pop_script();
+        assert!(cleanup_js.starts_with("delete globalThis["));
+        assert!(cleanup_js.contains("__nsh_evaluation_4_10_1"));
         let replies = h.take_replies();
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0].0, 10);
