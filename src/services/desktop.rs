@@ -1687,9 +1687,10 @@ mod ohos {
             },
         };
         let primary_id = primary_display()
+            .ok()
             .map(|d| d.id)
-            .unwrap_or_else(|_| default_display_id() as u32);
-        let has_primary = screens.iter().any(|s| s.id == primary_id);
+            .or_else(|| default_display_id().ok().map(|id| id as u32));
+        let has_primary = primary_id.is_some_and(|id| screens.iter().any(|s| s.id == id));
 
         screens
             .into_iter()
@@ -1723,7 +1724,7 @@ mod ohos {
                     _ => bounds,
                 };
                 let is_primary = if has_primary {
-                    info.id == primary_id
+                    Some(info.id) == primary_id
                 } else {
                     index == 0
                 };

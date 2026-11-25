@@ -580,8 +580,10 @@ impl State {
                                 }
                             }
                             if became_focused
+                                && self.attached
                                 && self.laid_out
                                 && let Some(mounter) = &self.mounter
+                                && mounter.batch_count() > 0
                             {
                                 mounter.request_desktop_focus();
                             }
@@ -732,7 +734,12 @@ impl State {
             .expect("running surface has a mounter");
         let first_batch = mounter.batch_count() == 0;
         let result = mounter.apply(batch);
-        if first_batch && self.environment.os.is_desktop() && result.is_ok() {
+        if first_batch
+            && self.attached
+            && self.laid_out
+            && self.environment.os.is_desktop()
+            && result.is_ok()
+        {
             mounter.request_desktop_focus();
         }
         self.retire()?;
@@ -1732,6 +1739,14 @@ impl Runtime {
             }
             if changed {
                 updated = updated.and(mounter.native_context(attached).map_err(napi_error));
+                if updated.is_ok()
+                    && attached
+                    && state.laid_out
+                    && state.environment.os.is_desktop()
+                    && mounter.batch_count() > 0
+                {
+                    mounter.request_desktop_focus();
+                }
             }
         }
         state.update_back();
@@ -1767,8 +1782,10 @@ impl Runtime {
         let first_layout = !state.laid_out;
         state.laid_out = true;
         if first_layout
+            && state.attached
             && state.environment.os.is_desktop()
             && let Some(mounter) = &state.mounter
+            && mounter.batch_count() > 0
         {
             mounter.request_desktop_focus();
         }

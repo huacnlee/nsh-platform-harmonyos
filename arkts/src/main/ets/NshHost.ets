@@ -606,9 +606,9 @@ class HostSession {
     const language = config?.language || i18n.System.getSystemLanguage();
     const localeDetails = readSystemLocaleDetails();
     let pixelRatio = uiContext.vp2px(1);
-    const displayId = mainWindow.getWindowProperties().displayId;
-    if (displayId !== undefined) {
-      pixelRatio = display.getDisplayByIdSync(displayId).densityPixels;
+    const screen = readWindowDisplay(mainWindow);
+    if (screen !== undefined && screen.densityPixels > 0) {
+      pixelRatio = screen.densityPixels;
     }
     if (pixelRatio > 0) {
       pixelRatio = Math.round(pixelRatio * 10000) / 10000;
@@ -1442,6 +1442,23 @@ interface WindowPixelSize {
   height: number;
 }
 
+function readWindowDisplay(mainWindow: window.Window): display.Display | undefined {
+  let id: number | undefined = undefined;
+  try {
+    id = mainWindow.getWindowProperties().displayId;
+  } catch {}
+  if (id !== undefined) {
+    try {
+      return display.getDisplayByIdSync(id);
+    } catch {}
+  }
+  try {
+    return display.getDefaultDisplaySync();
+  } catch {
+    return undefined;
+  }
+}
+
 function readWindowSize(mainWindow: window.Window): WindowPixelSize {
   let width = 0;
   let height = 0;
@@ -1451,25 +1468,23 @@ function readWindowSize(mainWindow: window.Window): WindowPixelSize {
     height = rect?.height ?? 0;
   } catch {}
   if (width <= 0 || height <= 0) {
-    try {
-      const displayId = mainWindow.getWindowProperties().displayId;
-      const screen =
-        displayId === undefined
-          ? display.getDefaultDisplaySync()
-          : display.getDisplayByIdSync(displayId);
+    const screen = readWindowDisplay(mainWindow);
+    if (screen !== undefined) {
       width = screen.width;
       height = screen.height;
-    } catch {}
+    }
   }
   return { width, height };
 }
 
-function maximumRefreshRate(mainWindow: window.Window): number {
-  const id = mainWindow.getWindowProperties().displayId;
-  const screen =
-    id === undefined ? display.getDefaultDisplaySync() : display.getDisplayByIdSync(id);
-  return (screen.supportedRefreshRates ?? []).reduce(
+function maximumRefreshRate(mainWindow: window.Window): number | undefined {
+  const screen = readWindowDisplay(mainWindow);
+  if (screen === undefined) {
+    return undefined;
+  }
+  const rate = (screen.supportedRefreshRates ?? []).reduce(
     (maximum: number, hz: number): number => Math.max(maximum, hz),
     screen.refreshRate,
   );
+  return rate > 0 ? rate : undefined;
 }

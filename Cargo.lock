@@ -3288,9 +3288,9 @@ checksum = "be3125873f2c81c78eccc7b2f2a32e37943e1d2a35132848173ad783d5320b14"
 
 [[package]]
 name = "ohos-display-binding"
-version = "0.1.6"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a04568d9fef331b00bf2287b0dd618ae0b9977382b77d11097a15d5afbe7a2f4"
+checksum = "5c2fc1ce5637ca0308c4314bb05750a83de4d8878cbf829bb5c10cf237a0c2fc"
 dependencies = [
  "ohos-display-sys",
  "ohos-enum-derive",

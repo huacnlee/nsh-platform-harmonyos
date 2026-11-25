@@ -983,10 +983,9 @@ impl Services {
             active: AtomicBool::new(true),
             appearance: std::sync::atomic::AtomicU8::new(0),
             pixel_ratio: AtomicU32::new((init.pixel_ratio as f32).to_bits()),
-            max_refresh_rate: AtomicU32::new(
-                init.max_refresh_rate
-                    .unwrap_or_else(ohos_display_binding::default_display_refresh_rate),
-            ),
+            max_refresh_rate: AtomicU32::new(init.max_refresh_rate.unwrap_or_else(|| {
+                ohos_display_binding::default_display_refresh_rate().unwrap_or(0)
+            })),
             loads: AtomicUsize::new(0),
             resource_lock: Mutex::new(()),
             resource_manager: Arc::new(resource_manager),
