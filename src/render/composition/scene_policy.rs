@@ -79,7 +79,10 @@ pub(crate) fn opaque_background_covers_bounds(
     height: f32,
     sample_bounds: [f32; 4],
 ) -> bool {
-    if scene_opacity < 1.0 || !is_opaque_color(style.background_color) {
+    if scene_opacity < 1.0
+        || style.clip_path().is_some()
+        || !is_opaque_color(style.background_color)
+    {
         return false;
     }
     if width <= 0.0 || height <= 0.0 {

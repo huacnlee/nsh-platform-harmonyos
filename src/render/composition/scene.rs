@@ -808,7 +808,7 @@ fn scene_root_for(node: &Rc<Node>, root: &Rc<Node>) -> Rc<Node> {
         {
             return ancestor;
         }
-        if ancestor.clips_children() {
+        if ancestor.clips_children() && ancestor.style.borrow().clip_path().is_none() {
             let opaque_bg = is_opaque_color(ancestor.style.borrow().background_color)
                 || ancestor
                     .children

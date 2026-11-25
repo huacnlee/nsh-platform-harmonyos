@@ -1,8 +1,8 @@
 //! Worker-owned native paint planes, ordered backdrop roots and group effects.
 use std::sync::Arc;
 
-use nsh_core::{BlendMode, Matrix as Transform, ViewStyle};
-use ohos_drawing_binding::{Bitmap, BitmapFormat, Brush, Canvas, ClipOperation, Matrix};
+use nsh_core::{BlendMode, ClipInset, Matrix as Transform, ViewStyle, shape::Segment};
+use ohos_drawing_binding::{Bitmap, BitmapFormat, Brush, Canvas, ClipOperation, Matrix, Path};
 
 use crate::render::{
     composition::{filter::Image, geometry::Bounds, worker::Key},
@@ -136,6 +136,10 @@ impl<S: Sources> Renderer<'_, S> {
         }
         destination.save();
         destination.concat(&pixel_matrix(node.transform, self.scale));
+        if let Some(clip_path) = node.style.clip_path() {
+            let path = clip_inset_drawing_path(clip_path, node.size.into(), self.scale);
+            destination.clip_path(&path, ClipOperation::Intersect, true);
+        }
         let effects = node.style.effects.as_ref();
         let filters = effects.map_or(&[][..], |effects| effects.filters.as_slice());
         let masks = effects.map_or(&[][..], |effects| effects.mask_images.as_slice());
@@ -373,4 +377,26 @@ fn pixel_matrix(matrix: Transform, scale: f32) -> Matrix {
         (m[7] / s) as f32,
         m[15] as f32,
     ])
+}
+
+fn clip_inset_drawing_path(
+    clip: &ClipInset,
+    size: nsh_core::Size<nsh_core::Points>,
+    scale: f32,
+) -> Path {
+    let mut path = Path::new();
+    clip.outline(size, &mut |segment| match segment {
+        Segment::Move(p) => path.move_to(p.x.0 * scale, p.y.0 * scale),
+        Segment::Line(p) => path.line_to(p.x.0 * scale, p.y.0 * scale),
+        Segment::Cubic([c1, c2, to]) => path.bezier_curve_to(
+            c1.x.0 * scale,
+            c1.y.0 * scale,
+            c2.x.0 * scale,
+            c2.y.0 * scale,
+            to.x.0 * scale,
+            to.y.0 * scale,
+        ),
+        Segment::Close => path.close(),
+    });
+    path
 }

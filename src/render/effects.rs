@@ -1,7 +1,54 @@
 //! Unified CSS filter and effect routing across native ArkUI attributes,
 //! GLES composition of native snapshots (`Composite`), and surface-level `Scene` drawing.
 
-use nsh_core::{BlendMode, Filter, ViewStyle};
+use std::fmt::Write as _;
+
+use nsh_core::{BlendMode, ClipInset, Filter, ViewStyle, geometry::size, shape::Segment};
+
+/// Formats `clip` as an SVG path string in physical pixels for ArkUI's
+/// `NODE_CLIP_SHAPE` (`ARKUI_CLIP_TYPE_PATH`), matching [`ClipInset::outline`].
+pub(crate) fn clip_inset_svg_path(
+    clip: &ClipInset,
+    width_vp: f32,
+    height_vp: f32,
+    scale: f32,
+) -> String {
+    let px = |v: f32| {
+        let scaled = v * scale;
+        if scaled == 0.0 { 0.0 } else { scaled }
+    };
+    let mut svg = String::with_capacity(192);
+    clip.outline(
+        size(nsh_core::Points(width_vp), nsh_core::Points(height_vp)),
+        &mut |segment| {
+            if !svg.is_empty() {
+                svg.push(' ');
+            }
+            match segment {
+                Segment::Move(p) => {
+                    let _ = write!(svg, "M {} {}", px(p.x.0), px(p.y.0));
+                }
+                Segment::Line(p) => {
+                    let _ = write!(svg, "L {} {}", px(p.x.0), px(p.y.0));
+                }
+                Segment::Cubic([c1, c2, to]) => {
+                    let _ = write!(
+                        svg,
+                        "C {} {} {} {} {} {}",
+                        px(c1.x.0),
+                        px(c1.y.0),
+                        px(c2.x.0),
+                        px(c2.y.0),
+                        px(to.x.0),
+                        px(to.y.0)
+                    );
+                }
+                Segment::Close => svg.push('Z'),
+            }
+        },
+    );
+    svg
+}
 
 /// Whether `filter` is a mathematical identity (produces no pixel or bounds change).
 pub(crate) fn is_noop_filter(filter: &Filter) -> bool {
@@ -520,5 +567,21 @@ mod tests {
         let plan = EffectsPlan::compute(&view_grayscale, EffectsContext::default());
         assert!(!plan.requires_texture);
         assert_eq!(plan.native_color_filter, NativeColorFilter::Grayscale(1.0));
+    }
+
+    #[test]
+    fn clip_inset_svg_path_scales_to_pixels_and_closes() {
+        let clip = ClipInset::new()
+            .inset(nsh_core::Points(4.0))
+            .rounded(nsh_core::Points(8.0));
+        let path = clip_inset_svg_path(&clip, 100.0, 60.0, 2.0);
+        assert!(path.starts_with("M "));
+        assert!(path.ends_with(" Z"));
+        // Left edge at 4vp * 2 = 8px, plus 8vp * 2 = 16px corner radius => M 24 8.
+        assert!(path.starts_with("M 24 8 L 176 8 "));
+        // Percentage inset resolves against box dimensions before pixel scaling.
+        let half = ClipInset::new().left(nsh_core::geometry::Percentage(0.5));
+        let half_path = clip_inset_svg_path(&half, 100.0, 40.0, 3.0);
+        assert!(half_path.starts_with("M 150 0 L 300 0 "));
     }
 }
