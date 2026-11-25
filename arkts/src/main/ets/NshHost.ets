@@ -58,7 +58,7 @@ interface HostInitPayload {
   cacheDir: string;
   filesDir: string;
   pixelRatio: number;
-  maxRefreshRate: number;
+  maxRefreshRate?: number;
   rtl: boolean;
   lifecycle: string;
   colorMode: number;

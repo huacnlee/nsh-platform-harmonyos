@@ -2948,17 +2948,17 @@ impl Mounter {
             self.shaders.log_idle_configured();
         }
         Self::attribute(self.animator.flush());
-        for node in self.nodes.values() {
-            if let Some(scroll) = node.scroll.borrow().as_ref() {
-                Self::attribute(scroll.update_child_culling());
-            }
-        }
         for &id in &batch_created_ids {
             if let Ok(node) = self.node(id)
                 && !node.pending_delete.get()
                 && node.mount_parent.borrow().strong_count() > 0
             {
                 Self::attribute(node.flush_deferred_native());
+            }
+        }
+        for node in self.nodes.values() {
+            if let Some(scroll) = node.scroll.borrow().as_ref() {
+                Self::attribute(scroll.update_child_culling());
             }
         }
         Self::attribute(self.shaders.frame().map(|_| ()));

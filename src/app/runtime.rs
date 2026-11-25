@@ -248,9 +248,16 @@ impl<T: Send + 'static> UiReply<T> {
     }
 }
 
+#[derive(Default)]
+struct Inbox {
+    queue: std::collections::VecDeque<Message>,
+    scheduled: bool,
+}
+
 pub(crate) struct Dispatcher {
     pub(crate) owner: std::sync::Weak<crate::app::surface::Queue>,
-    queue: ThreadsafeFunction<Message, (), (), Status, false>,
+    inbox: Arc<std::sync::Mutex<Inbox>>,
+    wake: ThreadsafeFunction<(), (), (), Status, false>,
     pub(crate) wants_back: std::sync::atomic::AtomicBool,
     /// Keeps mounted status-bar changes hidden during native video fullscreen.
     pub(crate) video_fullscreen: std::sync::atomic::AtomicBool,
@@ -272,10 +279,27 @@ impl Dispatcher {
         self.send(Message::ImageProgress(progress));
     }
     pub(crate) fn send(&self, message: Message) {
-        let status = self
-            .queue
-            .call(message, ThreadsafeFunctionCallMode::NonBlocking);
+        let should_wake = {
+            let mut inbox = self.inbox.lock().unwrap_or_else(|e| e.into_inner());
+            inbox.queue.push_back(message);
+            if inbox.scheduled {
+                false
+            } else {
+                inbox.scheduled = true;
+                true
+            }
+        };
+        if should_wake {
+            self.call_wake();
+        }
+    }
+    fn call_wake(&self) {
+        let status = self.wake.call((), ThreadsafeFunctionCallMode::NonBlocking);
         if status != Status::Ok {
+            self.inbox
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .scheduled = false;
             log::error!("OHOS UI dispatch failed: {status:?}");
         }
     }
@@ -1455,31 +1479,76 @@ impl Runtime {
             hot_version: None,
         }));
         let ui_state = state.clone();
+        let inbox = Arc::new(std::sync::Mutex::new(Inbox::default()));
+        let route_ref: Rc<std::cell::OnceCell<Weak<Dispatcher>>> =
+            Rc::new(std::cell::OnceCell::new());
+        let drain_inbox = inbox.clone();
+        let drain_route = route_ref.clone();
         let wake = env.create_function_from_closure::<(), (), _>("nshCommit", |_| Ok(()))?;
         let dispatcher = Arc::new(Dispatcher {
             owner,
-            queue: wake
-                .build_threadsafe_function::<Message>()
+            inbox,
+            wake: wake
+                .build_threadsafe_function::<()>()
                 .callee_handled::<false>()
-                .build_callback(move |ctx| {
-                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let Ok(mut state) = ui_state.try_borrow_mut() else {
-                            // Re-enqueue on synchronous re-entry instead of panicking.
-                            if let Ok(state) = ui_state.try_borrow()
-                                && let Some(route) = state.dispatcher.upgrade()
-                            {
-                                route.send(ctx.value);
+                .build_callback(move |_| {
+                    for pass in 0..4 {
+                        let messages = {
+                            let mut inbox = drain_inbox.lock().unwrap_or_else(|e| e.into_inner());
+                            if inbox.queue.is_empty() {
+                                inbox.scheduled = false;
+                                break;
                             }
-                            return;
+                            inbox.scheduled = true;
+                            std::mem::take(&mut inbox.queue)
                         };
-                        if let Err(error) = state.receive(ctx.value) {
-                            state.report(error.to_string());
-                            log::error!("OHOS surface: {error}");
+                        let deferred =
+                            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                let Ok(mut state) = ui_state.try_borrow_mut() else {
+                                    // Re-enqueue on synchronous re-entry at front to preserve FIFO order.
+                                    let mut inbox =
+                                        drain_inbox.lock().unwrap_or_else(|e| e.into_inner());
+                                    for msg in messages.into_iter().rev() {
+                                        inbox.queue.push_front(msg);
+                                    }
+                                    inbox.scheduled = true;
+                                    drop(inbox);
+                                    if let Some(route) = drain_route.get().and_then(Weak::upgrade) {
+                                        route.call_wake();
+                                    }
+                                    return true;
+                                };
+                                for msg in messages {
+                                    if let Err(error) = state.receive(msg) {
+                                        state.report(error.to_string());
+                                        log::error!("OHOS surface: {error}");
+                                    }
+                                }
+                                false
+                            })) {
+                                Ok(deferred) => deferred,
+                                Err(_) => {
+                                    log::error!("panic in OHOS runtime TSFN callback");
+                                    false
+                                }
+                            };
+                        if deferred {
+                            break;
                         }
-                    }))
-                    .is_err()
-                    {
-                        log::error!("panic in OHOS runtime TSFN callback");
+                        if pass == 3 {
+                            let has_more = {
+                                let mut inbox =
+                                    drain_inbox.lock().unwrap_or_else(|e| e.into_inner());
+                                let has_more = !inbox.queue.is_empty();
+                                inbox.scheduled = has_more;
+                                has_more
+                            };
+                            if has_more
+                                && let Some(route) = drain_route.get().and_then(Weak::upgrade)
+                            {
+                                route.call_wake();
+                            }
+                        }
                     }
                     Ok(())
                 })?,
@@ -1494,6 +1563,7 @@ impl Runtime {
             keyboard: std::sync::Mutex::default(),
             live: std::sync::atomic::AtomicBool::new(true),
         });
+        let _ = route_ref.set(Arc::downgrade(&dispatcher));
         state.borrow_mut().dispatcher = Arc::downgrade(&dispatcher);
         state.borrow_mut().rate_driver = Some(super::frame_source::RateDriver::new(
             vsync,

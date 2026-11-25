@@ -80,17 +80,20 @@ impl CanvasView {
                 job.store(true, Ordering::Relaxed);
             }
         }
+        let base_budget = self.budget.get().saturating_sub(self.image_bytes.get());
+        let mut next_bytes = 0usize;
         let mut next = Vec::new();
         for image in drawing.images() {
             if next.iter().any(|i: &Image| i.uri == image.uri) {
                 continue;
             }
-            let bitmap = images
+            let mut bitmap = images
                 .iter_mut()
                 .find(|i| i.uri == image.uri)
                 .and_then(|i| i.bitmap.take());
-            let job = bitmap.is_none().then(|| {
-                owner.images.load(
+            let mut job = None;
+            if bitmap.is_none() {
+                match owner.images.load_or_cached(
                     crate::media::image::Target::Canvas {
                         id: owner.id,
                         generation,
@@ -98,8 +101,38 @@ impl CanvasView {
                     },
                     image.uri.to_string(),
                     None,
-                )
-            });
+                ) {
+                    crate::media::image::LoadResult::Ready(Ok(data)) => {
+                        if base_budget
+                            .saturating_add(next_bytes)
+                            .saturating_add(data.decoded_bytes().saturating_mul(2))
+                            > BUDGET
+                        {
+                            log::warn!(
+                                "OHOS canvas image {}: canvas image memory budget exhausted",
+                                image.uri
+                            );
+                        } else {
+                            match data.bitmap() {
+                                Ok(decoded) => bitmap = Some(decoded),
+                                Err(error) => {
+                                    log::warn!("OHOS canvas image {}: {error}", image.uri);
+                                }
+                            }
+                        }
+                    }
+                    crate::media::image::LoadResult::Ready(Err(error)) => {
+                        log::warn!("OHOS canvas image {}: {error}", image.uri);
+                    }
+                    crate::media::image::LoadResult::Pending(pending) => {
+                        job = Some(pending);
+                    }
+                }
+            }
+            if let Some(b) = bitmap.as_ref() {
+                next_bytes =
+                    next_bytes.saturating_add(b.width() as usize * b.height() as usize * 4);
+            }
             next.push(Image {
                 uri: image.uri.clone(),
                 bitmap,
@@ -107,13 +140,8 @@ impl CanvasView {
             });
         }
         *images = next;
-        let bytes = images
-            .iter()
-            .filter_map(|i| i.bitmap.as_ref())
-            .map(|b| b.width() as usize * b.height() as usize * 4)
-            .sum();
-        self.budget
-            .set(self.budget.get() - self.image_bytes.replace(bytes) + bytes);
+        self.image_bytes.set(next_bytes);
+        self.budget.set(base_budget.saturating_add(next_bytes));
         self.slots
             .borrow_mut()
             .resize(drawing.slots.len(), AnimationValue::Number(0.0));

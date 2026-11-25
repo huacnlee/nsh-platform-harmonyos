@@ -136,6 +136,12 @@ pub(crate) struct Step {
 }
 
 impl Live {
+    pub(crate) fn is_idle(&self) -> bool {
+        self.inner.idle()
+            && self.target_style.is_none()
+            && self.text_color.is_none()
+            && !self.recolor
+    }
     #[cfg(feature = "dev")]
     pub(crate) fn test_finishing(&self, now: f64) -> bool {
         self.inner.deadline(now).is_some()

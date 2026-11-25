@@ -122,16 +122,24 @@ impl Node {
         if self.live.borrow().is_some() || target.transition.is_some() || target.animation.is_some()
         {
             let old = self.style.borrow().clone();
-            self.live
-                .borrow_mut()
-                .get_or_insert_with(Default::default)
-                .style(
+            let idle = {
+                let mut live = self.live.borrow_mut();
+                let entry = live.get_or_insert_with(Default::default);
+                entry.style(
                     &mut target,
                     *old,
                     self.platform.get().reduce_motion,
                     self.styled.get(),
                 );
-            self.animator.track(self);
+                let idle = entry.is_idle();
+                if idle {
+                    *live = None;
+                }
+                idle
+            };
+            if !idle {
+                self.animator.track(self);
+            }
         }
         let (paint_dirty, had_effects, hidden_changed) = {
             let prev = self.style.borrow();

@@ -71,6 +71,10 @@ pub(crate) struct Progress {
     pub(crate) loaded: u64,
     pub(crate) total: u64,
 }
+pub(crate) enum LoadResult {
+    Ready(std::result::Result<Arc<Data>, String>),
+    Pending(Arc<AtomicBool>),
+}
 pub(crate) struct Decoded {
     bytes: Arc<[u8]>,
     svg: Option<nsh_core::svg::Raster>,
@@ -205,13 +209,12 @@ impl Loader {
     pub(crate) fn set_disk_cache(&self, cache: Option<DiskCache>) {
         self.context.lock().expect("image context").disk = cache;
     }
-    pub(crate) fn load(
+    pub(crate) fn load_or_cached(
         self: &Arc<Self>,
         target: Target,
         uri: String,
         inline: Option<ImageData>,
-    ) -> Arc<AtomicBool> {
-        let cancelled = Arc::new(AtomicBool::new(false));
+    ) -> LoadResult {
         // A pixel buffer needs no read or decode, and never enters the
         // caches: every buffer is a new image, shown as it is.
         if let Some(data) = inline.as_ref().filter(|data| data.rgba().is_some()) {
@@ -231,30 +234,41 @@ impl Loader {
                     _lease: Lease::none(),
                 }))
             };
-            if let Some(dispatcher) = self.dispatcher.upgrade() {
-                dispatcher.image(Ready {
-                    target,
-                    data: result,
-                });
-            }
-            return cancelled;
+            return LoadResult::Ready(result);
         }
         let key = (uri.clone(), matches!(target, Target::View { .. }));
+        let context = self.context.lock().expect("image context").clone();
+        if inline.is_none() && !context.access.allows_media(&uri) {
+            return LoadResult::Ready(Err(
+                "image URL is not granted by capabilities.network".into()
+            ));
+        }
+        if let Some((decoded, lease)) = self.cache.get(&key) {
+            return LoadResult::Ready(Ok(Arc::new(Data {
+                decoded,
+                _lease: lease,
+            })));
+        }
+        let location = inline
+            .map(|bytes| Location::Memory(uri.clone().into(), bytes))
+            .or_else(|| context.resolve(&uri));
+        let Some(location) = location else {
+            return LoadResult::Ready(Err("unsupported image URI".into()));
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
         let request = {
             let mut pending = self.pending.lock().expect("pending images");
+            if let Some((decoded, lease)) = self.cache.get(&key) {
+                return LoadResult::Ready(Ok(Arc::new(Data {
+                    decoded,
+                    _lease: lease,
+                })));
+            }
             if let Some(request) = pending.get(&key) {
                 match request.join(target, &cancelled) {
-                    Ok(true) => return cancelled,
+                    Ok(true) => return LoadResult::Pending(cancelled),
                     Ok(false) => {}
-                    Err(error) => {
-                        if let Some(dispatcher) = self.dispatcher.upgrade() {
-                            dispatcher.image(Ready {
-                                target,
-                                data: Err(error.into()),
-                            });
-                        }
-                        return cancelled;
-                    }
+                    Err(error) => return LoadResult::Ready(Err(error.into())),
                 }
             }
             let request = Arc::new(Loading {
@@ -263,33 +277,6 @@ impl Loader {
             });
             pending.insert(key.clone(), request.clone());
             request
-        };
-        let context = self.context.lock().expect("image context").clone();
-        if inline.is_none() && !context.access.allows_media(&uri) {
-            self.finish(
-                &key,
-                &request,
-                Err("image URL is not granted by capabilities.network".into()),
-            );
-            return cancelled;
-        }
-        if let Some((decoded, lease)) = self.cache.get(&key) {
-            self.finish(
-                &key,
-                &request,
-                Ok(Arc::new(Data {
-                    decoded,
-                    _lease: lease,
-                })),
-            );
-            return cancelled;
-        }
-        let location = inline
-            .map(|bytes| Location::Memory(uri.clone().into(), bytes))
-            .or_else(|| context.resolve(&uri));
-        let Some(location) = location else {
-            self.finish(&key, &request, Err("unsupported image URI".into()));
-            return cancelled;
         };
         let decode_key = key.clone();
         let progress_loader = self.clone();
@@ -338,7 +325,26 @@ impl Loader {
             }),
         );
         *request.ticket.lock().expect("image ticket") = Some(ticket);
-        cancelled
+        LoadResult::Pending(cancelled)
+    }
+    pub(crate) fn load(
+        self: &Arc<Self>,
+        target: Target,
+        uri: String,
+        inline: Option<ImageData>,
+    ) -> Arc<AtomicBool> {
+        match self.load_or_cached(target, uri, inline) {
+            LoadResult::Ready(result) => {
+                if let Some(dispatcher) = self.dispatcher.upgrade() {
+                    dispatcher.image(Ready {
+                        target,
+                        data: result,
+                    });
+                }
+                Arc::new(AtomicBool::new(false))
+            }
+            LoadResult::Pending(cancelled) => cancelled,
+        }
     }
     fn finish(
         &self,
@@ -601,6 +607,7 @@ pub(crate) struct ImageView {
     fade_ms: Cell<f32>,
     fade_pending: Cell<bool>,
     fade_start: Cell<Option<f64>>,
+    cached_hit: Cell<bool>,
     source: RefCell<Option<ImageSource>>,
     placeholder: RefCell<Option<ImageSource>>,
 }
@@ -631,6 +638,7 @@ impl ImageView {
             fade_ms: Cell::new(0.0),
             fade_pending: Cell::new(false),
             fade_start: Cell::new(None),
+            cached_hit: Cell::new(false),
             source: RefCell::new(None),
             placeholder: RefCell::new(None),
         });
@@ -646,7 +654,10 @@ impl ImageView {
                         && !image.loaded.replace(true)
                         && let Some(owner) = image.owner.upgrade()
                     {
-                        if image.fade_ms.get() > 0.0 && !owner.platform.get().reduce_motion {
+                        if !image.cached_hit.get()
+                            && image.fade_ms.get() > 0.0
+                            && !owner.platform.get().reduce_motion
+                        {
                             image.native.borrow().set_f32_attribute(A::Opacity, 0.0)?;
                             image.fade_start.set(None);
                             image.fade_pending.set(true);
@@ -808,29 +819,81 @@ impl ImageView {
             .and_then(|source| source.data.as_ref())
             .is_some_and(|data| data.rgba().is_some());
         self.native.borrow().reset_attribute(A::ImageAlt)?;
-        if seamless {
-            self.decoded.borrow_mut()[1] = None;
-        } else {
-            self.native.borrow().reset_attribute(A::ImageSrc)?;
-            *self.decoded.borrow_mut() = [None, None];
-        }
+        self.decoded.borrow_mut()[1] = None;
         let Some(owner) = self.owner.upgrade() else {
+            self.cached_hit.set(false);
+            if !seamless {
+                self.native.borrow().reset_attribute(A::ImageSrc)?;
+                self.decoded.borrow_mut()[0] = None;
+            }
             return Ok(());
         };
         if let Some(source) = source {
             owner.emit(EventKind::LoadStart, EventPayload::None);
-            for (source, placeholder) in [(Some(source), false), (options.placeholder, true)] {
-                if let Some(source) = source {
-                    self.jobs.borrow_mut().push(self.loader.load(
-                        Target::View {
-                            id: owner.id,
-                            generation,
-                            placeholder,
-                        },
-                        source.uri.to_string(),
-                        source.data,
-                    ));
+            match self.loader.load_or_cached(
+                Target::View {
+                    id: owner.id,
+                    generation,
+                    placeholder: false,
+                },
+                source.uri.to_string(),
+                source.data,
+            ) {
+                LoadResult::Ready(result) => {
+                    let ok = result.is_ok();
+                    self.cached_hit.set(ok);
+                    self.ready(generation, false, result)?;
+                    if !ok && let Some(placeholder) = options.placeholder {
+                        match self.loader.load_or_cached(
+                            Target::View {
+                                id: owner.id,
+                                generation,
+                                placeholder: true,
+                            },
+                            placeholder.uri.to_string(),
+                            placeholder.data,
+                        ) {
+                            LoadResult::Ready(res) => {
+                                self.ready(generation, true, res)?;
+                            }
+                            LoadResult::Pending(pjob) => {
+                                self.jobs.borrow_mut().push(pjob);
+                            }
+                        }
+                    }
                 }
+                LoadResult::Pending(job) => {
+                    self.cached_hit.set(false);
+                    if !seamless {
+                        self.native.borrow().reset_attribute(A::ImageSrc)?;
+                        self.decoded.borrow_mut()[0] = None;
+                    }
+                    self.jobs.borrow_mut().push(job);
+                    if let Some(placeholder) = options.placeholder {
+                        match self.loader.load_or_cached(
+                            Target::View {
+                                id: owner.id,
+                                generation,
+                                placeholder: true,
+                            },
+                            placeholder.uri.to_string(),
+                            placeholder.data,
+                        ) {
+                            LoadResult::Ready(res) => {
+                                self.ready(generation, true, res)?;
+                            }
+                            LoadResult::Pending(pjob) => {
+                                self.jobs.borrow_mut().push(pjob);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            self.cached_hit.set(false);
+            if !seamless {
+                self.native.borrow().reset_attribute(A::ImageSrc)?;
+                self.decoded.borrow_mut()[0] = None;
             }
         }
         Ok(())
