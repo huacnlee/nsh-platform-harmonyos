@@ -23,7 +23,9 @@ use std::{
     time::Duration,
 };
 
-use nsh_engine::{FetchEvent, FetchEvents, FetchTask, HttpBody, HttpHead, HttpRequest, Network};
+use nsh_engine::{
+    FetchEvent, FetchEvents, FetchTask, HttpBody, HttpCache, HttpHead, HttpRequest, Network,
+};
 use ureq::{Agent, RequestExt, ResponseExt, SendBody, http};
 
 /// Bytes read from the response per chunk.
@@ -91,7 +93,16 @@ impl UreqNetwork {
 }
 
 impl Network for UreqNetwork {
-    fn fetch(&self, request: HttpRequest, events: FetchEvents) -> Box<dyn FetchTask> {
+    fn fetch(&self, request: HttpRequest, mut events: FetchEvents) -> Box<dyn FetchTask> {
+        if request.cache == HttpCache::OnlyIfCached {
+            events(FetchEvent::Failed(
+                "no cached response (`cache: \"only-if-cached\"`)".into(),
+            ));
+            return Box::new(Task {
+                control: Arc::default(),
+                body: None,
+            });
+        }
         let agent = if request.follow_redirects {
             self.follow.clone()
         } else {
