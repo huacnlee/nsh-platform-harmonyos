@@ -223,6 +223,7 @@ impl Node {
             applied.z_index = 0;
             self.applied.set(applied);
             self.interaction.invalidate_opacity();
+            self.interaction.invalidate_wrapper_clip();
         }
     }
     fn unhidden_for_effects(&self, style: &ViewStyle) -> bool {
@@ -673,8 +674,11 @@ impl Node {
             } else {
                 native.reset_attribute(Attribute::ClipShape)?;
             }
+            drop(native);
             applied.clip_path = next_clip_path;
             self.applied.set(applied);
+            self.interaction.hit_region(self)?;
+            self.interaction.sync_clip_intercept(self)?;
         }
         Ok(())
     }

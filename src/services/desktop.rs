@@ -1859,6 +1859,7 @@ mod ohos {
         pub(crate) selection_menu_target: Option<nsh_core::NodeId>,
         pub(crate) hosted_main_window: Option<nsh_core::NodeId>,
         pub(crate) main_window_launch_applied: bool,
+        pub(crate) main_window_activated: std::cell::Cell<bool>,
         pub(crate) hotkeys: FxHashMap<u32, HotkeyMonitor>,
     }
 
@@ -1878,6 +1879,7 @@ mod ohos {
                 selection_menu_target: None,
                 hosted_main_window: None,
                 main_window_launch_applied: false,
+                main_window_activated: std::cell::Cell::new(false),
                 hotkeys: FxHashMap::default(),
             }
         }

@@ -277,6 +277,12 @@ impl Mounter {
         let reduce_motion_changed = self.platform.get().reduce_motion != environment.reduce_motion;
         let was_background = self.platform.get().lifecycle == nsh_engine::Lifecycle::Background;
         self.platform.set(environment);
+        if environment
+            .window_state
+            .is_some_and(|state| state.visible && state.focused)
+        {
+            self.desktop.main_window_activated.set(true);
+        }
         let mut result = Ok(());
         for node in self.nodes.values() {
             if density_changed {
@@ -660,6 +666,9 @@ impl Mounter {
         self.desktop.main_window_launch_applied = true;
     }
     pub(crate) fn on_main_window_state(&self, state: nsh_core::desktop::WindowState) {
+        if state.visible && state.focused {
+            self.desktop.main_window_activated.set(true);
+        }
         if let Some(id) = self.desktop.hosted_main_window {
             self.control.dispatch_event(
                 id,

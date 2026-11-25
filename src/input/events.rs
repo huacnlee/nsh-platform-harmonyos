@@ -13,7 +13,7 @@ use nsh_core::{
 };
 use ohos_arkui_binding::{
     arkui_input_binding::{
-        ArkUIInputEvent, ModifierKey, UIAxisEventAction, UIInputAction, UIInputSourceType,
+        ArkUIInputEvent, HitTest, ModifierKey, UIAxisEventAction, UIInputAction, UIInputSourceType,
         UIInputToolType, UIMouseEventAction, UIMouseEventButton,
     },
     component::attribute::{ArkUICommonAttribute, ArkUIEvent, ArkUIGesture},
@@ -42,7 +42,11 @@ pub(crate) struct Interaction {
     click_registered: Cell<bool>,
     touch_registered: Cell<bool>,
     expanded_hit_region: Cell<bool>,
+    wrapper_hit_region: Cell<bool>,
+    clip_intercept_registered: Cell<bool>,
+    wrapper_clip_intercept_registered: Cell<bool>,
     hover_registered: Cell<bool>,
+    effective_hovered: Cell<bool>,
     key_focusable: Cell<bool>,
     focus_wrapped: Cell<bool>,
     focus_command_gen: Cell<u32>,
@@ -79,7 +83,11 @@ impl Default for Interaction {
             click_registered: Cell::new(false),
             touch_registered: Cell::new(false),
             expanded_hit_region: Cell::new(false),
+            wrapper_hit_region: Cell::new(false),
+            clip_intercept_registered: Cell::new(false),
+            wrapper_clip_intercept_registered: Cell::new(false),
             hover_registered: Cell::new(false),
+            effective_hovered: Cell::new(false),
             key_focusable: Cell::new(false),
             focus_wrapped: Cell::new(false),
             focus_command_gen: Cell::new(0),
@@ -126,43 +134,114 @@ impl Interaction {
     pub(crate) fn test_id(&self) -> Option<String> {
         self.props.borrow().test_id.as_deref().map(str::to_owned)
     }
+    pub(crate) fn invalidate_wrapper_clip(&self) {
+        self.wrapper_hit_region.set(false);
+        self.wrapper_clip_intercept_registered.set(false);
+    }
     pub(crate) fn hit_region(&self, owner: &Node) -> Result<()> {
         let frame = owner.frame.get();
-        let has_area = frame.width > 0.0 && frame.height > 0.0;
-        let slop = if has_area {
-            self.props.borrow().hit_slop
-        } else {
-            nsh_core::EdgeInsets::default()
-        };
-        let eff_w = if frame.width > 0.0 {
-            frame.width
-        } else {
-            1.0 / owner.scale.get()
-        };
-        let eff_h = if frame.height > 0.0 {
-            frame.height
-        } else {
-            1.0 / owner.scale.get()
-        };
+        let slop = self.props.borrow().hit_slop;
+        let clip_path = owner.style.borrow().clip_path().copied();
+        let region = crate::input::intercept::response_region_percent(
+            frame.width,
+            frame.height,
+            slop,
+            clip_path,
+        );
         // ArkUI visits the children of an unclipped node even outside its own
         // response region. Extending the parent to their bounding box lets a
         // decorative sibling intercept clicks in empty space between children.
-        if slop == nsh_core::EdgeInsets::default() {
-            if self.expanded_hit_region.replace(false) {
-                owner.native.borrow().reset_attribute(A::ResponseRegion)?;
+        // Conversely, shrinking `ResponseRegion` to `clipPath`'s resolved inset
+        // rect lets touch, click, hover, and wheel events pass through clipped
+        // margins directly to underlying siblings.
+        if let Some(region) = region {
+            self.expanded_hit_region.set(true);
+            owner
+                .native
+                .borrow()
+                .set_attribute(A::ResponseRegion, region.into())?;
+        } else if self.expanded_hit_region.replace(false) {
+            owner.native.borrow().reset_attribute(A::ResponseRegion)?;
+        }
+        if let Some(wrapper) = owner.wrapper.borrow().as_ref() {
+            if clip_path.is_some()
+                && let Some(region) = region
+            {
+                self.wrapper_hit_region.set(true);
+                wrapper
+                    .outer
+                    .borrow()
+                    .set_attribute(A::ResponseRegion, region.into())?;
+            } else if self.wrapper_hit_region.replace(false) {
+                wrapper.outer.borrow().reset_attribute(A::ResponseRegion)?;
             }
         } else {
-            self.expanded_hit_region.set(true);
-            owner.native.borrow().set_attribute(
-                A::ResponseRegion,
-                [
-                    -slop.left.0,
-                    -slop.top.0,
-                    (eff_w + slop.left.0 + slop.right.0) / eff_w * 100.0,
-                    (eff_h + slop.top.0 + slop.bottom.0) / eff_h * 100.0,
-                ]
-                .into(),
-            )?;
+            self.wrapper_hit_region.set(false);
+        }
+        Ok(())
+    }
+    pub(crate) fn sync_clip_intercept(&self, owner: &Node) -> Result<()> {
+        let want = owner.style.borrow().clip_path().is_some();
+        let attach = |target: &crate::render::node::NativeNode, weak: std::rc::Weak<Node>| {
+            target
+                .borrow_mut()
+                .on_event(E::OnTouchIntercept, move |event| {
+                    let Some(owner) = weak.upgrade() else {
+                        return;
+                    };
+                    let Some(input) = event.input_event() else {
+                        return;
+                    };
+                    let x = input.pointer_x();
+                    let y = input.pointer_y();
+                    if !owner.hit_within_clip_path(x, y) {
+                        let _ =
+                            input.pointer_set_intercept_hit_test_mode(HitTest::BlockDescendants);
+                    }
+                });
+        };
+        let weak = || owner.self_ref().map(|node| Rc::downgrade(&node));
+        if self.clip_intercept_registered.replace(want) != want {
+            if want {
+                if let Some(weak) = weak() {
+                    attach(&owner.native, weak);
+                } else {
+                    self.clip_intercept_registered.set(false);
+                }
+            } else {
+                owner.native.borrow_mut().off_event(E::OnTouchIntercept)?;
+            }
+        }
+        if let Some(wrapper) = owner.wrapper.borrow().as_ref() {
+            if self.wrapper_clip_intercept_registered.replace(want) != want {
+                if want {
+                    if let Some(weak) = weak() {
+                        attach(&wrapper.outer, weak);
+                    } else {
+                        self.wrapper_clip_intercept_registered.set(false);
+                    }
+                } else {
+                    wrapper.outer.borrow_mut().off_event(E::OnTouchIntercept)?;
+                }
+            }
+        } else {
+            self.wrapper_clip_intercept_registered.set(false);
+        }
+        Ok(())
+    }
+    fn set_hovered(&self, owner: &Rc<Node>, hovered: bool, x: f32, y: f32) -> Result<()> {
+        if self.effective_hovered.replace(hovered) == hovered {
+            return Ok(());
+        }
+        owner.cursor.update(owner, hovered)?;
+        self.state(owner, state::HOVERED, hovered)?;
+        let kind = if hovered {
+            EventKind::MouseEnter
+        } else {
+            EventKind::MouseLeave
+        };
+        if self.mask().contains(kind) {
+            owner.emit(kind, owner.mouse_payload(x, y, None));
         }
         Ok(())
     }
@@ -415,43 +494,35 @@ impl Interaction {
                             if let Some(owner) = weak.upgrade()
                                 && let Some(input) = event.input_event()
                             {
+                                let x = input.pointer_x();
+                                let y = input.pointer_y();
+                                let is_root = owner.id == nsh_core::ROOT_ID
+                                    || owner.kind == nsh_core::ViewKind::Modal;
                                 let hovered = input.is_hovered();
-                                if !hovered
-                                    && (owner.id == nsh_core::ROOT_ID
-                                        || owner.kind == nsh_core::ViewKind::Modal)
-                                {
+                                if !hovered && is_root {
                                     owner.cursor.clear_dynamic(&owner)?;
                                 }
-                                owner.cursor.update(&owner, hovered)?;
-                                owner.interaction.state(&owner, state::HOVERED, hovered)?;
-                                let kind = if hovered {
-                                    EventKind::MouseEnter
-                                } else {
-                                    EventKind::MouseLeave
-                                };
-                                if owner.interaction.mask().contains(kind) {
-                                    owner.emit(
-                                        kind,
-                                        owner.mouse_payload(
-                                            input.pointer_x(),
-                                            input.pointer_y(),
-                                            None,
-                                        ),
-                                    );
-                                }
+                                let effective =
+                                    hovered && (is_root || owner.hit_within_clip_path(x, y));
+                                owner.interaction.set_hovered(&owner, effective, x, y)?;
                             }
                             Ok(())
                         })
                     });
             } else {
                 owner.native.borrow_mut().off_event(E::OnHoverEvent)?;
+                if self.effective_hovered.replace(false) {
+                    owner.cursor.update(owner, false)?;
+                    self.state(owner, state::HOVERED, false)?;
+                }
             }
         }
         let mouse = !blocked
             && (is_surface_root
                 || owner.selectable()
                 || events.contains(EventKind::MouseMove)
-                || events.contains(EventKind::ContextMenu));
+                || events.contains(EventKind::ContextMenu)
+                || (hover && !is_surface_root));
         if self.mouse_registered.replace(mouse) != mouse {
             if mouse {
                 let weak = Rc::downgrade(owner);
@@ -464,7 +535,14 @@ impl Interaction {
                             let y = input.pointer_y();
                             let is_root = owner.id == nsh_core::ROOT_ID
                                 || owner.kind == nsh_core::ViewKind::Modal;
-                            if !is_root && !owner.hit_within_clip_path(x, y) {
+                            let in_clip = is_root || owner.hit_within_clip_path(x, y);
+                            if !is_root
+                                && input.mouse_action() == UIMouseEventAction::Move
+                                && owner.interaction.hover_registered.get()
+                            {
+                                owner.interaction.set_hovered(&owner, in_clip, x, y)?;
+                            }
+                            if !in_clip {
                                 return Ok(());
                             }
                             let wx = input.pointer_window_x();

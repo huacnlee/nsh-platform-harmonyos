@@ -46,6 +46,20 @@ impl Mounter {
                     if frame.width <= 0.0 || frame.height <= 0.0 {
                         return None;
                     }
+                    let env = self.platform.get();
+                    if !crate::input::intercept::desktop_surface_ready_for_input(
+                        env.os.is_desktop(),
+                        env.window_state,
+                        self.desktop.main_window_activated.get(),
+                    ) {
+                        return None;
+                    }
+                    if env
+                        .window_state
+                        .is_some_and(|state| state.visible && state.focused)
+                    {
+                        self.desktop.main_window_activated.set(true);
+                    }
                     let origin = self
                         .mount
                         .parent

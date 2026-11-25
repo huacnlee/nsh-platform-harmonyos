@@ -123,6 +123,7 @@ struct KeyInput<'a> {
     action: i32,
     code: N,
     unicode: u32,
+    caps_lock: bool,
     key_text: &'a str,
     pressed_keys: Option<&'a [i32]>,
     explicit_modifiers: Option<Modifiers>,
@@ -177,6 +178,7 @@ impl KeyboardWindow {
                 action,
                 code: event.key_code(),
                 unicode: event.unicode(),
+                caps_lock: event.caps_lock_on().unwrap_or(false),
                 key_text: &key_text,
                 pressed_keys,
                 explicit_modifiers: None,
@@ -203,6 +205,7 @@ impl KeyboardWindow {
                 action: event.action,
                 code,
                 unicode: event.unicode,
+                caps_lock: false,
                 key_text: &event.key_text,
                 pressed_keys: None,
                 explicit_modifiers: Some(Modifiers {
@@ -302,7 +305,14 @@ impl KeyboardWindow {
         }
         if (observes || captures) && !route.keyboard.lock().unwrap().composing {
             let mut details = nsh_core::KeyEvent::default();
-            details.key = logical_key(code, input.unicode, modifiers.shift, input.key_text).into();
+            details.key = logical_key(
+                code,
+                input.unicode,
+                modifiers.shift,
+                input.caps_lock,
+                input.key_text,
+            )
+            .into();
             // ArkUI exposes a logical key identifier but no hardware scan code.
             details.modifiers = modifiers;
             match code {
@@ -547,8 +557,23 @@ impl KeyboardWindow {
             }
             false
         });
+        let is_modifier_or_lock = matches!(
+            code,
+            N::ShiftLeft
+                | N::ShiftRight
+                | N::CtrlLeft
+                | N::CtrlRight
+                | N::AltLeft
+                | N::AltRight
+                | N::MetaLeft
+                | N::MetaRight
+                | N::CapsLock
+                | N::NumLock
+                | N::ScrollLock
+        );
         if !shortcut
             && !captures
+            && !is_modifier_or_lock
             && action == 1
             && !route.keyboard.lock().unwrap().composing
             && let Some(container) = text_capture_container(target)
@@ -556,6 +581,7 @@ impl KeyboardWindow {
                 stroke.as_ref().map(|s| s.key),
                 input.unicode,
                 modifiers,
+                input.caps_lock,
                 (!input.key_text.is_empty()).then_some(input.key_text),
             )
             && let Some(dest_input) = first_enabled_input(&container)
@@ -822,7 +848,7 @@ impl Held {
             .any(|(code, _)| *code == left || *code == right)
     }
 }
-fn logical_key(code: N, unicode: u32, shift: bool, key_text: &str) -> String {
+fn logical_key(code: N, unicode: u32, shift: bool, caps_lock: bool, key_text: &str) -> String {
     let named = match code {
         N::ShiftLeft | N::ShiftRight => "Shift",
         N::AltLeft | N::AltRight => "Alt",
@@ -848,14 +874,32 @@ fn logical_key(code: N, unicode: u32, shift: bool, key_text: &str) -> String {
     if !named.is_empty() {
         return named.to_owned();
     }
+    let uppercase = shift ^ caps_lock;
+    let mapped = key(code);
     if let Some(ch) = char::from_u32(unicode).filter(|ch| !ch.is_control()) {
+        let ch = match mapped {
+            Some(Key::Char(base))
+                if base.is_ascii_alphabetic() && ch.eq_ignore_ascii_case(&base) =>
+            {
+                if uppercase {
+                    base.to_ascii_uppercase()
+                } else {
+                    base.to_ascii_lowercase()
+                }
+            }
+            _ => ch,
+        };
         return ch.to_string();
     }
-    if let Some(mapped) = key(code) {
+    if let Some(mapped) = mapped {
         match mapped {
             Key::Char(ch) => {
-                let ch = if shift && ch.is_ascii_lowercase() {
-                    ch.to_ascii_uppercase()
+                let ch = if ch.is_ascii_alphabetic() {
+                    if uppercase {
+                        ch.to_ascii_uppercase()
+                    } else {
+                        ch.to_ascii_lowercase()
+                    }
                 } else {
                     ch
                 };
@@ -1016,12 +1060,21 @@ mod tests {
     }
     #[test]
     fn logical_key_maps_space_and_letters_when_unicode_is_zero() {
-        assert_eq!(logical_key(N::Space, 0, true, "KEYCODE_SPACE"), " ");
-        assert_eq!(logical_key(N::A, 0, false, "KEYCODE_A"), "a");
-        assert_eq!(logical_key(N::A, 0, true, "KEYCODE_A"), "A");
-        assert_eq!(logical_key(N::F5, 0, false, "KEYCODE_F5"), "F5");
-        assert_eq!(logical_key(N::A, 'ä' as u32, false, "KEYCODE_A"), "ä");
-        assert_eq!(logical_key(N::NumpadEnter, 0, false, ""), "Enter");
+        assert_eq!(logical_key(N::Space, 0, true, false, "KEYCODE_SPACE"), " ");
+        assert_eq!(logical_key(N::A, 0, false, false, "KEYCODE_A"), "a");
+        assert_eq!(logical_key(N::A, 0, true, false, "KEYCODE_A"), "A");
+        assert_eq!(
+            logical_key(N::A, 'A' as u32, false, false, "KEYCODE_A"),
+            "a"
+        );
+        assert_eq!(logical_key(N::A, 'A' as u32, false, true, "KEYCODE_A"), "A");
+        assert_eq!(logical_key(N::A, 'A' as u32, true, true, "KEYCODE_A"), "a");
+        assert_eq!(logical_key(N::F5, 0, false, false, "KEYCODE_F5"), "F5");
+        assert_eq!(
+            logical_key(N::A, 'ä' as u32, false, false, "KEYCODE_A"),
+            "ä"
+        );
+        assert_eq!(logical_key(N::NumpadEnter, 0, false, false, ""), "Enter");
     }
     #[test]
     fn sync_modifiers_tracks_external_state_without_overwriting_active_modifier() {
