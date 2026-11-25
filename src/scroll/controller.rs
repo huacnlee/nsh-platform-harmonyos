@@ -34,6 +34,19 @@ use crate::{
 
 const KEY_SCROLL_PAGE_OVERLAP_VP: f32 = 40.0;
 
+fn apply_scrollbar_margin(
+    node: &ohos_arkui_binding::common::node::ArkUINode,
+    start: f32,
+    end: f32,
+) -> Result<()> {
+    if start > 0.0 || end > 0.0 {
+        node.set_number_attribute(A::ScrollBarMargin, vec![N::Float(start), N::Float(end)])?;
+    } else {
+        node.reset_attribute(A::ScrollBarMargin)?;
+    }
+    Ok(())
+}
+
 pub(crate) struct Scroller {
     pub(crate) native: NativeNode,
     pub(crate) wrapper: NativeNode,
@@ -692,6 +705,20 @@ impl Scroller {
                 .borrow()
                 .set_i32_attribute(A::ScrollBarDisplayMode, if indicator { 1 } else { 0 })?;
         }
+        drop(native);
+        let behavior = self.behavior.borrow();
+        let (start, end) = if !behavior.zooms() && horizontal {
+            (
+                behavior.scrollbar_inset.left.0.max(0.0),
+                behavior.scrollbar_inset.right.0.max(0.0),
+            )
+        } else {
+            (
+                behavior.scrollbar_inset.top.0.max(0.0),
+                behavior.scrollbar_inset.bottom.0.max(0.0),
+            )
+        };
+        apply_scrollbar_margin(&self.native.borrow(), start, end)?;
         Ok(())
     }
     pub(crate) fn behavior(self: &Rc<Self>, behavior: &ScrollBehavior) -> Result<()> {
@@ -1743,7 +1770,26 @@ impl Scroller {
                 A::ScrollEnableScrollInteraction,
                 !self.blocked.get() && self.behavior.borrow().enabled,
             )?;
+            let inset = self.behavior.borrow().scrollbar_inset;
+            apply_scrollbar_margin(
+                &cross.borrow(),
+                inset.left.0.max(0.0),
+                inset.right.0.max(0.0),
+            )?;
         }
+        let behavior = self.behavior.borrow();
+        let (start, end) = if !zooms && self.horizontal.get() {
+            (
+                behavior.scrollbar_inset.left.0.max(0.0),
+                behavior.scrollbar_inset.right.0.max(0.0),
+            )
+        } else {
+            (
+                behavior.scrollbar_inset.top.0.max(0.0),
+                behavior.scrollbar_inset.bottom.0.max(0.0),
+            )
+        };
+        apply_scrollbar_margin(&self.native.borrow(), start, end)?;
         self.native.borrow().set_i32_attribute(
             A::ScrollScrollDirection,
             i32::from(if !zooms && self.horizontal.get() {
