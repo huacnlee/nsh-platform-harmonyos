@@ -849,7 +849,7 @@ class EditorEntry {
     if (this.keyEvent(event)) {
       return true;
     }
-    if (this.settings.reportPaste && this.canEdit() && this.focused && this.preview.length === 0) {
+    if (this.canEdit() && this.focused && this.preview.length === 0) {
       if (
         event.type === KeyType.Down &&
         event.keyCode === KeyCode.KEYCODE_V &&
@@ -910,6 +910,9 @@ class EditorEntry {
                 rich.image,
                 rich.tooLarge,
               );
+              if (!this.settings.reportPaste && this.canEdit() && rich.text.length > 0) {
+                this.insertText(rich.text);
+              }
             })
             .catch((): void => {
               this.emit("edit-action", "paste");
@@ -953,53 +956,59 @@ class EditorEntry {
       : this.settings.height;
   }
   paste(text: string, event: PasteEvent): void {
-    if (!this.canEdit() || this.settings.reportPaste) {
-      event.preventDefault?.();
-    }
-    if (this.settings.reportPaste) {
-      try {
-        pasteboard
-          .getSystemPasteboard()
-          .getData()
-          .then((data: pasteboard.PasteData): void => {
-            if (this.closed || !this.context.isActive()) {
-              return;
-            }
-            if (data.getRecordCount() === 0) {
-              this.emit("paste", text);
-              return;
-            }
-            extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
-              .then((rich: ExtractedPasteData): void => {
-                if (this.closed || !this.context.isActive()) {
-                  return;
-                }
-                this.emit(
-                  "paste",
-                  rich.text.length > 0 ? rich.text : text,
-                  0,
-                  0,
-                  0,
-                  0,
-                  0,
-                  0,
-                  rich.html,
-                  rich.files,
-                  rich.image,
-                  rich.tooLarge,
-                );
-              })
-              .catch((): void => {
-                this.emit("paste", text);
-              });
-          })
-          .catch((): void => {
-            this.emit("paste", text);
-          });
-        return;
-      } catch {}
-    }
-    this.emit("paste", text);
+    event.preventDefault?.();
+    const finishPlain = (): void => {
+      this.emit("paste", text);
+      if (!this.settings.reportPaste && this.canEdit() && text.length > 0) {
+        this.insertText(text);
+      }
+    };
+    try {
+      pasteboard
+        .getSystemPasteboard()
+        .getData()
+        .then((data: pasteboard.PasteData): void => {
+          if (this.closed || !this.context.isActive()) {
+            return;
+          }
+          if (data.getRecordCount() === 0) {
+            finishPlain();
+            return;
+          }
+          extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
+            .then((rich: ExtractedPasteData): void => {
+              if (this.closed || !this.context.isActive()) {
+                return;
+              }
+              const pastedText = rich.text.length > 0 ? rich.text : text;
+              this.emit(
+                "paste",
+                pastedText,
+                0,
+                0,
+                0,
+                0,
+                0,
+                0,
+                rich.html,
+                rich.files,
+                rich.image,
+                rich.tooLarge,
+              );
+              if (!this.settings.reportPaste && this.canEdit() && pastedText.length > 0) {
+                this.insertText(pastedText);
+              }
+            })
+            .catch((): void => {
+              finishPlain();
+            });
+        })
+        .catch((): void => {
+          finishPlain();
+        });
+      return;
+    } catch {}
+    finishPlain();
   }
   selection(start: number, end: number): void {
     if (this.isSink()) {
