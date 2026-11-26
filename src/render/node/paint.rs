@@ -65,6 +65,10 @@ impl Node {
         self.invalidate_paint()
     }
 
+    pub(crate) fn has_custom_paint(&self) -> bool {
+        self.drawing.borrow().is_some() || self.outlined.borrow().is_some()
+    }
+
     pub(crate) fn invalidate_paint(&self) -> Result<()> {
         if self.batch_created.get() {
             self.paint_deferred.set(true);

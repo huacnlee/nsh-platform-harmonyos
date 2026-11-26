@@ -167,6 +167,7 @@ pub(crate) struct TextureInsets {
 #[napi(object)]
 pub(crate) struct ViewOptions {
     pub target_id: u32,
+    pub window_id: Option<u32>,
     pub width: f64,
     pub height: f64,
     pub texture_insets: Option<TextureInsets>,
@@ -389,9 +390,8 @@ pub(crate) fn nsh_attach_native_subtree(
         })
         .ok_or_else(|| Error::from_reason("Native subtree route is no longer live"))?;
     NativeAttachment::attach_subtree(&env, target_id, &content, &slot)?;
-    owner.invalidate_composites();
     owner
-        .update_wrapper()
+        .on_subtree_attached()
         .map_err(|e| Error::from_reason(e.to_string()))?;
 
     Ok(())
@@ -506,6 +506,11 @@ pub(crate) fn nsh_view_action(action: MenuAction) -> Result<bool> {
                         accepted = true;
                     } else if action.action == "blur" {
                         owner.emit(nsh_core::EventKind::Blur, nsh_core::EventPayload::None);
+                        accepted = true;
+                    } else if action.action == "appear" {
+                        if let Some(modal) = owner.modal.borrow().as_ref() {
+                            modal.sync_sub_window_focus_after_attach();
+                        }
                         accepted = true;
                     }
                 } else if action.kind.is_some() {

@@ -1288,17 +1288,14 @@ impl Interaction {
                         if let Some(id) = values.pan_y {
                             owner.animator.set(id, start[1] + ty)?;
                         }
-                        let (vx, vy) =
-                            gesture_velocity_vp((pan.velocity_x, pan.velocity_y), scale);
+                        let (vx, vy) = gesture_velocity_vp((pan.velocity_x, pan.velocity_y), scale);
                         let saved = owner.interaction.pan_origin.get();
                         let origin = nsh_core::Point::new(
                             nsh_core::Points(saved[0]),
                             nsh_core::Points(saved[1]),
                         );
-                        let translation = nsh_core::Point::new(
-                            nsh_core::Points(tx),
-                            nsh_core::Points(ty),
-                        );
+                        let translation =
+                            nsh_core::Point::new(nsh_core::Points(tx), nsh_core::Points(ty));
                         let value_x = values
                             .pan_x
                             .map(|id| nsh_core::Points(owner.animator.value(id)));
@@ -1409,7 +1406,10 @@ impl Interaction {
                     })
                 },
             )?;
-            owner.native.borrow().add_gesture_ref(&gesture, None, None)?;
+            owner
+                .native
+                .borrow()
+                .add_gesture_ref(&gesture, None, None)?;
             self.gestures.borrow_mut().push(gesture);
         }
 
@@ -1466,7 +1466,10 @@ impl Interaction {
                     })
                 },
             )?;
-            owner.native.borrow().add_gesture_ref(&gesture, None, None)?;
+            owner
+                .native
+                .borrow()
+                .add_gesture_ref(&gesture, None, None)?;
             self.gestures.borrow_mut().push(gesture);
         }
         Ok(())
@@ -1905,7 +1908,7 @@ fn blur_desktop_focus_on_empty_press(root: &Rc<Node>, x: f32, y: f32) -> Result<
         let _ = input.focus(false);
     }
     if let Some(sink) = root.focus_sink.borrow().as_ref() {
-        let _ = sink.borrow().request_focus();
+        let _ = crate::input::keyboard::request_node_focus(&sink.borrow());
     }
     Ok(())
 }

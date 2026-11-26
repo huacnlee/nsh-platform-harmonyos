@@ -2101,6 +2101,10 @@ export class NativeDesktop {
     return this.subWindows.get(windowId)?.windowRef();
   }
 
+  getSubWindowUIContext(windowId: number): UIContext | undefined {
+    return this.subWindows.get(windowId)?.uiContext();
+  }
+
   nextCascade(): number {
     return this.nextCascadeIndex++;
   }

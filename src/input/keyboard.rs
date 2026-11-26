@@ -397,9 +397,7 @@ impl KeyboardWindow {
 
         if action == 2 {
             let (mut observes, mut captures) = (false, false);
-            if !composing
-                && let Some(target) = &raw_target
-            {
+            if !composing && let Some(target) = &raw_target {
                 walk_keyboard_ancestors(
                     target.clone(),
                     |node| keyboard_parent(node, window),
@@ -413,9 +411,11 @@ impl KeyboardWindow {
                 );
                 if observes || captures {
                     let details = build_key_event(captures, &held);
-                    target
-                        .control
-                        .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
+                    target.control.dispatch_event(
+                        target.id,
+                        kind,
+                        nsh_core::EventPayload::Key(details),
+                    );
                 } else {
                     captures = false;
                 }
@@ -524,9 +524,7 @@ impl KeyboardWindow {
             }
 
             // 2. Raw key listeners & `captureKeys` on non-native views (following `key_parent`).
-            if !consumed
-                && let Some(target) = &raw_target
-            {
+            if !consumed && let Some(target) = &raw_target {
                 walk_keyboard_ancestors(
                     target.clone(),
                     |node| keyboard_parent(node, window),
@@ -540,9 +538,11 @@ impl KeyboardWindow {
                 );
                 if observes || captures {
                     let details = build_key_event(captures, &held);
-                    target
-                        .control
-                        .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
+                    target.control.dispatch_event(
+                        target.id,
+                        kind,
+                        nsh_core::EventPayload::Key(details),
+                    );
                 } else {
                     captures = false;
                 }
@@ -576,7 +576,8 @@ impl KeyboardWindow {
                 if !repeat
                     && snapshot.desktop
                     && let Some(menu) = snapshot.menu.as_deref()
-                    && let Some(shortcut) = crate::services::desktop::shortcut_from_keystroke(stroke)
+                    && let Some(shortcut) =
+                        crate::services::desktop::shortcut_from_keystroke(stroke)
                     && let Some(action) =
                         nsh_core::desktop::MenuItem::find_shortcut(menu, &shortcut)
                     && (!editing || action.fires_while_editing())
@@ -623,7 +624,10 @@ impl KeyboardWindow {
                         role: Some(nsh_core::desktop::MenuRole::Quit),
                     });
                     consumed = true;
-                } else if !repeat && stroke.key == Key::Escape && stroke.modifiers == Modifiers::default() {
+                } else if !repeat
+                    && stroke.key == Key::Escape
+                    && stroke.modifiers == Modifiers::default()
+                {
                     if snapshot.input.is_some() && !snapshot.desktop {
                         route.send(crate::app::runtime::Message::DismissKeyboard);
                         consumed = true;
@@ -854,6 +858,25 @@ fn first_enabled_input(
     visit(root, true)
 }
 
+/// Requests ArkUI focus for a live native node without going through
+/// `ohos_arkui_binding::ArkUINode::request_focus()`, whose `ArkUIErrorCode`
+/// conversion panics on ArkUI focus status codes (`150001..=150003`, e.g.
+/// when a node is not yet attached to a window tree or its window is inactive).
+pub(crate) fn request_node_focus(
+    node: &ohos_arkui_binding::common::node::ArkUINode,
+) -> std::result::Result<(), i32> {
+    unsafe extern "C" {
+        fn OH_ArkUI_FocusRequest(node: *mut std::ffi::c_void) -> i32;
+    }
+    let raw = node.raw_handle();
+    if raw.is_null() {
+        return Err(-1);
+    }
+    // SAFETY: `raw` is a live ArkUI node handle borrowed on the UI thread.
+    let status = unsafe { OH_ArkUI_FocusRequest(raw.cast()) };
+    if status == 0 { Ok(()) } else { Err(status) }
+}
+
 /// Root and native dialog boundaries receive bubbling keys only from their own
 /// focus subtree. ArkUI retires the handler with its node on the UI thread.
 pub(crate) fn install(
@@ -862,10 +885,12 @@ pub(crate) fn install(
     owner.native.borrow().set_focusable(true)?;
     if owner.platform.get().os.is_desktop() {
         // ArkUI delegates focus requested on a container to its first focusable
-        // leaf descendant (e.g. a search TextInput). A childless leaf focus sink
-        // inside the root absorbs surface-level focus so global shortcuts bubble
-        // to `on_key_event` without focusing an editor or clearing selections.
-        let sink = ohos_arkui_binding::component::built_in_component::Stack::new()?.into_node();
+        // leaf descendant (e.g. a search TextInput), while a childless Stack
+        // (`FocusType::SCOPE`) cannot hold focus itself. Use an invisible
+        // `FocusType::NODE` leaf (`Image` has no built-in Enter/Space/IME
+        // handlers) inside `owner.native` so surface-level focus stays inside
+        // this window/modal and keys bubble cleanly to `owner.native`.
+        let sink = ohos_arkui_binding::component::built_in_component::Image::new()?.into_node();
         {
             use ohos_arkui_binding::{
                 common::attribute::ArkUINodeAttributeNumber,
@@ -1281,15 +1306,12 @@ mod tests {
             "a"
         );
         // When Caps Lock state is unavailable, preserve the OS-produced case.
+        assert_eq!(logical_key(N::A, 'A' as u32, false, None, "KEYCODE_A"), "A");
+        assert_eq!(logical_key(N::A, 'a' as u32, true, None, "KEYCODE_A"), "a");
         assert_eq!(
-            logical_key(N::A, 'A' as u32, false, None, "KEYCODE_A"),
-            "A"
+            logical_key(N::F5, 0, false, Some(false), "KEYCODE_F5"),
+            "F5"
         );
-        assert_eq!(
-            logical_key(N::A, 'a' as u32, true, None, "KEYCODE_A"),
-            "a"
-        );
-        assert_eq!(logical_key(N::F5, 0, false, Some(false), "KEYCODE_F5"), "F5");
         assert_eq!(
             logical_key(N::A, 'ä' as u32, false, Some(false), "KEYCODE_A"),
             "ä"

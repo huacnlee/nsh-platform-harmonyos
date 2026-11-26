@@ -146,6 +146,7 @@ export interface NshRuntimeContext {
   isActive(): boolean;
   getUIContext(): UIContext;
   getUIContextFor?(componentId: string): UIContext;
+  getWindowUIContext?(windowId: number): UIContext | undefined;
   requestFocus?(componentId: string): boolean;
   colorMode?(): ThemeColorMode;
   attachNativeNode(targetId: number, content: FrameNode | null): boolean;

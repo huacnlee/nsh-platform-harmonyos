@@ -26,6 +26,7 @@ export interface Settings {
   textureSurface?: string;
   textureInsets?: TextureInsets | null;
   targetId: number;
+  windowId?: number | null;
   testId?: string | null;
   width: number;
   height: number;
@@ -329,7 +330,11 @@ class ViewEntry {
     this.state = new ViewState(settings);
     this.menus = menus;
     this.context = context;
-    this.ui = context.getUIContext();
+    const windowUi =
+      settings.windowId !== undefined && settings.windowId !== null
+        ? context.getWindowUIContext?.(settings.windowId)
+        : undefined;
+    this.ui = windowUi ?? context.getUIContext();
     if (settings.textureSurface !== undefined) {
       this.textureNode = new BuilderNode<[ViewParameters]>(this.ui, {
         type: NodeRenderType.RENDER_TYPE_TEXTURE,
@@ -470,6 +475,12 @@ class ViewEntry {
     if (this.focusPending && !this.closed && this.context.isActive()) {
       this.focusPending = false;
       this.requestViewFocus();
+    } else if (!this.closed && this.context.isActive() && this.settings.windowId != null) {
+      this.context.viewAction({
+        targetId: this.settings.targetId,
+        action: "appear",
+        kind: "focus",
+      });
     }
   }
   focusEvent(name: string): void {

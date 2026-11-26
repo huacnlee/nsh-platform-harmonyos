@@ -182,6 +182,22 @@ impl Node {
                     .borrow()
                     .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
             }
+            if (old.width <= 0.0 || old.height <= 0.0) && frame.width > 0.0 && frame.height > 0.0 {
+                // First transition from 0x0 to laid-out bounds (common for newly
+                // presented sub-window modals whose children flush styles before
+                // the engine computes bounds): ensure Rosen syncs layout & paint.
+                let mounted = self.mounted();
+                {
+                    let borrowed = mounted.borrow();
+                    let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedLayout);
+                    let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedRender);
+                }
+                if !Rc::ptr_eq(&mounted, &self.native) {
+                    let borrowed = self.native.borrow();
+                    let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedLayout);
+                    let _ = borrowed.mark_dirty(NodeDirtyFlag::NeedRender);
+                }
+            }
         }
         // Size changes request measure/layout through LayoutRect. Position is a
         // native render property, so moving a node does not measure its subtree.
@@ -318,6 +334,9 @@ impl Node {
     }
     pub(crate) fn measure_children(&self, event: &NodeCustomEvent) -> Result<()> {
         let mut measure = crate::render::layout::ChildMeasure::new(event);
+        if let Some(sink) = self.focus_sink.borrow().as_ref() {
+            measure.child(&sink.borrow())?;
+        }
         if let Some(web) = self
             .web
             .borrow()
@@ -378,6 +397,9 @@ impl Node {
         Ok(())
     }
     pub(crate) fn layout_children(&self, event: &NodeCustomEvent) -> Result<()> {
+        if let Some(sink) = self.focus_sink.borrow().as_ref() {
+            event.layout_child(&sink.borrow(), 0, 0)?;
+        }
         if let Some(web) = self
             .web
             .borrow()

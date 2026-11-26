@@ -105,7 +105,8 @@ pub(crate) struct UiContext {
     pub(crate) composite_nodes: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) key_focus: std::cell::RefCell<std::rc::Weak<Node>>,
     pub(crate) nodes_index: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, std::rc::Weak<Node>>>,
-    pub(crate) modals_index: std::cell::RefCell<Vec<std::rc::Weak<crate::navigation::modal::Modal>>>,
+    pub(crate) modals_index:
+        std::cell::RefCell<Vec<std::rc::Weak<crate::navigation::modal::Modal>>>,
     pub(crate) axis_routers:
         std::cell::RefCell<rustc_hash::FxHashMap<NodeId, crate::input::wheel::AxisRouter>>,
     pub(crate) selected_text: std::cell::RefCell<Option<std::rc::Weak<Node>>>,
@@ -678,19 +679,30 @@ impl Mounter {
                     modal.cancel_pending_present();
                     continue;
                 }
-                if !modal.is_desktop_window()
-                    && !modal.is_main_window_host()
-                    && !modal.is_sub_window_modal()
-                {
+                if !modal.is_desktop_window() && !modal.is_main_window_host() {
                     let win_id = modal.config_window();
-                    if win_id != nsh_core::ROOT_ID
-                        && let Some(host) = self
+                    if win_id != nsh_core::ROOT_ID {
+                        if self.desktop.hosted_main_window == Some(win_id) {
+                            // Modal targets the hosted main window; allow native dialog presentation.
+                        } else if let Some(host) = self
                             .nodes
                             .get(&win_id)
                             .and_then(|win| win.modal.borrow().clone())
-                            .filter(|host| host.is_desktop_window())
-                    {
-                        modal.set_host_sub_window(Some(host));
+                            .filter(|host| host.is_desktop_window() && host.is_visible())
+                        {
+                            if !modal.is_sub_window_modal() {
+                                modal.set_host_sub_window(Some(host));
+                            }
+                        } else {
+                            // Target secondary window is already closed or gone; never
+                            // leak its modal onto the main window.
+                            modal.cancel_pending_present();
+                            continue;
+                        }
+                    }
+                    if !self.modal_has_live_ancestor(&modal) {
+                        modal.cancel_pending_present();
+                        continue;
                     }
                 }
                 modal.present_if_pending()?;
@@ -700,6 +712,33 @@ impl Mounter {
         // Capture releases deferred by a batch still need synchronization if
         // a preceding host, stack or modal update failed.
         result.and(self.reconcile_navigation_capture())
+    }
+    fn modal_has_live_ancestor(&self, modal: &crate::navigation::modal::Modal) -> bool {
+        let Some(owner) = modal.owner_node() else {
+            return false;
+        };
+        if owner.pending_delete.get() {
+            return false;
+        }
+        let mut cursor = owner.parent_node.borrow().upgrade();
+        for _ in 0..1024 {
+            let Some(node) = cursor else {
+                return false;
+            };
+            if node.pending_delete.get() {
+                return false;
+            }
+            if let Some(parent_modal) = node.modal.borrow().as_ref()
+                && parent_modal.is_desktop_window()
+            {
+                return parent_modal.is_visible();
+            }
+            if node.id == nsh_core::ROOT_ID {
+                return true;
+            }
+            cursor = node.parent_node.borrow().upgrade();
+        }
+        false
     }
     fn reconcile_navigation_capture(&self) -> Result<()> {
         let res = self
@@ -898,11 +937,10 @@ impl Mounter {
             return Ok(());
         }
         self.desktop.main_window_parked = true;
-        self.host.desktop_command(
-            &crate::services::desktop::WireCommand::ParkMainWindow {
+        self.host
+            .desktop_command(&crate::services::desktop::WireCommand::ParkMainWindow {
                 has_open_sub_windows: self.has_open_sub_windows(),
-            },
-        )?;
+            })?;
         Ok(())
     }
     fn open_hosted_main_window(
@@ -1478,7 +1516,10 @@ impl Mounter {
                 if let Ok(node) = self.node(window_id)
                     && let Some(modal) = node.modal.borrow().clone()
                 {
-                    modal.on_sub_window_state(state)?;
+                    let became_focused = modal.on_sub_window_state(state)?;
+                    if became_focused {
+                        self.request_desktop_focus_for(window_id);
+                    }
                 }
             }
             DesktopEvent::SubWindowTitleBar { window_id, edges } => {
@@ -1668,7 +1709,7 @@ impl Mounter {
                         if let Ok(window) = self.node(target.key_window_id())
                             && let Some(sink) = window.focus_sink.borrow().as_ref()
                         {
-                            let _ = sink.borrow().request_focus();
+                            let _ = crate::input::keyboard::request_node_focus(&sink.borrow());
                         }
                         target.selection_select_all_target(true)?;
                         return Ok(());
@@ -1754,6 +1795,29 @@ impl Mounter {
         self.request_desktop_focus_for(nsh_core::ROOT_ID);
     }
     pub(crate) fn request_desktop_focus_for(&self, window_id: NodeId) {
+        let active_sub_modal = (window_id != nsh_core::ROOT_ID)
+            .then(|| {
+                self.modals
+                    .iter()
+                    .rev()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .find(|modal| {
+                        modal.is_visible()
+                            && !modal.closing()
+                            && !modal.is_desktop_window()
+                            && !modal.is_main_window_host()
+                            && modal.host_sub_window_id() == Some(window_id)
+                    })
+                    .and_then(|modal| modal.owner_node())
+            })
+            .flatten();
+        let in_scope = |node: &Node| {
+            node.visible_in_tree()
+                && node.key_window_id() == window_id
+                && active_sub_modal
+                    .as_ref()
+                    .is_none_or(|modal| node.is_descendant_of(modal.id))
+        };
         let mut stale_other_window_focus = false;
         let has_input_focus = self
             .dispatcher
@@ -1761,8 +1825,7 @@ impl Mounter {
             .and_then(|route| route.keyboard.lock().unwrap().focused)
             .is_some_and(|focused_id| {
                 if let Ok(node) = self.node(focused_id)
-                    && node.visible_in_tree()
-                    && node.key_window_id() == window_id
+                    && in_scope(node)
                 {
                     true
                 } else {
@@ -1774,7 +1837,7 @@ impl Mounter {
             .key_focus
             .borrow()
             .upgrade()
-            .is_some_and(|node| node.visible_in_tree() && node.key_window_id() == window_id);
+            .is_some_and(|node| in_scope(&node));
         if has_input_focus || has_child_focus {
             return;
         }
@@ -1784,11 +1847,12 @@ impl Mounter {
             keyboard.input = None;
             keyboard.composing = false;
         }
-        if let Ok(window) = self.node(window_id) {
-            if let Some(sink) = window.focus_sink.borrow().as_ref() {
-                let _ = sink.borrow().request_focus();
+        let target = active_sub_modal.or_else(|| self.node(window_id).ok().cloned());
+        if let Some(target) = target {
+            if let Some(sink) = target.focus_sink.borrow().as_ref() {
+                let _ = crate::input::keyboard::request_node_focus(&sink.borrow());
             } else {
-                let _ = window.native.borrow().request_focus();
+                let _ = crate::input::keyboard::request_node_focus(&target.native.borrow());
             }
         }
     }

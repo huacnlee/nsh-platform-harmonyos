@@ -288,6 +288,7 @@ class ComponentRuntimeContext implements NshRuntimeContext {
   private themeColorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
   private focusHandler?: (componentId: string) => boolean;
   private uiContextResolver?: (componentId: string) => UIContext | undefined;
+  private windowUIContextResolver?: (windowId: number) => UIContext | undefined;
 
   constructor(ui: UIContext, mod: NshNativeModule) {
     this.ui = ui;
@@ -310,8 +311,16 @@ class ComponentRuntimeContext implements NshRuntimeContext {
     this.uiContextResolver = resolver;
   }
 
+  setWindowUIContextResolver(resolver?: (windowId: number) => UIContext | undefined): void {
+    this.windowUIContextResolver = resolver;
+  }
+
   getUIContextFor(componentId: string): UIContext {
     return this.uiContextResolver?.(componentId) ?? this.ui;
+  }
+
+  getWindowUIContext(windowId: number): UIContext | undefined {
+    return this.windowUIContextResolver?.(windowId);
   }
 
   requestFocus(componentId: string): boolean {
@@ -770,6 +779,9 @@ class HostSession {
         );
         this.runtimeContext.setUIContextResolver((componentId: string): UIContext | undefined =>
           this.desktop?.resolveComponentUIContext(componentId),
+        );
+        this.runtimeContext.setWindowUIContextResolver((windowId: number): UIContext | undefined =>
+          this.desktop?.getSubWindowUIContext(windowId),
         );
         try {
           abilityContext.eventHub.on("nsh.secondInstance", this.onSecondInstance);

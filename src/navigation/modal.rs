@@ -200,6 +200,58 @@ impl Modal {
     pub(crate) fn node_id(&self) -> Option<nsh_core::NodeId> {
         self.owner.upgrade().map(|node| node.id)
     }
+    pub(crate) fn owner_node(&self) -> Option<Rc<Node>> {
+        self.owner.upgrade()
+    }
+    pub(crate) fn is_host_sub_window_focused(&self) -> bool {
+        self.host_sub_window
+            .borrow()
+            .upgrade()
+            .is_some_and(|host| host.is_desktop_focused())
+    }
+    pub(crate) fn active_focus_target(&self) -> Option<Rc<Node>> {
+        if self.is_desktop_window() {
+            let top_modal = self
+                .sub_modals
+                .borrow()
+                .iter()
+                .rev()
+                .filter_map(Weak::upgrade)
+                .find(|modal| modal.is_visible() && !modal.closing.get())
+                .and_then(|modal| modal.owner.upgrade());
+            top_modal.or_else(|| self.owner.upgrade())
+        } else if self.is_sub_window_modal() {
+            self.owner.upgrade()
+        } else {
+            None
+        }
+    }
+    pub(crate) fn request_surface_focus(&self) {
+        if let Some(target) = self.active_focus_target() {
+            if let Some(sink) = target.focus_sink.borrow().as_ref() {
+                if let Err(code) = crate::input::keyboard::request_node_focus(&sink.borrow()) {
+                    log::debug!("OHOS modal focus_sink request_focus status={code}");
+                }
+            } else if let Err(code) =
+                crate::input::keyboard::request_node_focus(&target.native.borrow())
+            {
+                log::debug!("OHOS modal native request_focus status={code}");
+            }
+        }
+    }
+    pub(crate) fn sync_sub_window_focus_after_attach(&self) {
+        if (self.is_sub_window_modal()
+            && self.is_visible()
+            && !self.closing.get()
+            && self.sub_window_container.borrow().upgrade().is_some()
+            && self.is_host_sub_window_focused())
+            || (self.is_desktop_window()
+                && self.sub_window.borrow().is_some()
+                && self.is_desktop_focused())
+        {
+            self.request_surface_focus();
+        }
+    }
     pub(crate) fn presentation(&self) -> ModalPresentation {
         self.config.borrow().presentation
     }
@@ -242,7 +294,7 @@ impl Modal {
             .host_sub_window
             .borrow()
             .upgrade()
-            .filter(|host| host.is_desktop_window())
+            .filter(|host| host.is_desktop_window() && host.is_visible())
         {
             return Some(host);
         }
@@ -252,7 +304,7 @@ impl Modal {
                 .modal
                 .borrow()
                 .as_ref()
-                .filter(|modal| modal.is_desktop_window())
+                .filter(|modal| modal.is_desktop_window() && modal.is_visible())
                 .cloned()
             {
                 *self.host_sub_window.borrow_mut() = Rc::downgrade(&host);
@@ -373,21 +425,7 @@ impl Modal {
         if let Some(host) = self.host_sub_window.borrow().upgrade() {
             host.unregister_sub_modal(self);
             if host.is_visible() && !host.closing.get() {
-                let target = {
-                    let sub_modals = host.sub_modals.borrow();
-                    sub_modals
-                        .iter()
-                        .rev()
-                        .filter_map(Weak::upgrade)
-                        .find(|modal| modal.is_visible() && !modal.closing.get())
-                        .and_then(|modal| modal.owner.upgrade())
-                }
-                .or_else(|| host.owner.upgrade());
-                if let Some(target) = target
-                    && let Some(sink) = target.focus_sink.borrow().as_ref()
-                {
-                    let _ = sink.borrow().request_focus();
-                }
+                host.request_surface_focus();
             }
         }
     }
@@ -455,9 +493,7 @@ impl Modal {
         let mut refreshed = false;
         for child in children {
             if child.is_visible()
-                && (force
-                    || host_geom.is_none()
-                    || child.applied_sub_modal_geom.get() != host_geom)
+                && (force || host_geom.is_none() || child.applied_sub_modal_geom.get() != host_geom)
             {
                 refreshed = true;
                 let _ = child.refresh_sub_window_modal_layout(host_geom, force);
@@ -804,6 +840,9 @@ impl Modal {
             }
         }
         let _ = self.refresh_desktop_layout();
+        if self.is_desktop_focused() {
+            self.request_surface_focus();
+        }
         Ok(true)
     }
     pub(crate) fn set_desktop_attributes(&self, diff: WindowAttributes) -> Result<()> {
@@ -1090,21 +1129,22 @@ impl Modal {
             ))?;
         Ok(())
     }
-    pub(crate) fn on_sub_window_state(&self, state: WindowState) -> Result<()> {
+    pub(crate) fn on_sub_window_state(&self, state: WindowState) -> Result<bool> {
         let Some(owner) = self.owner.upgrade() else {
-            return Ok(());
+            return Ok(false);
         };
         let content_size = Size::new(
             state.content_bounds.size.width.0,
             state.content_bounds.size.height.0,
         );
-        let geom_changed = {
+        let (geom_changed, became_focused) = {
             let mut slot = self.desktop.borrow_mut();
             let Some(win) = slot.as_mut() else {
-                return Ok(());
+                return Ok(false);
             };
             let prev_content = win.content_size;
             let prev_scale = win.scale_factor;
+            let prev_focused = win.focused;
             win.mode = state.mode;
             win.minimized = state.minimized;
             win.focused = state.focused;
@@ -1124,10 +1164,12 @@ impl Modal {
                 win.normal_size = Size::new(normal.size.width.0, normal.size.height.0);
                 win.normal_origin = Some((normal.origin.x.0, normal.origin.y.0));
             }
-            content_size.width > 0.0
+            let geom_changed = content_size.width > 0.0
                 && content_size.height > 0.0
                 && (prev_content != win.content_size
-                    || (prev_scale - win.scale_factor).abs() > 1e-4)
+                    || (prev_scale - win.scale_factor).abs() > 1e-4);
+            let became_focused = !prev_focused && win.focused && !win.hidden && !win.minimized;
+            (geom_changed, became_focused)
         };
         if geom_changed {
             self.available.set(Some(content_size));
@@ -1138,7 +1180,7 @@ impl Modal {
             EventKind::Window,
             EventPayload::Window(Box::new(WindowEvent::State(Box::new(state)))),
         );
-        Ok(())
+        Ok(became_focused)
     }
     pub(crate) fn on_sub_window_title_bar(&self, edges: Edges<Points>) {
         if let Some(owner) = self.owner.upgrade() {
@@ -1384,8 +1426,8 @@ impl Modal {
             if !was_shown {
                 self.show_emitted.set(false);
                 *self.overlay.borrow_mut() = Some(owner.host.overlay(owner.dispatcher.clone())?);
-                if let Some(sink) = owner.focus_sink.borrow().as_ref() {
-                    let _ = sink.borrow().request_focus();
+                if self.is_host_sub_window_focused() {
+                    self.request_surface_focus();
                 }
             }
             let host_geom = host
