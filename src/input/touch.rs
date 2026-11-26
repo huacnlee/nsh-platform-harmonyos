@@ -310,6 +310,9 @@ impl Touches {
         }
         if phase == TouchPhase::Start && count == 1 {
             self.primary = changed;
+            // Clear any orphaned pointer left behind if a previous native gesture
+            // or child consumed its terminal Up/Cancel before reaching root.
+            self.pan_tracker.clear();
         }
         if self.window_resize.is_some() {
             if matches!(phase, TouchPhase::End | TouchPhase::Cancel) {

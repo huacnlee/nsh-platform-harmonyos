@@ -195,7 +195,7 @@ khronos-egl = { version = "6", default-features = false, features = ["static", "
 napi-ohos = { version = "1.2.0", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
 napi-derive-ohos = "1.2.0"
 napi-build-ohos = "1.2.0"
-ohos-arkui-binding = { version = "0.6.3", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
+ohos-arkui-binding = { version = "0.6.4", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
 ohos-accessibility-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-display-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
 ohos-device-binding = { version = "0.1.0", default-features = false }

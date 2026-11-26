@@ -3445,9 +3445,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-arkui-binding"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e358e5638b919359465d2e41f30ffe15c0a0d998dffbc61fc8134bd1fd01f360"
+checksum = "45da7d96c299b1dc69b4190e382379d570222d21fb5412a21898b498253d7d4f"
 dependencies = [
  "bitflags 2.13.2",
  "log",

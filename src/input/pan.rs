@@ -22,6 +22,7 @@ pub(crate) enum PanDirectionSpec {
 pub(crate) struct PanSpec {
     pub(crate) direction: PanDirectionSpec,
     pub(crate) distance_px: f64,
+    pub(crate) has_activation: bool,
 }
 
 /// Complete native gesture recognizer specification for a view.
@@ -86,6 +87,7 @@ pub(crate) fn gesture_spec(
         PanSpec {
             direction,
             distance_px,
+            has_activation: activation.is_some(),
         }
     });
     let pinch = values.pinch.is_some()
@@ -108,6 +110,36 @@ pub(crate) enum PanDecision {
     Waiting,
     Activated,
     Failed,
+}
+
+/// Kind of gesture recognizer currently being arbitrated by ArkUI's node-level
+/// gesture interrupter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArbitratedRecognizer {
+    Pan,
+    Pinch,
+    Rotation,
+    Other,
+    Unknown,
+}
+
+/// Returns `true` only when ArkUI's node-level gesture interrupter is
+/// arbitrating this node's `panActivation`-controlled `PanGesture` and
+/// `PanTracker` has already decided `PanDecision::Failed`.
+///
+/// System/built-in gestures, `Pinch`, `Rotation`, other recognizers, and
+/// unidentified recognizers always continue.
+#[cfg_attr(not(target_env = "ohos"), allow(dead_code))]
+pub(crate) fn should_reject_gesture_interrupt(
+    system_or_built_in: bool,
+    recognizer: ArbitratedRecognizer,
+    has_pan_activation: bool,
+    pan_decision: Option<PanDecision>,
+) -> bool {
+    !system_or_built_in
+        && has_pan_activation
+        && recognizer == ArbitratedRecognizer::Pan
+        && pan_decision == Some(PanDecision::Failed)
 }
 
 /// Three-state lifecycle of an active ArkUI `PanGesture` callback sequence on a
@@ -158,15 +190,31 @@ impl PanTracker {
         candidates: impl IntoIterator<Item = (NodeId, PanActivation)>,
     ) {
         self.pointers.retain(|p| p.pointer_id != pointer_id);
+        // An edge swipe is a single-finger gesture: if a second finger touches
+        // down while an earlier edge candidate is still `Waiting` (not yet
+        // activated), fail it so asymmetric two-finger Pinch/Rotation gestures
+        // (one finger inside the edge, one outside) never leak `PanStart`.
+        if !self.pointers.is_empty() {
+            for existing in &mut self.pointers {
+                for cand in &mut existing.candidates {
+                    if cand.activation.edge.is_some() && cand.state == PanDecision::Waiting {
+                        cand.state = PanDecision::Failed;
+                    }
+                }
+            }
+        }
+        let is_secondary_pointer = !self.pointers.is_empty();
         let at = Point::new(Points(start_surface.0), Points(start_surface.1));
         let size = Size::new(Points(surface_size.0), Points(surface_size.1));
         let entries = candidates
             .into_iter()
             .map(|(id, activation)| {
-                let state = if activation.starts_at(at, size) {
-                    PanDecision::Waiting
-                } else {
+                let state = if (is_secondary_pointer && activation.edge.is_some())
+                    || !activation.starts_at(at, size)
+                {
                     PanDecision::Failed
+                } else {
+                    PanDecision::Waiting
                 };
                 CandidateEntry {
                     id,
@@ -227,9 +275,9 @@ impl PanTracker {
     }
 
     /// Returns the decision and surface-relative start origin (vp) for `node_id`
-    /// on the most recent tracked pointer carrying that candidate.
+    /// on the primary (earliest active) tracked pointer carrying that candidate.
     pub(crate) fn decision(&self, node_id: NodeId) -> Option<(PanDecision, (f32, f32))> {
-        self.pointers.iter().rev().find_map(|p| {
+        self.pointers.iter().find_map(|p| {
             p.candidates
                 .iter()
                 .find(|c| c.id == node_id)
@@ -237,10 +285,10 @@ impl PanTracker {
         })
     }
 
-    /// Returns the surface-relative down origin (vp) of the primary/latest
-    /// tracked pointer, if any.
+    /// Returns the surface-relative down origin (vp) of the primary (earliest
+    /// active) tracked pointer, if any.
     pub(crate) fn latest_start(&self) -> Option<(f32, f32)> {
-        self.pointers.last().map(|p| p.start_surface)
+        self.pointers.first().map(|p| p.start_surface)
     }
 }
 
@@ -355,14 +403,15 @@ mod tests {
         let mut tracker = PanTracker::default();
         let mut act = PanActivation::horizontal(Points(10.0), Points(8.0));
         act.edge = Some(nsh_core::PanEdge::Left);
-        // Down at x = 80 vp is outside the left edge zone (PanActivation::EDGE_WIDTH = 24 vp).
+        // Down at x = 80 vp is outside the left edge zone (PanActivation::EDGE_WIDTH = 20 vp).
         tracker.down(1, (80.0, 200.0), (400.0, 800.0), [(9, act)]);
         assert_eq!(
             tracker.decision(9),
             Some((PanDecision::Failed, (80.0, 200.0)))
         );
+        tracker.up_or_cancel(1);
 
-        // Down at x = 10 vp is inside the left edge zone and activates on rightward drag.
+        // Next single-finger sequence: down at x = 10 vp is inside the left edge zone and activates on rightward drag.
         tracker.down(2, (10.0, 200.0), (400.0, 800.0), [(9, act)]);
         assert_eq!(
             tracker.decision(9),
@@ -395,5 +444,133 @@ mod tests {
         let vel = gesture_velocity_vp((500.0, -250.0), 2.5);
         assert!((vel.0 - 200.0).abs() < 1e-5);
         assert!((vel.1 + 100.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn edge_pan_failure_rejects_only_pan_and_never_blocks_pinch_rotation_or_system_gestures() {
+        let mut mask = EventMask::default();
+        mask.set(EventKind::PanStart, true);
+        mask.set(EventKind::PinchStart, true);
+        mask.set(EventKind::RotationStart, true);
+        let mut act = PanActivation::horizontal(Points(10.0), Points(8.0));
+        act.edge = Some(nsh_core::PanEdge::Left);
+
+        let spec = gesture_spec(GestureValues::default(), mask, Some(act), false, 2.0);
+        let pan = spec.pan.expect("edge pan spec");
+        assert!(pan.has_activation);
+        assert!(spec.pinch);
+        assert!(spec.rotation);
+
+        let mut tracker = PanTracker::default();
+        // Outside left edge (x = 80 vp > 24 vp): Pan fails immediately.
+        tracker.down(1, (80.0, 200.0), (400.0, 800.0), [(9, act)]);
+        let failed = tracker.decision(9).map(|(d, _)| d);
+        assert_eq!(failed, Some(PanDecision::Failed));
+
+        // Outside the edge: Pinch, Rotation, system/built-in, and unknown recognizers all continue.
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pinch,
+            true,
+            failed
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Rotation,
+            true,
+            failed
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            true,
+            ArbitratedRecognizer::Pan,
+            true,
+            failed
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Other,
+            true,
+            failed
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Unknown,
+            true,
+            failed
+        ));
+        // Only this node's panActivation-controlled Pan is rejected.
+        assert!(should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pan,
+            true,
+            failed
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pan,
+            false,
+            failed
+        ));
+        tracker.up_or_cancel(1);
+
+        // Inside left edge (x = 10 vp): Pan stays Waiting/Activated and is NOT rejected.
+        tracker.down(2, (10.0, 200.0), (400.0, 800.0), [(9, act)]);
+        let waiting = tracker.decision(9).map(|(d, _)| d);
+        assert_eq!(waiting, Some(PanDecision::Waiting));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pan,
+            true,
+            waiting
+        ));
+        assert_eq!(tracker.move_pointer(2, (22.0, 201.0)), Some(9));
+        let activated = tracker.decision(9).map(|(d, _)| d);
+        assert_eq!(activated, Some(PanDecision::Activated));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pan,
+            true,
+            activated
+        ));
+    }
+
+    #[test]
+    fn asymmetric_two_finger_pinch_never_leaks_edge_pan_in_either_touch_order() {
+        let mut act = PanActivation::horizontal(Points(10.0), Points(30.0));
+        act.edge = Some(nsh_core::PanEdge::Left);
+
+        // Order G2 (reproduced on Mate 60 Pro): finger 0 outside edge, finger 1 inside edge.
+        let mut tracker = PanTracker::default();
+        tracker.down(0, (153.8, 362.2), (387.7, 771.1), [(68, act)]);
+        tracker.down(1, (18.5, 362.2), (387.7, 771.1), [(68, act)]);
+        assert_eq!(
+            tracker.decision(68).map(|(d, _)| d),
+            Some(PanDecision::Failed)
+        );
+        assert!(should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pan,
+            true,
+            tracker.decision(68).map(|(d, _)| d),
+        ));
+        assert!(!should_reject_gesture_interrupt(
+            false,
+            ArbitratedRecognizer::Pinch,
+            true,
+            tracker.decision(68).map(|(d, _)| d),
+        ));
+
+        // Order G1: finger 0 inside edge (still Waiting), then finger 1 touches outside to pinch.
+        let mut tracker2 = PanTracker::default();
+        tracker2.down(0, (18.5, 362.2), (387.7, 771.1), [(68, act)]);
+        assert_eq!(
+            tracker2.decision(68).map(|(d, _)| d),
+            Some(PanDecision::Waiting)
+        );
+        tracker2.down(1, (153.8, 362.2), (387.7, 771.1), [(68, act)]);
+        assert_eq!(
+            tracker2.decision(68).map(|(d, _)| d),
+            Some(PanDecision::Failed)
+        );
     }
 }

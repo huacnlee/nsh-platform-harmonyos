@@ -1066,23 +1066,49 @@ impl Interaction {
             let _ = owner.native.borrow().clear_gesture_interrupter();
         }
         if let Some(pan_spec) = spec.pan {
-            let weak_interrupt = Rc::downgrade(owner);
-            owner.native.borrow().set_gesture_interrupter(move |info| {
-                use ohos_arkui_binding::types::gesture::GestureInterruptResult;
-                if info.system_flag() {
-                    return GestureInterruptResult::Continue;
-                }
-                let Some(owner) = weak_interrupt.upgrade() else {
-                    return GestureInterruptResult::Continue;
-                };
-                if let Some((PanDecision::Failed, _)) =
-                    owner.touches.borrow().pan_decision(owner.id)
-                {
-                    return GestureInterruptResult::Reject;
-                }
-                GestureInterruptResult::Continue
-            })?;
-            self.pan_interrupter_installed.set(true);
+            if pan_spec.has_activation {
+                let weak_interrupt = Rc::downgrade(owner);
+                owner.native.borrow().set_gesture_interrupter(move |info| {
+                    use crate::input::pan::{
+                        ArbitratedRecognizer, should_reject_gesture_interrupt,
+                    };
+                    use ohos_arkui_binding::types::gesture::{
+                        GestureInterruptResult, GestureRecognizerType,
+                    };
+                    if info.system_flag() {
+                        return GestureInterruptResult::Continue;
+                    }
+                    let Some(recognizer) = info.recognizer() else {
+                        return GestureInterruptResult::Continue;
+                    };
+                    let built_in = recognizer.is_built_in();
+                    let kind = match recognizer.gesture_type() {
+                        Ok(GestureRecognizerType::PanGesture) => ArbitratedRecognizer::Pan,
+                        Ok(GestureRecognizerType::PinchGesture) => ArbitratedRecognizer::Pinch,
+                        Ok(GestureRecognizerType::RotationGesture) => {
+                            ArbitratedRecognizer::Rotation
+                        }
+                        Ok(_) => ArbitratedRecognizer::Other,
+                        Err(_) => ArbitratedRecognizer::Unknown,
+                    };
+                    let Some(owner) = weak_interrupt.upgrade() else {
+                        return GestureInterruptResult::Continue;
+                    };
+                    let has_pan_activation =
+                        owner.interaction.props.borrow().pan_activation.is_some();
+                    let decision = owner
+                        .touches
+                        .borrow()
+                        .pan_decision(owner.id)
+                        .map(|(decision, _)| decision);
+                    if should_reject_gesture_interrupt(built_in, kind, has_pan_activation, decision)
+                    {
+                        return GestureInterruptResult::Reject;
+                    }
+                    GestureInterruptResult::Continue
+                })?;
+                self.pan_interrupter_installed.set(true);
+            }
 
             let direction = match pan_spec.direction {
                 PanDirectionSpec::Left => GestureDirection::Left,
