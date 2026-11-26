@@ -17,5 +17,6 @@ export {
   onBackPressIntercept,
 } from "libnsh_platform_harmonyos.so";
 export { onAbilityWant, WantKind } from "./src/main/ets/NativeExtensions";
+export { bindLaunchSurface, onLaunchWant } from "./src/main/ets/NativeLaunch";
 export { onNotificationWant } from "./src/main/ets/NativeNotifications";
 export { prepareWebEngine } from "./src/main/ets/NativeWebViews";

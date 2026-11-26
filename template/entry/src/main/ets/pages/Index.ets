@@ -1,6 +1,6 @@
 import { common } from "@kit.AbilityKit";
 import { KeyboardAvoidMode } from "@kit.ArkUI";
-import { NshSurface, prepareWebEngine } from "@nsh/harmonyos";
+import { bindLaunchSurface, NshSurface, prepareWebEngine } from "@nsh/harmonyos";
 
 // The app fills the window: written in Rust, it is linked into the native
 // library (`runApp`); written in TSX, its bundle is a raw file of the HAP.
@@ -8,6 +8,7 @@ import { NshSurface, prepareWebEngine } from "@nsh/harmonyos";
 @Component
 struct Index {
   private surface: NshSurface = new NshSurface(this.getUIContext());
+  private unbindLaunch?: () => void;
   private readonly onOpenUrl = (url: string): void => {
     this.surface.openUrl(url);
   };
@@ -20,13 +21,8 @@ struct Index {
       this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
     } catch {}
     const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
-    host?.eventHub.on("nsh.openUrl", this.onOpenUrl);
     host?.eventHub.on("nsh.devUrl", this.onDevUrl);
-    const launchUrl = AppStorage.get<string>("nsh.launchUrl");
-    if (typeof launchUrl === "string" && launchUrl.length > 0) {
-      AppStorage.delete("nsh.launchUrl");
-      this.surface.openUrl(launchUrl);
-    }
+    this.unbindLaunch = host ? bindLaunchSurface(host, this.onOpenUrl) : undefined;
     const devUrl = AppStorage.get<string>("nsh.devUrl");
     if (typeof devUrl === "string" && devUrl.length > 0) {
       this.surface.connectDevServer(devUrl);
@@ -42,8 +38,9 @@ struct Index {
 
   aboutToDisappear(): void {
     const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
-    host?.eventHub.off("nsh.openUrl", this.onOpenUrl);
     host?.eventHub.off("nsh.devUrl", this.onDevUrl);
+    this.unbindLaunch?.();
+    this.unbindLaunch = undefined;
     this.surface.dispose();
   }
 

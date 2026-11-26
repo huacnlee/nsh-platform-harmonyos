@@ -4,22 +4,51 @@ import notification from "@ohos.notificationManager";
 import wantAgent from "@ohos.app.ability.wantAgent";
 import preferences from "@ohos.data.preferences";
 
-const pending: Map<string, string[]> = new Map();
-const receivers: Map<string, (name: string) => void> = new Map();
+const pendingByContext: Map<common.UIAbilityContext, string[]> = new Map();
+const pendingByAbility: Map<string, string[]> = new Map();
+const instancesByContext: Map<common.UIAbilityContext, NativeNotifications[]> = new Map();
+const instancesByAbility: Map<string, NativeNotifications[]> = new Map();
+
+function pickReceiver(list: NativeNotifications[] | undefined): NativeNotifications | undefined {
+  if (!list || list.length === 0) {
+    return undefined;
+  }
+  // Prefer the newest instance actively listening, else the newest live instance.
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].hasListener()) {
+      return list[i];
+    }
+  }
+  return list[list.length - 1];
+}
+
+function enqueuePending<K>(map: Map<K, string[]>, key: K, name: string): void {
+  const queued = map.get(key) ?? [];
+  queued.push(name);
+  map.set(key, queued);
+}
+
 /** Forward the Ability's onCreate/onNewWant before loading its content. */
-export function onNotificationWant(want: Want): void {
+export function onNotificationWant(want: Want, context?: common.UIAbilityContext): void {
   const name = want.parameters?.["nsh.notification"];
   if (typeof name !== "string") {
     return;
   }
+  if (context !== undefined) {
+    const target = pickReceiver(instancesByContext.get(context));
+    if (target) {
+      target.deliver(name);
+    } else {
+      enqueuePending(pendingByContext, context, name);
+    }
+    return;
+  }
   const ability = want.abilityName ?? "";
-  const receiver = receivers.get(ability);
-  if (receiver) {
-    receiver(name);
+  const target = pickReceiver(instancesByAbility.get(ability));
+  if (target) {
+    target.deliver(name);
   } else {
-    const queued = pending.get(ability) ?? [];
-    queued.push(name);
-    pending.set(ability, queued);
+    enqueuePending(pendingByAbility, ability, name);
   }
 }
 export interface NotificationReply extends SystemReply {
@@ -29,22 +58,29 @@ export interface NotificationReply extends SystemReply {
 }
 export class NativeNotifications {
   private readonly context: common.UIAbilityContext;
+  private readonly abilityName: string;
   private readonly settings: preferences.Preferences;
   private listener?: (reply: NotificationReply) => void;
-  private readonly pressed = (name: string): void => {
+  hasListener(): boolean {
+    return this.listener !== undefined;
+  }
+  deliver(name: string): void {
     if (this.listener) {
       this.listener({ pressed: name });
     } else {
-      const key = this.context.abilityInfo.name;
-      const queued = pending.get(key) ?? [];
-      queued.push(name);
-      pending.set(key, queued);
+      enqueuePending(pendingByContext, this.context, name);
     }
-  };
+  }
   constructor(context: common.UIAbilityContext) {
     this.context = context;
+    this.abilityName = context.abilityInfo?.name ?? "";
     this.settings = preferences.getPreferencesSync(context, { name: "nsh-notifications" });
-    receivers.set(context.abilityInfo.name, this.pressed);
+    const ctxList = instancesByContext.get(context) ?? [];
+    ctxList.push(this);
+    instancesByContext.set(context, ctxList);
+    const nameList = instancesByAbility.get(this.abilityName) ?? [];
+    nameList.push(this);
+    instancesByAbility.set(this.abilityName, nameList);
   }
   async permission(ask: boolean): Promise<NotificationReply> {
     if (await notification.isNotificationEnabled()) {
@@ -123,18 +159,40 @@ export class NativeNotifications {
   listen(listener?: (reply: NotificationReply) => void): void {
     this.listener = listener;
     if (listener) {
-      const key = this.context.abilityInfo.name;
-      const queued = pending.get(key) ?? [];
-      pending.delete(key);
-      for (const name of queued) {
-        listener({ pressed: name });
+      const ctxQueued = pendingByContext.get(this.context) ?? [];
+      pendingByContext.delete(this.context);
+      for (let i = 0; i < ctxQueued.length; i++) {
+        listener({ pressed: ctxQueued[i] });
+      }
+      const nameQueued = pendingByAbility.get(this.abilityName) ?? [];
+      pendingByAbility.delete(this.abilityName);
+      for (let i = 0; i < nameQueued.length; i++) {
+        listener({ pressed: nameQueued[i] });
       }
     }
   }
   close(): void {
     this.listener = undefined;
-    if (receivers.get(this.context.abilityInfo.name) === this.pressed) {
-      receivers.delete(this.context.abilityInfo.name);
+    const ctxList = instancesByContext.get(this.context);
+    if (ctxList) {
+      const idx = ctxList.indexOf(this);
+      if (idx >= 0) {
+        ctxList.splice(idx, 1);
+      }
+      if (ctxList.length === 0) {
+        instancesByContext.delete(this.context);
+        pendingByContext.delete(this.context);
+      }
+    }
+    const nameList = instancesByAbility.get(this.abilityName);
+    if (nameList) {
+      const idx = nameList.indexOf(this);
+      if (idx >= 0) {
+        nameList.splice(idx, 1);
+      }
+      if (nameList.length === 0) {
+        instancesByAbility.delete(this.abilityName);
+      }
     }
   }
 }

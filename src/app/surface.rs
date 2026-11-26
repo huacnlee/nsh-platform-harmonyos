@@ -1729,8 +1729,26 @@ impl NshSurface {
         if let Some(runtime) = state.phase.runtime() {
             runtime.open_url_scheme(url)?;
         } else {
-            if state.pending_urls.len() >= nsh_core::url_scheme::MAX_PENDING {
-                state.pending_urls.remove(0);
+            const MAX_PENDING_FILES: usize = 64;
+            let is_file_url = |u: &str| u.len() >= 5 && u[..5].eq_ignore_ascii_case("file:");
+            let is_file = is_file_url(&url);
+            let cap = if is_file {
+                MAX_PENDING_FILES
+            } else {
+                nsh_core::url_scheme::MAX_PENDING
+            };
+            let count_same = state
+                .pending_urls
+                .iter()
+                .filter(|existing| is_file_url(existing) == is_file)
+                .count();
+            if count_same >= cap
+                && let Some(pos) = state
+                    .pending_urls
+                    .iter()
+                    .position(|existing| is_file_url(existing) == is_file)
+            {
+                state.pending_urls.remove(pos);
             }
             state.pending_urls.push(url);
         }

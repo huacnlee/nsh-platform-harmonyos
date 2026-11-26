@@ -1,24 +1,25 @@
 import { UIAbility, Want } from "@kit.AbilityKit";
 import { window } from "@kit.ArkUI";
-import { onAbilityWant, onNotificationWant } from "@nsh/harmonyos";
+import { onAbilityWant, onLaunchWant, onNotificationWant } from "@nsh/harmonyos";
 
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want): void {
     onAbilityWant(want, "create");
-    onNotificationWant(want);
+    onNotificationWant(want, this.context);
     const devUrl = want.parameters?.["nsh.devUrl"];
     if (typeof devUrl === "string" && devUrl.length > 0) {
       AppStorage.setOrCreate("nsh.devUrl", devUrl);
+      return;
     }
-    if (typeof want.uri === "string" && want.uri.length > 0) {
-      AppStorage.setOrCreate("nsh.launchUrl", want.uri);
+    if (typeof want.parameters?.["nsh.notification"] !== "string") {
+      onLaunchWant(this.context, want, true);
     }
   }
 
   onNewWant(want: Want): void {
     onAbilityWant(want, "new-want");
     const isNotification = typeof want.parameters?.["nsh.notification"] === "string";
-    onNotificationWant(want);
+    onNotificationWant(want, this.context);
     if (isNotification) {
       return;
     }
@@ -28,12 +29,9 @@ export default class EntryAbility extends UIAbility {
       this.context.eventHub.emit("nsh.devUrl", devUrl);
       return;
     }
-    const hasUri = typeof want.uri === "string" && want.uri.length > 0;
-    if (hasUri) {
-      this.context.eventHub.emit("nsh.openUrl", want.uri);
-    }
+    const hasLaunch = onLaunchWant(this.context, want, false);
     const rawArgs = want.parameters?.["nsh.args"];
-    if (hasUri && !Array.isArray(rawArgs)) {
+    if (hasLaunch && !Array.isArray(rawArgs)) {
       return;
     }
     const args: string[] = [];
