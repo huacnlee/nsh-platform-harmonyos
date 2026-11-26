@@ -4,4 +4,6 @@ pub(crate) mod editor_state;
 pub(crate) mod events;
 pub(crate) mod intercept;
 pub(crate) mod keyboard;
+pub(crate) mod pan;
 pub(crate) mod touch;
+pub(crate) mod wheel;

@@ -14,7 +14,6 @@ use crate::render::node::{Node, Result};
 struct Finger {
     point: TouchPoint,
     node: Weak<Node>,
-    start: (f32, f32),
     pans: Vec<(Weak<Node>, bool)>,
 }
 struct KeyboardTap {
@@ -137,8 +136,18 @@ pub(crate) struct Touches {
     handled_context_menu: Option<(i64, i32, i32)>,
     down_recorded: bool,
     last_down_time_ns: Option<i64>,
+    pan_tracker: crate::input::pan::PanTracker,
 }
 impl Touches {
+    pub(crate) fn pan_decision(
+        &self,
+        id: nsh_core::NodeId,
+    ) -> Option<(crate::input::pan::PanDecision, (f32, f32))> {
+        self.pan_tracker.decision(id)
+    }
+    pub(crate) fn latest_pan_start(&self) -> Option<(f32, f32)> {
+        self.pan_tracker.latest_start()
+    }
     pub(crate) fn record_pointer_for(&mut self, window_id: nsh_core::NodeId, point: (f32, f32)) {
         if point.0.is_finite() && point.1.is_finite() {
             self.last_pointer.insert(window_id, point);
@@ -208,6 +217,8 @@ impl Touches {
         self.window_resize = None;
         self.pending_window_drag = None;
         self.mouse_up_targets.clear();
+        self.pan_tracker.clear();
+        root.clear_axis_router(root.self_ref().map_or(root.id, |n| n.key_surface_root().id));
         if let Some(drag) = self.selection.take() {
             drag.unblock()?;
             if let Some(owner) = drag.owner.upgrade() {
@@ -294,6 +305,9 @@ impl Touches {
             surface = parent;
         }
         let origin = surface.native.borrow().layout_position_in_window()?;
+        if phase == TouchPhase::Start {
+            root.clear_axis_router(surface.id);
+        }
         if phase == TouchPhase::Start && count == 1 {
             self.primary = changed;
         }
@@ -333,6 +347,8 @@ impl Touches {
                 let mut parent = Some(node.clone());
                 let mut path = Vec::new();
                 let mut pans = Vec::new();
+                let mut tracker_candidates = Vec::new();
+                let sf = surface.frame.get();
                 while let Some(node) = parent {
                     if consumes {
                         self.suppressed_presses.push(node.id);
@@ -341,21 +357,29 @@ impl Touches {
                         path.push(node.id);
                     }
                     if let Some(activation) = node.interaction.gate_pan_activation() {
-                        let rf = root.frame.get();
+                        tracker_candidates.push((node.id, activation));
                         if activation.starts_at(
                             nsh_core::Point::new(
                                 nsh_core::Points(page.0),
                                 nsh_core::Points(page.1),
                             ),
                             nsh_core::Size::new(
-                                nsh_core::Points(rf.width),
-                                nsh_core::Points(rf.height),
+                                nsh_core::Points(sf.width),
+                                nsh_core::Points(sf.height),
                             ),
                         ) {
                             pans.push((Rc::downgrade(&node), false));
                         }
                     }
                     parent = node.parent_node.borrow().upgrade();
+                }
+                if !consumes {
+                    self.pan_tracker.down(
+                        id,
+                        page,
+                        (sf.width, sf.height),
+                        tracker_candidates,
+                    );
                 }
                 if !path.is_empty() && !consumes {
                     self.fingers.push(Finger {
@@ -381,10 +405,12 @@ impl Touches {
                             },
                         },
                         node: Rc::downgrade(&node),
-                        start: page,
                         pans,
                     });
                 }
+            }
+            if phase == TouchPhase::Move {
+                let _ = self.pan_tracker.move_pointer(id, page);
             }
             if self.keyboard_tap.as_ref().is_some_and(|tap| {
                 tap.finger == id
@@ -446,14 +472,13 @@ impl Touches {
                         *failed = true;
                         continue;
                     };
-                    match node.interaction.gate_pan_activation().and_then(|p| {
-                        p.decide(
-                            nsh_core::Points(finger.point.page.x.0 - finger.start.0),
-                            nsh_core::Points(finger.point.page.y.0 - finger.start.1),
-                        )
-                    }) {
-                        Some(false) => *failed = true,
-                        Some(true) => {
+                    let decision = self
+                        .pan_tracker
+                        .decision(node.id)
+                        .map(|(state, _)| state);
+                    match decision {
+                        Some(crate::input::pan::PanDecision::Failed) => *failed = true,
+                        Some(crate::input::pan::PanDecision::Activated) => {
                             block(&node, true)?;
                             let mut ancestor = Some(node.clone());
                             while let Some(current) = ancestor {
@@ -464,7 +489,7 @@ impl Touches {
                             activated = Some(node.id);
                             break;
                         }
-                        None => {}
+                        Some(crate::input::pan::PanDecision::Waiting) | None => {}
                     }
                 }
             }
@@ -483,9 +508,13 @@ impl Touches {
             );
         }
         if phase == TouchPhase::End {
+            if let Some(id) = changed {
+                self.pan_tracker.up_or_cancel(id);
+            }
             self.fingers.retain(|f| !f.point.changed);
         }
         if phase == TouchPhase::Cancel {
+            self.pan_tracker.clear();
             self.fingers.clear()
         }
         if self.fingers.is_empty()

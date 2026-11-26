@@ -100,6 +100,13 @@ impl Scroller {
     pub(crate) fn test_animating(&self) -> bool {
         self.phases.get() != [0; 2] || self.zoom_motion.get().is_some()
     }
+    pub(crate) fn is_scrolling(&self) -> bool {
+        self.phases.get() != [0; 2]
+    }
+    pub(crate) fn is_zoomable(&self) -> bool {
+        let behavior = self.behavior.borrow();
+        behavior.max_zoom > behavior.min_zoom
+    }
     pub(crate) fn mounted(&self) -> NativeNode {
         self.overlay
             .borrow()
@@ -257,6 +264,18 @@ impl Scroller {
                     {
                         route.send(crate::app::runtime::Message::FlushScrollLayout(owner.id));
                     }
+                }
+                Ok(())
+            })
+        });
+        let weak = Rc::downgrade(&scroll);
+        scroll.content.borrow_mut().on_axis(move |event| {
+            callback(|| {
+                if let Some(scroll) = weak.upgrade()
+                    && let Some(owner) = scroll.owner.upgrade()
+                    && let Some(input) = event.input_event()
+                {
+                    crate::input::events::handle_axis_event(&owner, &input)?;
                 }
                 Ok(())
             })
@@ -1283,6 +1302,7 @@ impl Scroller {
     pub(crate) fn dispose(&self) -> Result<()> {
         self.phases.set([0; 2]);
         self.zoom_motion.set(None);
+        let _ = self.content.borrow_mut().off_event(E::OnAxis);
         use ohos_arkui_binding::component::attribute::ArkUIGesture;
         if let Some(gesture) = self.pinch.borrow_mut().take()
             && self.wrapper.borrow().is_owned()

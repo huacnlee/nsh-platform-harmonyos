@@ -54,7 +54,6 @@ pub(crate) struct Interaction {
     mouse_registered: Cell<bool>,
     axis_registered: Cell<bool>,
     drag_registered: Cell<bool>,
-    pinch_scale: Cell<f32>,
     opacity: Cell<Option<f32>>,
     applied_opacity: Cell<Option<f32>>,
     label: RefCell<Option<Arc<str>>>,
@@ -63,8 +62,9 @@ pub(crate) struct Interaction {
     long_fired: Cell<bool>,
     gestures: RefCell<Vec<Gesture>>,
     gesture_values: Cell<GestureValues>,
-    applied_pan_activation: Cell<Option<nsh_core::PanActivation>>,
-    pan_rejected: Cell<bool>,
+    applied_gesture_spec: Cell<Option<crate::input::pan::GestureSpec>>,
+    pan_phase: Cell<crate::input::pan::PanPhaseState>,
+    pan_interrupter_installed: Cell<bool>,
     gesture_start: Cell<[f32; 4]>,
     pan_origin: Cell<[f32; 2]>,
 }
@@ -95,7 +95,6 @@ impl Default for Interaction {
             mouse_registered: Cell::new(false),
             axis_registered: Cell::new(false),
             drag_registered: Cell::new(false),
-            pinch_scale: Cell::new(1.0),
             opacity: Cell::new(Some(1.0)),
             applied_opacity: Cell::new(Some(1.0)),
             label: RefCell::default(),
@@ -104,8 +103,9 @@ impl Default for Interaction {
             long_fired: Cell::new(false),
             gestures: RefCell::default(),
             gesture_values: Cell::default(),
-            applied_pan_activation: Cell::default(),
-            pan_rejected: Cell::new(false),
+            applied_gesture_spec: Cell::default(),
+            pan_phase: Cell::default(),
+            pan_interrupter_installed: Cell::new(false),
             gesture_start: Cell::default(),
             pan_origin: Cell::default(),
         }
@@ -705,8 +705,11 @@ impl Interaction {
                 owner.native.borrow_mut().off_event(E::OnMouse)?;
             }
         }
-        let axis =
-            !blocked && (events.contains(EventKind::Wheel) || events.contains(EventKind::Pinch));
+        let axis = !blocked
+            && (owner.id == nsh_core::ROOT_ID
+                || owner.kind == nsh_core::ViewKind::Modal
+                || events.contains(EventKind::Wheel)
+                || events.contains(EventKind::Pinch));
         if self.axis_registered.replace(axis) != axis {
             if axis {
                 let weak = Rc::downgrade(owner);
@@ -715,108 +718,7 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade()
                             && let Some(input) = event.input_event()
                         {
-                            let mask = owner.interaction.mask();
-                            let x = input.pointer_x();
-                            let y = input.pointer_y();
-                            if !owner.hit_within_clip_path(x, y) {
-                                return Ok(());
-                            }
-                            let action = input.axis_action();
-                            let pinch_scale = input.axis_pinch_scale_value() as f32;
-                            if mask.contains(EventKind::Pinch)
-                                && pinch_scale.is_finite()
-                                && pinch_scale > 0.0
-                                && (pinch_scale != 1.0
-                                    || matches!(
-                                        action,
-                                        UIAxisEventAction::Begin
-                                            | UIAxisEventAction::End
-                                            | UIAxisEventAction::Cancel
-                                    ))
-                            {
-                                let (phase, delta) = match action {
-                                    UIAxisEventAction::Begin => {
-                                        owner.interaction.pinch_scale.set(pinch_scale);
-                                        (nsh_core::PinchPhase::Start, 0.0)
-                                    }
-                                    UIAxisEventAction::End | UIAxisEventAction::Cancel => {
-                                        let prev = owner.interaction.pinch_scale.replace(1.0);
-                                        let delta = if prev > 0.0 {
-                                            pinch_scale / prev - 1.0
-                                        } else {
-                                            0.0
-                                        };
-                                        (nsh_core::PinchPhase::End, delta)
-                                    }
-                                    _ => {
-                                        let prev =
-                                            owner.interaction.pinch_scale.replace(pinch_scale);
-                                        let delta = if prev > 0.0 {
-                                            pinch_scale / prev - 1.0
-                                        } else {
-                                            0.0
-                                        };
-                                        (nsh_core::PinchPhase::Move, delta)
-                                    }
-                                };
-                                let modifiers = axis_modifiers(&owner, &input);
-                                owner.emit(
-                                    EventKind::Pinch,
-                                    owner.pinch_payload(x, y, delta, phase, modifiers),
-                                );
-                                if takes_axis(&owner, x, y, EventKind::Pinch) {
-                                    let _ = input.axis_set_propagation(false);
-                                }
-                                return Ok(());
-                            }
-                            let is_mouse = input.tool_type == UIInputToolType::Mouse
-                                || (input.source_type == UIInputSourceType::Mouse
-                                    && input.tool_type != UIInputToolType::Touchpad);
-                            let modifiers = axis_modifiers(&owner, &input);
-                            let vx = input.axis_horizontal_value();
-                            let vy = input.axis_vertical_value();
-                            if mask.contains(EventKind::Pinch)
-                                && is_mouse
-                                && modifiers.ctrl
-                                && vy.is_finite()
-                                && vy != 0.0
-                            {
-                                let delta = crate::services::desktop::ctrl_wheel_pinch_delta(
-                                    (vy as f32) / 15.0,
-                                );
-                                if delta != 0.0 {
-                                    owner.emit(
-                                        EventKind::Pinch,
-                                        owner.pinch_payload(
-                                            x,
-                                            y,
-                                            delta,
-                                            nsh_core::PinchPhase::Move,
-                                            modifiers,
-                                        ),
-                                    );
-                                    if takes_axis(&owner, x, y, EventKind::Pinch) {
-                                        let _ = input.axis_set_propagation(false);
-                                    }
-                                }
-                            } else if mask.contains(EventKind::Wheel)
-                                && let Some(delta) =
-                                    crate::services::desktop::wheel_delta_from_axis(
-                                        vx,
-                                        vy,
-                                        is_mouse,
-                                        owner.scale.get(),
-                                        modifiers.shift && !modifiers.ctrl,
-                                    )
-                            {
-                                owner.emit(
-                                    EventKind::Wheel,
-                                    owner.wheel_payload(x, y, delta, modifiers),
-                                );
-                                if takes_axis(&owner, x, y, EventKind::Wheel) {
-                                    let _ = input.axis_set_propagation(false);
-                                }
-                            }
+                            handle_axis_event(&owner, &input)?;
                         }
                         Ok(())
                     })
@@ -950,6 +852,7 @@ impl Interaction {
                 *self.long_press.borrow_mut() = Some((delay, gesture));
             }
         }
+        self.sync_gestures(owner)?;
         Ok(())
     }
     pub(crate) fn props(&self, owner: &Rc<Node>, props: ViewProps) -> Result<()> {
@@ -1027,7 +930,7 @@ impl Interaction {
             self.events(owner, self.events.get())?;
         }
         if pan_activation_changed {
-            self.gestures(owner, self.gesture_values.get())?;
+            self.sync_gestures(owner)?;
         }
         if selection_changed {
             owner.selection_configure()?;
@@ -1131,60 +1034,66 @@ impl Interaction {
             )
     }
     pub(crate) fn gestures(&self, owner: &Rc<Node>, values: GestureValues) -> Result<()> {
+        if self.gesture_values.replace(values) != values {
+            self.sync_gestures(owner)?;
+        }
+        Ok(())
+    }
+    pub(crate) fn sync_gestures(&self, owner: &Rc<Node>) -> Result<()> {
+        use crate::input::pan::{
+            PanDecision, PanDirectionSpec, PanPhaseState, gesture_local_down_vp,
+            gesture_origin_surface_vp, gesture_spec, gesture_translation_vp, gesture_velocity_vp,
+        };
+        let blocked = self.inherited_block.get()
+            || matches!(
+                self.props.borrow().pointer_events,
+                PointerEvents::None | PointerEvents::BoxNone
+            );
+        let values = self.gesture_values.get();
+        let events = self.mask();
         let activation = self.props.borrow().pan_activation;
-        let values_changed = self.gesture_values.replace(values) != values;
-        let activation_changed = self.applied_pan_activation.replace(activation) != activation;
-        if !values_changed && !activation_changed {
+        let spec = gesture_spec(values, events, activation, blocked, owner.scale.get());
+        if self.applied_gesture_spec.get() == Some(spec) {
             return Ok(());
         }
-        self.pan_rejected.set(false);
+        self.applied_gesture_spec.set(Some(spec));
+        self.pan_phase.set(PanPhaseState::Pending);
         for gesture in self.gestures.borrow_mut().drain(..) {
             owner.native.borrow().remove_gesture(&gesture)?;
             gesture.dispose()?;
         }
-        for kind in 0..3 {
-            let enabled = match kind {
-                0 => values.pan_x.is_some() || values.pan_y.is_some(),
-                1 => values.pinch.is_some(),
-                _ => values.rotation.is_some(),
-            };
-            if !enabled {
-                continue;
-            }
-            let gesture = match kind {
-                0 => {
-                    let direction = match activation.and_then(|a| a.way()) {
-                        Some(nsh_core::PanDirection::Left) => GestureDirection::Left,
-                        Some(nsh_core::PanDirection::Right) => GestureDirection::Right,
-                        Some(nsh_core::PanDirection::Up) => GestureDirection::Up,
-                        Some(nsh_core::PanDirection::Down) => GestureDirection::Down,
-                        None | Some(_) => match activation.and_then(|a| a.axis()) {
-                            Some(true) => GestureDirection::Horizontal,
-                            Some(false) => GestureDirection::Vertical,
-                            None => match (values.pan_x.is_some(), values.pan_y.is_some()) {
-                                (true, true) => GestureDirection::All,
-                                (true, false) => GestureDirection::Horizontal,
-                                (false, true) => GestureDirection::Vertical,
-                                (false, false) => GestureDirection::None,
-                            },
-                        },
-                    };
-                    let distance_px = activation
-                        .and_then(|a| {
-                            [a.active_offset_x, a.active_offset_y]
-                                .into_iter()
-                                .flatten()
-                                .map(|p| p.0.abs())
-                                .reduce(f32::min)
-                        })
-                        .map_or(0.0, |vp| {
-                            f64::from(vp) * f64::from(owner.scale.get().max(1.0))
-                        });
-                    Gesture::create_pan_gesture(1, direction, distance_px)?
+        if self.pan_interrupter_installed.replace(false) {
+            let _ = owner.native.borrow().clear_gesture_interrupter();
+        }
+        if let Some(pan_spec) = spec.pan {
+            let weak_interrupt = Rc::downgrade(owner);
+            owner.native.borrow().set_gesture_interrupter(move |info| {
+                use ohos_arkui_binding::types::gesture::GestureInterruptResult;
+                if info.system_flag() {
+                    return GestureInterruptResult::Continue;
                 }
-                1 => Gesture::create_pinch_gesture(2, 0.0)?,
-                _ => Gesture::create_rotation_gesture(2, 0.0)?,
+                let Some(owner) = weak_interrupt.upgrade() else {
+                    return GestureInterruptResult::Continue;
+                };
+                if let Some((PanDecision::Failed, _)) =
+                    owner.touches.borrow().pan_decision(owner.id)
+                {
+                    return GestureInterruptResult::Reject;
+                }
+                GestureInterruptResult::Continue
+            })?;
+            self.pan_interrupter_installed.set(true);
+
+            let direction = match pan_spec.direction {
+                PanDirectionSpec::Left => GestureDirection::Left,
+                PanDirectionSpec::Right => GestureDirection::Right,
+                PanDirectionSpec::Up => GestureDirection::Up,
+                PanDirectionSpec::Down => GestureDirection::Down,
+                PanDirectionSpec::Horizontal => GestureDirection::Horizontal,
+                PanDirectionSpec::Vertical => GestureDirection::Vertical,
+                PanDirectionSpec::All => GestureDirection::All,
             };
+            let gesture = Gesture::create_pan_gesture(1, direction, pan_spec.distance_px)?;
             let weak = Rc::downgrade(owner);
             gesture.on_gesture(
                 GestureEventAction::Accept
@@ -1196,217 +1105,377 @@ impl Interaction {
                         let Some(owner) = weak.upgrade() else {
                             return Ok(());
                         };
+                        let GestureData::Pan(pan) = event.event_action_data else {
+                            return Ok(());
+                        };
                         let values = owner.interaction.gesture_values.get();
+                        let mask = owner.interaction.mask();
                         let accept = event.event_action_type == GestureEventAction::Accept;
                         let ended = event
                             .event_action_type
                             .intersects(GestureEventAction::End | GestureEventAction::Cancel);
+                        let scale = owner.scale.get().max(1.0);
+                        let mut just_activated = false;
+
                         if accept {
-                            owner.interaction.pan_rejected.set(false);
+                            owner.interaction.pan_phase.set(PanPhaseState::Pending);
                             owner.interaction.gesture_start.set([
                                 values.pan_x.map_or(0.0, |id| owner.animator.value(id)),
                                 values.pan_y.map_or(0.0, |id| owner.animator.value(id)),
                                 values.pinch.map_or(1.0, |id| owner.animator.value(id)),
                                 values.rotation.map_or(0.0, |id| owner.animator.value(id)),
                             ]);
-                        }
-                        let start = owner.interaction.gesture_start.get();
-                        match event.event_action_data {
-                            GestureData::Pan(pan) => {
-                                if !accept && owner.interaction.pan_rejected.get() {
+                            if let Some(input) = event.input {
+                                let (lx, ly) = gesture_local_down_vp(
+                                    (input.x, input.y),
+                                    (pan.offset_x, pan.offset_y),
+                                    scale,
+                                );
+                                if !owner.hit_within_clip_path(lx, ly) {
+                                    owner.interaction.pan_phase.set(if ended {
+                                        PanPhaseState::Pending
+                                    } else {
+                                        PanPhaseState::Rejected
+                                    });
+                                    return Ok(());
+                                }
+                            }
+                            let surface = owner.key_surface_root();
+                            let surface_origin_px = surface
+                                .native
+                                .borrow()
+                                .layout_position_in_window()
+                                .map(|pos| (pos.x as f32, pos.y as f32))
+                                .unwrap_or((0.0, 0.0));
+                            let tracker_hit = owner.touches.borrow().pan_decision(owner.id);
+                            let origin = tracker_hit
+                                .map(|(_, start)| start)
+                                .or_else(|| owner.touches.borrow().latest_pan_start())
+                                .or_else(|| {
+                                    event.input.map(|i| {
+                                        gesture_origin_surface_vp(
+                                            (i.window_x, i.window_y),
+                                            (pan.offset_x, pan.offset_y),
+                                            surface_origin_px,
+                                            scale,
+                                        )
+                                    })
+                                })
+                                .unwrap_or((0.0, 0.0));
+                            owner.interaction.pan_origin.set([origin.0, origin.1]);
+
+                            let activation = owner.interaction.props.borrow().pan_activation;
+                            if let Some(act) = activation {
+                                let sf = surface.frame.get();
+                                let at = nsh_core::Point::new(
+                                    nsh_core::Points(origin.0),
+                                    nsh_core::Points(origin.1),
+                                );
+                                let size = nsh_core::Size::new(
+                                    nsh_core::Points(sf.width),
+                                    nsh_core::Points(sf.height),
+                                );
+                                let (dx_vp, dy_vp) =
+                                    gesture_translation_vp((pan.offset_x, pan.offset_y), scale);
+                                let decision = if !act.starts_at(at, size) {
+                                    PanDecision::Failed
+                                } else {
+                                    match tracker_hit.map(|(d, _)| d) {
+                                        Some(PanDecision::Failed) => PanDecision::Failed,
+                                        Some(PanDecision::Activated) => PanDecision::Activated,
+                                        Some(PanDecision::Waiting) | None => {
+                                            match act.decide(
+                                                nsh_core::Points(dx_vp),
+                                                nsh_core::Points(dy_vp),
+                                            ) {
+                                                Some(true) => PanDecision::Activated,
+                                                Some(false) => PanDecision::Failed,
+                                                None => PanDecision::Waiting,
+                                            }
+                                        }
+                                    }
+                                };
+                                match decision {
+                                    PanDecision::Activated => {
+                                        owner.interaction.pan_phase.set(PanPhaseState::Active);
+                                        just_activated = true;
+                                    }
+                                    PanDecision::Failed => {
+                                        owner.interaction.pan_phase.set(if ended {
+                                            PanPhaseState::Pending
+                                        } else {
+                                            PanPhaseState::Rejected
+                                        });
+                                        return Ok(());
+                                    }
+                                    PanDecision::Waiting => {
+                                        if ended {
+                                            owner.interaction.pan_phase.set(PanPhaseState::Pending);
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            } else {
+                                owner.interaction.pan_phase.set(PanPhaseState::Active);
+                                just_activated = true;
+                            }
+                        } else {
+                            match owner.interaction.pan_phase.get() {
+                                PanPhaseState::Rejected => {
                                     if ended {
-                                        owner.interaction.pan_rejected.set(false);
+                                        owner.interaction.pan_phase.set(PanPhaseState::Pending);
                                     }
                                     return Ok(());
                                 }
-                                let accept_origin = if accept {
-                                    let scale = owner.scale.get().max(1.0);
-                                    if let Some(input) = event.input
-                                        && !owner.hit_within_clip_path(
-                                            (input.x - pan.offset_x) / scale,
-                                            (input.y - pan.offset_y) / scale,
-                                        )
-                                    {
-                                        owner.interaction.pan_rejected.set(!ended);
+                                PanPhaseState::Pending => {
+                                    if ended {
+                                        owner.interaction.pan_phase.set(PanPhaseState::Pending);
                                         return Ok(());
                                     }
-                                    let origin = event
-                                        .input
-                                        .map(|i| {
-                                            (
-                                                i.window_x - pan.offset_x / scale,
-                                                i.window_y - pan.offset_y / scale,
-                                            )
-                                        })
-                                        .or_else(|| {
-                                            owner
-                                                .touches
-                                                .borrow()
-                                                .last_pointer_for(owner.key_window_id())
-                                        })
-                                        .unwrap_or((0.0, 0.0));
-                                    let mut surface = owner.clone();
-                                    while surface.id != nsh_core::ROOT_ID
-                                        && surface.kind != nsh_core::ViewKind::Modal
-                                    {
-                                        let Some(parent) = surface.parent_node.borrow().upgrade()
-                                        else {
-                                            break;
-                                        };
-                                        surface = parent;
-                                    }
-                                    let scale = owner.scale.get().max(1.0);
-                                    let surface_origin = surface
-                                        .native
+                                    let activation =
+                                        owner.interaction.props.borrow().pan_activation;
+                                    let decision = match owner
+                                        .touches
                                         .borrow()
-                                        .layout_position_in_window()
-                                        .map(|pos| (pos.x as f32 / scale, pos.y as f32 / scale))
-                                        .unwrap_or((0.0, 0.0));
-                                    let sf = surface.frame.get();
-                                    let at = nsh_core::Point::new(
-                                        nsh_core::Points(origin.0 - surface_origin.0),
-                                        nsh_core::Points(origin.1 - surface_origin.1),
-                                    );
-                                    let size = nsh_core::Size::new(
-                                        nsh_core::Points(sf.width),
-                                        nsh_core::Points(sf.height),
-                                    );
-                                    if owner
-                                        .interaction
-                                        .props
-                                        .borrow()
-                                        .pan_activation
-                                        .is_some_and(|a| !a.starts_at(at, size))
+                                        .pan_decision(owner.id)
+                                        .map(|(d, _)| d)
                                     {
-                                        owner.interaction.pan_rejected.set(!ended);
-                                        return Ok(());
-                                    }
-                                    owner.interaction.pan_origin.set([origin.0, origin.1]);
-                                    Some(origin)
-                                } else {
-                                    None
-                                };
-                                if let Some(id) = values.pan_x {
-                                    owner
-                                        .animator
-                                        .set(id, start[0] + pan.offset_x / owner.scale.get())?;
-                                }
-                                if let Some(id) = values.pan_y {
-                                    owner
-                                        .animator
-                                        .set(id, start[1] + pan.offset_y / owner.scale.get())?;
-                                }
-                                if accept || ended {
-                                    let origin = if let Some(origin) = accept_origin {
-                                        origin
-                                    } else {
-                                        let saved = owner.interaction.pan_origin.get();
-                                        (saved[0], saved[1])
+                                        Some(PanDecision::Failed) => PanDecision::Failed,
+                                        Some(PanDecision::Activated) => PanDecision::Activated,
+                                        Some(PanDecision::Waiting) | None => {
+                                            if let Some(act) = activation {
+                                                let (dx_vp, dy_vp) = gesture_translation_vp(
+                                                    (pan.offset_x, pan.offset_y),
+                                                    scale,
+                                                );
+                                                match act.decide(
+                                                    nsh_core::Points(dx_vp),
+                                                    nsh_core::Points(dy_vp),
+                                                ) {
+                                                    Some(true) => PanDecision::Activated,
+                                                    Some(false) => PanDecision::Failed,
+                                                    None => PanDecision::Waiting,
+                                                }
+                                            } else {
+                                                PanDecision::Activated
+                                            }
+                                        }
                                     };
-                                    let origin = nsh_core::Point::new(
-                                        nsh_core::Points(origin.0),
-                                        nsh_core::Points(origin.1),
-                                    );
-                                    let translation = nsh_core::Point::new(
-                                        nsh_core::Points(pan.offset_x / owner.scale.get()),
-                                        nsh_core::Points(pan.offset_y / owner.scale.get()),
-                                    );
-                                    let velocity_x = pan.velocity_x / owner.scale.get();
-                                    let velocity_y = pan.velocity_y / owner.scale.get();
-                                    let value_x = values
-                                        .pan_x
-                                        .map(|id| nsh_core::Points(owner.animator.value(id)));
-                                    let value_y = values
-                                        .pan_y
-                                        .map(|id| nsh_core::Points(owner.animator.value(id)));
-                                    owner.emit(
-                                        if accept {
-                                            EventKind::PanStart
-                                        } else {
-                                            EventKind::PanEnd
-                                        },
-                                        if event.event_action_type == GestureEventAction::Cancel {
-                                            EventPayload::PanCancelled {
-                                                origin,
-                                                translation,
-                                                velocity_x,
-                                                velocity_y,
-                                                value_x,
-                                                value_y,
-                                            }
-                                        } else {
-                                            EventPayload::Pan {
-                                                origin,
-                                                translation,
-                                                velocity_x,
-                                                velocity_y,
-                                                value_x,
-                                                value_y,
-                                            }
-                                        },
-                                    );
+                                    match decision {
+                                        PanDecision::Activated => {
+                                            owner.interaction.pan_phase.set(PanPhaseState::Active);
+                                            just_activated = true;
+                                        }
+                                        PanDecision::Failed => {
+                                            owner
+                                                .interaction
+                                                .pan_phase
+                                                .set(PanPhaseState::Rejected);
+                                            return Ok(());
+                                        }
+                                        PanDecision::Waiting => return Ok(()),
+                                    }
                                 }
+                                PanPhaseState::Active => {}
                             }
-                            GestureData::Pinch(pinch) => {
-                                if let Some(id) = values.pinch {
-                                    owner.animator.set(id, start[2] * pinch.scale)?;
-                                }
-                                if accept || ended {
-                                    owner.emit(
-                                        if accept {
-                                            EventKind::PinchStart
-                                        } else {
-                                            EventKind::PinchEnd
-                                        },
-                                        EventPayload::Map(vec![
-                                            ("scale", PayloadValue::Number(pinch.scale as f64)),
-                                            ("velocity", PayloadValue::Number(0.0)),
-                                        ]),
-                                    );
-                                }
+                        }
+
+                        let start = owner.interaction.gesture_start.get();
+                        let (tx, ty) = gesture_translation_vp((pan.offset_x, pan.offset_y), scale);
+                        if let Some(id) = values.pan_x {
+                            owner.animator.set(id, start[0] + tx)?;
+                        }
+                        if let Some(id) = values.pan_y {
+                            owner.animator.set(id, start[1] + ty)?;
+                        }
+                        let (vx, vy) =
+                            gesture_velocity_vp((pan.velocity_x, pan.velocity_y), scale);
+                        let saved = owner.interaction.pan_origin.get();
+                        let origin = nsh_core::Point::new(
+                            nsh_core::Points(saved[0]),
+                            nsh_core::Points(saved[1]),
+                        );
+                        let translation = nsh_core::Point::new(
+                            nsh_core::Points(tx),
+                            nsh_core::Points(ty),
+                        );
+                        let value_x = values
+                            .pan_x
+                            .map(|id| nsh_core::Points(owner.animator.value(id)));
+                        let value_y = values
+                            .pan_y
+                            .map(|id| nsh_core::Points(owner.animator.value(id)));
+                        if just_activated && mask.contains(EventKind::PanStart) {
+                            owner.emit(
+                                EventKind::PanStart,
+                                EventPayload::Pan {
+                                    origin,
+                                    translation,
+                                    velocity_x: vx,
+                                    velocity_y: vy,
+                                    value_x,
+                                    value_y,
+                                },
+                            );
+                        }
+                        if ended {
+                            owner.interaction.pan_phase.set(PanPhaseState::Pending);
+                            if mask.contains(EventKind::PanEnd) {
+                                owner.emit(
+                                    EventKind::PanEnd,
+                                    if event.event_action_type == GestureEventAction::Cancel {
+                                        EventPayload::PanCancelled {
+                                            origin,
+                                            translation,
+                                            velocity_x: vx,
+                                            velocity_y: vy,
+                                            value_x,
+                                            value_y,
+                                        }
+                                    } else {
+                                        EventPayload::Pan {
+                                            origin,
+                                            translation,
+                                            velocity_x: vx,
+                                            velocity_y: vy,
+                                            value_x,
+                                            value_y,
+                                        }
+                                    },
+                                );
                             }
-                            GestureData::Rotation(rotation) => {
-                                if let Some(id) = values.rotation {
-                                    owner.animator.set(id, start[3] + rotation.angle)?;
-                                }
-                                if accept || ended {
-                                    owner.emit(
-                                        if accept {
-                                            EventKind::RotationStart
-                                        } else {
-                                            EventKind::RotationEnd
-                                        },
-                                        EventPayload::Map(vec![
-                                            (
-                                                "rotation",
-                                                PayloadValue::Number(rotation.angle as f64),
-                                            ),
-                                            ("velocity", PayloadValue::Number(0.0)),
-                                        ]),
-                                    );
-                                }
-                            }
-                            _ => {}
                         }
                         Ok(())
                     })
                 },
             )?;
-            let priority = if kind == 0 {
-                Some(GesturePriority::Normal)
-            } else {
-                None
-            };
             owner
                 .native
                 .borrow()
-                .add_gesture_ref(&gesture, priority, None)?;
+                .add_gesture_ref(&gesture, Some(GesturePriority::Normal), None)?;
+            self.gestures.borrow_mut().push(gesture);
+        }
+
+        if spec.pinch {
+            let gesture = Gesture::create_pinch_gesture(2, 0.0)?;
+            let weak = Rc::downgrade(owner);
+            gesture.on_gesture(
+                GestureEventAction::Accept
+                    | GestureEventAction::Update
+                    | GestureEventAction::End
+                    | GestureEventAction::Cancel,
+                move |event| {
+                    callback(|| {
+                        let Some(owner) = weak.upgrade() else {
+                            return Ok(());
+                        };
+                        let GestureData::Pinch(pinch) = event.event_action_data else {
+                            return Ok(());
+                        };
+                        let values = owner.interaction.gesture_values.get();
+                        let mask = owner.interaction.mask();
+                        let accept = event.event_action_type == GestureEventAction::Accept;
+                        let ended = event
+                            .event_action_type
+                            .intersects(GestureEventAction::End | GestureEventAction::Cancel);
+                        if accept {
+                            let mut start = owner.interaction.gesture_start.get();
+                            start[2] = values.pinch.map_or(1.0, |id| owner.animator.value(id));
+                            owner.interaction.gesture_start.set(start);
+                        }
+                        let start = owner.interaction.gesture_start.get();
+                        if let Some(id) = values.pinch {
+                            owner.animator.set(id, start[2] * pinch.scale)?;
+                        }
+                        let kind = if accept {
+                            Some(EventKind::PinchStart)
+                        } else if ended {
+                            Some(EventKind::PinchEnd)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind
+                            && mask.contains(kind)
+                        {
+                            owner.emit(
+                                kind,
+                                EventPayload::Map(vec![
+                                    ("scale", PayloadValue::Number(pinch.scale as f64)),
+                                    ("velocity", PayloadValue::Number(0.0)),
+                                ]),
+                            );
+                        }
+                        Ok(())
+                    })
+                },
+            )?;
+            owner.native.borrow().add_gesture_ref(&gesture, None, None)?;
+            self.gestures.borrow_mut().push(gesture);
+        }
+
+        if spec.rotation {
+            let gesture = Gesture::create_rotation_gesture(2, 0.0)?;
+            let weak = Rc::downgrade(owner);
+            gesture.on_gesture(
+                GestureEventAction::Accept
+                    | GestureEventAction::Update
+                    | GestureEventAction::End
+                    | GestureEventAction::Cancel,
+                move |event| {
+                    callback(|| {
+                        let Some(owner) = weak.upgrade() else {
+                            return Ok(());
+                        };
+                        let GestureData::Rotation(rotation) = event.event_action_data else {
+                            return Ok(());
+                        };
+                        let values = owner.interaction.gesture_values.get();
+                        let mask = owner.interaction.mask();
+                        let accept = event.event_action_type == GestureEventAction::Accept;
+                        let ended = event
+                            .event_action_type
+                            .intersects(GestureEventAction::End | GestureEventAction::Cancel);
+                        if accept {
+                            let mut start = owner.interaction.gesture_start.get();
+                            start[3] = values.rotation.map_or(0.0, |id| owner.animator.value(id));
+                            owner.interaction.gesture_start.set(start);
+                        }
+                        let start = owner.interaction.gesture_start.get();
+                        if let Some(id) = values.rotation {
+                            owner.animator.set(id, start[3] + rotation.angle)?;
+                        }
+                        let kind = if accept {
+                            Some(EventKind::RotationStart)
+                        } else if ended {
+                            Some(EventKind::RotationEnd)
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = kind
+                            && mask.contains(kind)
+                        {
+                            owner.emit(
+                                kind,
+                                EventPayload::Map(vec![
+                                    ("rotation", PayloadValue::Number(rotation.angle as f64)),
+                                    ("velocity", PayloadValue::Number(0.0)),
+                                ]),
+                            );
+                        }
+                        Ok(())
+                    })
+                },
+            )?;
+            owner.native.borrow().add_gesture_ref(&gesture, None, None)?;
             self.gestures.borrow_mut().push(gesture);
         }
         Ok(())
     }
     pub(crate) fn dispose(&self, owner: &Node) -> Result<()> {
         self.clear_long(owner)?;
+        if self.pan_interrupter_installed.replace(false) {
+            let _ = owner.native.borrow().clear_gesture_interrupter();
+        }
         for gesture in self.gestures.borrow_mut().drain(..) {
             owner.native.borrow().remove_gesture(&gesture)?;
             gesture.dispose()?;
@@ -1939,38 +2008,171 @@ fn axis_modifiers(owner: &Node, input: &ArkUIInputEvent) -> nsh_core::keymap::Mo
     modifiers
 }
 
-fn takes_axis(owner: &Rc<Node>, x: f32, y: f32, event: EventKind) -> bool {
-    if owner.scroll.borrow().is_some() {
-        return false;
-    }
-    let Ok(Some(mut cur)) = crate::input::touch::hit(owner, (x, y), &nsh_core::Matrix::IDENTITY)
-    else {
-        return true;
+pub(crate) fn handle_axis_event(owner: &Rc<Node>, input: &ArkUIInputEvent) -> Result<()> {
+    use crate::input::wheel::{AxisAction, AxisDispatch, AxisEventKey, AxisInput, AxisNode};
+    let surface = owner.key_surface_root();
+    let scale = owner.scale.get().max(1.0);
+    let surface_origin = surface
+        .native
+        .borrow()
+        .layout_position_in_window()
+        .map(|pos| (pos.x as f32 / scale, pos.y as f32 / scale))
+        .unwrap_or((0.0, 0.0));
+    let (sx, sy) = {
+        let wx = input.pointer_window_x();
+        let wy = input.pointer_window_y();
+        if wx.is_finite() && wy.is_finite() {
+            (wx - surface_origin.0, wy - surface_origin.1)
+        } else {
+            (input.pointer_x(), input.pointer_y())
+        }
     };
     let mut chain = Vec::new();
-    loop {
-        let stop = cur.id == owner.id;
-        chain.push(cur.clone());
-        if stop {
-            break;
+    if let Ok(Some(mut cur)) =
+        crate::input::touch::hit(&surface, (sx, sy), &nsh_core::Matrix::IDENTITY)
+    {
+        loop {
+            let mask = cur.interaction.mask();
+            let scroll_ref = cur.scroll.borrow();
+            let is_scroll = scroll_ref.is_some();
+            let native_scroll_scrolling = scroll_ref.as_ref().is_some_and(|s| s.is_scrolling());
+            let native_scroll_zoomable = scroll_ref.as_ref().is_some_and(|s| s.is_zoomable());
+            drop(scroll_ref);
+            let within_clip = cur
+                .input_in_root(&surface)
+                .ok()
+                .flatten()
+                .and_then(|m| crate::render::geometry::local_point(&m.0, (sx, sy)))
+                .is_none_or(|(lx, ly)| cur.hit_within_clip_path(lx, ly));
+            if within_clip {
+                chain.push(AxisNode {
+                    id: cur.id,
+                    listens_wheel: mask.contains(EventKind::Wheel),
+                    listens_pinch: mask.contains(EventKind::Pinch),
+                    pan_activation: cur.interaction.props.borrow().pan_activation,
+                    is_native_scroll: is_scroll
+                        || matches!(
+                            cur.kind,
+                            nsh_core::ViewKind::WebView | nsh_core::ViewKind::Input
+                        ),
+                    native_scroll_scrolling,
+                    native_scroll_zoomable,
+                });
+            }
+            if cur.id == surface.id {
+                break;
+            }
+            let Some(parent) = cur.parent_node.borrow().upgrade() else {
+                break;
+            };
+            cur = parent;
         }
-        let Some(parent) = cur.parent_node.borrow().upgrade() else {
-            break;
-        };
-        cur = parent;
     }
-    nsh_core::input::wheel_listener(
-        chain,
-        |node| node.interaction.mask().contains(event),
-        |node| {
-            node.scroll.borrow().is_some()
-                || matches!(
-                    node.kind,
-                    nsh_core::ViewKind::WebView | nsh_core::ViewKind::Input
-                )
+
+    let raw_action = input.axis_action();
+    let action = match raw_action {
+        UIAxisEventAction::Begin => AxisAction::Begin,
+        UIAxisEventAction::Update => AxisAction::Update,
+        UIAxisEventAction::End => AxisAction::End,
+        UIAxisEventAction::Cancel => AxisAction::Cancel,
+        _ => AxisAction::None,
+    };
+    let raw_pinch = input.axis_pinch_scale_value() as f32;
+    let pinch_scale = (raw_pinch.is_finite()
+        && raw_pinch > 0.0
+        && (raw_pinch != 1.0
+            || matches!(
+                action,
+                AxisAction::Begin | AxisAction::End | AxisAction::Cancel
+            )))
+    .then_some(raw_pinch);
+    let is_mouse = input.tool_type == UIInputToolType::Mouse
+        || (input.source_type == UIInputSourceType::Mouse
+            && input.tool_type != UIInputToolType::Touchpad);
+    let modifiers = axis_modifiers(&surface, input);
+    let vx = input.axis_horizontal_value();
+    let vy = input.axis_vertical_value();
+    let key = AxisEventKey {
+        time_ns: input.event_time(),
+        source_type: match input.source_type {
+            UIInputSourceType::Mouse => 1,
+            UIInputSourceType::TouchScreen => 2,
+            _ => 0,
         },
-    )
-    .is_some_and(|(target, takes)| target.id == owner.id && takes)
+        tool_type: match input.tool_type {
+            UIInputToolType::Mouse => 1,
+            UIInputToolType::Touchpad => 2,
+            UIInputToolType::Finger => 3,
+            UIInputToolType::Pen => 4,
+            _ => 0,
+        },
+        action: match action {
+            AxisAction::None => 0,
+            AxisAction::Begin => 1,
+            AxisAction::Update => 2,
+            AxisAction::End => 3,
+            AxisAction::Cancel => 4,
+        },
+        vx_bits: vx.to_bits(),
+        vy_bits: vy.to_bits(),
+        pinch_bits: raw_pinch.to_bits() as u64,
+    };
+    let axis_input = AxisInput {
+        key,
+        time_ms: input.event_time() as f64 / 1_000_000.0,
+        action,
+        is_mouse,
+        vx,
+        vy,
+        pinch_scale,
+        modifiers,
+        scale,
+    };
+
+    let outcome = surface
+        .axis_routers
+        .borrow_mut()
+        .entry(surface.id)
+        .or_default()
+        .route(axis_input, &chain, |&id| {
+            surface
+                .node_by_id(id)
+                .is_some_and(|node| node.visible_in_tree())
+        });
+
+    // HarmonyOS defaults `OH_ArkUI_AxisEvent_SetPropagation` to `false`; always
+    // set it explicitly so unconsumed wheels still bubble to parent `Scroll` views.
+    let _ = input.axis_set_propagation(outcome.propagate);
+
+    if let Some(dispatch) = outcome.dispatch
+        && let Some(target) = match dispatch {
+            AxisDispatch::Wheel { target, .. } | AxisDispatch::Pinch { target, .. } => {
+                surface.node_by_id(target)
+            }
+        }
+    {
+        let (lx, ly) = target
+            .input_in_root(&surface)
+            .ok()
+            .flatten()
+            .and_then(|m| crate::render::geometry::local_point(&m.0, (sx, sy)))
+            .unwrap_or((sx, sy));
+        match dispatch {
+            AxisDispatch::Wheel { delta, .. } => {
+                target.emit(
+                    EventKind::Wheel,
+                    target.wheel_payload(lx, ly, delta, modifiers),
+                );
+            }
+            AxisDispatch::Pinch { delta, phase, .. } => {
+                target.emit(
+                    EventKind::Pinch,
+                    target.pinch_payload(lx, ly, delta, phase, modifiers),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn handle_window_drag_press(

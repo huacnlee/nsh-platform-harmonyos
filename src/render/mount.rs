@@ -106,6 +106,8 @@ pub(crate) struct UiContext {
     pub(crate) key_focus: std::cell::RefCell<std::rc::Weak<Node>>,
     pub(crate) nodes_index: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, std::rc::Weak<Node>>>,
     pub(crate) modals_index: std::cell::RefCell<Vec<std::rc::Weak<crate::navigation::modal::Modal>>>,
+    pub(crate) axis_routers:
+        std::cell::RefCell<rustc_hash::FxHashMap<NodeId, crate::input::wheel::AxisRouter>>,
     pub(crate) selected_text: std::cell::RefCell<Option<std::rc::Weak<Node>>>,
     pub(crate) accessibility_dirty: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) accessibility_focus: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
@@ -145,6 +147,12 @@ impl UiContext {
         self.text_locale
             .get()
             .unwrap_or_else(|| self.platform.get().locale)
+    }
+
+    pub(crate) fn clear_axis_router(&self, surface_id: NodeId) {
+        if let Some(router) = self.axis_routers.borrow_mut().get_mut(&surface_id) {
+            router.clear();
+        }
     }
 
     pub(crate) fn node_by_id(&self, id: NodeId) -> Option<Rc<Node>> {

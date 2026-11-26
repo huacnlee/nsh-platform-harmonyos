@@ -122,3 +122,15 @@ mod net;
 #[path = "../../src/services/speech.rs"]
 #[allow(dead_code)]
 mod speech;
+
+mod services {
+    pub(crate) use super::desktop;
+}
+
+#[path = "../../src/input/pan.rs"]
+#[allow(dead_code)]
+mod pan;
+
+#[path = "../../src/input/wheel.rs"]
+#[allow(dead_code)]
+mod wheel;

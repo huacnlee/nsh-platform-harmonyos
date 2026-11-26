@@ -1689,6 +1689,7 @@ impl Runtime {
             key_focus: RefCell::default(),
             nodes_index: RefCell::default(),
             modals_index: RefCell::default(),
+            axis_routers: RefCell::default(),
             selected_text: RefCell::default(),
             accessibility_dirty: RefCell::default(),
             accessibility_focus: RefCell::default(),
