@@ -73,13 +73,13 @@ impl Clipboard {
         Ok(())
     }
 
-    pub(crate) fn write_text(
+    fn write_text_inner(
         &self,
-        route: Weak<Dispatcher>,
+        report_route: Option<Weak<Dispatcher>>,
         text: String,
         html: Option<String>,
     ) -> napi_ohos::Result<()> {
-        let route_fallback = route.clone();
+        let route_fallback = report_route.clone();
         if let Err(error) = self.enqueue(move || {
             let written = match write_text_sync(&text, html.as_deref()) {
                 Ok(()) => true,
@@ -88,7 +88,7 @@ impl Clipboard {
                     false
                 }
             };
-            if let Some(route) = route.upgrade()
+            if let Some(route) = report_route.and_then(|w| w.upgrade())
                 && route.live.load(Ordering::Acquire)
             {
                 route.send(Message::HostEvent(
@@ -97,7 +97,7 @@ impl Clipboard {
                 ));
             }
         }) {
-            if let Some(route) = route_fallback.upgrade()
+            if let Some(route) = route_fallback.and_then(|w| w.upgrade())
                 && route.live.load(Ordering::Acquire)
             {
                 route.send(Message::HostEvent(
@@ -108,6 +108,23 @@ impl Clipboard {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Writes app-requested clipboard text/HTML and emits one `ClipboardWrite` receipt.
+    pub(crate) fn write_text(
+        &self,
+        route: Weak<Dispatcher>,
+        text: String,
+        html: Option<String>,
+    ) -> napi_ohos::Result<()> {
+        self.write_text_inner(Some(route), text, html)
+    }
+
+    /// Writes internal native selection copy on the same serialized worker
+    /// without emitting a `ClipboardWrite` receipt (which would shift core's
+    /// FIFO pending promise queue).
+    pub(crate) fn copy_text(&self, text: String) -> napi_ohos::Result<()> {
+        self.write_text_inner(None, text, None)
     }
 
     pub(crate) fn write_image(&self, uri: String) -> napi_ohos::Result<()> {

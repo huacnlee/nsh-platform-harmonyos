@@ -385,11 +385,9 @@ impl Node {
                     .map(|a| a.text())
                     .transpose()?
                     .unwrap_or_default();
-                self.host.system.command(
-                    &self.host,
-                    self.dispatcher.clone(),
-                    nsh_core::Command::SetClipboard(text),
-                )?;
+                if !text.is_empty() {
+                    self.host.system.copy_clipboard(text)?;
+                }
                 self.selection_clear()?;
             }
             Command::SelectAll => {

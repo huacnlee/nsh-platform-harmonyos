@@ -1063,7 +1063,7 @@ mod ohos {
         let metadata = file.metadata().ok();
         if metadata
             .as_ref()
-            .is_some_and(|m| m.len() > MAX_IMAGE_BYTES as u64)
+            .is_some_and(|m| m.is_file() && m.len() > MAX_IMAGE_BYTES as u64)
         {
             return None;
         }
@@ -1072,7 +1072,7 @@ mod ohos {
         file.take(MAX_IMAGE_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        let mut prepared = prepare_image_bytes(&bytes, name, request)?;
+        let mut prepared = prepare_image_owned(bytes, name, request)?;
         prepared.last_modified = modified;
         Some(prepared)
     }
@@ -1085,25 +1085,52 @@ mod ohos {
         name: &str,
         request: &PickRequest,
     ) -> Option<PickedFile> {
+        prepare_image_cow(std::borrow::Cow::Borrowed(bytes), name, request)
+    }
+
+    /// Owned-buffer counterpart of [`prepare_image_bytes`], avoiding a copy on
+    /// the [`Encoding::Keep`] passthrough path.
+    pub(crate) fn prepare_image_owned(
+        bytes: Vec<u8>,
+        name: &str,
+        request: &PickRequest,
+    ) -> Option<PickedFile> {
+        prepare_image_cow(std::borrow::Cow::Owned(bytes), name, request)
+    }
+
+    fn prepare_image_cow(
+        bytes: std::borrow::Cow<'_, [u8]>,
+        name: &str,
+        request: &PickRequest,
+    ) -> Option<PickedFile> {
         if bytes.is_empty() || bytes.len() > MAX_IMAGE_BYTES {
             return None;
         }
-        let source = ImageSource::create_from_data(bytes).ok()?;
+        let source = ImageSource::create_from_data(&bytes).ok()?;
         let info = source.image_info(0).ok()?;
         let (raw_w, raw_h) = (info.width().ok()?, info.height().ok()?);
         if raw_w == 0 || raw_h == 0 {
             return None;
         }
-        let orientation = read_exif_orientation(&source, bytes);
+        let orientation = read_exif_orientation(&source, &bytes);
         let (display_w, display_h) = orientation.display_dimensions(raw_w, raw_h);
         let display_size = Size::new(
             DevicePixels(i32::try_from(display_w).ok()?),
             DevicePixels(i32::try_from(display_h).ok()?),
         );
-        let source_mime = sniff(bytes).unwrap_or("application/octet-stream");
+        let info_mime = info
+            .mime_type()
+            .ok()
+            .and_then(|s| s.to_string_lossy())
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let source_mime = sniff(&bytes)
+            .or(info_mime.as_deref())
+            .or_else(|| nsh_core::picker::mime_for_name(name))
+            .unwrap_or("application/octet-stream");
         let encoding = request.needs_encoding(source_mime, display_size);
         let Some((out_mime, quality)) = encode_mime_and_quality(encoding, request) else {
-            let mut picked = PickedFile::new(name, source_mime, ImageData::from(bytes.to_vec()));
+            let mut picked = PickedFile::new(name, source_mime, ImageData::from(bytes.into_owned()));
             picked.size = display_size;
             return Some(picked);
         };
@@ -1138,10 +1165,26 @@ mod ohos {
             decoded_h,
         )
         .ok()?;
-        let pm_info = pixelmap.image_info().ok()?;
-        let (out_w, out_h) = (pm_info.width().ok()?, pm_info.height().ok()?);
+        let mut pm_info = pixelmap.image_info().ok()?;
+        let (mut out_w, mut out_h) = (pm_info.width().ok()?, pm_info.height().ok()?);
         if out_w == 0 || out_h == 0 {
             return None;
+        }
+        let target = request.scaled_size(display_size);
+        let target_w = u32::try_from(target.width.0).ok().filter(|&v| v > 0);
+        let target_h = u32::try_from(target.height.0).ok().filter(|&v| v > 0);
+        if let (Some(tw), Some(th)) = (target_w, target_h)
+            && (out_w != tw || out_h != th)
+        {
+            let sx = tw as f32 / out_w as f32;
+            let sy = th as f32 / out_h as f32;
+            pixelmap.scale(sx, sy).ok()?;
+            pm_info = pixelmap.image_info().ok()?;
+            out_w = pm_info.width().ok()?;
+            out_h = pm_info.height().ok()?;
+            if out_w == 0 || out_h == 0 {
+                return None;
+            }
         }
         let out_size = Size::new(
             DevicePixels(i32::try_from(out_w).ok()?),
@@ -1260,6 +1303,8 @@ mod ohos {
     }
 }
 
+#[cfg(target_env = "ohos")]
+pub(crate) use ohos::prepare_image_owned;
 #[cfg(target_env = "ohos")]
 pub use ohos::{
     UiThread, ability, cache_dir, files_dir, launch_want, on_ability_want, prepare_image,
