@@ -87,7 +87,7 @@ impl NativeText {
                 {
                     return None;
                 }
-                let (mut paragraph, _backgrounds, _decorations, _fonts) =
+                let (mut paragraph, _backgrounds, _decorations) =
                     build_typography(&self.source, &self.alignments, fonts);
                 paragraph.layout(self.layout_width);
                 let layout = crate::text::selection::layout::Layout::new(
@@ -140,7 +140,6 @@ pub(crate) struct TextDrawing {
     backgrounds: Option<ohos_drawing_binding::RecordCmd>,
     commands: ohos_drawing_binding::RecordCmd,
     supports_tint: bool,
-    _fonts: Vec<Arc<[u8]>>,
 }
 
 // SAFETY: a completed Rosen DrawCmdList owns the recorded paths, brushes and
@@ -191,7 +190,6 @@ type BuiltTypography = (
     Typography,
     Vec<(u32, u32, nsh_core::TextBackground)>,
     Vec<crate::text::decoration::Decoration>,
-    Vec<Arc<[u8]>>,
 );
 
 fn build_typography(
@@ -392,12 +390,7 @@ fn build_typography(
             ));
         }
     }
-    (
-        builder.build(),
-        backgrounds,
-        decorations,
-        fonts.data.clone(),
-    )
+    (builder.build(), backgrounds, decorations)
 }
 
 const SELECTION_BUDGET: usize = 256 << 20;
@@ -415,7 +408,6 @@ impl Drop for Reservation {
 struct Paragraph {
     native: Typography,
     width: Option<f64>,
-    _fonts: Vec<Arc<[u8]>>,
 }
 // SAFETY: Typography owns its native paragraph and retained font providers. All
 // native access is serialized by its Mutex; only the engine measures or queries
@@ -632,13 +624,13 @@ impl TextEngine for OhosTextEngine {
         {
             return Ok(());
         }
-        let mut bytes: Arc<[u8]> = Arc::from(data.as_ref());
+        let mut bytes: Box<[u8]> = data.as_ref().into();
         fonts
             .collection
-            .register_font_buffer(&family, Arc::get_mut(&mut bytes).expect("new font buffer"))
+            .register_font_buffer(&family, &mut bytes)
             .map_err(|e| e.to_string())?;
-        // Retain the buffer for the global font collection's lifetime, even on
-        // SDKs where registration copies it internally.
+        // Retain the boxed buffer in the process-wide `OnceLock` for the global
+        // font collection's lifetime, even on SDKs that borrow the slice.
         fonts.data.push(bytes);
         fonts.generation = fonts.generation.wrapping_add(1);
         Ok(())
@@ -654,14 +646,12 @@ impl TextEngine for OhosTextEngine {
         alignments: &AttachmentAlignments,
     ) -> Prepared {
         let rtl = text.writing_direction.unwrap_or(text.rtl);
-        let (native, backgrounds, decorations, font_data) =
-            build_typography(text, alignments, &self.fonts);
+        let (native, backgrounds, decorations) = build_typography(text, alignments, &self.fonts);
         let shared_text: Arc<str> = Arc::from(text.text.as_str());
         Prepared {
             paragraph: RefCell::new(Arc::new(Mutex::new(Paragraph {
                 native,
                 width: None,
-                _fonts: font_data,
             }))),
             source: Arc::new(text.clone()),
             alignments: alignments.clone(),
@@ -944,7 +934,6 @@ impl TextEngine for OhosTextEngine {
                         backgrounds: recorded_backgrounds,
                         commands,
                         supports_tint,
-                        _fonts: self.fonts.lock().expect("font collection").data.clone(),
                     });
                 }
                 Err(error) => log::warn!("OHOS text recording: {error}"),

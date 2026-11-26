@@ -12,7 +12,12 @@ pub(crate) use super::family::families;
 
 pub(crate) struct Fonts {
     pub(crate) collection: FontCollection,
-    pub(crate) data: Vec<Arc<[u8]>>,
+    /// Append-only heap-boxed font buffers owned by the process-wide `SHARED`
+    /// `OnceLock` for the lifetime of the process. Heap addresses remain stable
+    /// even when the `Vec` reallocates, so every `Paragraph`, `TextDrawing`,
+    /// and `ShapedText` derived from `collection` stays valid without cloning
+    /// a per-object `Vec<Arc<[u8]>>`.
+    pub(crate) data: Vec<Box<[u8]>>,
     pub(crate) generation: u64,
 }
 

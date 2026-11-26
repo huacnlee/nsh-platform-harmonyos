@@ -1418,7 +1418,6 @@ struct ShapedText {
     ascent: f32,
     height: f32,
     blobs: Vec<(TextBlob, f32)>,
-    _data: Vec<Arc<[u8]>>,
 }
 impl ShapedText {
     fn new(text: &str, font: CanvasFont, rtl: bool, fonts: &mut crate::text::fonts::Fonts) -> Self {
@@ -1490,7 +1489,6 @@ impl ShapedText {
             ascent,
             height,
             blobs,
-            _data: fonts.data.clone(),
         }
     }
 }
