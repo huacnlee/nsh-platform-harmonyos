@@ -319,6 +319,17 @@ pub(crate) fn nsh_service_event(
 }
 
 #[napi]
+pub(crate) fn nsh_speech_event(
+    session_id: u32,
+    key: u32,
+    value: crate::services::system::SystemEvent,
+) {
+    if crate::app::session::get(session_id).is_ok() {
+        crate::services::speech::handle_event(key, value);
+    }
+}
+
+#[napi]
 pub(crate) fn nsh_desktop_event(session_id: u32, kind: String, payload: String) {
     if let Ok(host) = crate::app::session::get(session_id) {
         host.handle_desktop_event(&kind, &payload);

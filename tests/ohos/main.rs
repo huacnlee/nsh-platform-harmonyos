@@ -118,3 +118,7 @@ mod network_monitor;
 #[path = "../../src/services/net.rs"]
 #[allow(dead_code)]
 mod net;
+
+#[path = "../../src/services/speech.rs"]
+#[allow(dead_code)]
+mod speech;

@@ -80,6 +80,7 @@ pub(crate) struct AvoidArea {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct HostInit {
     pub share_available: Option<bool>,
+    pub speech_available: Option<bool>,
     pub sdk_api_version: i32,
     pub device_type: String,
     pub cache_dir: String,
@@ -974,6 +975,7 @@ impl Services {
             Vec::new()
         };
         let (queue, receiver) = mpsc::sync_channel(256);
+        let speech_available = init.speech_available.unwrap_or(false);
         let services = Arc::new(Self {
             share_available: init.share_available.unwrap_or(false),
             id,
@@ -1109,6 +1111,7 @@ impl Services {
             sessions.insert(id, Arc::downgrade(&services));
         }
         HAS_CREATED_SESSION.store(true, Ordering::Release);
+        crate::services::speech::on_session_created(speech_available);
         Ok(id)
     }
 
@@ -1200,6 +1203,7 @@ impl Services {
             self.keyboard.lock().unwrap().take();
             self.open_urls.lock().unwrap().clear();
             self.picks.lock().unwrap().clear();
+            crate::services::speech::on_session_closed(self.id);
             crate::extensions::on_session_closed(self.id);
             self.broadcast(|| Message::HostClosed);
             let _ = self.queue.try_send(Operation::Stop);

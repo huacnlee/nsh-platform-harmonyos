@@ -33,6 +33,7 @@ import { createFrameSource, FrameCallbacks, FrameRequest } from "./NativeFrames"
 import { NativeAlertOptions, showNativeAlert } from "./NativeAlerts";
 import { isDesktopDevice, NativeDesktop } from "./NativeDesktop";
 import { startAbilityForResult } from "./NativeExtensions";
+import { NativeSpeech, SpeechReply } from "./NativeSpeech";
 import { NativeSystem, SystemReply, SystemRequest } from "./NativeSystem";
 
 interface AvoidRectPayload {
@@ -52,6 +53,7 @@ interface AvoidAreaPayload {
 
 interface HostInitPayload {
   shareAvailable: boolean;
+  speechAvailable: boolean;
   sdkApiVersion: number;
   deviceType: string;
   cacheDir: string;
@@ -109,6 +111,7 @@ interface NshNativeModule {
   ): number;
   nshCloseSession(sessionId: number): void;
   nshServiceEvent(sessionId: number, key: number, event: SystemReply): void;
+  nshSpeechEvent(sessionId: number, key: number, event: SpeechReply): void;
   nshDesktopEvent(sessionId: number, kind: string, payload: string): void;
   nshAttachSubWindow(
     sessionId: number,
@@ -482,6 +485,7 @@ class HostSession {
   private readonly windowId: number;
   private readonly runtimeContext: ComponentRuntimeContext;
   private readonly system: NativeSystem;
+  private readonly speech: NativeSpeech;
   private readonly desktop?: NativeDesktop;
   private readonly isDesktop: boolean;
   private readonly plugin: NshPlugin = new NshPlugin();
@@ -625,6 +629,7 @@ class HostSession {
       {
         shareAvailable:
           deviceInfo.sdkApiVersion >= 18 && canIUse("SystemCapability.Collaboration.SystemShare"),
+        speechAvailable: canIUse("SystemCapability.AI.SpeechRecognizer"),
         sdkApiVersion: deviceInfo.sdkApiVersion,
         deviceType: deviceInfo.deviceType ?? "phone",
         cacheDir: abilityContext.cacheDir,
@@ -673,6 +678,7 @@ class HostSession {
         this.mod.nshServiceEvent(this.sessionId, key, event),
       );
       this.system = system;
+      this.speech = new NativeSpeech(abilityContext);
       this.isDesktop = isDesktopDevice(deviceInfo.deviceType);
       if (this.isDesktop) {
         this.desktop = new NativeDesktop(
@@ -859,6 +865,7 @@ class HostSession {
       } catch {}
     }
     this.desktop?.close();
+    this.speech.close();
     this.system.close();
     try {
       this.updateCursor("auto");
@@ -1202,6 +1209,29 @@ class HostSession {
     }
     if (command.kind === "system-cancel") {
       this.system.cancel(command.openId ?? 0);
+      return;
+    }
+    if (command.kind === "speech-start") {
+      const key = command.openId ?? 0;
+      this.speech
+        .start(key, command.text, command.enabled ?? true, (event: SpeechReply): void => {
+          if (!this.closed) {
+            this.mod.nshSpeechEvent(this.sessionId, key, event);
+          }
+        })
+        .catch((error: Error) => console.error(`NSH speech start: ${error}`));
+      return;
+    }
+    if (command.kind === "speech-stop") {
+      this.speech
+        .stop(command.openId ?? 0, false)
+        .catch((error: Error) => console.error(`NSH speech stop: ${error}`));
+      return;
+    }
+    if (command.kind === "speech-abort") {
+      this.speech
+        .stop(command.openId ?? 0, true)
+        .catch((error: Error) => console.error(`NSH speech abort: ${error}`));
       return;
     }
     if (command.kind === "desktop") {

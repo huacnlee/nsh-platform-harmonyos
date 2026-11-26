@@ -432,15 +432,18 @@ fn package(
         }
     };
     let runner = work.join("runner");
-    runner::write(&runner, linked, dev, options.api)?;
+    runner::write(&runner, linked, dev, false, options.api)?;
     // Merge `[package.metadata.nsh.harmonyos]` (and active feature sections)
     // from every resolved crate before compiling the native library so clashes
     // and invalid declarations fail fast.
     let crate_meta =
         module_meta::ModuleMeta::of_manifest(&runner.join("Cargo.toml"), arch.triple())?;
     crate_meta.apply(&mut config.harmonyos)?;
+    if crate_meta.speech_enabled {
+        runner::write(&runner, linked, dev, true, options.api)?;
+    }
     let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
-    project::write(
+    let written = project::write(
         out,
         &config,
         &project::Contents {
@@ -455,10 +458,9 @@ fn package(
                 .unwrap_or(project::MIN_API),
         },
     )?;
-    let profile = fs::read_to_string(out.join("build-profile.json5")).unwrap_or_default();
     Ok(Packaged {
         id: config.id,
-        signed: profile.contains("\"signingConfig\":"),
+        signed: written.signed,
     })
 }
 
@@ -616,7 +618,7 @@ fn link_packages(project: &Path) -> anyhow::Result<()> {
             .with_context(|| format!("clearing {}", entry_modules.display()))?;
     }
     if let Ok(text) = fs::read_to_string(join_all(project, ["entry", "oh-package.json5"]))
-        && let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Ok(json) = json5::from_str::<serde_json::Value>(&text)
         && let Some(deps) = json.get("dependencies").and_then(|v| v.as_object())
     {
         for (pkg, spec) in deps {

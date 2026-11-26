@@ -28,6 +28,9 @@ default = []
 # What the HarmonyOS library is built with.
 backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto"]
 dev = ["dep:nsh-dev", "dep:nsh-testing", "dep:url"]
+# Registers the HarmonyOS HMS speech recognizer with `nsh-extra`'s `speech`
+# module when an app enables `nsh-extra`'s `speech` feature.
+speech = ["dep:nsh-extra"]
 # The large parts of `nsh/base`, as NSH's Android and iOS backends name them.
 # An app that imports one the library was built without fails at the import,
 # naming it.
@@ -91,6 +94,7 @@ getrandom = { workspace = true, features = ["std"] }
 nsh-package.workspace = true
 nsh-dev = { workspace = true, features = ["client"], optional = true }
 nsh-testing = { workspace = true, features = ["agent"], optional = true }
+nsh-extra = { workspace = true, features = ["speech"], optional = true }
 url = { workspace = true, optional = true }
 nsh-engine = { workspace = true, features = ["js"] }
 nsh-base.workspace = true
@@ -164,6 +168,7 @@ nsh-base = { version = "0.7", default-features = false }
 nsh-package = "0.7"
 nsh-dev = "0.7"
 nsh-testing = { version = "0.7", default-features = false }
+nsh-extra = { version = "0.7", default-features = false }
 serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }

@@ -139,6 +139,7 @@ export interface HostCommand {
 
 export interface HostInit {
   shareAvailable?: boolean
+  speechAvailable?: boolean
   sdkApiVersion: number
   deviceType: string
   cacheDir: string
@@ -514,6 +515,8 @@ export declare function nshRunUiTask(sessionId: number, taskId: number, uiContex
 export declare function nshServiceEvent(sessionId: number, key: number, value: SystemEvent): void
 
 export declare function nshSetLifecycle(sessionId: number, lifecycle: string): void
+
+export declare function nshSpeechEvent(sessionId: number, key: number, value: SystemEvent): void
 
 export declare function nshUpdateAccessibility(sessionId: number, screenReader?: boolean | undefined | null, reduceMotion?: boolean | undefined | null): void
 

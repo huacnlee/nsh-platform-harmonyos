@@ -28,10 +28,13 @@ pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 /// when set, else this package's own source (the nshm's directory, a
 /// checkout or crates.io's copy) when it is still there, else this version
 /// from crates.io.
-fn backend(dev: bool, api: ApiLevel) -> String {
+fn backend(dev: bool, speech: bool, api: ApiLevel) -> String {
     let mut enabled = vec!["\"backend\""];
     if dev {
         enabled.push("\"dev\"");
+    }
+    if speech {
+        enabled.push("\"speech\"");
     }
     if let Some(feature) = api.backend_feature() {
         enabled.push(match feature {
@@ -89,6 +92,7 @@ pub(crate) fn package_name(manifest: &str) -> Option<&str> {
 }
 
 /// What the runner links with the backend.
+#[derive(Clone, Copy)]
 pub(crate) enum App<'a> {
     /// A TSX app: its bundle is a raw file of the HAP; `nsh/base`'s UI set.
     Tsx,
@@ -268,22 +272,29 @@ fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
 }
 
 /// Writes the runner crate in `dir` for `app`.
-pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyhow::Result<()> {
+pub(crate) fn write(
+    dir: &Path,
+    app: App<'_>,
+    dev: bool,
+    speech: bool,
+    api: ApiLevel,
+) -> anyhow::Result<()> {
     let (app_dependency, patch, lib) = match app {
         App::Rust(rust_app) => {
             let manifest = fs::read_to_string(rust_app.join("Cargo.toml"))
                 .with_context(|| format!("reading {}", rust_app.display()))?;
             let package =
                 package_name(&manifest).context("NSH's rust-app crate has no [package] name")?;
-            let patches = rust_app
+            let mut patches = rust_app
                 .parent()
                 .map(patches_of)
                 .unwrap_or_else(|| crate::embedded::NSH_PATCH.to_owned());
-            let patches = if dev {
-                testing_patches(&patches, Some(&manifest))
-            } else {
-                patches
-            };
+            if dev {
+                patches = sibling_nsh_patch(&patches, Some(&manifest), "nsh-testing");
+            }
+            if speech {
+                patches = sibling_nsh_patch(&patches, Some(&manifest), "nsh-extra");
+            }
             (
                 format!(
                     "nsh_rust_app = {{ package = {}, path = {} }}\n",
@@ -311,12 +322,13 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyho
                 dependencies.push_str(&krate.dependency_line(&alias));
                 sets.push(format!("{alias}::registry"));
             }
-            let patches = merge_patch_entries(&patches_of(workspace), lock_patches);
-            let patches = if dev {
-                testing_patches(&patches, None)
-            } else {
-                patches
-            };
+            let mut patches = merge_patch_entries(&patches_of(workspace), lock_patches);
+            if dev {
+                patches = sibling_nsh_patch(&patches, None, "nsh-testing");
+            }
+            if speech {
+                patches = sibling_nsh_patch(&patches, None, "nsh-extra");
+            }
             (
                 dependencies,
                 patches,
@@ -349,7 +361,7 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyho
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\
              {patch}\n[workspace]\n",
-            backend(dev, api),
+            backend(dev, speech, api),
         ),
     )?;
     fs::write(
@@ -367,15 +379,17 @@ pub(crate) fn write(dir: &Path, app: App<'_>, dev: bool, api: ApiLevel) -> anyho
     Ok(())
 }
 
-/// The agent must use the same core/engine as the app, including when its
-/// generated workspace points to a local NSH checkout instead of crates.io.
-fn testing_patches(patches: &str, app_manifest: Option<&str>) -> String {
+/// Optional NSH workspace crates (`nsh-testing`, `nsh-extra`) must use the same
+/// core/engine as the app, including when its generated workspace points to a
+/// local NSH checkout instead of crates.io.
+fn sibling_nsh_patch(patches: &str, app_manifest: Option<&str>, crate_name: &str) -> String {
+    let prefix = format!("{crate_name} =");
     let mut in_crates_io = false;
     for line in patches.lines() {
         if line.starts_with('[') {
             in_crates_io = line.trim() == "[patch.crates-io]";
         }
-        if in_crates_io && line.trim_start().starts_with("nsh-testing =") {
+        if in_crates_io && line.trim_start().starts_with(&prefix) {
             return patches.to_owned();
         }
     }
@@ -383,17 +397,17 @@ fn testing_patches(patches: &str, app_manifest: Option<&str>) -> String {
         .or_else(|| app_manifest.and_then(|m| value(m, "nsh-core", "path")));
     let patch = if let Some(core) = core {
         format!(
-            "nsh-testing = {{ path = {:?} }}",
-            Path::new(core).with_file_name("nsh-testing")
+            "{crate_name} = {{ path = {:?} }}",
+            Path::new(core).with_file_name(crate_name)
         )
     } else if let Some(line) = patches
         .lines()
         .find(|line| line.trim_start().starts_with("nsh-core ="))
     {
-        line.replacen("nsh-core", "nsh-testing", 1)
+        line.replacen("nsh-core", crate_name, 1)
     } else if let Some(line) = crate::embedded::NSH_PATCH
         .lines()
-        .find(|line| line.starts_with("nsh-testing ="))
+        .find(|line| line.starts_with(&prefix))
     {
         line.to_owned()
     } else {
@@ -614,7 +628,14 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        write(&dir.join("runner"), App::Rust(&app), false, ApiLevel::Api20).unwrap();
+        write(
+            &dir.join("runner"),
+            App::Rust(&app),
+            false,
+            false,
+            ApiLevel::Api20,
+        )
+        .unwrap();
         let manifest = fs::read_to_string(dir.join("runner").join("Cargo.toml")).unwrap();
         assert!(manifest.contains("nsh_rust_app = { package = \"counter-rust-app\", path = "));
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
@@ -628,24 +649,44 @@ mod tests {
             &dir.join("runner-dev"),
             App::Rust(&app),
             true,
+            true,
             ApiLevel::Api20,
         )
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
-        assert!(dev_manifest.contains("features = [\"backend\", \"dev\"]"));
+        assert!(dev_manifest.contains("features = [\"backend\", \"dev\", \"speech\"]"));
         let expected_testing = format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
         );
         assert!(dev_manifest.contains(&expected_testing), "{dev_manifest}");
+        let expected_extra = format!(
+            "nsh-extra = {{ path = {:?} }}",
+            Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-extra")
+        );
+        assert!(dev_manifest.contains(&expected_extra), "{dev_manifest}");
 
-        write(&dir.join("tsx"), App::Tsx, true, ApiLevel::Api23).unwrap();
+        write(
+            &dir.join("tsx"),
+            App::Tsx,
+            true,
+            false,
+            ApiLevel::Api23,
+        )
+        .unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
         assert!(tsx_manifest.contains("features = [\"backend\", \"dev\", \"api-23\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
         assert!(lib.contains("backend::app!();"));
 
-        write(&dir.join("tsx-api26"), App::Tsx, false, ApiLevel::Api26).unwrap();
+        write(
+            &dir.join("tsx-api26"),
+            App::Tsx,
+            false,
+            false,
+            ApiLevel::Api26,
+        )
+        .unwrap();
         let api26_manifest = fs::read_to_string(dir.join("tsx-api26").join("Cargo.toml")).unwrap();
         assert!(api26_manifest.contains("features = [\"backend\", \"api-26\"]"));
         fs::remove_dir_all(&dir).unwrap();
@@ -703,6 +744,7 @@ mod tests {
                 workspace: &ws,
             },
             false,
+            false,
             ApiLevel::Api20,
         )
         .unwrap();
@@ -757,6 +799,7 @@ mod tests {
                 workspace: &ws,
             },
             true,
+            false,
             ApiLevel::Api20,
         )
         .unwrap();
@@ -790,6 +833,7 @@ mod tests {
             &dir.join("runner-dev"),
             App::Rust(&app),
             true,
+            false,
             ApiLevel::Api20,
         )
         .unwrap();
