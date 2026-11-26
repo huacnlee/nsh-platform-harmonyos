@@ -114,6 +114,7 @@ pub(crate) fn typing_text(
 /// window has been visible and focused at least once prevents early taps from
 /// being dropped before the window can accept focus, while keeping bounds
 /// queries working later when a system dialog temporarily takes focus.
+#[cfg(any(feature = "dev", test))]
 pub(crate) fn desktop_surface_ready_for_input(
     is_desktop: bool,
     window_state: Option<nsh_core::desktop::WindowState>,
