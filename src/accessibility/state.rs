@@ -208,6 +208,9 @@ impl State {
         crate::accessibility::node::apply_value(owner, &spec)?;
         drop(spec);
         owner.update_wrapper()?;
+        if let Some(input) = owner.input.borrow().as_ref() {
+            input.update();
+        }
         #[cfg(feature = "api-23")]
         if owner.accessibility_provider.hides_native_children() {
             owner.accessibility_provider.configure(owner)?;

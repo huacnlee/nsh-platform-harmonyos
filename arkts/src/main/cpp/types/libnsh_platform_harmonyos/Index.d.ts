@@ -30,6 +30,8 @@ export interface Batch {
 export interface EditorAccessibility {
   label: string
   hint: string
+  stateDescription: string
+  api23: boolean
   hidden: boolean
   accessible?: boolean
   disabled: boolean

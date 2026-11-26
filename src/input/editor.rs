@@ -566,6 +566,12 @@ impl Input {
             accessibility: Some(EditorAccessibility {
                 label: accessibility.label.as_deref().unwrap_or("").to_owned(),
                 hint: accessibility.help_text(None).unwrap_or_default(),
+                state_description: crate::accessibility::value::spoken_value_for_locale(
+                    &accessibility,
+                    owner.spoken_locale().as_str(),
+                )
+                .unwrap_or_default(),
+                api23: cfg!(feature = "api-23"),
                 hidden: accessibility.hidden,
                 accessible: accessibility.accessible,
                 disabled: accessibility.state.disabled,

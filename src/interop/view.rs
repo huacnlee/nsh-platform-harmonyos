@@ -340,7 +340,7 @@ impl Wrapper {
                 String::new()
             },
             hint: spec.help_text(None).unwrap_or_default(),
-            api23: cfg!(feature = "api-23") && !value.is_empty(),
+            api23: cfg!(feature = "api-23"),
             api26: !actions.is_empty(),
             value,
             role: crate::accessibility::value::role_str(spec.role).to_owned(),

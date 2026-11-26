@@ -1,5 +1,6 @@
 import { BuilderNode, ComponentContent, FrameNode, NodeContent } from "@ohos.arkui.node";
 import { FrameCallback, UIContext } from "@ohos.arkui.UIContext";
+import deviceInfo from "@ohos.deviceInfo";
 import inputMethod from "@ohos.inputMethod";
 import { KeyCode } from "@ohos.multimodalInput.keyCode";
 import pasteboard from "@ohos.pasteboard";
@@ -45,9 +46,14 @@ export interface EditorSettings {
 interface EditorAccessibility {
   label: string;
   hint: string;
+  stateDescription?: string;
+  api23?: boolean;
   hidden: boolean;
   accessible?: boolean | null;
   disabled: boolean;
+}
+interface EditorStateAttribute {
+  accessibilityStateDescription(description: string): CommonAttribute;
 }
 export interface EditorCommand {
   targetId: number;
@@ -334,7 +340,15 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       .enablePreviewText(s.editable)
       .barState(BarState.Off)
       .accessibilityText(s.accessibility?.label ?? "")
-      .accessibilityDescription(s.accessibility?.hint ?? "")
+      .accessibilityDescription(
+        s.accessibility?.api23 === true &&
+          deviceInfo.sdkApiVersion >= 23 &&
+          typeof (node as EditorStateAttribute).accessibilityStateDescription === "function"
+          ? s.accessibility?.hint ?? ""
+          : [s.accessibility?.hint ?? "", s.accessibility?.stateDescription ?? ""]
+              .filter((part: string): boolean => part.length > 0)
+              .join(", "),
+      )
       .accessibilityLevel(
         s.accessibility?.hidden === true
           ? "no-hide-descendants"
@@ -350,6 +364,15 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       .enableAutoFill(s.autoFill)
       .contentType(contentType(s.contentType))
       .hitTestBehavior(s.hitTest as HitTestMode);
+    if (
+      s.accessibility?.api23 === true &&
+      deviceInfo.sdkApiVersion >= 23 &&
+      typeof (node as EditorStateAttribute).accessibilityStateDescription === "function"
+    ) {
+      (node as EditorStateAttribute).accessibilityStateDescription(
+        s.accessibility?.stateDescription ?? "",
+      );
+    }
     if (s.fontFamily) {
       node.fontFamily(s.fontFamily);
     }

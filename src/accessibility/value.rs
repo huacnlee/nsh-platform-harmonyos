@@ -1,6 +1,6 @@
 //! Spoken and ranged accessibility values for ArkUI nodes and virtual providers.
 
-use nsh_core::{Accessibility, AccessibilityRole, Checked};
+use nsh_core::{Accessibility, AccessibilityCurrent, AccessibilityRole, Checked};
 
 /// Canonical ArkUI / accessibility-provider role name shared across ArkTS
 /// wrappers and the native virtual provider.
@@ -30,16 +30,26 @@ pub(crate) fn role_str(role: AccessibilityRole) -> &'static str {
     }
 }
 
-fn state_words(
-    locale: &str,
-) -> (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static str,
-) {
+struct StateWords {
+    checked: &'static str,
+    not_checked: &'static str,
+    mixed: &'static str,
+    pressed: &'static str,
+    not_pressed: &'static str,
+    pressed_mixed: &'static str,
+    expanded: &'static str,
+    collapsed: &'static str,
+    busy: &'static str,
+    invalid: &'static str,
+    current_true: &'static str,
+    current_page: &'static str,
+    current_step: &'static str,
+    current_location: &'static str,
+    current_date: &'static str,
+    current_time: &'static str,
+}
+
+fn state_words(locale: &str) -> StateWords {
     match locale
         .split(['-', '_'])
         .next()
@@ -47,55 +57,132 @@ fn state_words(
         .to_ascii_lowercase()
         .as_str()
     {
-        "zh" => ("已选中", "未选中", "部分选中", "已展开", "已折叠", "忙碌"),
-        "ja" => (
-            "選択済み",
-            "未選択",
-            "一部選択",
-            "展開中",
-            "折りたたみ中",
-            "処理中",
-        ),
-        "ko" => (
-            "선택됨",
-            "선택 안 됨",
-            "일부 선택됨",
-            "펼쳐짐",
-            "접힘",
-            "사용 중",
-        ),
-        "es" => (
-            "seleccionado",
-            "no seleccionado",
-            "mixto",
-            "expandido",
-            "contraído",
-            "ocupado",
-        ),
-        "fr" => (
-            "coché",
-            "non coché",
-            "mixte",
-            "développé",
-            "réduit",
-            "occupé",
-        ),
-        "de" => (
-            "aktiviert",
-            "nicht aktiviert",
-            "gemischt",
-            "erweitert",
-            "reduziert",
-            "beschäftigt",
-        ),
-        _ => (
-            "checked",
-            "not checked",
-            "mixed",
-            "expanded",
-            "collapsed",
-            "busy",
-        ),
+        "zh" => StateWords {
+            checked: "已选中",
+            not_checked: "未选中",
+            mixed: "部分选中",
+            pressed: "已按下",
+            not_pressed: "未按下",
+            pressed_mixed: "部分按下",
+            expanded: "已展开",
+            collapsed: "已折叠",
+            busy: "忙碌",
+            invalid: "无效",
+            current_true: "当前项",
+            current_page: "当前页面",
+            current_step: "当前步骤",
+            current_location: "当前位置",
+            current_date: "当前日期",
+            current_time: "当前时间",
+        },
+        "ja" => StateWords {
+            checked: "選択済み",
+            not_checked: "未選択",
+            mixed: "一部選択",
+            pressed: "押下中",
+            not_pressed: "未押下",
+            pressed_mixed: "一部押下",
+            expanded: "展開中",
+            collapsed: "折りたたみ中",
+            busy: "処理中",
+            invalid: "無効",
+            current_true: "現在",
+            current_page: "現在のページ",
+            current_step: "現在のステップ",
+            current_location: "現在の場所",
+            current_date: "現在の日付",
+            current_time: "現在の時刻",
+        },
+        "ko" => StateWords {
+            checked: "선택됨",
+            not_checked: "선택 안 됨",
+            mixed: "일부 선택됨",
+            pressed: "눌림",
+            not_pressed: "눌리지 않음",
+            pressed_mixed: "일부 눌림",
+            expanded: "펼쳐짐",
+            collapsed: "접힘",
+            busy: "사용 중",
+            invalid: "유효하지 않음",
+            current_true: "현재",
+            current_page: "현재 페이지",
+            current_step: "현재 단계",
+            current_location: "현재 위치",
+            current_date: "현재 날짜",
+            current_time: "현재 시간",
+        },
+        "es" => StateWords {
+            checked: "seleccionado",
+            not_checked: "no seleccionado",
+            mixed: "mixto",
+            pressed: "pulsado",
+            not_pressed: "no pulsado",
+            pressed_mixed: "mixto",
+            expanded: "expandido",
+            collapsed: "contraído",
+            busy: "ocupado",
+            invalid: "no válido",
+            current_true: "actual",
+            current_page: "página actual",
+            current_step: "paso actual",
+            current_location: "ubicación actual",
+            current_date: "fecha actual",
+            current_time: "hora actual",
+        },
+        "fr" => StateWords {
+            checked: "coché",
+            not_checked: "non coché",
+            mixed: "mixte",
+            pressed: "enfoncé",
+            not_pressed: "non enfoncé",
+            pressed_mixed: "mixte",
+            expanded: "développé",
+            collapsed: "réduit",
+            busy: "occupé",
+            invalid: "non valide",
+            current_true: "actuel",
+            current_page: "page actuelle",
+            current_step: "étape actuelle",
+            current_location: "emplacement actuel",
+            current_date: "date actuelle",
+            current_time: "heure actuelle",
+        },
+        "de" => StateWords {
+            checked: "aktiviert",
+            not_checked: "nicht aktiviert",
+            mixed: "gemischt",
+            pressed: "gedrückt",
+            not_pressed: "nicht gedrückt",
+            pressed_mixed: "gemischt",
+            expanded: "erweitert",
+            collapsed: "reduziert",
+            busy: "beschäftigt",
+            invalid: "ungültig",
+            current_true: "aktuell",
+            current_page: "aktuelle Seite",
+            current_step: "aktueller Schritt",
+            current_location: "aktueller Ort",
+            current_date: "aktuelles Datum",
+            current_time: "aktuelle Uhrzeit",
+        },
+        _ => StateWords {
+            checked: "checked",
+            not_checked: "not checked",
+            mixed: "mixed",
+            pressed: "pressed",
+            not_pressed: "not pressed",
+            pressed_mixed: "mixed",
+            expanded: "expanded",
+            collapsed: "collapsed",
+            busy: "busy",
+            invalid: "invalid",
+            current_true: "current",
+            current_page: "current page",
+            current_step: "current step",
+            current_location: "current location",
+            current_date: "current date",
+            current_time: "current time",
+        },
     }
 }
 
@@ -123,8 +210,8 @@ pub(crate) fn spoken_value_for_locale(
     accessibility: &Accessibility,
     locale: &str,
 ) -> Option<String> {
-    let (checked, not_checked, mixed, expanded, collapsed, busy) = state_words(locale);
-    let mut parts = Vec::new();
+    let words = state_words(locale);
+    let mut parts: Vec<String> = Vec::new();
     if let Some(value) = &accessibility.value {
         if let Some(text) = &value.text {
             if !text.is_empty() {
@@ -140,18 +227,38 @@ pub(crate) fn spoken_value_for_locale(
         }
     }
     match accessibility.state.checked {
-        Some(Checked::True) => parts.push(checked.into()),
-        Some(Checked::False) => parts.push(not_checked.into()),
-        Some(Checked::Mixed) => parts.push(mixed.into()),
+        Some(Checked::True) => parts.push(words.checked.into()),
+        Some(Checked::False) => parts.push(words.not_checked.into()),
+        Some(Checked::Mixed) => parts.push(words.mixed.into()),
+        None => {}
+    }
+    match accessibility.state.pressed {
+        Some(Checked::True) => parts.push(words.pressed.into()),
+        Some(Checked::False) => parts.push(words.not_pressed.into()),
+        Some(Checked::Mixed) => parts.push(words.pressed_mixed.into()),
         None => {}
     }
     match accessibility.state.expanded {
-        Some(true) => parts.push(expanded.into()),
-        Some(false) => parts.push(collapsed.into()),
+        Some(true) => parts.push(words.expanded.into()),
+        Some(false) => parts.push(words.collapsed.into()),
         None => {}
     }
+    if let Some(current) = accessibility.state.current {
+        let word = match current {
+            AccessibilityCurrent::True => words.current_true,
+            AccessibilityCurrent::Page => words.current_page,
+            AccessibilityCurrent::Step => words.current_step,
+            AccessibilityCurrent::Location => words.current_location,
+            AccessibilityCurrent::Date => words.current_date,
+            AccessibilityCurrent::Time => words.current_time,
+        };
+        parts.push(word.into());
+    }
+    if accessibility.state.invalid {
+        parts.push(words.invalid.into());
+    }
     if accessibility.state.busy {
-        parts.push(busy.into());
+        parts.push(words.busy.into());
     }
     if accessibility.state.has_popup {
         // Use the app's localized popup action, never a built-in control label.
@@ -354,5 +461,50 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(range_value(&out_of_bounds), Some((10, 20, 20)));
+    }
+
+    #[test]
+    fn pressed_current_and_invalid_states_localize_and_clear() {
+        let mut spec = Accessibility::default();
+        spec.state.pressed = Some(Checked::True);
+        assert_eq!(spoken_value(&spec).as_deref(), Some("pressed"));
+        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("已按下"));
+
+        spec.state.pressed = Some(Checked::False);
+        assert_eq!(spoken_value(&spec).as_deref(), Some("not pressed"));
+        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("未按下"));
+
+        spec.state.pressed = Some(Checked::Mixed);
+        assert_eq!(spoken_value(&spec).as_deref(), Some("mixed"));
+        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("部分按下"));
+
+        spec.state.pressed = None;
+        for (variant, en, zh) in [
+            (AccessibilityCurrent::True, "current", "当前项"),
+            (AccessibilityCurrent::Page, "current page", "当前页面"),
+            (AccessibilityCurrent::Step, "current step", "当前步骤"),
+            (AccessibilityCurrent::Location, "current location", "当前位置"),
+            (AccessibilityCurrent::Date, "current date", "当前日期"),
+            (AccessibilityCurrent::Time, "current time", "当前时间"),
+        ] {
+            spec.state.current = Some(variant);
+            assert_eq!(spoken_value(&spec).as_deref(), Some(en));
+            assert_eq!(spoken_value_for_locale(&spec, "zh").as_deref(), Some(zh));
+        }
+
+        spec.state.current = Some(AccessibilityCurrent::Step);
+        spec.state.invalid = true;
+        assert_eq!(
+            spoken_value(&spec).as_deref(),
+            Some("current step, invalid")
+        );
+        assert_eq!(
+            spoken_value_for_locale(&spec, "zh-Hans").as_deref(),
+            Some("当前步骤, 无效")
+        );
+
+        spec.state.current = None;
+        spec.state.invalid = false;
+        assert_eq!(spoken_value(&spec), None);
     }
 }

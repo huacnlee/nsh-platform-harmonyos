@@ -54,6 +54,8 @@ pub(crate) struct EditorSettings {
 pub(crate) struct EditorAccessibility {
     pub label: String,
     pub hint: String,
+    pub state_description: String,
+    pub api23: bool,
     pub hidden: bool,
     pub accessible: Option<bool>,
     pub disabled: bool,
