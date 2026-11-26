@@ -135,6 +135,7 @@ export interface HostCommand {
   limit?: number
   filters?: Array<string>
   url?: string
+  orientations?: number
 }
 
 export interface HostInit {

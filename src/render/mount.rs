@@ -2777,8 +2777,11 @@ impl Mounter {
                             }
                         }
                         // Mode controls the desktop FPS overlay. Collection is
-                        // independent on mobile. Orientations are iOS/Android-only.
-                        Command::PerfMonitorMode(_) | Command::Orientations(_) => {}
+                        // independent on mobile.
+                        Command::PerfMonitorMode(_) => {}
+                        Command::Orientations(bits) => {
+                            self.host.orientations(self.dispatcher.clone(), bits)?;
+                        }
                         Command::Back => self.back_fallback()?,
                         Command::ExitApp => {
                             if self.platform.get().os.is_desktop() {

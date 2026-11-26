@@ -87,6 +87,7 @@ interface HostCommandPayload {
   limit?: number;
   filters?: string[];
   url?: string;
+  orientations?: number;
 }
 
 interface PickedDescriptor {
@@ -495,6 +496,8 @@ class HostSession {
   private savedStatusVisible: boolean = true;
   private savedNavigationVisible: boolean = true;
   private barsWork: Promise<void> = Promise.resolve();
+  private savedOrientation?: window.Orientation;
+  private orientationWork: Promise<void> = Promise.resolve();
   private envCallbackId?: number;
   private lifecycleCallbackId?: number;
   private screenReaderHandler?: (enabled: boolean) => void;
@@ -873,6 +876,9 @@ class HostSession {
     try {
       this.updateSystemBars();
     } catch {}
+    try {
+      this.updateOrientations(0);
+    } catch {}
 
     if (this.windowStage !== undefined) {
       try {
@@ -1086,6 +1092,44 @@ class HostSession {
       });
   }
 
+  private updateOrientations(bits: number): void {
+    if (this.isDesktop) {
+      return;
+    }
+    const mask = bits & 0x0f;
+    // Serialize orientation transitions in arrival order so a restore never
+    // races ahead of an earlier page restriction.
+    this.orientationWork = this.orientationWork
+      .then(async (): Promise<void> => {
+        if (mask === 0) {
+          const saved = this.savedOrientation;
+          if (saved === undefined) {
+            return;
+          }
+          this.savedOrientation = undefined;
+          await this.mainWindow.setPreferredOrientation(saved);
+          return;
+        }
+        if (this.savedOrientation === undefined) {
+          try {
+            this.savedOrientation = this.mainWindow.getPreferredOrientation();
+          } catch {
+            this.savedOrientation = window.Orientation.UNSPECIFIED;
+          }
+        }
+        const target = resolvePreferredOrientation(mask);
+        await this.mainWindow.setPreferredOrientation(target);
+      })
+      .catch((error: Error): void => {
+        if (!this.closed) {
+          this.mod.nshReportHostError(
+            this.sessionId,
+            `OHOS preferred orientation update: ${String(error)}`,
+          );
+        }
+      });
+  }
+
   private updateCursor(name: string, windowId?: number): void {
     const controller = this.runtimeContext.getUIContext().getCursorController();
     if (name === "none") {
@@ -1248,6 +1292,10 @@ class HostSession {
     }
     if (command.kind === "video-fullscreen" || command.kind === "status-bar") {
       this.updateSystemBars(command);
+      return;
+    }
+    if (command.kind === "orientations") {
+      this.updateOrientations(command.orientations ?? 0);
       return;
     }
     if (command.kind === "appearance") {
@@ -1515,4 +1563,32 @@ function maximumRefreshRate(mainWindow: window.Window): number | undefined {
     screen.refreshRate,
   );
   return rate > 0 ? rate : undefined;
+}
+
+// Maps NSH ModalConfig orientation bitmask (Portrait=1, PortraitUpsideDown=2,
+// LandscapeLeft=4, LandscapeRight=8) to HarmonyOS `window.Orientation`.
+// HarmonyOS has no arbitrary 2- or 3-orientation subset (e.g. Portrait + LandscapeLeft);
+// mixed portrait+landscape subsets degrade to `AUTO_ROTATION_RESTRICTED` (honoring
+// the Control Panel rotation lock) while all-4 uses `AUTO_ROTATION_RESTRICTED`.
+function resolvePreferredOrientation(mask: number): window.Orientation {
+  const PORTRAIT = 1;
+  const PORTRAIT_UPSIDE_DOWN = 2;
+  const LANDSCAPE_LEFT = 4;
+  const LANDSCAPE_RIGHT = 8;
+  switch (mask & 0x0f) {
+    case PORTRAIT:
+      return window.Orientation.PORTRAIT;
+    case PORTRAIT_UPSIDE_DOWN:
+      return window.Orientation.PORTRAIT_INVERTED;
+    case LANDSCAPE_LEFT:
+      return window.Orientation.LANDSCAPE;
+    case LANDSCAPE_RIGHT:
+      return window.Orientation.LANDSCAPE_INVERTED;
+    case PORTRAIT | PORTRAIT_UPSIDE_DOWN:
+      return window.Orientation.AUTO_ROTATION_PORTRAIT_RESTRICTED;
+    case LANDSCAPE_LEFT | LANDSCAPE_RIGHT:
+      return window.Orientation.AUTO_ROTATION_LANDSCAPE_RESTRICTED;
+    default:
+      return window.Orientation.AUTO_ROTATION_RESTRICTED;
+  }
 }

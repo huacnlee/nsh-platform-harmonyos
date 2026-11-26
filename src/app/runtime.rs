@@ -268,6 +268,7 @@ pub(crate) struct Dispatcher {
     pub(crate) manages_status_bar: bool,
     pub(crate) status_bar_configured: std::sync::atomic::AtomicBool,
     pub(crate) status_bar: std::sync::Mutex<Option<(nsh_core::StatusBarConfig, bool)>>,
+    pub(crate) orientations: std::sync::atomic::AtomicU8,
     pub(crate) keyboard: std::sync::Mutex<crate::input::keyboard::Snapshot>,
 }
 impl Dispatcher {
@@ -876,6 +877,9 @@ impl State {
         self.environment = environment;
         let mut updated = Ok(());
         if let Some(mounter) = &self.mounter {
+            if idiom_changed {
+                mounter.host.apply_selected_orientations();
+            }
             if lifecycle_changed && environment.lifecycle != nsh_engine::Lifecycle::Active {
                 updated = updated.and(mounter.cancel_input());
             }
@@ -991,6 +995,9 @@ impl State {
                 self.retiring_dispatcher = Some(dispatcher.clone());
             }
             dispatcher
+                .orientations
+                .store(0, std::sync::atomic::Ordering::Release);
+            dispatcher
                 .active
                 .store(false, std::sync::atomic::Ordering::Release);
             dispatcher
@@ -1019,6 +1026,7 @@ impl State {
         let closed = if let Some(mounter) = &mut self.mounter {
             mounter.host.system.retire(&mounter.host, &self.dispatcher);
             mounter.host.apply_selected_status();
+            mounter.host.apply_selected_orientations();
             mounter.close()
         } else {
             Ok(())
@@ -1586,6 +1594,7 @@ impl Runtime {
             manages_status_bar: config.manages_status_bar,
             status_bar_configured: std::sync::atomic::AtomicBool::new(false),
             status_bar: std::sync::Mutex::new(None),
+            orientations: std::sync::atomic::AtomicU8::new(0),
             keyboard: std::sync::Mutex::default(),
             live: std::sync::atomic::AtomicBool::new(true),
         });

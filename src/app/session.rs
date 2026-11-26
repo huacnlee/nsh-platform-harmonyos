@@ -116,6 +116,7 @@ pub(crate) struct HostCommand {
     pub limit: Option<u32>,
     pub filters: Option<Vec<String>>,
     pub url: Option<String>,
+    pub orientations: Option<u32>,
 }
 
 pub(crate) type HostCommandCallback =
@@ -244,6 +245,7 @@ pub(crate) struct Services {
     id: u32,
     active: AtomicBool,
     appearance: std::sync::atomic::AtomicU8,
+    orientations: std::sync::atomic::AtomicU8,
     pixel_ratio: AtomicU32,
     max_refresh_rate: AtomicU32,
     loads: AtomicUsize,
@@ -503,12 +505,14 @@ impl Services {
         }
         *self.focused.lock().unwrap() = route;
         self.apply_selected_status();
+        self.apply_selected_orientations();
     }
 
     pub(crate) fn select_surface(&self, owner: Weak<crate::app::surface::Queue>) {
         *self.selected.lock().unwrap() = owner;
         *self.focused.lock().unwrap() = Weak::new();
         self.apply_selected_status();
+        self.apply_selected_orientations();
     }
 
     fn selected_route(&self) -> Option<Arc<Dispatcher>> {
@@ -604,6 +608,33 @@ impl Services {
             route.status_bar_configured.store(true, Ordering::Release);
             *route.status_bar.lock().unwrap() = Some((config, dark));
             self.apply_selected_status();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_selected_orientations(&self) {
+        let desktop = self.environment.lock().unwrap().idiom.as_deref() == Some("desktop");
+        let desired = if desktop {
+            0
+        } else {
+            self.selected_route()
+                .map_or(0, |route| route.orientations.load(Ordering::Acquire))
+        };
+        if self.orientations.swap(desired, Ordering::AcqRel) != desired
+            && let Err(error) = self.send_host_command(HostCommand {
+                kind: "orientations".into(),
+                orientations: Some(u32::from(desired)),
+                ..Default::default()
+            })
+        {
+            log::warn!("OHOS orientation update: {error}");
+        }
+    }
+
+    pub(crate) fn orientations(&self, route: Weak<Dispatcher>, bits: u8) -> Result<()> {
+        if let Some(route) = route.upgrade() {
+            route.orientations.store(bits, Ordering::Release);
+            self.apply_selected_orientations();
         }
         Ok(())
     }
@@ -981,6 +1012,7 @@ impl Services {
             id,
             active: AtomicBool::new(true),
             appearance: std::sync::atomic::AtomicU8::new(0),
+            orientations: std::sync::atomic::AtomicU8::new(0),
             pixel_ratio: AtomicU32::new((init.pixel_ratio as f32).to_bits()),
             max_refresh_rate: AtomicU32::new(init.max_refresh_rate.unwrap_or_else(|| {
                 ohos_display_binding::default_display_refresh_rate().unwrap_or(0)
