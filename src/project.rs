@@ -663,9 +663,11 @@ fn preset_utd_for_mime(mime: &str) -> Option<&'static str> {
     }
 }
 
-/// Maps common Apple UTIs (`contentTypes`) to OpenHarmony preset UTDs.
-fn preset_utd_for_content_type(uti: &str) -> Option<&'static str> {
-    match uti.to_ascii_lowercase().as_str() {
+/// Maps common Apple UTIs (`contentTypes`) to OpenHarmony preset UTDs, and
+/// passes through OpenHarmony `general.*` UTDs directly.
+fn resolve_utd_for_content_type(uti: &str) -> Option<String> {
+    let lowered = uti.trim().to_ascii_lowercase();
+    let mapped = match lowered.as_str() {
         "public.plain-text" => Some("general.plain-text"),
         "public.text" | "public.utf8-plain-text" => Some("general.text"),
         "public.html" => Some("general.html"),
@@ -690,7 +692,20 @@ fn preset_utd_for_content_type(uti: &str) -> Option<&'static str> {
         "public.zip-archive" => Some("general.zip-archive"),
         "public.data" | "public.content" | "public.item" => Some("general.file"),
         _ => None,
+    };
+    if let Some(utd) = mapped {
+        return Some(utd.to_owned());
     }
+    if lowered.starts_with("general.") && lowered.len() > "general.".len() {
+        return Some(lowered);
+    }
+    None
+}
+
+struct FileTypeArtifacts {
+    skills: Vec<Value>,
+    custom_utd_json: Option<String>,
+    runtime_file_types_json: Option<String>,
 }
 
 fn sanitize_utd_prefix(bundle_id: &str) -> String {
@@ -711,37 +726,52 @@ fn sanitize_utd_prefix(bundle_id: &str) -> String {
     }
 }
 
-/// Builds OpenHarmony `viewData` / `sendData` skills and optional custom
-/// `arkdata/utd/utd.json5` declarations from `nsh.json` `"fileTypes"`.
+/// Builds OpenHarmony `viewData` / `sendData` skills, optional custom
+/// `arkdata/utd/utd.json5` declarations, and the runtime `nsh-file-types.json`
+/// manifest from `nsh.json` `"fileTypes"` so packaging and runtime launch
+/// filtering share one exact UTD mapping.
 fn build_file_type_skills(
     bundle_id: &str,
     file_types: &[nsh_core::file_type::FileType],
-) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+) -> anyhow::Result<FileTypeArtifacts> {
     if file_types.is_empty() {
-        return Ok((Vec::new(), None));
+        return Ok(FileTypeArtifacts {
+            skills: Vec::new(),
+            custom_utd_json: None,
+            runtime_file_types_json: None,
+        });
     }
     let utd_prefix = sanitize_utd_prefix(bundle_id);
     let mut view_types: Vec<String> = Vec::new();
     let mut send_utds: Vec<String> = Vec::new();
+    let mut runtime_extensions: Vec<String> = Vec::new();
+    let mut runtime_mime_types: Vec<String> = Vec::new();
     let mut custom_utds: Vec<Value> = Vec::new();
 
     for (index, ft) in file_types.iter().enumerate() {
         let mut custom_exts: Vec<String> = Vec::new();
         for ext in &ft.extensions {
-            if let Some(utd) = preset_utd_for_extension(ext) {
+            let cleaned = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+            if !cleaned.is_empty() {
+                push_unique_string(&mut runtime_extensions, cleaned.clone());
+            }
+            if let Some(utd) = preset_utd_for_extension(&cleaned) {
                 push_unique_string(&mut view_types, utd.to_owned());
                 push_unique_string(&mut send_utds, utd.to_owned());
-            } else {
-                custom_exts.push(format!(".{ext}"));
+            } else if !cleaned.is_empty() {
+                custom_exts.push(format!(".{cleaned}"));
             }
         }
         let mut exact_mimes: Vec<String> = Vec::new();
         for mime in &ft.mime_types {
-            if let Some(utd) = preset_utd_for_mime(mime) {
+            let lowered = mime.trim().to_ascii_lowercase();
+            if !lowered.is_empty() {
+                push_unique_string(&mut runtime_mime_types, lowered.clone());
+            }
+            if let Some(utd) = preset_utd_for_mime(&lowered) {
                 push_unique_string(&mut view_types, utd.to_owned());
                 push_unique_string(&mut send_utds, utd.to_owned());
-            } else if !mime.contains('*') {
-                let lowered = mime.to_ascii_lowercase();
+            } else if !lowered.is_empty() && !lowered.contains('*') {
                 push_unique_string(&mut exact_mimes, lowered.clone());
                 if custom_exts.is_empty() {
                     push_unique_string(&mut view_types, lowered);
@@ -749,9 +779,9 @@ fn build_file_type_skills(
             }
         }
         for uti in &ft.content_types {
-            if let Some(utd) = preset_utd_for_content_type(uti) {
-                push_unique_string(&mut view_types, utd.to_owned());
-                push_unique_string(&mut send_utds, utd.to_owned());
+            if let Some(utd) = resolve_utd_for_content_type(uti) {
+                push_unique_string(&mut view_types, utd.clone());
+                push_unique_string(&mut send_utds, utd);
             }
         }
         if !custom_exts.is_empty() {
@@ -818,7 +848,7 @@ fn build_file_type_skills(
             "uris": uris,
         }));
     }
-    let utd_json = if custom_utds.is_empty() {
+    let custom_utd_json = if custom_utds.is_empty() {
         None
     } else {
         Some(
@@ -828,7 +858,24 @@ fn build_file_type_skills(
             .expect("serializing custom utd.json5"),
         )
     };
-    Ok((skills, utd_json))
+    let runtime_file_types_json =
+        if send_utds.is_empty() && runtime_extensions.is_empty() && runtime_mime_types.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string_pretty(&json!({
+                    "utds": send_utds,
+                    "extensions": runtime_extensions,
+                    "mimeTypes": runtime_mime_types,
+                }))
+                .expect("serializing runtime nsh-file-types.json"),
+            )
+        };
+    Ok(FileTypeArtifacts {
+        skills,
+        custom_utd_json,
+        runtime_file_types_json,
+    })
 }
 
 fn ability_skills_value(
@@ -836,7 +883,7 @@ fn ability_skills_value(
     schemes: &[String],
     links: &[nsh_core::url_scheme::WebLink],
     file_types: &[nsh_core::file_type::FileType],
-) -> anyhow::Result<(Value, Option<String>)> {
+) -> anyhow::Result<(Value, FileTypeArtifacts)> {
     let mut skills = vec![json!({
         "entities": ["entity.system.home"],
         "actions": ["action.system.home"],
@@ -863,9 +910,9 @@ fn ability_skills_value(
             "uris": uris,
         }));
     }
-    let (file_skills, custom_utd) = build_file_type_skills(bundle_id, file_types)?;
-    skills.extend(file_skills);
-    Ok((Value::Array(skills), custom_utd))
+    let mut file_artifacts = build_file_type_skills(bundle_id, file_types)?;
+    skills.extend(std::mem::take(&mut file_artifacts.skills));
+    Ok((Value::Array(skills), file_artifacts))
 }
 
 fn build_abilities(
@@ -874,8 +921,8 @@ fn build_abilities(
     links: &[nsh_core::url_scheme::WebLink],
     file_types: &[nsh_core::file_type::FileType],
     extra: &[Map<String, Value>],
-) -> anyhow::Result<(String, Option<String>)> {
-    let (skills, custom_utd) = ability_skills_value(bundle_id, schemes, links, file_types)?;
+) -> anyhow::Result<(String, FileTypeArtifacts)> {
+    let (skills, file_artifacts) = ability_skills_value(bundle_id, schemes, links, file_types)?;
     let mut abilities = vec![json!({
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
@@ -898,7 +945,7 @@ fn build_abilities(
             .or_insert_with(|| Value::String("$color:start_window_background".to_owned()));
         abilities.push(Value::Object(obj));
     }
-    Ok((indent_json(&Value::Array(abilities), 4), custom_utd))
+    Ok((indent_json(&Value::Array(abilities), 4), file_artifacts))
 }
 
 fn build_module_extras(harmonyos: &HarmonyMeta) -> String {
@@ -1239,7 +1286,7 @@ pub(crate) fn write(
     // BEFORE removing any previously generated directories or files.
     let profile_path = out.join("build-profile.json5");
     let preserved_signing = read_preserved_signing(&profile_path, "default")?;
-    let (abilities, custom_utd) = build_abilities(
+    let (abilities, file_artifacts) = build_abilities(
         &config.id,
         &config.schemes,
         &config.links,
@@ -1354,9 +1401,15 @@ pub(crate) fn write(
 
     let rawfile = join_all(out, ["entry", "src", "main", "resources", "rawfile"]);
     fs::create_dir_all(&rawfile)?;
-    if let Some(utd_json) = custom_utd {
+    if let Some(utd_json) = file_artifacts.custom_utd_json {
         let utd_path = join_all(&rawfile, ["arkdata", "utd", "utd.json5"]);
         write_file(&utd_path, utd_json.as_bytes())?;
+    }
+    if let Some(runtime_file_types_json) = file_artifacts.runtime_file_types_json {
+        write_file(
+            &rawfile.join("nsh-file-types.json"),
+            runtime_file_types_json.as_bytes(),
+        )?;
     }
     for name in ["app.json", "capabilities.json"] {
         let source = contents.build.join(name);
@@ -2461,6 +2514,87 @@ mod tests {
             json!(["application/x-nsh-note"])
         );
 
-        fs::remove_dir_all(&dir).unwrap();
+        let runtime_types_path = join_all(
+            &out,
+            [
+                "entry",
+                "src",
+                "main",
+                "resources",
+                "rawfile",
+                "nsh-file-types.json",
+            ],
+        );
+        let runtime_types: Value =
+            serde_json::from_str(&fs::read_to_string(&runtime_types_path).unwrap()).unwrap();
+        let runtime_utds = runtime_types["utds"].as_array().unwrap();
+        assert!(runtime_utds.contains(&json!("general.markdown")));
+        assert!(runtime_utds.contains(&json!("com.adobe.pdf")));
+        assert!(runtime_utds.contains(&json!("general.video")));
+        assert!(runtime_utds.contains(&json!("com.example.reader.nsh_filetype_1")));
+        assert_eq!(runtime_types["extensions"], json!(["md", "pdf", "nshnote"]));
+        assert_eq!(
+            runtime_types["mimeTypes"],
+            json!(["video/*", "application/x-nsh-note"])
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_runtime_file_types_manifest_for_content_types_only() {
+        let dir = std::env::temp_dir().join(format!(
+            "nsh-hm-filetypes-content-types-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+        let config = AppConfig::from_json(
+            &dir.join("app"),
+            &json!({
+                "name": "PdfOnly",
+                "id": "com.example.pdfonly",
+                "fileTypes": [
+                    { "name": "PDF", "contentTypes": ["com.adobe.pdf"] },
+                    { "name": "Images", "contentTypes": ["public.image"] }
+                ]
+            }),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+        write(&out, &config, &contents).unwrap();
+
+        let runtime_types_path = join_all(
+            &out,
+            [
+                "entry",
+                "src",
+                "main",
+                "resources",
+                "rawfile",
+                "nsh-file-types.json",
+            ],
+        );
+        let runtime_types: Value =
+            serde_json::from_str(&fs::read_to_string(&runtime_types_path).unwrap()).unwrap();
+        assert_eq!(
+            runtime_types["utds"],
+            json!(["com.adobe.pdf", "general.image"])
+        );
+        assert_eq!(runtime_types["extensions"], json!([]));
+        assert_eq!(runtime_types["mimeTypes"], json!([]));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

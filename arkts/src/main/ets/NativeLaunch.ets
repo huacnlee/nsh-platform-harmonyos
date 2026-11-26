@@ -1,4 +1,5 @@
 import { AbilityLifecycleCallback, common, UIAbility, Want } from "@kit.AbilityKit";
+import { uniformTypeDescriptor } from "@kit.ArkData";
 import { fileIo as fs } from "@kit.CoreFileKit";
 
 const MAX_PENDING_LAUNCH_URLS = 64;
@@ -9,8 +10,10 @@ const MAX_CACHE_TOTAL_BYTES = 1024 * 1024 * 1024;
 const STAGED_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const STAGED_SUBDIR = "nsh-opened-files";
 const COPY_CHUNK_BYTES = 64 * 1024;
+const RUNTIME_FILE_TYPES_RAWFILE = "nsh-file-types.json";
 
-interface DeclaredFileType {
+interface DeclaredFileTypes {
+  utds: string[];
   extensions: string[];
   mimeTypes: string[];
 }
@@ -35,7 +38,7 @@ class AbilityLaunchQueue {
   pending: string[] = [];
   receiver?: (url: string) => void;
   work: Promise<void> = Promise.resolve();
-  declaredTypes?: DeclaredFileType[];
+  declaredTypes?: DeclaredFileTypes;
 
   deliver(url: string): void {
     if (this.receiver !== undefined) {
@@ -108,55 +111,96 @@ function decodeUtf8(bytes: Uint8Array): string {
   return out;
 }
 
+function pushUniqueString(list: string[], value: string): void {
+  if (value.length > 0 && !list.includes(value)) {
+    list.push(value);
+  }
+}
+
+function appendNormalizedExtensions(target: string[], raw: Object | undefined): void {
+  if (!Array.isArray(raw)) {
+    return;
+  }
+  const list = raw as Object[];
+  for (let i = 0; i < list.length; i++) {
+    const v: Object = list[i];
+    if (typeof v === "string" && v.trim().length > 0) {
+      const cleaned = v.trim().toLowerCase().replace(/^\.+/, "");
+      pushUniqueString(target, cleaned);
+    }
+  }
+}
+
+function appendNormalizedStrings(target: string[], raw: Object | undefined): void {
+  if (!Array.isArray(raw)) {
+    return;
+  }
+  const list = raw as Object[];
+  for (let i = 0; i < list.length; i++) {
+    const v: Object = list[i];
+    if (typeof v === "string" && v.trim().length > 0) {
+      pushUniqueString(target, v.trim().toLowerCase());
+    }
+  }
+}
+
+function appendTrimmedStrings(target: string[], raw: Object | undefined): void {
+  if (!Array.isArray(raw)) {
+    return;
+  }
+  const list = raw as Object[];
+  for (let i = 0; i < list.length; i++) {
+    const v: Object = list[i];
+    if (typeof v === "string" && v.trim().length > 0) {
+      pushUniqueString(target, v.trim());
+    }
+  }
+}
+
 function loadDeclaredFileTypes(
   context: common.UIAbilityContext,
   queue: AbilityLaunchQueue,
-): DeclaredFileType[] {
+): DeclaredFileTypes {
   if (queue.declaredTypes !== undefined) {
     return queue.declaredTypes;
   }
-  const parsed: DeclaredFileType[] = [];
+  const parsed: DeclaredFileTypes = {
+    utds: [],
+    extensions: [],
+    mimeTypes: [],
+  };
+  let loadedFromManifest = false;
   try {
-    const raw = context.resourceManager.getRawFileContentSync("app.json");
+    const raw = context.resourceManager.getRawFileContentSync(RUNTIME_FILE_TYPES_RAWFILE);
     const doc = JSON.parse(decodeUtf8(raw)) as Record<string, Object>;
-    const list = doc["fileTypes"];
-    if (Array.isArray(list)) {
-      for (let i = 0; i < list.length; i++) {
-        const entry = list[i] as Record<string, Object>;
-        if (!entry || typeof entry !== "object") {
-          continue;
-        }
-        const exts: string[] = [];
-        const rawExts = entry["extensions"];
-        if (Array.isArray(rawExts)) {
-          const extList = rawExts as Object[];
-          for (let j = 0; j < extList.length; j++) {
-            const v: Object = extList[j];
-            if (typeof v === "string" && v.trim().length > 0) {
-              const cleaned = v.trim().toLowerCase().replace(/^\.+/, "");
-              if (cleaned.length > 0) {
-                exts.push(cleaned);
-              }
-            }
-          }
-        }
-        const mimes: string[] = [];
-        const rawMimes = entry["mimeTypes"];
-        if (Array.isArray(rawMimes)) {
-          const mimeList = rawMimes as Object[];
-          for (let j = 0; j < mimeList.length; j++) {
-            const v: Object = mimeList[j];
-            if (typeof v === "string" && v.trim().length > 0) {
-              mimes.push(v.trim().toLowerCase());
-            }
-          }
-        }
-        if (exts.length > 0 || mimes.length > 0) {
-          parsed.push({ extensions: exts, mimeTypes: mimes });
-        }
-      }
+    if (doc && typeof doc === "object") {
+      // Preserve UTD case because custom HarmonyOS TypeIds are prefixed with
+      // the case-sensitive bundleName in utd.json5.
+      appendTrimmedStrings(parsed.utds, doc["utds"]);
+      appendNormalizedExtensions(parsed.extensions, doc["extensions"]);
+      appendNormalizedStrings(parsed.mimeTypes, doc["mimeTypes"]);
+      loadedFromManifest = true;
     }
   } catch {}
+  if (!loadedFromManifest) {
+    try {
+      const raw = context.resourceManager.getRawFileContentSync("app.json");
+      const doc = JSON.parse(decodeUtf8(raw)) as Record<string, Object>;
+      const list = doc["fileTypes"];
+      if (Array.isArray(list)) {
+        const entries = list as Object[];
+        for (let i = 0; i < entries.length; i++) {
+          const entry = entries[i] as Record<string, Object>;
+          if (!entry || typeof entry !== "object") {
+            continue;
+          }
+          appendNormalizedExtensions(parsed.extensions, entry["extensions"]);
+          appendNormalizedStrings(parsed.mimeTypes, entry["mimeTypes"]);
+          appendTrimmedStrings(parsed.utds, entry["contentTypes"]);
+        }
+      }
+    } catch {}
+  }
   queue.declaredTypes = parsed;
   return parsed;
 }
@@ -207,30 +251,144 @@ function mimeMatches(declared: string, actual: string): boolean {
   return false;
 }
 
-function matchesDeclaredFileTypes(
-  types: DeclaredFileType[],
-  filename: string,
-  wantMime?: string,
-): boolean {
-  if (types.length === 0) {
-    return false;
+function resolveUtdsByMime(mime: string): string[] {
+  const out: string[] = [];
+  try {
+    const many = uniformTypeDescriptor.getUniformDataTypesByMIMEType(mime);
+    if (Array.isArray(many)) {
+      for (let i = 0; i < many.length; i++) {
+        const value = many[i];
+        if (typeof value === "string" && value.length > 0) {
+          pushUniqueString(out, value);
+        }
+      }
+    }
+  } catch {
+    try {
+      const one = uniformTypeDescriptor.getUniformDataTypeByMIMEType(mime);
+      if (typeof one === "string" && one.length > 0) {
+        pushUniqueString(out, one);
+      }
+    } catch {}
   }
-  const ext = extensionOf(filename);
-  const mime = wantMime?.trim().toLowerCase() ?? "";
-  for (let i = 0; i < types.length; i++) {
-    const entry = types[i];
-    if (ext.length > 0 && entry.extensions.includes(ext)) {
+  return out;
+}
+
+function resolveUtdsByExtension(ext: string): string[] {
+  const out: string[] = [];
+  const dotted = ext.startsWith(".") ? ext : `.${ext}`;
+  try {
+    const many = uniformTypeDescriptor.getUniformDataTypesByFilenameExtension(dotted);
+    if (Array.isArray(many)) {
+      for (let i = 0; i < many.length; i++) {
+        const value = many[i];
+        if (typeof value === "string" && value.length > 0) {
+          pushUniqueString(out, value);
+        }
+      }
+    }
+  } catch {
+    try {
+      const one = uniformTypeDescriptor.getUniformDataTypeByFilenameExtension(dotted);
+      if (typeof one === "string" && one.length > 0) {
+        pushUniqueString(out, one);
+      }
+    } catch {}
+  }
+  return out;
+}
+
+function utdMatchesDeclared(actualUtd: string, declaredUtds: string[]): boolean {
+  const lowerActual = actualUtd.toLowerCase();
+  for (let i = 0; i < declaredUtds.length; i++) {
+    if (actualUtd === declaredUtds[i] || lowerActual === declaredUtds[i].toLowerCase()) {
       return true;
     }
-    if (mime.length > 0) {
-      for (let j = 0; j < entry.mimeTypes.length; j++) {
-        if (mimeMatches(entry.mimeTypes[j], mime)) {
+  }
+  try {
+    const descriptor = uniformTypeDescriptor.getTypeDescriptor(actualUtd);
+    if (descriptor !== undefined && descriptor !== null) {
+      for (let i = 0; i < declaredUtds.length; i++) {
+        if (descriptor.belongsTo(declaredUtds[i])) {
           return true;
         }
       }
     }
+  } catch {}
+  return false;
+}
+
+function matchesDeclaredFileTypes(
+  declared: DeclaredFileTypes,
+  filename: string,
+  wantType?: string,
+): boolean {
+  if (
+    declared.utds.length === 0 &&
+    declared.extensions.length === 0 &&
+    declared.mimeTypes.length === 0
+  ) {
+    return false;
+  }
+  const ext = extensionOf(filename);
+  const rawType = wantType?.trim() ?? "";
+  const lowerType = rawType.toLowerCase();
+  const wantIsMime = lowerType.includes("/");
+
+  if (ext.length > 0 && declared.extensions.includes(ext)) {
+    return true;
+  }
+  if (wantIsMime && lowerType.length > 0) {
+    for (let i = 0; i < declared.mimeTypes.length; i++) {
+      if (mimeMatches(declared.mimeTypes[i], lowerType)) {
+        return true;
+      }
+    }
+  }
+  if (declared.utds.length > 0) {
+    const candidates: string[] = [];
+    if (rawType.length > 0) {
+      if (wantIsMime) {
+        const byMime = resolveUtdsByMime(lowerType);
+        for (let i = 0; i < byMime.length; i++) {
+          pushUniqueString(candidates, byMime[i]);
+        }
+      } else {
+        pushUniqueString(candidates, rawType);
+      }
+    }
+    if (ext.length > 0) {
+      const byExt = resolveUtdsByExtension(ext);
+      for (let i = 0; i < byExt.length; i++) {
+        pushUniqueString(candidates, byExt[i]);
+      }
+    }
+    for (let i = 0; i < candidates.length; i++) {
+      if (utdMatchesDeclared(candidates[i], declared.utds)) {
+        return true;
+      }
+    }
   }
   return false;
+}
+
+function normalizePosixPath(raw: string): string {
+  const parts = raw.replace(/\/+/g, "/").split("/");
+  const stack: string[] = [];
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i];
+    if (part.length === 0 || part === ".") {
+      continue;
+    }
+    if (part === "..") {
+      if (stack.length > 0) {
+        stack.pop();
+      }
+      continue;
+    }
+    stack.push(part);
+  }
+  return `/${stack.join("/")}`;
 }
 
 function isOwnSandboxUri(context: common.UIAbilityContext, uri: string): boolean {
@@ -239,17 +397,31 @@ function isOwnSandboxUri(context: common.UIAbilityContext, uri: string): boolean
   if (path.toLowerCase().startsWith("file://")) {
     const rest = path.slice(7);
     const slash = rest.indexOf("/");
+    const host = slash >= 0 ? rest.slice(0, slash) : rest;
+    if (host.length > 0) {
+      const decodedHost = decodeUriPathSegment(host);
+      if (decodedHost.toLowerCase() !== "localhost") {
+        const bundleName = context.abilityInfo?.bundleName ?? "";
+        if (bundleName.length === 0) {
+          return true;
+        }
+        return host === bundleName || decodedHost === bundleName;
+      }
+    }
     if (slash < 0) {
       return false;
     }
-    const host = rest.slice(0, slash);
     path = decodeUriPathSegment(rest.slice(slash));
-    const bundleName = context.abilityInfo?.bundleName ?? "";
-    if (bundleName.length > 0 && host === bundleName) {
-      return true;
-    }
+  } else if (path.toLowerCase().startsWith("file:")) {
+    path = decodeUriPathSegment(path.slice(5));
   }
-  const normalized = path.replace(/\/+/g, "/");
+  const normalized = normalizePosixPath(path);
+  // Hostless `file:///data/storage/...` always refers to the current process's
+  // private sandbox mount namespace (across el1..el5); cross-app shared files
+  // always carry a non-empty authority (`file://<bundleName>/...`, `file://docs/...`).
+  if (normalized === "/data/storage" || normalized.startsWith("/data/storage/")) {
+    return true;
+  }
   const roots: string[] = [
     context.filesDir,
     context.cacheDir,
@@ -257,9 +429,12 @@ function isOwnSandboxUri(context: common.UIAbilityContext, uri: string): boolean
     context.databaseDir,
     context.preferencesDir,
     context.bundleCodeDir,
+    context.distributedFilesDir,
+    context.resourceDir,
+    context.cloudFileDir,
   ].filter((dir: string | undefined): boolean => typeof dir === "string" && dir.length > 0);
   for (let i = 0; i < roots.length; i++) {
-    const root = roots[i].replace(/\/+$/, "");
+    const root = normalizePosixPath(roots[i]);
     if (normalized === root || normalized.startsWith(`${root}/`)) {
       return true;
     }
@@ -383,7 +558,16 @@ async function stagePinnedFile(
       if (written + read > maxBytes) {
         return { bytes: 0 };
       }
-      await fs.write(destFile.fd, buffer, { length: read });
+      let consumed = 0;
+      while (consumed < read) {
+        const remaining = read - consumed;
+        const chunk: ArrayBuffer = consumed === 0 ? buffer : buffer.slice(consumed, read);
+        const wrote = await fs.write(destFile.fd, chunk, { length: remaining });
+        if (wrote <= 0 || wrote > remaining) {
+          return { bytes: 0 };
+        }
+        consumed += wrote;
+      }
       written += read;
     }
     ok = true;
@@ -472,13 +656,22 @@ export function onLaunchWant(
       const cacheRoot = `${context.cacheDir}/${STAGED_SUBDIR}`;
       queue.work = queue.work
         .then(async (): Promise<void> => {
-          pruneStagedCache(cacheRoot);
-          let remainingBatch = MAX_STAGED_BATCH_BYTES;
-          for (let i = 0; i < pinned.length; i++) {
-            const staged = await stagePinnedFile(cacheRoot, pinned[i], remainingBatch);
-            if (staged.url !== undefined) {
-              remainingBatch = Math.max(0, remainingBatch - staged.bytes);
-              queue.deliver(staged.url);
+          let nextIndex = 0;
+          try {
+            pruneStagedCache(cacheRoot);
+            let remainingBatch = MAX_STAGED_BATCH_BYTES;
+            for (; nextIndex < pinned.length; nextIndex++) {
+              const staged = await stagePinnedFile(cacheRoot, pinned[nextIndex], remainingBatch);
+              if (staged.url !== undefined) {
+                remainingBatch = Math.max(0, remainingBatch - staged.bytes);
+                queue.deliver(staged.url);
+              }
+            }
+          } finally {
+            for (let j = nextIndex + 1; j < pinned.length; j++) {
+              try {
+                fs.closeSync(pinned[j].fd);
+              } catch {}
             }
           }
         })
