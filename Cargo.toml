@@ -143,6 +143,7 @@ unicode-segmentation.workspace = true
 nsh-engine.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+ureq.workspace = true
 
 [workspace]
 resolver = "3"
@@ -180,7 +181,7 @@ thiserror = "2"
 tokio = { version = "1", default-features = false }
 ttf-parser = "0.25"
 unicode-segmentation = "1.13"
-ureq = "3.1"
+ureq = "~3.5.2"
 url = "2.5"
 glow = "0.18"
 khronos-egl = { version = "6", default-features = false, features = ["static", "no-pkg-config", "1_5"] }

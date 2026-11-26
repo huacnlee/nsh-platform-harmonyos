@@ -114,3 +114,7 @@ mod extensions;
 #[path = "../../src/services/network_monitor.rs"]
 #[allow(dead_code)]
 mod network_monitor;
+
+#[path = "../../src/services/net.rs"]
+#[allow(dead_code)]
+mod net;

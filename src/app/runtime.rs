@@ -1711,13 +1711,11 @@ impl Runtime {
         // Keep rollback ownership before registering with the shared session.
         // A rejected route must still close the engine and detach its root.
         config.host.attach(Arc::downgrade(&runtime._dispatcher))?;
-        crate::services::network_monitor::subscribe(Arc::downgrade(&runtime._dispatcher));
-        let latest_network = crate::services::network_monitor::current_network();
-        if runtime.state.borrow().environment.network != latest_network {
-            runtime
-                ._dispatcher
-                .send(Message::HostNetwork(latest_network));
-        }
+        let initial_network = runtime.state.borrow().environment.network;
+        crate::services::network_monitor::subscribe(
+            Arc::downgrade(&runtime._dispatcher),
+            initial_network,
+        );
         if drain_buffered && let Some(buffered) = booted.gate.attach(runtime._dispatcher.clone()) {
             let chunks = booted.chunks.clone();
             let dispatcher_weak = Arc::downgrade(&runtime._dispatcher);
