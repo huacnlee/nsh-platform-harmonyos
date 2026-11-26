@@ -35,23 +35,23 @@ impl crate::render::node::Node {
         Ok(())
     }
     pub(crate) fn key_window_id(&self) -> NodeId {
-        if self
-            .modal
-            .borrow()
-            .as_ref()
-            .is_some_and(|modal| modal.is_desktop_window())
-        {
-            return self.id;
+        if let Some(modal) = self.modal.borrow().as_ref() {
+            if modal.is_desktop_window() {
+                return self.id;
+            }
+            if let Some(host_id) = modal.host_sub_window_id() {
+                return host_id;
+            }
         }
         let mut parent = self.parent_node.borrow().upgrade();
         while let Some(node) = parent {
-            if node
-                .modal
-                .borrow()
-                .as_ref()
-                .is_some_and(|modal| modal.is_desktop_window())
-            {
-                return node.id;
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                if modal.is_desktop_window() {
+                    return node.id;
+                }
+                if let Some(host_id) = modal.host_sub_window_id() {
+                    return host_id;
+                }
             }
             parent = node.parent_node.borrow().upgrade();
         }

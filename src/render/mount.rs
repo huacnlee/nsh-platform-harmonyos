@@ -495,24 +495,46 @@ impl Mounter {
     fn route_back(&self, app_listener: bool) -> Result<()> {
         use nsh_core::navigation::{Back, back_target};
         let desktop = self.platform.get().os.is_desktop();
-        let modal = self
-            .modals
-            .iter()
-            .rev()
-            .filter_map(std::rc::Weak::upgrade)
-            .find(|modal| modal.is_desktop_focused())
-            .or_else(|| {
+        let modal = if desktop {
+            if let Some(focused_sub) = self
+                .modals
+                .iter()
+                .rev()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|modal| modal.is_desktop_focused())
+            {
+                let sub_id = focused_sub.node_id();
                 self.modals
                     .iter()
                     .rev()
                     .filter_map(std::rc::Weak::upgrade)
                     .find(|modal| {
                         modal.is_visible()
-                            && (!desktop
-                                || (!modal.is_desktop_window() && !modal.is_main_window_host())
+                            && !modal.is_desktop_window()
+                            && !modal.is_main_window_host()
+                            && modal.host_sub_window_id() == sub_id
+                    })
+                    .or(Some(focused_sub))
+            } else {
+                self.modals
+                    .iter()
+                    .rev()
+                    .filter_map(std::rc::Weak::upgrade)
+                    .find(|modal| {
+                        modal.is_visible()
+                            && ((!modal.is_desktop_window()
+                                && !modal.is_main_window_host()
+                                && !modal.is_sub_window_modal())
                                 || modal.is_desktop_modal())
                     })
-            });
+            }
+        } else {
+            self.modals
+                .iter()
+                .rev()
+                .filter_map(std::rc::Weak::upgrade)
+                .find(|modal| modal.is_visible())
+        };
         let target = back_target(
             modal.as_ref().and_then(|modal| modal.node_id()),
             app_listener
@@ -608,6 +630,21 @@ impl Mounter {
                 if self.is_unopened_window_container(&modal) {
                     modal.cancel_pending_present();
                     continue;
+                }
+                if !modal.is_desktop_window()
+                    && !modal.is_main_window_host()
+                    && !modal.is_sub_window_modal()
+                {
+                    let win_id = modal.config_window();
+                    if win_id != nsh_core::ROOT_ID
+                        && let Some(host) = self
+                            .nodes
+                            .get(&win_id)
+                            .and_then(|win| win.modal.borrow().clone())
+                            .filter(|host| host.is_desktop_window())
+                    {
+                        modal.set_host_sub_window(Some(host));
+                    }
                 }
                 modal.present_if_pending()?;
             }
@@ -1888,8 +1925,15 @@ impl Mounter {
                 parent.accessibility_state.changed(parent);
             }
         }
+        let keep_closing_modal_parent = node
+            .modal
+            .borrow()
+            .as_ref()
+            .is_some_and(|modal| modal.closing());
         if !retain {
-            *node.mount_parent.borrow_mut() = std::rc::Weak::new();
+            if !keep_closing_modal_parent {
+                *node.mount_parent.borrow_mut() = std::rc::Weak::new();
+            }
             *node.retained_owner.borrow_mut() = std::rc::Weak::new();
             node.culled_by_scroll.set(false);
         }
@@ -2488,8 +2532,14 @@ impl Mounter {
                     }
                     MountItem::ModalConfig { id, config } => {
                         if !self.frozen(id) {
+                            let host_sub_window = (config.window != nsh_core::ROOT_ID)
+                                .then(|| self.nodes.get(&config.window))
+                                .flatten()
+                                .and_then(|win| win.modal.borrow().clone())
+                                .filter(|modal| modal.is_desktop_window());
                             let node = self.node(id)?;
                             if let Some(modal) = node.modal.borrow().as_ref() {
+                                modal.set_host_sub_window(host_sub_window);
                                 modal.configure(config)?;
                                 if node.scene_active() {
                                     node.invalidate_scene();
