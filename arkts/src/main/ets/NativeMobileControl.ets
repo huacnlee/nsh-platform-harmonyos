@@ -64,8 +64,7 @@ function is24HourClock(): boolean {
   return cached24HourClock;
 }
 
-function date(fields?: Fields): Date {
-  const now = new Date();
+function date(fields?: Fields, now: Date = new Date()): Date {
   return new Date(
     fields?.year ?? now.getFullYear(),
     (fields?.month ?? now.getMonth() + 1) - 1,
@@ -73,6 +72,15 @@ function date(fields?: Fields): Date {
     fields?.hour ?? now.getHours(),
     fields?.minute ?? now.getMinutes(),
   );
+}
+
+function snapTimeToInterval(picked: Date, interval: number): Date {
+  const step = Number.isFinite(interval) && interval >= 1 ? Math.min(60, Math.floor(interval)) : 1;
+  const rawMinutes = picked.getMinutes();
+  const snapped = rawMinutes - (rawMinutes % step);
+  const adjusted = new Date(picked.getTime());
+  adjusted.setMinutes(snapped, 0, 0);
+  return adjusted;
 }
 
 function clampDate(value: Date, start?: Date, end?: Date): Date {
@@ -272,9 +280,10 @@ export class NativeMobileControl {
     }
     this.presenting = true;
     const mode = s.mode;
-    const start = s.minimum ? date(s.minimum) : undefined;
-    const end = s.maximum ? date(s.maximum) : undefined;
-    const selected = clampDate(date(s.value), start, end);
+    const now = new Date();
+    const start = s.minimum ? date(s.minimum, now) : undefined;
+    const end = s.maximum ? date(s.maximum, now) : undefined;
+    const selected = clampDate(date(s.value, now), start, end);
     const done = (): void => {
       this.presenting = false;
     };
@@ -282,23 +291,8 @@ export class NativeMobileControl {
       if (this.closed || this.settings.disabled || this.settings.mode !== mode) {
         return;
       }
-      if (mode !== "date") {
-        const interval = Number.isFinite(s.interval) && s.interval >= 1 ? Math.floor(s.interval) : 1;
-        const rawMinutes = picked.getMinutes();
-        let snapped = Math.round(rawMinutes / interval) * interval;
-        // Clamp within [0, 59] when rounding at 23:55 would otherwise roll over to the next day.
-        if (snapped >= 60) {
-          if (picked.getHours() === 23) {
-            snapped = Math.floor(59 / interval) * interval;
-            picked.setMinutes(snapped);
-          } else {
-            picked.setMinutes(snapped);
-          }
-        } else {
-          picked.setMinutes(snapped);
-        }
-      }
-      const chosen = clampDate(picked, start, end);
+      const adjusted = mode !== "date" ? snapTimeToInterval(picked, s.interval) : picked;
+      const chosen = clampDate(adjusted, start, end);
       const fields: Fields = {};
       if (mode !== "time") {
         fields.year = chosen.getFullYear();
