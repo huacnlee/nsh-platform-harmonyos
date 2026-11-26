@@ -20,6 +20,17 @@ interface PinnedFileSource {
   name: string;
 }
 
+interface CacheDirInfo {
+  path: string;
+  mtimeMs: number;
+  bytes: number;
+}
+
+interface StagedFileResult {
+  url?: string;
+  bytes: number;
+}
+
 class AbilityLaunchQueue {
   pending: string[] = [];
   receiver?: (url: string) => void;
@@ -118,8 +129,9 @@ function loadDeclaredFileTypes(
         const exts: string[] = [];
         const rawExts = entry["extensions"];
         if (Array.isArray(rawExts)) {
-          for (let j = 0; j < rawExts.length; j++) {
-            const v = rawExts[j];
+          const extList = rawExts as Object[];
+          for (let j = 0; j < extList.length; j++) {
+            const v: Object = extList[j];
             if (typeof v === "string" && v.trim().length > 0) {
               const cleaned = v.trim().toLowerCase().replace(/^\.+/, "");
               if (cleaned.length > 0) {
@@ -131,8 +143,9 @@ function loadDeclaredFileTypes(
         const mimes: string[] = [];
         const rawMimes = entry["mimeTypes"];
         if (Array.isArray(rawMimes)) {
-          for (let j = 0; j < rawMimes.length; j++) {
-            const v = rawMimes[j];
+          const mimeList = rawMimes as Object[];
+          for (let j = 0; j < mimeList.length; j++) {
+            const v: Object = mimeList[j];
             if (typeof v === "string" && v.trim().length > 0) {
               mimes.push(v.trim().toLowerCase());
             }
@@ -271,8 +284,9 @@ function collectWantUris(want: Want): string[] {
   const seen: Set<string> = new Set();
   const stream = want.parameters?.["ability.params.stream"];
   if (Array.isArray(stream)) {
-    for (let i = 0; i < stream.length; i++) {
-      const item = stream[i];
+    const streamList = stream as Object[];
+    for (let i = 0; i < streamList.length; i++) {
+      const item: Object = streamList[i];
       if (typeof item === "string" && item.length > 0 && !seen.has(item)) {
         seen.add(item);
         uris.push(item);
@@ -293,11 +307,6 @@ function pruneStagedCache(rootDir: string): void {
     }
     const now = Date.now();
     const entries = fs.listFileSync(rootDir);
-    interface CacheDirInfo {
-      path: string;
-      mtimeMs: number;
-      bytes: number;
-    }
     const live: CacheDirInfo[] = [];
     let totalBytes = 0;
     for (let i = 0; i < entries.length; i++) {
@@ -349,7 +358,7 @@ async function stagePinnedFile(
   rootDir: string,
   source: PinnedFileSource,
   remainingBatchBytes: number,
-): Promise<{ url?: string; bytes: number }> {
+): Promise<StagedFileResult> {
   const maxBytes = Math.min(MAX_STAGED_FILE_BYTES, remainingBatchBytes);
   const subDir = `${rootDir}/${Date.now()}-${++stageSequence}`;
   const destPath = `${subDir}/${source.name}`;
