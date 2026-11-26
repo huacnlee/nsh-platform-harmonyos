@@ -85,12 +85,15 @@ impl Input {
                 _ => None,
             };
             if let Some(stroke) = stroke {
-                let matched = route.keyboard.lock().unwrap().map.find_in(
-                    owner.key_window_id(),
-                    stroke,
-                    true,
-                    false,
-                );
+                let matched = {
+                    let snapshot = route.keyboard.lock().unwrap();
+                    snapshot.map.find_in(
+                        snapshot.keymap_window(owner.key_window_id()),
+                        stroke,
+                        true,
+                        false,
+                    )
+                };
                 if let Some(id) = matched.fired() {
                     route.send(crate::app::runtime::Message::HostEvent(
                         EventKind::KeyCommand,
@@ -385,6 +388,7 @@ impl Input {
                     let window = owner.key_window_id();
                     let (select_id, delete_id) = {
                         let snapshot = route.keyboard.lock().unwrap();
+                        let window = snapshot.keymap_window(window);
                         (
                             snapshot.map.find_in(
                                 window,
@@ -429,18 +433,21 @@ impl Input {
             "undo" => {
                 if let Some(route) = owner.dispatcher.upgrade() {
                     use nsh_core::keymap::{Key, Keystroke, Modifiers};
-                    let matched = route.keyboard.lock().unwrap().map.find_in(
-                        owner.key_window_id(),
-                        Keystroke {
-                            key: Key::Char('z'),
-                            modifiers: Modifiers {
-                                ctrl: true,
-                                ..Modifiers::default()
+                    let matched = {
+                        let snapshot = route.keyboard.lock().unwrap();
+                        snapshot.map.find_in(
+                            snapshot.keymap_window(owner.key_window_id()),
+                            Keystroke {
+                                key: Key::Char('z'),
+                                modifiers: Modifiers {
+                                    ctrl: true,
+                                    ..Modifiers::default()
+                                },
                             },
-                        },
-                        true,
-                        false,
-                    );
+                            true,
+                            false,
+                        )
+                    };
                     if let Some(id) = matched.fired() {
                         route.send(crate::app::runtime::Message::HostEvent(
                             EventKind::KeyCommand,

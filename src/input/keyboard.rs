@@ -92,8 +92,19 @@ pub(crate) struct Snapshot {
     pub(crate) focused: Option<NodeId>,
     pub(crate) input: Option<NodeId>,
     pub(crate) selection: Option<NodeId>,
+    pub(crate) hosted_main_window: Option<NodeId>,
     pub(crate) composing: bool,
 }
+impl Snapshot {
+    pub(crate) fn keymap_window(&self, window: NodeId) -> NodeId {
+        if window == nsh_core::ROOT_ID {
+            self.hosted_main_window.unwrap_or(nsh_core::ROOT_ID)
+        } else {
+            window
+        }
+    }
+}
+
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
@@ -108,6 +119,7 @@ impl Default for Snapshot {
             focused: None,
             input: None,
             selection: None,
+            hosted_main_window: None,
             composing: false,
         }
     }
@@ -421,9 +433,11 @@ impl KeyboardWindow {
                     return true;
                 }
             }
-            let matched = snapshot
-                .map
-                .find_in(window, stroke, snapshot.focused.is_some(), repeat);
+            let keymap_window = snapshot.keymap_window(window);
+            let matched =
+                snapshot
+                    .map
+                    .find_in(keymap_window, stroke, snapshot.focused.is_some(), repeat);
             if let Some(id) = matched.fired() {
                 route.send(crate::app::runtime::Message::HostEvent(
                     nsh_core::EventKind::KeyCommand,
@@ -1100,5 +1114,14 @@ mod tests {
             },
         );
         assert!(!fresh.modifiers().ctrl);
+    }
+    #[test]
+    fn keymap_window_maps_root_to_hosted_main_window_only() {
+        let mut snapshot = Snapshot::default();
+        assert_eq!(snapshot.keymap_window(nsh_core::ROOT_ID), nsh_core::ROOT_ID);
+        assert_eq!(snapshot.keymap_window(42), 42);
+        snapshot.hosted_main_window = Some(7);
+        assert_eq!(snapshot.keymap_window(nsh_core::ROOT_ID), 7);
+        assert_eq!(snapshot.keymap_window(42), 42);
     }
 }

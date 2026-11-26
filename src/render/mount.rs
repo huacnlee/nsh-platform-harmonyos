@@ -630,6 +630,58 @@ impl Mounter {
         }
         res
     }
+    fn node_has_visual_paint(node: &Node) -> bool {
+        let style = node.style.borrow();
+        !style.background_color.is_transparent()
+            || style.borders.widths.any(|v| v.0 > 0.0)
+            || style.effects.is_some()
+            || style.elevation.0 > 0.0
+            || style.outline.is_visible()
+            || style.glass_effect != nsh_core::GlassEffect::None
+            || !node.shader_layers.borrow().is_empty()
+            || node.backdrop_layer.get().is_some()
+    }
+    fn is_transparent_host_view(node: &Node) -> bool {
+        node.modal.borrow().is_none()
+            && node.kind == ViewKind::View
+            && node.component.borrow().is_none()
+            && !Self::node_has_visual_paint(node)
+    }
+    fn subtree_has_non_modal_content(node: &Rc<Node>) -> bool {
+        if node.modal.borrow().is_some() {
+            return false;
+        }
+        if !Self::is_transparent_host_view(node) {
+            return true;
+        }
+        node.children
+            .borrow()
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|child| Self::subtree_has_non_modal_content(&child))
+    }
+    fn has_only_transparent_root_ancestors(&self, node: &Node) -> bool {
+        let mut current = node.parent.get();
+        while let Some(parent_id) = current {
+            if parent_id == nsh_core::ROOT_ID {
+                return true;
+            }
+            let Ok(parent) = self.node(parent_id) else {
+                return false;
+            };
+            if !Self::is_transparent_host_view(parent) {
+                return false;
+            }
+            current = parent.parent.get();
+        }
+        false
+    }
+    fn set_hosted_main_window(&mut self, id: Option<NodeId>) {
+        self.desktop.hosted_main_window = id;
+        if let Some(route) = self.dispatcher.upgrade() {
+            route.keyboard.lock().unwrap().hosted_main_window = id;
+        }
+    }
     fn is_unopened_window_container(&self, modal: &crate::navigation::modal::Modal) -> bool {
         if !self.platform.get().os.is_desktop()
             || modal.has_modal_config()
@@ -644,7 +696,7 @@ impl Mounter {
         let Ok(node) = self.node(id) else {
             return false;
         };
-        node.parent.get() == Some(nsh_core::ROOT_ID)
+        self.has_only_transparent_root_ancestors(node)
             && node
                 .children
                 .borrow()
@@ -660,7 +712,7 @@ impl Mounter {
             .borrow()
             .iter()
             .filter_map(std::rc::Weak::upgrade)
-            .any(|child| child.modal.borrow().is_none())
+            .any(|child| Self::subtree_has_non_modal_content(&child))
     }
     pub(crate) fn note_main_window_launch_applied(&mut self) {
         self.desktop.main_window_launch_applied = true;
@@ -726,7 +778,7 @@ impl Mounter {
     ) -> Result<()> {
         let root = self.node(nsh_core::ROOT_ID)?.clone();
         modal.open_in_main_window(&root)?;
-        self.desktop.hosted_main_window = Some(id);
+        self.set_hosted_main_window(Some(id));
         self.apply_main_window_attributes(&open.options.attributes)?;
         if (!self.desktop.main_window_launch_applied || !open.implicit)
             && let Some(launch) = crate::services::desktop::wire_open_main_window_launch(&open)
@@ -766,7 +818,7 @@ impl Mounter {
                         if matches!(request, nsh_core::desktop::WindowRequest::Close) {
                             self.close_desktop_children(id)?;
                             self.close_desktop_children(nsh_core::ROOT_ID)?;
-                            self.desktop.hosted_main_window = None;
+                            self.set_hosted_main_window(None);
                             if let Ok(node) = self.node(id)
                                 && let Some(modal) = node.modal.borrow().clone()
                             {
@@ -1776,7 +1828,7 @@ impl Mounter {
 
     fn unlink(&mut self, id: NodeId, retain: bool) -> Result<()> {
         if self.desktop.hosted_main_window == Some(id) {
-            self.desktop.hosted_main_window = None;
+            self.set_hosted_main_window(None);
         }
         let node = self.node(id)?;
         let parent = node.parent.get().map(|id| self.node(id)).transpose()?;
@@ -1959,7 +2011,7 @@ impl Mounter {
     fn delete_now_inner(&mut self, id: NodeId) -> Result<()> {
         self.uncreated_scroll_content.remove(&id);
         if self.desktop.hosted_main_window == Some(id) {
-            self.desktop.hosted_main_window = None;
+            self.set_hosted_main_window(None);
         }
         if !self.nodes.contains_key(&id) {
             return Ok(());
