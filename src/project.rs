@@ -985,11 +985,9 @@ mod tests {
         };
         write(&out, &config, &contents).unwrap();
         let index = join_relative(&out, "entry/src/main/ets/pages/Index.ets");
-        assert!(
-            fs::read_to_string(&index)
-                .unwrap()
-                .contains("if (false) {\n      prepareWebEngine();")
-        );
+        let index_source = fs::read_to_string(&index).unwrap();
+        assert!(index_source.contains("if (false) {\n      prepareWebEngine();"));
+        assert!(index_source.contains("KeyboardAvoidMode.NONE"));
         let app = fs::read_to_string(join_all(&out, ["AppScope", "app.json5"])).unwrap();
         assert!(
             app.contains("\"bundleName\": \"com.example.counter\""),

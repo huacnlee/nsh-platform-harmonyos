@@ -1,4 +1,5 @@
 import { common } from "@kit.AbilityKit";
+import { KeyboardAvoidMode } from "@kit.ArkUI";
 import { NshSurface, prepareWebEngine } from "@nsh/harmonyos";
 
 // The app fills the window: written in Rust, it is linked into the native
@@ -15,6 +16,9 @@ struct Index {
   };
 
   aboutToAppear(): void {
+    try {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+    } catch {}
     const host = this.getUIContext().getHostContext() as common.UIAbilityContext | undefined;
     host?.eventHub.on("nsh.openUrl", this.onOpenUrl);
     host?.eventHub.on("nsh.devUrl", this.onDevUrl);

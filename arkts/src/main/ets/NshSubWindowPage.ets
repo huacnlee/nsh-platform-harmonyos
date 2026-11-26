@@ -1,3 +1,4 @@
+import { KeyboardAvoidMode } from "@kit.ArkUI";
 import { NodeContent } from "@ohos.arkui.node";
 
 export const NSH_SUBWINDOW_ROUTE = "nshSubWindow";
@@ -48,6 +49,9 @@ struct NshSubWindowPage {
   @State private colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
 
   aboutToAppear(): void {
+    try {
+      this.getUIContext().setKeyboardAvoidMode(KeyboardAvoidMode.NONE);
+    } catch {}
     const bridge = this.getUIContext()
       .getSharedLocalStorage()
       ?.get<SubWindowPageBridge>(NSH_SUBWINDOW_BRIDGE_KEY);

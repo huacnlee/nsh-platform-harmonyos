@@ -95,10 +95,10 @@ pub(crate) fn visual_insets(
         for (edge, rect) in area.into_iter().enumerate() {
             if let Some(overlap) = viewport.intersection(rect) {
                 let depth = match edge {
-                    0 => overlap.y + overlap.height - viewport.y,
+                    0 => overlap.y + overlap.height - viewport.y.max(0.0),
                     1 => viewport.x + viewport.width - overlap.x,
                     2 => viewport.y + viewport.height - overlap.y,
-                    _ => overlap.x + overlap.width - viewport.x,
+                    _ => overlap.x + overlap.width - viewport.x.max(0.0),
                 };
                 insets[edge] = insets[edge].max(depth);
             }
@@ -331,5 +331,20 @@ mod tests {
             window_avoid_insets(rect(0.0, 0.0, 1080.0, 2400.0), 3.0, [status, nav], None);
         assert_eq!(safe, [30.0, 0.0, 20.0, 0.0]);
         assert_eq!(keyboard, 0.0);
+    }
+
+    #[test]
+    fn negative_viewport_origin_does_not_inflate_visual_safe_areas() {
+        let empty = WindowRect::default();
+        let status = [rect(0.0, 0.0, 1260.0, 123.0), empty, empty, empty];
+        assert_eq!(
+            visual_insets(rect(0.0, -411.0, 1260.0, 2506.0), [status]),
+            [123.0, 0.0, 0.0, 0.0]
+        );
+        let left_cutout = [empty, empty, empty, rect(0.0, 0.0, 60.0, 1080.0)];
+        assert_eq!(
+            visual_insets(rect(-100.0, 0.0, 2400.0, 1080.0), [left_cutout]),
+            [0.0, 0.0, 0.0, 60.0]
+        );
     }
 }
