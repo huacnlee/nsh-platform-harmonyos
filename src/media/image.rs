@@ -602,12 +602,18 @@ pub(crate) struct ImageView {
     data: RefCell<Option<Arc<Data>>>,
     color_filter: Cell<Option<[f32; 20]>>,
     radii: Cell<[f32; 4]>,
+    applied_radii: Cell<[f32; 4]>,
     blur_radius: Cell<f32>,
     applied_blur: Cell<f32>,
     fade_ms: Cell<f32>,
     fade_pending: Cell<bool>,
     fade_start: Cell<Option<f64>>,
     cached_hit: Cell<bool>,
+    mode: Cell<ResizeMode>,
+    position: Cell<nsh_core::ObjectPosition>,
+    container_size: Cell<Size>,
+    fitted: Cell<Option<crate::render::geometry::Rect>>,
+    custom_fit: Cell<bool>,
     source: RefCell<Option<ImageSource>>,
     placeholder: RefCell<Option<ImageSource>>,
 }
@@ -633,12 +639,18 @@ impl ImageView {
             data: RefCell::default(),
             color_filter: Cell::new(None),
             radii: Cell::new([0.0; 4]),
+            applied_radii: Cell::new([0.0; 4]),
             blur_radius: Cell::new(0.0),
             applied_blur: Cell::new(0.0),
             fade_ms: Cell::new(0.0),
             fade_pending: Cell::new(false),
             fade_start: Cell::new(None),
             cached_hit: Cell::new(false),
+            mode: Cell::new(ResizeMode::Cover),
+            position: Cell::new(nsh_core::ObjectPosition::default()),
+            container_size: Cell::new(Size::new(0.0, 0.0)),
+            fitted: Cell::new(None),
+            custom_fit: Cell::new(false),
             source: RefCell::new(None),
             placeholder: RefCell::new(None),
         });
@@ -699,8 +711,120 @@ impl ImageView {
         Ok(image)
     }
     pub(crate) fn frame(&self, size: Size) -> Result<()> {
-        self.native.borrow().width(size.width)?;
-        self.native.borrow().height(size.height)?;
+        self.container_size.set(size);
+        self.sync_layout()
+    }
+    pub(crate) fn layout(
+        &self,
+        event: &ohos_arkui_binding::api::node_custom_event::NodeCustomEvent,
+        scale: f32,
+    ) -> Result<()> {
+        let (x, y) = match self.fitted.get() {
+            Some(rect) if self.custom_fit.get() => (
+                (rect.x * scale).round() as i32,
+                (rect.y * scale).round() as i32,
+            ),
+            _ => (0, 0),
+        };
+        event.layout_child(&self.native.borrow(), x, y)?;
+        Ok(())
+    }
+    fn natural_size(&self) -> Option<nsh_core::Size<nsh_core::Points>> {
+        if !self.primary.get() {
+            return None;
+        }
+        let data = self.data.borrow();
+        let data = data.as_ref()?;
+        if let Some(svg) = &data.svg {
+            return Some(svg.size);
+        }
+        if let Some(size) = self.source.borrow().as_ref().and_then(|s| s.size)
+            && size.width.0 > 0.0
+            && size.height.0 > 0.0
+        {
+            return Some(size);
+        }
+        if data.width == 0 || data.height == 0 {
+            return None;
+        }
+        let density = self
+            .source
+            .borrow()
+            .as_ref()
+            .map_or(1.0, |s| nsh_core::image::density(&s.uri))
+            .max(f32::EPSILON);
+        Some(nsh_core::Size::new(
+            nsh_core::Points(data.width as f32 / density),
+            nsh_core::Points(data.height as f32 / density),
+        ))
+    }
+    fn sync_radii(&self) -> Result<()> {
+        let container = self.container_size.get();
+        let fills_container = self.fitted.get().is_none_or(|r| {
+            !self.custom_fit.get()
+                || (r.x.abs() <= 0.5
+                    && r.y.abs() <= 0.5
+                    && (r.width - container.width).abs() <= 0.5
+                    && (r.height - container.height).abs() <= 0.5)
+        });
+        let desired = if fills_container {
+            self.radii.get()
+        } else {
+            [0.0; 4]
+        };
+        if self.applied_radii.replace(desired) != desired {
+            self.native
+                .borrow()
+                .set_attribute(A::BorderRadius, desired.to_vec().into())?;
+        }
+        Ok(())
+    }
+    fn sync_layout(&self) -> Result<()> {
+        use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
+        let container = self.container_size.get();
+        let mode = self.mode.get();
+        let fitted = crate::render::geometry::image_fit(
+            mode,
+            self.position.get(),
+            self.natural_size(),
+            container,
+        );
+        let custom = fitted.is_some();
+        let object_fit = if custom {
+            3 // ARKUI_OBJECT_FIT_FILL: fitted bounds own scale, crop and objectPosition
+        } else {
+            match mode {
+                ResizeMode::Contain => 0,   // ARKUI_OBJECT_FIT_CONTAIN
+                ResizeMode::Cover => 1,     // ARKUI_OBJECT_FIT_COVER
+                ResizeMode::Stretch => 3,   // ARKUI_OBJECT_FIT_FILL
+                ResizeMode::ScaleDown => 4, // ARKUI_OBJECT_FIT_SCALE_DOWN
+                ResizeMode::Center => 10,   // ARKUI_OBJECT_FIT_NONE_AND_ALIGN_CENTER
+            }
+        };
+        let (target_w, target_h) = match fitted {
+            Some(rect) => (rect.width.max(0.0), rect.height.max(0.0)),
+            None => (container.width.max(0.0), container.height.max(0.0)),
+        };
+        let prev_fitted = self.fitted.replace(fitted);
+        let prev_custom = self.custom_fit.replace(custom);
+        {
+            let native = self.native.borrow();
+            native.set_i32_attribute(A::ImageObjectFit, object_fit)?;
+            native.width(target_w)?;
+            native.height(target_h)?;
+        }
+        self.sync_radii()?;
+        if (prev_fitted != fitted || prev_custom != custom)
+            && let Some(owner) = self.owner.upgrade()
+        {
+            let host = owner.native.borrow();
+            host.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            host.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            owner.invalidate_composites();
+            if owner.scene_active() {
+                owner.invalidate_scene();
+            }
+        }
         Ok(())
     }
     pub(crate) fn style(
@@ -730,9 +854,7 @@ impl ImageView {
         let radii =
             [c.top_left, c.top_right, c.bottom_left, c.bottom_right].map(|v| v.map_or(r, |p| p.0));
         if self.radii.replace(radii) != radii {
-            self.native
-                .borrow()
-                .set_attribute(A::BorderRadius, radii.to_vec().into())?;
+            self.sync_radii()?;
         }
         self.sync_blur()?;
         Ok(())
@@ -786,17 +908,10 @@ impl ImageView {
             *self.source.borrow() == source && *self.placeholder.borrow() == options.placeholder;
         self.fade_ms.set(options.fade_ms.unwrap_or(0.0).max(0.0));
         self.blur_radius.set(options.blur_radius.0);
+        self.mode.set(mode);
+        self.position.set(options.position);
         self.sync_blur()?;
-        self.native.borrow().set_i32_attribute(
-            A::ImageObjectFit,
-            match mode {
-                ResizeMode::Contain => 0,   // ARKUI_OBJECT_FIT_CONTAIN
-                ResizeMode::Cover => 1,     // ARKUI_OBJECT_FIT_COVER
-                ResizeMode::Stretch => 3,   // ARKUI_OBJECT_FIT_FILL
-                ResizeMode::ScaleDown => 4, // ARKUI_OBJECT_FIT_SCALE_DOWN
-                ResizeMode::Center => 10,   // ARKUI_OBJECT_FIT_NONE_AND_ALIGN_CENTER
-            },
-        )?;
+        self.sync_layout()?;
         if same_sources {
             return Ok(());
         }
@@ -811,6 +926,7 @@ impl ImageView {
         self.primary.set(false);
         self.loaded.set(false);
         self.data.borrow_mut().take();
+        self.sync_layout()?;
         // A pixel buffer swaps in synchronously: keep the previous frame on
         // screen until the new one is set, so a per-frame source does not
         // flash blank between the reset and the set.
@@ -929,6 +1045,7 @@ impl ImageView {
                 } else {
                     self.primary.set(true);
                     *self.data.borrow_mut() = Some(data.clone());
+                    self.sync_layout()?;
                     self.native
                         .borrow()
                         .set_attribute(A::ImageSrc, (&decoded.descriptor).into())?;

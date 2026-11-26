@@ -369,7 +369,7 @@ impl Node {
         if let Some(input) = self.input.borrow().as_ref() {
             input.layout(event, self.scale.get())?;
         } else if let Some(image) = self.image.borrow().as_ref() {
-            event.layout_child(&image.native.borrow(), 0, 0)?;
+            image.layout(event, self.scale.get())?;
         } else if let Some(scroll) = self.scroll.borrow().as_ref() {
             event.layout_child(&scroll.mounted().borrow(), 0, 0)?;
         } else {

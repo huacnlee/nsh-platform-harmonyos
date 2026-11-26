@@ -169,11 +169,49 @@ pub(crate) fn local_point(matrix: &[f64; 16], point: (f32, f32)) -> Option<(f32,
         .then_some((x as f32, y as f32))
 }
 
+/// Computes the fitted child rectangle (in vp) for an `Image` with the given
+/// `ResizeMode` and `ObjectPosition`, returning `None` when natural or
+/// container dimensions are unavailable.
+#[allow(dead_code)]
+pub(crate) fn image_fit(
+    mode: nsh_core::ResizeMode,
+    position: nsh_core::ObjectPosition,
+    natural: Option<nsh_core::Size<nsh_core::Points>>,
+    container: Size,
+) -> Option<Rect> {
+    if !container.width.is_finite()
+        || !container.height.is_finite()
+        || container.width <= 0.0
+        || container.height <= 0.0
+    {
+        return None;
+    }
+    let natural = natural?;
+    if !natural.width.0.is_finite()
+        || !natural.height.0.is_finite()
+        || natural.width.0 <= 0.0
+        || natural.height.0 <= 0.0
+    {
+        return None;
+    }
+    let box_size = nsh_core::Size::new(
+        nsh_core::Points(container.width),
+        nsh_core::Points(container.height),
+    );
+    let bounds = mode.fit(natural, box_size, position);
+    Some(Rect {
+        x: bounds.origin.x.0,
+        y: bounds.origin.y.0,
+        width: bounds.size.width.0,
+        height: bounds.size.height.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        WindowRect, full_window_matches, local_point, page_point, visual_insets,
-        window_avoid_insets,
+        Rect, Size, WindowRect, full_window_matches, image_fit, local_point, page_point,
+        visual_insets, window_avoid_insets,
     };
 
     fn rect(x: f64, y: f64, width: f64, height: f64) -> WindowRect {
@@ -345,6 +383,82 @@ mod tests {
         assert_eq!(
             visual_insets(rect(-100.0, 0.0, 2400.0, 1080.0), [left_cutout]),
             [0.0, 0.0, 0.0, 60.0]
+        );
+    }
+
+    #[test]
+    fn image_fit_resolves_cover_contain_and_object_position_edges() {
+        use nsh_core::{ObjectPosition, Points, ResizeMode, Size as CoreSize};
+        let tall = Some(CoreSize::new(Points(100.0), Points(300.0)));
+        let box_sq = Size::new(100.0, 100.0);
+
+        // Cover: 100x300 in 100x100 -> 100x300; top anchors at y=0, bottom at y=-200, center at y=-100.
+        let top = image_fit(
+            ResizeMode::Cover,
+            ObjectPosition::parse("center top").unwrap(),
+            tall,
+            box_sq,
+        )
+        .unwrap();
+        assert_eq!(top, Rect { x: 0.0, y: 0.0, width: 100.0, height: 300.0 });
+
+        let bottom = image_fit(
+            ResizeMode::Cover,
+            ObjectPosition::parse("center bottom").unwrap(),
+            tall,
+            box_sq,
+        )
+        .unwrap();
+        assert_eq!(
+            bottom,
+            Rect { x: 0.0, y: -200.0, width: 100.0, height: 300.0 }
+        );
+
+        let center = image_fit(ResizeMode::Cover, ObjectPosition::default(), tall, box_sq).unwrap();
+        assert_eq!(
+            center,
+            Rect { x: 0.0, y: -100.0, width: 100.0, height: 300.0 }
+        );
+
+        // Contain with right-edge length offset: 100x200 in 200x200 -> 100x200; right 10px -> x = 90.
+        let contain = image_fit(
+            ResizeMode::Contain,
+            ObjectPosition::parse("right 10px top 0px").unwrap(),
+            Some(CoreSize::new(Points(100.0), Points(200.0))),
+            Size::new(200.0, 200.0),
+        )
+        .unwrap();
+        assert_eq!(
+            contain,
+            Rect { x: 90.0, y: 0.0, width: 100.0, height: 200.0 }
+        );
+
+        // Stretch fills container regardless of position.
+        let stretch = image_fit(
+            ResizeMode::Stretch,
+            ObjectPosition::parse("right bottom").unwrap(),
+            tall,
+            box_sq,
+        )
+        .unwrap();
+        assert_eq!(
+            stretch,
+            Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }
+        );
+
+        // Unknown natural size or empty container yields None.
+        assert_eq!(
+            image_fit(ResizeMode::Cover, ObjectPosition::default(), None, box_sq),
+            None
+        );
+        assert_eq!(
+            image_fit(
+                ResizeMode::Cover,
+                ObjectPosition::default(),
+                tall,
+                Size::new(0.0, 100.0)
+            ),
+            None
         );
     }
 }
