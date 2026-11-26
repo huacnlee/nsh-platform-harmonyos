@@ -801,7 +801,6 @@ fn build_file_type_skills(
             }
             decl.insert("Description".to_owned(), Value::String(ft.name.clone()));
             decl.insert("ReferenceURL".to_owned(), Value::String(String::new()));
-            decl.insert("IconFile".to_owned(), Value::String(String::new()));
             custom_utds.push(Value::Object(decl));
             push_unique_string(&mut view_types, type_id.clone());
             push_unique_string(&mut send_utds, type_id);
@@ -2513,6 +2512,25 @@ mod tests {
             utd["UniformDataTypeDeclarations"][0]["MIMETypes"],
             json!(["application/x-nsh-note"])
         );
+        // HarmonyOS hvigor UTD schema rejects unknown keys such as `IconFile`.
+        let allowed_utd_keys = [
+            "TypeId",
+            "BelongingToTypes",
+            "FilenameExtensions",
+            "MIMETypes",
+            "Description",
+            "ReferenceURL",
+        ];
+        for key in utd["UniformDataTypeDeclarations"][0]
+            .as_object()
+            .unwrap()
+            .keys()
+        {
+            assert!(
+                allowed_utd_keys.contains(&key.as_str()),
+                "unexpected utd.json5 key: {key}"
+            );
+        }
 
         let runtime_types_path = join_all(
             &out,
