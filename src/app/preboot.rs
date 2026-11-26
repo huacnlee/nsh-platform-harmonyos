@@ -19,6 +19,37 @@ use std::{
 
 use nsh_core::MountBatch;
 
+/// Absolute cold-start deadline shared across resource read, engine boot, and
+/// initial first-frame mount wait so the slow path never gets a second budget.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ColdDeadline {
+    started_at: Instant,
+    deadline: Instant,
+}
+
+impl ColdDeadline {
+    pub(crate) fn new(budget: Duration) -> Self {
+        let started_at = Instant::now();
+        Self {
+            started_at,
+            deadline: started_at + budget,
+        }
+    }
+
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_expired(&self) -> bool {
+        Instant::now() >= self.deadline
+    }
+
+    pub(crate) fn elapsed(&self) -> Duration {
+        self.started_at.elapsed()
+    }
+}
+
 /// Outcome of waiting on [`MountGate::wait_first_frame`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitReady {
@@ -173,8 +204,16 @@ impl<D> MountGate<D> {
 
     /// Waits up to `timeout` for the engine's first `MountBatch` or the end of
     /// its initial synchronous boot pass.
+    #[allow(dead_code)]
     pub(crate) fn wait_first_frame(&self, timeout: Duration) -> WaitReady {
-        let deadline = Instant::now() + timeout;
+        self.wait_first_frame_until(ColdDeadline::new(timeout))
+    }
+
+    /// Waits until `deadline` for the engine's first `MountBatch` or the end of
+    /// its initial synchronous boot pass. Returns immediately when `deadline`
+    /// has already elapsed without blocking, while still observing a batch or
+    /// flush that is already ready.
+    pub(crate) fn wait_first_frame_until(&self, deadline: ColdDeadline) -> WaitReady {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if state.first_batch_seen {
@@ -183,9 +222,10 @@ impl<D> MountGate<D> {
             if state.boot_settled || matches!(state.mode, Mode::Closed) {
                 return WaitReady::BootFlushed;
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
                 return WaitReady::TimedOut;
-            };
+            }
             let (guard, result) = self
                 .ready
                 .wait_timeout(state, remaining)
@@ -285,14 +325,21 @@ impl<T> ColdReadSlot<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn wait_timeout(&self, timeout: Duration) -> Option<T> {
-        let deadline = Instant::now() + timeout;
+        self.wait_until(ColdDeadline::new(timeout))
+    }
+
+    pub(crate) fn wait_until(&self, deadline: ColdDeadline) -> Option<T> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(value) = state.value.take() {
                 return Some(value);
             }
-            let remaining = deadline.checked_duration_since(Instant::now())?;
+            let remaining = deadline.remaining();
+            if remaining.is_zero() {
+                return None;
+            }
             let (guard, result) = self
                 .ready
                 .wait_timeout(state, remaining)
@@ -470,6 +517,47 @@ mod tests {
         });
         let value = poll_ready(slow.into_future());
         assert_eq!(value, 99);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn shared_cold_deadline_never_grants_a_second_budget_on_slow_path() {
+        // 1. Resource consumes the whole budget -> deadline expires -> first-frame
+        //    wait must return TimedOut immediately without blocking again.
+        let deadline = ColdDeadline::new(Duration::from_millis(15));
+        let slot = ColdReadSlot::<u32>::new();
+        assert_eq!(slot.wait_until(deadline), None);
+        assert!(deadline.is_expired());
+
+        let gate = MountGate::<()>::new_buffering();
+        let wait_start = Instant::now();
+        assert_eq!(gate.wait_first_frame_until(deadline), WaitReady::TimedOut);
+        assert!(
+            wait_start.elapsed() < Duration::from_millis(10),
+            "expired deadline must not block again"
+        );
+
+        // 2. If a batch was already submitted before an expired deadline check,
+        //    wait_first_frame_until still reports FirstBatch without blocking.
+        gate.on_submit(empty_batch(), |_, _| {});
+        assert_eq!(gate.wait_first_frame_until(deadline), WaitReady::FirstBatch);
+
+        // 3. Fast resource leaves remaining budget for first-frame wait.
+        let fast_deadline = ColdDeadline::new(Duration::from_millis(80));
+        let fast_slot = ColdReadSlot::<u32>::new();
+        fast_slot.complete(7);
+        assert_eq!(fast_slot.wait_until(fast_deadline), Some(7));
+        assert!(fast_deadline.remaining() > Duration::ZERO);
+        let fast_gate = MountGate::<()>::new_buffering();
+        let producer = fast_gate.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            producer.on_submit(empty_batch(), |_, _| {});
+        });
+        assert_eq!(
+            fast_gate.wait_first_frame_until(fast_deadline),
+            WaitReady::FirstBatch
+        );
         handle.join().unwrap();
     }
 

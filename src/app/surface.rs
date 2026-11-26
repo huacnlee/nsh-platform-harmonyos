@@ -626,14 +626,13 @@ impl State {
         Ok(Some((window_px, Size::new(width, height))))
     }
     fn accept_app(&mut self, env: Env, app: App) -> Result<()> {
-        self.accept_app_with_budget(env, app, COLD_START_BUDGET, None)
+        self.accept_app_with_deadline(env, app, None)
     }
-    fn accept_app_with_budget(
+    fn accept_app_with_deadline(
         &mut self,
         env: Env,
         mut app: App,
-        cold_budget: std::time::Duration,
-        cold_start_at: Option<std::time::Instant>,
+        cold_deadline: Option<crate::app::preboot::ColdDeadline>,
     ) -> Result<()> {
         self.check()?;
         let cold_viewport = self.cold_start_viewport()?;
@@ -649,7 +648,9 @@ impl State {
         app.grant(granted);
         self.errors.clear();
         if let Some((window_px, size)) = cold_viewport {
-            return self.start_cold(env, app, window_px, size, cold_budget, cold_start_at);
+            let deadline = cold_deadline
+                .unwrap_or_else(|| crate::app::preboot::ColdDeadline::new(COLD_START_BUDGET));
+            return self.start_cold(env, app, window_px, size, deadline);
         }
         self.phase = SurfacePhase::Staged(Box::new(app));
         self.start(env)
@@ -660,8 +661,7 @@ impl State {
         app: App,
         window_px: (i32, i32),
         size: Size,
-        budget: std::time::Duration,
-        cold_start_at: Option<std::time::Instant>,
+        deadline: crate::app::preboot::ColdDeadline,
     ) -> Result<()> {
         self.check()?;
         let pending_urls = std::mem::take(&mut self.pending_urls);
@@ -678,9 +678,9 @@ impl State {
             Some(flush_guard),
             true,
         )?;
-        let wait = gate.wait_first_frame(budget);
+        let wait = gate.wait_first_frame_until(deadline);
         let engine_ms = engine_start.elapsed().as_millis();
-        let total_ms = cold_start_at.map_or(engine_ms, |t| t.elapsed().as_millis());
+        let total_ms = deadline.elapsed().as_millis();
         log::info!(
             "OHOS cold start first-frame: {wait:?} (engine={engine_ms}ms, total={total_ms}ms, window={}x{})",
             window_px.0,
@@ -1361,8 +1361,11 @@ impl NshSurface {
         };
         let chunks = crate::app::chunks::ResourceChunks::new(host.clone(), &name);
         let entry_chunks_loader = chunks.clone();
-        if cold_start && let Ok(pool) = crate::services::executor::Executor::assets() {
-            let start = std::time::Instant::now();
+        let cold_deadline =
+            cold_start.then(|| crate::app::preboot::ColdDeadline::new(COLD_START_BUDGET));
+        if let Some(deadline) = cold_deadline
+            && let Ok(pool) = crate::services::executor::Executor::assets()
+        {
             let slot = crate::app::preboot::ColdReadSlot::new();
             let worker_slot = slot.clone();
             let worker_host = host.clone();
@@ -1395,8 +1398,7 @@ impl NshSurface {
                     |_, outcome| outcome,
                 );
             }
-            if let Some(result) = slot.wait_timeout(COLD_START_BUDGET) {
-                let remaining = COLD_START_BUDGET.saturating_sub(start.elapsed());
+            if let Some(result) = slot.wait_until(deadline) {
                 let outcome = {
                     let mut state = self.state.try_borrow_mut().map_err(reentry)?;
                     if state.generation.load(Ordering::Acquire) != token {
@@ -1428,7 +1430,7 @@ impl NshSurface {
                                     if !is_package {
                                         app.chunks = Some(chunks);
                                     }
-                                    state.accept_app_with_budget(*env, app, remaining, Some(start))
+                                    state.accept_app_with_deadline(*env, app, Some(deadline))
                                 });
                         if let Err(error) = &result {
                             state.errors.report(error.to_string());
@@ -1470,7 +1472,7 @@ impl NshSurface {
                         if !is_package {
                             app.chunks = Some(chunks);
                         }
-                        state.accept_app(*env, app)
+                        state.accept_app_with_deadline(*env, app, Some(deadline))
                     });
                 if let Err(error) = &result {
                     state.errors.report(error.to_string());
@@ -1533,7 +1535,7 @@ impl NshSurface {
                     if !is_package {
                         app.chunks = Some(chunks);
                     }
-                    state.accept_app(*env, app)
+                    state.accept_app_with_deadline(*env, app, cold_deadline)
                 });
             if let Err(error) = &result {
                 state.errors.report(error.to_string());

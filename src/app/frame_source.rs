@@ -171,10 +171,6 @@ impl RateDriver {
         self.request()
     }
 
-    pub(crate) fn active(&self) -> bool {
-        self.pending.lock().unwrap().active
-    }
-
     pub(crate) fn retire(self: &Arc<Self>, epoch: u64) -> Result<()> {
         let mut pending = self.pending.lock().unwrap();
         pending.reclaim = Some(pending.reclaim.map_or(epoch, |old| old.max(epoch)));

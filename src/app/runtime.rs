@@ -435,6 +435,7 @@ struct State {
     attached: bool,
     visible: bool,
     frame_wanted: bool,
+    ui_active: bool,
     retiring_dispatcher: Option<Arc<Dispatcher>>,
     #[cfg(feature = "dev")]
     reload: Option<(u64, std::sync::Weak<crate::app::surface::Queue>)>,
@@ -720,6 +721,7 @@ impl State {
             }
             Message::RequestFrame => self.request_frame()?,
             Message::EngineFrameRequested => {
+                self.frame_rate.record_engine_request();
                 if self.laid_out
                     && self.is_active()
                     && self.engine_in_flight == 0
@@ -798,6 +800,7 @@ impl State {
             }
             log::warn!("OHOS mount resource skipped: {error}");
         }
+        self.frame_rate.record_mount_request();
         self.request_frame()?;
         Ok(())
     }
@@ -902,8 +905,7 @@ impl State {
         });
     }
     fn step_frame(&mut self, timestamp: u64) -> Result<bool> {
-        let rate_driver = self.rate_driver.as_ref().unwrap().clone();
-        if !self.is_active() || !rate_driver.active() {
+        if !self.is_active() || !self.ui_active {
             return Ok(false);
         }
         if std::mem::take(&mut self.engine_wanted) {
@@ -918,39 +920,43 @@ impl State {
             worker.frame(timestamp);
         }
         self.native_demand = sampled.as_ref().copied().unwrap_or_default();
+        if self.native_demand != super::frame_rate::UiDemand::Idle {
+            self.frame_rate.record_animation_frame();
+        }
         let retired = self.retire();
         let scheduled = self.schedule_frame();
         self.update_back();
         sampled?;
         retired?;
         scheduled?;
-        Ok(rate_driver.active())
+        Ok(self.ui_active)
     }
     fn request_frame(&mut self) -> Result<()> {
         self.frame_wanted = true;
         self.schedule_frame()
     }
     fn schedule_frame(&mut self) -> Result<()> {
-        use super::frame_rate::UiDemand;
-        let demand = if self.engine_wanted || self.engine_in_flight > 0 || self.frame_wanted {
-            UiDemand::Uncapped
-        } else {
-            self.native_demand
-        };
-        self.frame_rate.set_ui_demand(demand);
-        let active =
-            self.is_active() && (demand != UiDemand::Idle || self.frame_rate.has_shader_demand());
+        let schedule = super::frame_rate::classify_frame_schedule(
+            self.is_active(),
+            self.engine_wanted || self.engine_in_flight > 0,
+            self.native_demand,
+            self.frame_rate.has_shader_demand(),
+            self.frame_wanted,
+        );
+        self.frame_rate.set_ui_demand(schedule.rate_demand);
         let rate_driver = self.rate_driver.as_ref().unwrap();
-        rate_driver.set_active(active)?;
+        rate_driver.set_active(schedule.rate_active)?;
         if let Err(error) = self
             .phase
             .as_ref()
             .unwrap()
-            .set_running(active, self.frame_rate.desired_range())
+            .set_running(schedule.ui_active, self.frame_rate.desired_range())
         {
+            self.ui_active = false;
             let _ = rate_driver.set_active(false);
             return Err(error.into());
         }
+        self.ui_active = schedule.ui_active;
         Ok(())
     }
     fn retire(&mut self) -> Result<()> {
@@ -972,6 +978,7 @@ impl State {
         self.engine_wanted = false;
         self.engine_in_flight = 0;
         self.frame_wanted = false;
+        self.ui_active = false;
         self.native_demand = super::frame_rate::UiDemand::Idle;
         self.frame_rate
             .set_ui_demand(crate::app::frame_rate::UiDemand::Idle);
@@ -1489,6 +1496,7 @@ impl Runtime {
             attached,
             visible,
             frame_wanted: false,
+            ui_active: false,
             retiring_dispatcher: None,
             environment: Environment::default(),
             #[cfg(feature = "dev")]

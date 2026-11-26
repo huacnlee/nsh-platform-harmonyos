@@ -4,7 +4,11 @@
 //! after an actual NativeVSync callback, and releases it when that source stops.
 //! Idle boundaries survive coalescing; the applied cache records only success.
 
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+    mpsc,
+};
 
 #[cfg(target_env = "ohos")]
 use ohos_vsync_binding::{OH_NativeVSync_ExpectedRateRange, Vsync};
@@ -54,6 +58,83 @@ impl UiDemand {
             (Self::Idle, demand) | (demand, Self::Idle) => demand,
             (Self::Uncapped, _) | (_, Self::Uncapped) => Self::Uncapped,
             (Self::Capped(left), Self::Capped(right)) => Self::Capped(left.max(right)),
+        }
+    }
+}
+
+/// Scheduling split between sustained `NativeVSync` high-refresh voting and
+/// ArkTS `DisplaySync` UI frame sampling.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameSchedule {
+    pub(crate) rate_demand: UiDemand,
+    pub(crate) rate_active: bool,
+    pub(crate) ui_active: bool,
+}
+
+/// Distinguishes sustained animation/rAF/shader demand (which votes for high
+/// refresh via `NativeVSync`) from discrete one-shot UI updates (`frame_wanted`,
+/// which only sample `DisplaySync` at the idle baseline without toggling
+/// `OH_NativeVSync_SetExpectedFrameRateRange`).
+pub(crate) fn classify_frame_schedule(
+    is_active: bool,
+    engine_active: bool,
+    native_demand: UiDemand,
+    has_shader_demand: bool,
+    frame_wanted: bool,
+) -> FrameSchedule {
+    let rate_demand = if engine_active {
+        UiDemand::Uncapped
+    } else {
+        native_demand
+    };
+    let rate_active = is_active && (rate_demand != UiDemand::Idle || has_shader_demand);
+    let ui_active = rate_active || (is_active && frame_wanted);
+    FrameSchedule {
+        rate_demand,
+        rate_active,
+        ui_active,
+    }
+}
+
+/// Diagnostic counters for frame demand sources and native rate setter IPCs
+/// (read-on-demand only; never logged per frame).
+#[derive(Default)]
+struct RateCounters {
+    mount_requests: AtomicU64,
+    engine_requests: AtomicU64,
+    animation_frames: AtomicU64,
+    shader_votes_added: AtomicU64,
+    publish_calls: AtomicU64,
+    release_calls: AtomicU64,
+    setter_calls: AtomicU64,
+    setter_failures: AtomicU64,
+}
+
+/// Point-in-time snapshot of [`FrameRate`] demand and IPC counters.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RateMetrics {
+    pub(crate) mount_requests: u64,
+    pub(crate) engine_requests: u64,
+    pub(crate) animation_frames: u64,
+    pub(crate) shader_votes_added: u64,
+    pub(crate) publish_calls: u64,
+    pub(crate) release_calls: u64,
+    pub(crate) setter_calls: u64,
+    pub(crate) setter_failures: u64,
+}
+
+impl RateCounters {
+    fn snapshot(&self) -> RateMetrics {
+        RateMetrics {
+            mount_requests: self.mount_requests.load(Ordering::Relaxed),
+            engine_requests: self.engine_requests.load(Ordering::Relaxed),
+            animation_frames: self.animation_frames.load(Ordering::Relaxed),
+            shader_votes_added: self.shader_votes_added.load(Ordering::Relaxed),
+            publish_calls: self.publish_calls.load(Ordering::Relaxed),
+            release_calls: self.release_calls.load(Ordering::Relaxed),
+            setter_calls: self.setter_calls.load(Ordering::Relaxed),
+            setter_failures: self.setter_failures.load(Ordering::Relaxed),
         }
     }
 }
@@ -196,6 +277,7 @@ pub(crate) struct FrameRate {
     sink: Arc<dyn RateSink>,
     state: Arc<Mutex<State>>,
     updates: RateUpdates,
+    counters: Arc<RateCounters>,
 }
 
 /// NativeVSync's range setter calls RS SyncFrameRateRange with TF_SYNC. Keep
@@ -207,6 +289,7 @@ impl RateUpdates {
     fn spawn(
         sink: Arc<dyn RateSink>,
         state: Arc<Mutex<State>>,
+        counters: Arc<RateCounters>,
     ) -> std::io::Result<(Self, std::thread::JoinHandle<()>)> {
         let (send, receive) = mpsc::sync_channel(1);
         let worker = std::thread::Builder::new()
@@ -224,10 +307,12 @@ impl RateUpdates {
                             continue;
                         }
                         // No arbitration lock is held while RS processes its IPC.
+                        counters.setter_calls.fetch_add(1, Ordering::Relaxed);
                         let status = Self::apply_range(&*sink, range);
                         if status == 0 {
                             state.lock().unwrap().applied = Some(range);
                         } else {
+                            counters.setter_failures.fetch_add(1, Ordering::Relaxed);
                             state.lock().unwrap().pending.retry(update);
                             log::warn!("OHOS VSync rate vote failed: {status}");
                             // Only another publication wakes a retry. There is
@@ -270,11 +355,13 @@ impl FrameRate {
             applied: None,
             pending: PendingRates::default(),
         }));
-        let (updates, _) = RateUpdates::spawn(sink.clone(), state.clone())?;
+        let counters = Arc::new(RateCounters::default());
+        let (updates, _) = RateUpdates::spawn(sink.clone(), state.clone(), counters.clone())?;
         Ok(Arc::new(Self {
             sink,
             state,
             updates,
+            counters,
         }))
     }
 
@@ -283,11 +370,37 @@ impl FrameRate {
     pub(crate) fn apply_initial(&self) -> i32 {
         // Called once before either UI or shader frame demand can be published.
         let desired = self.state.lock().unwrap().idle();
+        self.counters.setter_calls.fetch_add(1, Ordering::Relaxed);
         let status = RateUpdates::apply_range(&*self.sink, desired);
         if status == 0 {
             self.state.lock().unwrap().applied = Some(desired);
+        } else {
+            self.counters
+                .setter_failures
+                .fetch_add(1, Ordering::Relaxed);
         }
         status
+    }
+
+    pub(crate) fn record_mount_request(&self) {
+        self.counters.mount_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_engine_request(&self) {
+        self.counters
+            .engine_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_animation_frame(&self) {
+        self.counters
+            .animation_frames
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn metrics(&self) -> RateMetrics {
+        self.counters.snapshot()
     }
 
     pub(crate) fn set_ui_demand(&self, demand: UiDemand) {
@@ -300,6 +413,7 @@ impl FrameRate {
     /// RS has refreshed this connection's request time before this vote arrives.
     /// The source serializes this with release and its active-state changes.
     pub(crate) fn publish_frame(&self) {
+        self.counters.publish_calls.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         self.maybe_refresh_hz(&mut state);
         state.pending.frame = Some(state.desired());
@@ -310,6 +424,7 @@ impl FrameRate {
     /// after a background/foreground transition. A later publish cannot erase
     /// this Idle boundary while its IPC is pending.
     pub(crate) fn release(&self) {
+        self.counters.release_calls.fetch_add(1, Ordering::Relaxed);
         let mut state = self.state.lock().unwrap();
         self.maybe_refresh_hz(&mut state);
         let idle = state.idle();
@@ -339,6 +454,9 @@ impl FrameRate {
     fn update_vote(&self, delta: isize) {
         let mut state = self.state.lock().unwrap();
         if delta > 0 {
+            self.counters
+                .shader_votes_added
+                .fetch_add(delta as u64, Ordering::Relaxed);
             state.shader_votes = state.shader_votes.saturating_add(delta as usize);
         } else if delta < 0 {
             state.shader_votes = state.shader_votes.saturating_sub((-delta) as usize);
@@ -492,11 +610,14 @@ mod tests {
             applied: None,
             pending: PendingRates::default(),
         }));
-        let (updates, worker) = RateUpdates::spawn(sink.clone(), state.clone()).unwrap();
+        let counters = Arc::new(RateCounters::default());
+        let (updates, worker) =
+            RateUpdates::spawn(sink.clone(), state.clone(), counters.clone()).unwrap();
         let rate = Arc::new(FrameRate {
             sink,
             state,
             updates,
+            counters,
         });
         assert_eq!(rate.apply_initial(), 0);
         (rate, worker)
@@ -795,5 +916,54 @@ mod tests {
         assert_eq!(normalize_display_hz(10), 30);
         assert_eq!(normalize_display_hz(120), 120);
         assert_eq!(normalize_display_hz(360), 240);
+    }
+
+    #[test]
+    fn discrete_frame_wanted_samples_ui_without_voting_high_refresh_rate() {
+        let sink = MockSink::new();
+        let (rate, worker) = start(sink.clone());
+
+        // Simulate 20 periodic mount batches (e.g. 60 ms store snapshots) with
+        // no running animation, rAF, or active shader.
+        for _ in 0..20 {
+            rate.record_mount_request();
+            let sched = classify_frame_schedule(true, false, UiDemand::Idle, false, true);
+            assert_eq!(sched.rate_demand, UiDemand::Idle);
+            assert!(!sched.rate_active);
+            assert!(sched.ui_active);
+            rate.set_ui_demand(sched.rate_demand);
+            assert_eq!(rate.desired_range(), IDLE);
+        }
+
+        // Continuous animation activates both NativeVSync voting and UI sampling.
+        let anim = classify_frame_schedule(true, false, UiDemand::Capped(30), false, false);
+        assert_eq!(anim.rate_demand, UiDemand::Capped(30));
+        assert!(anim.rate_active);
+        assert!(anim.ui_active);
+
+        // Continuous engine rAF activates Uncapped high-refresh voting.
+        let raf = classify_frame_schedule(true, true, UiDemand::Idle, false, false);
+        assert_eq!(raf.rate_demand, UiDemand::Uncapped);
+        assert!(raf.rate_active);
+        assert!(raf.ui_active);
+
+        // Active shader activates high-refresh voting even without UI animation.
+        let shader = classify_frame_schedule(true, false, UiDemand::Idle, true, false);
+        assert!(shader.rate_active);
+        assert!(shader.ui_active);
+
+        // Background disables both rate voting and UI sampling.
+        let bg = classify_frame_schedule(false, true, UiDemand::Uncapped, true, true);
+        assert!(!bg.rate_active);
+        assert!(!bg.ui_active);
+
+        let metrics = rate.metrics();
+        assert_eq!(metrics.mount_requests, 20);
+        assert_eq!(metrics.publish_calls, 0);
+        assert_eq!(metrics.release_calls, 0);
+        // Only the single initial baseline setter call occurred.
+        assert_eq!(metrics.setter_calls, 1);
+        assert_eq!(finish(rate, worker), Some(IDLE));
+        assert_eq!(*sink.calls.lock().unwrap(), [IDLE]);
     }
 }
