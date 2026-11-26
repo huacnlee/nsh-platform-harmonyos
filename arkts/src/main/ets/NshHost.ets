@@ -612,9 +612,13 @@ class HostSession {
     if (this.closed || !this.isDesktop) {
       return;
     }
-    try {
-      this.mainWindow.showWindow().catch((): void => {});
-    } catch {}
+    if (this.desktop) {
+      this.desktop.revealMainWindow();
+    } else {
+      try {
+        this.mainWindow.showWindow().catch((): void => {});
+      } catch {}
+    }
     const args: string[] = [];
     if (Array.isArray(rawArgs)) {
       for (let i = 0; i < rawArgs.length; i++) {

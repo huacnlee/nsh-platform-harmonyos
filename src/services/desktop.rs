@@ -2788,4 +2788,43 @@ mod tests {
                 .unwrap();
         assert_eq!(sub_parent["parentWindowId"], 10);
     }
+
+    #[test]
+    fn window_requests_and_hidden_state_preserve_visibility_semantics() {
+        for (request, expected_action) in [
+            (WindowRequest::Show, "show"),
+            (WindowRequest::Hide, "hide"),
+            (WindowRequest::Focus, "focus"),
+            (WindowRequest::Minimize, "minimize"),
+            (WindowRequest::Restore, "restore"),
+        ] {
+            let wire = serde_json::to_value(wire_request(&request)).unwrap();
+            assert_eq!(wire["op"], "request");
+            assert_eq!(wire["action"], expected_action);
+            assert!(wire.get("windowId").is_none());
+        }
+
+        let DesktopEvent::WindowState(hidden) = parse_desktop_event(
+            "window-state",
+            r#"{"mode":"normal","minimized":false,"visible":false,"focused":false,"bounds":{"x":0,"y":0,"width":900,"height":600},"displayName":"display-0","scaleFactor":2.0}"#,
+        )
+        .unwrap() else {
+            panic!("expected window-state");
+        };
+        assert!(!hidden.minimized);
+        assert!(!hidden.visible);
+        assert!(!hidden.focused);
+
+        let DesktopEvent::WindowState(minimized) = parse_desktop_event(
+            "window-state",
+            r#"{"mode":"maximized","minimized":true,"visible":true,"focused":true,"bounds":{"x":0,"y":0,"width":900,"height":600},"displayName":"display-0","scaleFactor":2.0}"#,
+        )
+        .unwrap() else {
+            panic!("expected window-state");
+        };
+        assert_eq!(minimized.mode, WindowMode::Maximized);
+        assert!(minimized.minimized);
+        assert!(!minimized.visible);
+        assert!(!minimized.focused);
+    }
 }

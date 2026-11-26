@@ -1897,6 +1897,8 @@ export class NativeDesktop {
   private visible: boolean = true;
   private mode: string = "normal";
   private minimized: boolean = false;
+  private hiddenByApp: boolean = false;
+  private hiddenByAbility: boolean = false;
   private normalBounds?: WireBoundsPayload;
   private defaultLimits?: window.WindowLimits;
   private mainQueue: Promise<void> = Promise.resolve();
@@ -1935,9 +1937,7 @@ export class NativeDesktop {
     } else if (this.mainParked) {
       this.emit("reopen", "{}");
     } else {
-      try {
-        this.mainWindow.showWindow().catch((): void => {});
-      } catch {}
+      this.revealMainWindow();
     }
   };
 
@@ -2002,11 +2002,15 @@ export class NativeDesktop {
     switch (event) {
       case window.WindowEventType.WINDOW_SHOWN:
         this.visible = true;
+        this.hiddenByApp = false;
+        this.hiddenByAbility = false;
         break;
       case window.WindowEventType.WINDOW_ACTIVE:
         this.visible = true;
         this.focused = true;
         this.minimized = false;
+        this.hiddenByApp = false;
+        this.hiddenByAbility = false;
         break;
       case window.WindowEventType.WINDOW_INACTIVE:
         this.focused = false;
@@ -2722,6 +2726,88 @@ export class NativeDesktop {
       });
   }
 
+  revealMainWindow(): void {
+    if (this.closed || this.mainParked) {
+      return;
+    }
+    this.enqueueMain(async (): Promise<void> => {
+      await this.revealMainWindowAsync();
+    });
+  }
+
+  private isMainWindowMinimized(): boolean {
+    if (this.minimized) {
+      return true;
+    }
+    try {
+      return this.mainWindow.getWindowStatus() === window.WindowStatusType.MINIMIZE;
+    } catch {
+      return false;
+    }
+  }
+
+  private async hideMainWindowAsync(): Promise<void> {
+    await this.trayQueue.catch((): void => {});
+    if (this.closed || this.mainParked) {
+      return;
+    }
+    this.hiddenByApp = true;
+    this.hiddenByAbility = false;
+    this.closePopupMenuOnly();
+    this.closeMenuBarDropdown(false);
+    if (this.subWindows.size === 0 && this.trayAdded) {
+      try {
+        await this.abilityContext.hideAbility();
+        this.hiddenByAbility = true;
+        this.visible = false;
+        this.focused = false;
+        this.syncWindowState();
+        return;
+      } catch {}
+    }
+    try {
+      await this.mainWindow.minimize();
+    } catch {}
+    this.visible = false;
+    this.focused = false;
+    this.syncWindowState();
+  }
+
+  private async revealMainWindowAsync(): Promise<void> {
+    if (this.closed || this.mainParked) {
+      return;
+    }
+    const wasHiddenByAbility = this.hiddenByAbility;
+    const wasMinimized = this.isMainWindowMinimized();
+    this.hiddenByApp = false;
+    this.hiddenByAbility = false;
+    if (wasHiddenByAbility) {
+      try {
+        await this.abilityContext.showAbility();
+      } catch {}
+    }
+    if (wasMinimized || this.isMainWindowMinimized()) {
+      try {
+        await this.mainWindow.restore();
+      } catch {
+        try {
+          await this.mainWindow.recover();
+        } catch {}
+      }
+    }
+    try {
+      await this.mainWindow.showWindow();
+    } catch {}
+    try {
+      this.visible = this.mainWindow.isWindowShowing();
+      this.focused = this.mainWindow.isFocused();
+    } catch {}
+    try {
+      this.applyWindowStatus(this.mainWindow.getWindowStatus());
+    } catch {}
+    this.syncWindowState();
+  }
+
   private applyRequest(cmd: WireCommand): void {
     if (cmd.action === "setBounds") {
       this.pendingMainBounds = cmd;
@@ -2745,31 +2831,30 @@ export class NativeDesktop {
     switch (cmd.action) {
       case "show":
       case "focus":
+      case "restore":
         this.enqueueMain(async (): Promise<void> => {
-          try {
-            await this.mainWindow.showWindow();
-          } catch {}
-          this.syncWindowState();
+          await this.revealMainWindowAsync();
         });
         break;
       case "hide":
+        this.enqueueMain(async (): Promise<void> => {
+          await this.hideMainWindowAsync();
+        });
+        break;
       case "minimize":
         this.enqueueMain(async (): Promise<void> => {
+          this.hiddenByApp = false;
+          this.hiddenByAbility = false;
           try {
             await this.mainWindow.minimize();
           } catch {}
-          this.syncWindowState();
-        });
-        break;
-      case "restore":
-        this.enqueueMain(async (): Promise<void> => {
           try {
-            await this.mainWindow.restore();
-          } catch {
-            try {
-              await this.mainWindow.recover();
-            } catch {}
-          }
+            this.visible = this.mainWindow.isWindowShowing();
+            this.focused = this.mainWindow.isFocused();
+          } catch {}
+          try {
+            this.applyWindowStatus(this.mainWindow.getWindowStatus());
+          } catch {}
           this.syncWindowState();
         });
         break;
@@ -2809,6 +2894,8 @@ export class NativeDesktop {
   private parkMainWindow(hasOpenSubWindows: boolean): void {
     this.mainParked = true;
     this.reopenEmittedWhileParked = false;
+    this.hiddenByApp = false;
+    this.hiddenByAbility = false;
     this.closePopupMenuOnly();
     this.closeMenuBarDropdown(false);
     this.frameNone = false;
@@ -2821,9 +2908,9 @@ export class NativeDesktop {
     this.backdrop = "none";
     this.lastWindowStateJson = "";
     this.lastTitleBarJson = "";
-    const useHideAbility = !hasOpenSubWindows && this.trayAdded;
     this.enqueueMain(async (): Promise<void> => {
-      if (!this.mainParked) {
+      await this.trayQueue.catch((): void => {});
+      if (!this.mainParked || this.closed) {
         return;
       }
       try {
@@ -2839,9 +2926,10 @@ export class NativeDesktop {
         this.backgroundOverridden = false;
         this.applyOpaqueBackground();
       }
-      if (useHideAbility) {
+      if (!hasOpenSubWindows && this.subWindows.size === 0 && this.trayAdded) {
         try {
           await this.abilityContext.hideAbility();
+          this.hiddenByAbility = true;
           return;
         } catch {}
       }
@@ -2855,6 +2943,8 @@ export class NativeDesktop {
     const wasParked = this.mainParked;
     this.mainParked = false;
     this.reopenEmittedWhileParked = false;
+    this.hiddenByApp = false;
+    this.hiddenByAbility = false;
     this.lastWindowStateJson = "";
     this.lastTitleBarJson = "";
     if (!wasParked) {
@@ -2867,15 +2957,24 @@ export class NativeDesktop {
       try {
         await this.abilityContext.showAbility();
       } catch {}
-      try {
-        await this.mainWindow.restore();
-      } catch {
+      if (this.isMainWindowMinimized()) {
         try {
-          await this.mainWindow.recover();
-        } catch {}
+          await this.mainWindow.restore();
+        } catch {
+          try {
+            await this.mainWindow.recover();
+          } catch {}
+        }
       }
       try {
         await this.mainWindow.showWindow();
+      } catch {}
+      try {
+        this.visible = this.mainWindow.isWindowShowing();
+        this.focused = this.mainWindow.isFocused();
+      } catch {}
+      try {
+        this.applyWindowStatus(this.mainWindow.getWindowStatus());
       } catch {}
       this.syncWindowState();
     });
@@ -3000,9 +3099,8 @@ export class NativeDesktop {
         await this.setModeAsync(cmd.mode);
       }
       if (cmd.visible === false) {
-        try {
-          await this.mainWindow.minimize();
-        } catch {}
+        await this.hideMainWindowAsync();
+        return;
       }
       this.syncWindowState();
     } catch {}
@@ -3132,14 +3230,20 @@ export class NativeDesktop {
         width: (drawable.width > 0 ? drawable.width : rect.width) / scale,
         height: (drawable.height > 0 ? drawable.height : rect.height) / scale,
       };
-      if (this.mode === "normal" && !this.minimized && bounds.width > 0 && bounds.height > 0) {
+      if (
+        this.mode === "normal" &&
+        !this.minimized &&
+        !this.hiddenByApp &&
+        bounds.width > 0 &&
+        bounds.height > 0
+      ) {
         this.normalBounds = bounds;
       }
       const payload: WireWindowStatePayload = {
         mode: this.mode,
-        minimized: this.minimized,
-        visible: this.visible && !this.minimized,
-        focused: this.focused && this.visible && !this.minimized,
+        minimized: this.minimized && !this.hiddenByApp,
+        visible: this.visible && !this.minimized && !this.hiddenByApp,
+        focused: this.focused && this.visible && !this.minimized && !this.hiddenByApp,
         bounds,
         contentBounds,
         normalBounds: this.normalBounds ?? bounds,
@@ -3663,6 +3767,12 @@ export class NativeDesktop {
     this.trayAdded = false;
     this.trayLastIconKey = "";
     this.trayLastHoverTips = "";
+    if (!this.closed && this.hiddenByAbility && !this.mainParked) {
+      this.hiddenByAbility = false;
+      try {
+        await this.abilityContext.showAbility();
+      } catch {}
+    }
     try {
       const kit = await import("@hms.pcService.statusBarManager");
       await new Promise<void>((resolve, reject) => {
