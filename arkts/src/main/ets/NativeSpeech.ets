@@ -205,12 +205,13 @@ export class NativeSpeech {
       if (engine === undefined) {
         return;
       }
+      const activeEngine: speechRecognizer.SpeechRecognitionEngine = engine;
       if (!live()) {
-        engine.shutdown();
+        activeEngine.shutdown();
         return;
       }
-      session.engine = engine;
-      const supported = await engine.listLanguages({ sessionId: String(key) });
+      session.engine = activeEngine;
+      const supported = await activeEngine.listLanguages({ sessionId: String(key) });
       if (!live()) {
         return;
       }
@@ -221,7 +222,7 @@ export class NativeSpeech {
         session.end("language-not-supported");
         return;
       }
-      engine.setListener({
+      activeEngine.setListener({
         onStart: (_id: string, _message: string): void => {},
         onEvent: (_id: string, _code: number, _message: string): void => {},
         onResult: (_id: string, result: speechRecognizer.SpeechRecognitionResult): void => {
@@ -269,7 +270,7 @@ export class NativeSpeech {
         session.end();
         return;
       }
-      engine.startListening({
+      activeEngine.startListening({
         sessionId: String(key),
         audioInfo: { audioType: "pcm", sampleRate: 16000, soundChannel: 1, sampleBit: 16 },
       });
@@ -285,7 +286,7 @@ export class NativeSpeech {
         let offset = 0;
         try {
           for (; offset + 640 <= bytes.length; offset += 640) {
-            engine.writeAudio(String(key), bytes.slice(offset, offset + 640));
+            activeEngine.writeAudio(String(key), bytes.slice(offset, offset + 640));
           }
           session.pending = bytes.slice(offset);
         } catch (error) {
