@@ -545,6 +545,11 @@ pub(crate) enum WireCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         visible: Option<bool>,
     },
+    #[serde(rename_all = "camelCase")]
+    ParkMainWindow {
+        has_open_sub_windows: bool,
+    },
+    UnparkMainWindow,
     Quit,
     Restart,
 }
@@ -639,10 +644,20 @@ pub(crate) fn wire_attributes_for(window_id: Option<u32>, attrs: &WindowAttribut
     }
 }
 
+#[cfg(test)]
 pub(crate) fn wire_open_sub_window(
     window_id: u32,
     open: &OpenWindow,
     size: (f32, f32),
+) -> WireCommand {
+    wire_open_sub_window_for(window_id, open, size, false)
+}
+
+pub(crate) fn wire_open_sub_window_for(
+    window_id: u32,
+    open: &OpenWindow,
+    size: (f32, f32),
+    parent_is_main: bool,
 ) -> WireCommand {
     let attrs = &open.options.attributes;
     let mode = open
@@ -667,7 +682,11 @@ pub(crate) fn wire_open_sub_window(
             },
         }
     };
-    let parent_window_id = open.parent.filter(|id| *id != nsh_core::ROOT_ID);
+    let parent_window_id = if parent_is_main {
+        None
+    } else {
+        open.parent.filter(|id| *id != nsh_core::ROOT_ID)
+    };
     let display = open.options.display.map(|id| format!("{:016x}", id.0));
     WireCommand::OpenSubWindow {
         window_id,
@@ -1858,6 +1877,8 @@ mod ohos {
         pub(crate) close_on_press: bool,
         pub(crate) selection_menu_target: Option<nsh_core::NodeId>,
         pub(crate) hosted_main_window: Option<nsh_core::NodeId>,
+        pub(crate) pending_park_main: bool,
+        pub(crate) main_window_parked: bool,
         pub(crate) main_window_launch_applied: bool,
         pub(crate) main_window_activated: std::cell::Cell<bool>,
         pub(crate) hotkeys: FxHashMap<u32, HotkeyMonitor>,
@@ -1878,6 +1899,8 @@ mod ohos {
                 close_on_press: true,
                 selection_menu_target: None,
                 hosted_main_window: None,
+                pending_park_main: false,
+                main_window_parked: false,
                 main_window_launch_applied: false,
                 main_window_activated: std::cell::Cell::new(false),
                 hotkeys: FxHashMap::default(),
@@ -2729,5 +2752,40 @@ mod tests {
             parse_desktop_event("sub-window-destroyed", r#"{"windowId":42}"#),
             Some(DesktopEvent::SubWindowDestroyed { window_id: 42 })
         );
+    }
+
+    #[test]
+    fn park_and_unpark_main_window_and_parent_mapping_serialize_cleanly() {
+        let park_with_subs = serde_json::to_value(WireCommand::ParkMainWindow {
+            has_open_sub_windows: true,
+        })
+        .unwrap();
+        assert_eq!(park_with_subs["op"], "parkMainWindow");
+        assert_eq!(park_with_subs["hasOpenSubWindows"], true);
+
+        let park_alone = serde_json::to_value(WireCommand::ParkMainWindow {
+            has_open_sub_windows: false,
+        })
+        .unwrap();
+        assert_eq!(park_alone["op"], "parkMainWindow");
+        assert_eq!(park_alone["hasOpenSubWindows"], false);
+
+        let unpark = serde_json::to_value(WireCommand::UnparkMainWindow).unwrap();
+        assert_eq!(unpark["op"], "unparkMainWindow");
+
+        let mut open = OpenWindow::default();
+        open.parent = Some(10);
+        // When logical parent 10 is hosted in the OS main window, wire parentWindowId is omitted
+        // so NativeDesktop anchors to mainWindow rather than looking up subwindow 10.
+        let main_parent =
+            serde_json::to_value(wire_open_sub_window_for(20, &open, (400.0, 300.0), true))
+                .unwrap();
+        assert!(main_parent.get("parentWindowId").is_none());
+
+        // When logical parent 10 is itself a subwindow, wire parentWindowId is preserved.
+        let sub_parent =
+            serde_json::to_value(wire_open_sub_window_for(21, &open, (400.0, 300.0), false))
+                .unwrap();
+        assert_eq!(sub_parent["parentWindowId"], 10);
     }
 }

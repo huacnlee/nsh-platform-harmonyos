@@ -122,14 +122,18 @@ impl Node {
         self.visual_opacity_for(self.style.borrow().opacity)
     }
 
+    pub(crate) fn style_has_box_paint(style: &nsh_core::ViewStyle) -> bool {
+        !style.background_color.is_transparent()
+            || style.borders.widths.any(|v| v.0 > 0.0)
+            || style.outline.is_visible()
+    }
+
     pub(crate) fn has_native_paint(&self, style: &nsh_core::ViewStyle) -> bool {
         self.id == nsh_core::ROOT_ID
             || self.scene_root.get()
             || self.kind != ViewKind::View
             || self.shaders.contains(self.id)
-            || !style.background_color.is_transparent()
-            || style.borders.widths.any(|v| v.0 > 0.0)
-            || style.outline.is_visible()
+            || Self::style_has_box_paint(style)
             || style.effects.as_ref().is_some_and(|effects| {
                 !effects.background_images.is_empty() || !effects.box_shadows.is_empty()
             })

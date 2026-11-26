@@ -602,7 +602,9 @@ impl Node {
             let frame = self.frame.get();
             let size = Some((frame.width, frame.height));
             let resized = wrapper.measured.replace(size) != size;
-            let modal = self.modal.borrow().is_some();
+            let modal = self.modal.borrow().as_ref().is_some_and(|m| {
+                !m.is_desktop_window() && !m.is_sub_window_modal() && !m.is_main_window_host()
+            });
             if changed || composite || modal || resized {
                 wrapper
                     .outer

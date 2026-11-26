@@ -125,6 +125,7 @@ pub(crate) struct Modal {
     insets: Cell<EdgeInsets>,
     /// Native window geometry, refreshed by presentation, measure and window events.
     available: Cell<Option<Size>>,
+    applied_sub_modal_geom: Cell<Option<(Size, f32)>>,
     reported: Cell<nsh_core::navigation::Reported>,
     overlay: RefCell<Option<crate::app::session::Overlay>>,
     on_settled: RefCell<Vec<SettledCallback>>,
@@ -156,6 +157,7 @@ impl Modal {
             closing: Cell::new(false),
             insets: Cell::new(EdgeInsets::default()),
             available: Cell::new(None),
+            applied_sub_modal_geom: Cell::new(None),
             reported: Cell::new(nsh_core::navigation::Reported::default()),
             overlay: RefCell::default(),
             on_settled: RefCell::default(),
@@ -389,38 +391,62 @@ impl Modal {
             }
         }
     }
-    fn refresh_sub_window_modal_layout(&self) -> Result<()> {
+    fn mark_node_dirty(owner: &Node, need_render: bool) -> Result<()> {
         use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
-        self.refresh_metrics();
-        if let Some(owner) = self.owner.upgrade() {
-            owner.set_frame(owner.raw_frame.get())?;
-            owner.restore_style()?;
-            owner.update_wrapper()?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+        let mounted = owner.mounted();
+        let same = Rc::ptr_eq(&mounted, &owner.native);
+        {
+            let borrowed = mounted.borrow();
+            borrowed.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            borrowed.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            if same && need_render {
+                borrowed.mark_dirty(NodeDirtyFlag::NeedRender)?;
+            }
+        }
+        if !same {
+            let borrowed = owner.native.borrow();
+            borrowed.mark_dirty(NodeDirtyFlag::NeedMeasure)?;
+            borrowed.mark_dirty(NodeDirtyFlag::NeedLayout)?;
+            if need_render {
+                borrowed.mark_dirty(NodeDirtyFlag::NeedRender)?;
+            }
         }
         Ok(())
     }
-    fn refresh_hosted_sub_modals(&self) {
+    fn refresh_sub_window_modal_layout(
+        &self,
+        host_geom: Option<(Size, f32)>,
+        force: bool,
+    ) -> Result<()> {
+        if !force
+            && let Some(geom) = host_geom
+            && self.applied_sub_modal_geom.get() == Some(geom)
+        {
+            return Ok(());
+        }
+        if let Some(geom) = host_geom {
+            self.applied_sub_modal_geom.set(Some(geom));
+        } else if force {
+            self.applied_sub_modal_geom.set(None);
+        }
+        self.refresh_metrics();
+        if let Some(owner) = self.owner.upgrade() {
+            owner.set_frame(owner.raw_frame.get())?;
+            if force {
+                owner.restore_style()?;
+            }
+            owner.update_wrapper()?;
+            Self::mark_node_dirty(&owner, force)?;
+        }
+        Ok(())
+    }
+    fn refresh_hosted_sub_modals(&self, force: bool) {
         use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
+        let host_geom = self
+            .desktop
+            .borrow()
+            .as_ref()
+            .map(|w| (w.content_size, w.scale_factor));
         let children: Vec<Rc<Modal>> = {
             let mut sub_modals = self.sub_modals.borrow_mut();
             sub_modals.retain(|weak| weak.strong_count() > 0);
@@ -428,9 +454,13 @@ impl Modal {
         };
         let mut refreshed = false;
         for child in children {
-            if child.is_visible() {
+            if child.is_visible()
+                && (force
+                    || host_geom.is_none()
+                    || child.applied_sub_modal_geom.get() != host_geom)
+            {
                 refreshed = true;
-                let _ = child.refresh_sub_window_modal_layout();
+                let _ = child.refresh_sub_window_modal_layout(host_geom, force);
             }
         }
         if refreshed
@@ -568,7 +598,7 @@ impl Modal {
         self.desktop
             .borrow()
             .as_ref()
-            .and_then(|w| w.parent_window_id.or(Some(nsh_core::ROOT_ID)))
+            .and_then(|w| w.parent_window_id)
     }
     pub(crate) fn close_for_parent(&self) -> Result<()> {
         if !self.is_desktop_window() || !self.shown.get() {
@@ -610,7 +640,7 @@ impl Modal {
         let (w, h) = crate::services::desktop::clamp_window_size((size.width, size.height), attrs);
         Size::new(w, h)
     }
-    pub(crate) fn open_desktop_window(&self, open: OpenWindow) -> Result<()> {
+    pub(crate) fn open_desktop_window(&self, open: OpenWindow, parent_is_main: bool) -> Result<()> {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
@@ -637,13 +667,17 @@ impl Modal {
             .unwrap_or(WindowMode::Normal);
         let focused = open.options.attributes.activate != Some(false)
             && open.options.attributes.focusable != Some(false);
-        let wire = crate::services::desktop::wire_open_sub_window(
+        let wire = crate::services::desktop::wire_open_sub_window_for(
             owner.id,
             &open,
             (size.width, size.height),
+            parent_is_main,
         );
         let session_id = owner.host.session_id();
-        let parent_window_id = open.parent.filter(|id| *id != nsh_core::ROOT_ID);
+        // Preserve the true logical parent (`None` for independent top-level
+        // windows, `Some(parent)` for explicit child windows) so closing the
+        // main-hosted window never destroys unrelated top-level subwindows.
+        let parent_window_id = open.parent;
         self.config.borrow_mut().animation = ModalAnimation::None;
         *self.desktop.borrow_mut() = Some(DesktopWindow {
             session_id,
@@ -767,7 +801,6 @@ impl Modal {
                 && let Some(child_owner) = child.owner.upgrade()
             {
                 let _ = self.attach_child_modal_to_container(&child, &child_owner);
-                let _ = child.refresh_sub_window_modal_layout();
             }
         }
         let _ = self.refresh_desktop_layout();
@@ -798,7 +831,9 @@ impl Modal {
             return Ok(());
         };
         if matches!(request, WindowRequest::Close) {
-            return self.close_sub_window(false);
+            self.close_sub_window(false)?;
+            self.emit_desktop_closed(&owner, WindowCloseCause::Close);
+            return Ok(());
         }
         let mut content_resize = None;
         {
@@ -890,7 +925,7 @@ impl Modal {
         if let Some(size) = content_resize {
             self.available.set(Some(size));
             self.report_metrics(&owner, size);
-            self.refresh_hosted_sub_modals();
+            self.refresh_hosted_sub_modals(false);
         }
         Ok(())
     }
@@ -1063,11 +1098,13 @@ impl Modal {
             state.content_bounds.size.width.0,
             state.content_bounds.size.height.0,
         );
-        {
+        let geom_changed = {
             let mut slot = self.desktop.borrow_mut();
             let Some(win) = slot.as_mut() else {
                 return Ok(());
             };
+            let prev_content = win.content_size;
+            let prev_scale = win.scale_factor;
             win.mode = state.mode;
             win.minimized = state.minimized;
             win.focused = state.focused;
@@ -1087,11 +1124,15 @@ impl Modal {
                 win.normal_size = Size::new(normal.size.width.0, normal.size.height.0);
                 win.normal_origin = Some((normal.origin.x.0, normal.origin.y.0));
             }
-        }
-        if content_size.width > 0.0 && content_size.height > 0.0 {
+            content_size.width > 0.0
+                && content_size.height > 0.0
+                && (prev_content != win.content_size
+                    || (prev_scale - win.scale_factor).abs() > 1e-4)
+        };
+        if geom_changed {
             self.available.set(Some(content_size));
             self.report_metrics(&owner, content_size);
-            self.refresh_hosted_sub_modals();
+            self.refresh_hosted_sub_modals(false);
         }
         owner.emit(
             EventKind::Window,
@@ -1213,28 +1254,9 @@ impl Modal {
             owner.set_frame(owner.raw_frame.get())?;
             owner.restore_style()?;
             owner.update_wrapper()?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedRender)?;
+            Self::mark_node_dirty(&owner, true)?;
         }
-        self.refresh_hosted_sub_modals();
+        self.refresh_hosted_sub_modals(true);
         Ok(())
     }
     fn apply_dialog_config(&self) -> Result<()> {
@@ -1275,33 +1297,18 @@ impl Modal {
         if !self.is_sub_window_modal() && self.dialog.borrow().is_some() {
             self.apply_dialog_config()?;
         }
+        if !self.shown.get() {
+            return Ok(());
+        }
         self.refresh_metrics();
         if let Some(owner) = self.owner.upgrade() {
-            if !self.is_sub_window_modal()
-                && self.shown.get()
-                && previous.presentation != presentation
-            {
+            if !self.is_sub_window_modal() && previous.presentation != presentation {
                 owner.shaders.modal_presentation_changed(&owner)?;
             }
             owner.set_frame(owner.raw_frame.get())?;
             owner.restore_style()?;
             owner.update_wrapper()?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(ohos_arkui_binding::types::advanced::NodeDirtyFlag::NeedLayout)?;
+            Self::mark_node_dirty(&owner, false)?;
         }
         Ok(())
     }
@@ -1340,7 +1347,6 @@ impl Modal {
         Ok(())
     }
     pub(crate) fn present(&self) -> Result<()> {
-        use ohos_arkui_binding::types::advanced::NodeDirtyFlag;
         self.pending_present.set(false);
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
@@ -1382,26 +1388,13 @@ impl Modal {
                     let _ = sink.borrow().request_focus();
                 }
             }
-            owner
-                .mounted()
+            let host_geom = host
+                .desktop
                 .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .mounted()
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedLayout)?;
-            owner
-                .native
-                .borrow()
-                .mark_dirty(NodeDirtyFlag::NeedRender)?;
+                .as_ref()
+                .map(|w| (w.content_size, w.scale_factor));
+            self.applied_sub_modal_geom.set(host_geom);
+            Self::mark_node_dirty(&owner, true)?;
             if !was_shown || was_closing {
                 self.start_transition(1.0)?;
             }
@@ -1424,22 +1417,7 @@ impl Modal {
             owner.shaders.modal_shown(&owner, true)?;
             *self.overlay.borrow_mut() = Some(owner.host.overlay(owner.dispatcher.clone())?);
         }
-        owner
-            .mounted()
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-        owner
-            .mounted()
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedLayout)?;
-        owner
-            .native
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedMeasure)?;
-        owner
-            .native
-            .borrow()
-            .mark_dirty(NodeDirtyFlag::NeedLayout)?;
+        Self::mark_node_dirty(&owner, false)?;
         if !was_shown || was_closing {
             self.begin(1.0)?;
         }
