@@ -639,12 +639,7 @@ fn read_response(mut response: http::Response<ureq::Body>, events: &Events) -> s
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        io::Write as _,
-        net::TcpListener,
-        sync::mpsc,
-        time::Instant,
-    };
+    use std::{io::Write as _, net::TcpListener, sync::mpsc, time::Instant};
 
     use super::*;
 
@@ -721,10 +716,8 @@ mod tests {
             let (mut s1, _) = listener.accept().unwrap();
             let mut buf = [0u8; 512];
             let _ = s1.read(&mut buf);
-            s1.write_all(
-                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
-            )
-            .unwrap();
+            s1.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                .unwrap();
             s1.flush().unwrap();
 
             // Second request: completes normally after first is cancelled.
@@ -900,7 +893,9 @@ mod tests {
             let n = stream.read(&mut buf).unwrap();
             assert!(n > 0);
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nreuse")
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nreuse",
+                )
                 .unwrap();
             stream.flush().unwrap();
         });

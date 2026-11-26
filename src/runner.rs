@@ -666,14 +666,7 @@ mod tests {
         );
         assert!(dev_manifest.contains(&expected_extra), "{dev_manifest}");
 
-        write(
-            &dir.join("tsx"),
-            App::Tsx,
-            true,
-            false,
-            ApiLevel::Api23,
-        )
-        .unwrap();
+        write(&dir.join("tsx"), App::Tsx, true, false, ApiLevel::Api23).unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
         assert!(tsx_manifest.contains("features = [\"backend\", \"dev\", \"api-23\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();

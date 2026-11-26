@@ -234,11 +234,21 @@ impl Input {
             digits_only,
         )
     }
-    pub(crate) fn plan_replace(&self, previous: &str, candidate: &str) -> editor_state::PlannedEdit {
+    pub(crate) fn plan_replace(
+        &self,
+        previous: &str,
+        candidate: &str,
+    ) -> editor_state::PlannedEdit {
         let config = self.config.borrow();
         let multiline = config.multiline && !config.secure;
         let digits_only = config.keyboard == KeyboardType::Number;
-        editor_state::plan_replace(previous, candidate, config.max_length, multiline, digits_only)
+        editor_state::plan_replace(
+            previous,
+            candidate,
+            config.max_length,
+            multiline,
+            digits_only,
+        )
     }
     pub(crate) fn is_ime_cursor_sink(&self) -> bool {
         let config = self.config.borrow();

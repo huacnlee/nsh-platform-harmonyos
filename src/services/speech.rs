@@ -104,8 +104,13 @@ mod registry {
                 key = key.wrapping_add(1).max(1);
             }
             self.next_key = key.wrapping_add(1).max(1);
-            self.sessions
-                .insert(key, SessionEntry { host_session_id, sink });
+            self.sessions.insert(
+                key,
+                SessionEntry {
+                    host_session_id,
+                    sink,
+                },
+            );
             key
         }
 
@@ -306,11 +311,7 @@ mod ohos {
                     && session::any_active_session(false).is_ok()
             }
 
-            fn start(
-                &self,
-                request: SpeechRequest,
-                events: SpeechSink,
-            ) -> Box<dyn SpeechControl> {
+            fn start(&self, request: SpeechRequest, events: SpeechSink) -> Box<dyn SpeechControl> {
                 if !SPEECH_AVAILABLE.load(Ordering::Acquire) {
                     events.end(Some(SpeechError::Unavailable));
                     return Box::new(NoopControl);
@@ -334,15 +335,12 @@ mod ohos {
                     ..Default::default()
                 });
                 if send_result.is_err() {
-                    REGISTRY
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .deliver(
-                            key,
-                            SpeechWireEvent::End {
-                                error: Some(SpeechErrorKind::Unavailable),
-                            },
-                        );
+                    REGISTRY.lock().unwrap_or_else(|e| e.into_inner()).deliver(
+                        key,
+                        SpeechWireEvent::End {
+                            error: Some(SpeechErrorKind::Unavailable),
+                        },
+                    );
                     return Box::new(NoopControl);
                 }
                 Box::new(HarmonySpeechControl {

@@ -352,9 +352,7 @@ fn validate_build_profile(
         })?;
     let actual_ref = product.get("signingConfig").and_then(Value::as_str);
     if actual_ref != expected.product_signing_config.as_deref() {
-        bail!(
-            "generated build-profile.json5 product `{target_product}` signingConfig mismatch"
-        );
+        bail!("generated build-profile.json5 product `{target_product}` signingConfig mismatch");
     }
     Ok(())
 }
@@ -760,10 +758,7 @@ fn build_file_type_skills(
             let type_id = format!("{utd_prefix}.nsh_filetype_{index}");
             let mut decl = Map::new();
             decl.insert("TypeId".to_owned(), Value::String(type_id.clone()));
-            decl.insert(
-                "BelongingToTypes".to_owned(),
-                json!(["general.file"]),
-            );
+            decl.insert("BelongingToTypes".to_owned(), json!(["general.file"]));
             decl.insert(
                 "FilenameExtensions".to_owned(),
                 Value::Array(custom_exts.into_iter().map(Value::String).collect()),
@@ -1184,7 +1179,8 @@ fn stage_ohpm_dependencies(
                             "harmonyos.dependencies.{pkg}: HAR module name `{mod_name}` collides with {other} in build-profile.json5"
                         );
                     }
-                    seen_module_names.insert(mod_name.clone(), format!("harmonyos.dependencies.{pkg}"));
+                    seen_module_names
+                        .insert(mod_name.clone(), format!("harmonyos.dependencies.{pkg}"));
                     extra_modules.push_str(&format!(
                         "\n    {{\n      \"name\": \"{}\",\n      \"srcPath\": \"./nshm-deps/{}\"\n    }},",
                         json_text(&mod_name),
@@ -1705,7 +1701,10 @@ mod tests {
         assert!(module.contains("\"scheme\": \"counterapp\""), "{module}");
         assert!(module.contains("\"domainVerify\": true"), "{module}");
         assert!(module.contains("\"host\": \"example.com\""), "{module}");
-        assert!(module.contains("\"host\": \"shop.example.com\""), "{module}");
+        assert!(
+            module.contains("\"host\": \"shop.example.com\""),
+            "{module}"
+        );
         assert!(module.contains("\"pathStartWith\": \"items/\""), "{module}");
         assert!(module.contains("\"path\": \"exact\""), "{module}");
         assert!(module.contains("\"pathRegex\": \"$\""), "{module}");
@@ -1794,7 +1793,10 @@ mod tests {
                     .unwrap();
             assert_eq!(parsed["app"]["products"][0]["signingConfig"], "release");
             assert_eq!(parsed["app"]["signingConfigs"].as_array().unwrap().len(), 2);
-            assert_eq!(parsed["app"]["signingConfigs"][1]["material"]["cert"], "release.cer");
+            assert_eq!(
+                parsed["app"]["signingConfigs"][1]["material"]["cert"],
+                "release.cer"
+            );
         }
 
         // Corrupt existing build-profile.json5 fails without overwriting the original file.
@@ -2207,10 +2209,10 @@ mod tests {
                 .unwrap();
         let modules = root_profile["modules"].as_array().unwrap();
         assert!(
-            modules
-                .iter()
-                .any(|m| m["name"] == "scanner_har_mod"
-                    && m["srcPath"].as_str().is_some_and(|p| p.starts_with("./nshm-deps/"))),
+            modules.iter().any(|m| m["name"] == "scanner_har_mod"
+                && m["srcPath"]
+                    .as_str()
+                    .is_some_and(|p| p.starts_with("./nshm-deps/"))),
             "{root_profile}"
         );
 
@@ -2238,7 +2240,10 @@ mod tests {
         .unwrap();
         let err = write(&out, &dup_config, &contents).unwrap_err().to_string();
         assert!(err.contains("scanner_har_mod"), "{err}");
-        assert!(err.contains("@acme/scanner") && err.contains("@acme/dup"), "{err}");
+        assert!(
+            err.contains("@acme/scanner") && err.contains("@acme/dup"),
+            "{err}"
+        );
 
         // Broken JSON5 in HAR manifest reports package and path.
         fs::write(

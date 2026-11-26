@@ -60,12 +60,12 @@ pub(crate) fn gesture_spec(
                 Some(true) => PanDirectionSpec::Horizontal,
                 Some(false) => PanDirectionSpec::Vertical,
                 None => match candidate {
-                    nsh_core::input::Candidate::Pan { x: true, y: false, .. } => {
-                        PanDirectionSpec::Horizontal
-                    }
-                    nsh_core::input::Candidate::Pan { x: false, y: true, .. } => {
-                        PanDirectionSpec::Vertical
-                    }
+                    nsh_core::input::Candidate::Pan {
+                        x: true, y: false, ..
+                    } => PanDirectionSpec::Horizontal,
+                    nsh_core::input::Candidate::Pan {
+                        x: false, y: true, ..
+                    } => PanDirectionSpec::Vertical,
                     _ => PanDirectionSpec::All,
                 },
             },
@@ -191,7 +191,10 @@ impl PanTracker {
         pointer_id: u32,
         current_surface: (f32, f32),
     ) -> Option<NodeId> {
-        let pointer = self.pointers.iter_mut().find(|p| p.pointer_id == pointer_id)?;
+        let pointer = self
+            .pointers
+            .iter_mut()
+            .find(|p| p.pointer_id == pointer_id)?;
         let from = Point::new(Points(pointer.last_delta.0), Points(pointer.last_delta.1));
         let dx = current_surface.0 - pointer.start_surface.0;
         let dy = current_surface.1 - pointer.start_surface.1;
@@ -327,15 +330,24 @@ mod tests {
         let mut tracker = PanTracker::default();
         let act = PanActivation::horizontal(Points(10.0), Points(8.0));
         tracker.down(1, (100.0, 100.0), (400.0, 800.0), [(7, act)]);
-        assert_eq!(tracker.decision(7), Some((PanDecision::Waiting, (100.0, 100.0))));
+        assert_eq!(
+            tracker.decision(7),
+            Some((PanDecision::Waiting, (100.0, 100.0)))
+        );
 
         // Move vertically past fail_offset_y (8 vp) before reaching active_offset_x (10 vp).
         assert_eq!(tracker.move_pointer(1, (103.0, 109.0)), None);
-        assert_eq!(tracker.decision(7), Some((PanDecision::Failed, (100.0, 100.0))));
+        assert_eq!(
+            tracker.decision(7),
+            Some((PanDecision::Failed, (100.0, 100.0)))
+        );
 
         // Later moving far horizontally must NOT resurrect a failed candidate.
         assert_eq!(tracker.move_pointer(1, (140.0, 109.0)), None);
-        assert_eq!(tracker.decision(7), Some((PanDecision::Failed, (100.0, 100.0))));
+        assert_eq!(
+            tracker.decision(7),
+            Some((PanDecision::Failed, (100.0, 100.0)))
+        );
     }
 
     #[test]
@@ -345,13 +357,22 @@ mod tests {
         act.edge = Some(nsh_core::PanEdge::Left);
         // Down at x = 80 vp is outside the left edge zone (PanActivation::EDGE_WIDTH = 24 vp).
         tracker.down(1, (80.0, 200.0), (400.0, 800.0), [(9, act)]);
-        assert_eq!(tracker.decision(9), Some((PanDecision::Failed, (80.0, 200.0))));
+        assert_eq!(
+            tracker.decision(9),
+            Some((PanDecision::Failed, (80.0, 200.0)))
+        );
 
         // Down at x = 10 vp is inside the left edge zone and activates on rightward drag.
         tracker.down(2, (10.0, 200.0), (400.0, 800.0), [(9, act)]);
-        assert_eq!(tracker.decision(9), Some((PanDecision::Waiting, (10.0, 200.0))));
+        assert_eq!(
+            tracker.decision(9),
+            Some((PanDecision::Waiting, (10.0, 200.0)))
+        );
         assert_eq!(tracker.move_pointer(2, (22.0, 201.0)), Some(9));
-        assert_eq!(tracker.decision(9), Some((PanDecision::Activated, (10.0, 200.0))));
+        assert_eq!(
+            tracker.decision(9),
+            Some((PanDecision::Activated, (10.0, 200.0)))
+        );
     }
 
     #[test]

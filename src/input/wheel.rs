@@ -266,12 +266,9 @@ impl AxisRouter {
 
         // First try `onWheel` listeners (including Ctrl+wheel: upstream gives
         // `onWheel` priority over `onPinch` when a view handles wheel events).
-        let wheel_picked = self.wheel_latch.route(
-            step,
-            moved,
-            native_scrolling,
-            &is_alive,
-            || {
+        let wheel_picked = self
+            .wheel_latch
+            .route(step, moved, native_scrolling, &is_alive, || {
                 wheel_listener(
                     chain.iter().copied(),
                     |n| {
@@ -281,8 +278,7 @@ impl AxisRouter {
                     |n| n.is_native_scroll,
                 )
                 .map(|(n, takes)| (n.id, takes))
-            },
-        );
+            });
 
         let is_ctrl_mouse_zoom =
             input.is_mouse && input.modifiers.ctrl && input.vy.is_finite() && input.vy != 0.0;

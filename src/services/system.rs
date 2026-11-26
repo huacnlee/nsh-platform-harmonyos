@@ -874,25 +874,19 @@ fn read_picked_files(
             let mut file = File::from(handle.descriptor);
             let metadata = file.metadata().ok();
             let modified = metadata.as_ref().and_then(|m| m.modified().ok());
-            let initial_regular_len = metadata
-                .as_ref()
-                .filter(|m| m.is_file())
-                .map(|m| m.len());
+            let initial_regular_len = metadata.as_ref().filter(|m| m.is_file()).map(|m| m.len());
             let mut first_check = true;
-            read_bounded_file(
-                &mut file,
-                handle.name,
-                size_limit,
-                modified,
-                |file| {
-                    if first_check {
-                        first_check = false;
-                        initial_regular_len
-                    } else {
-                        file.metadata().ok().filter(|m| m.is_file()).map(|m| m.len())
-                    }
-                },
-            )
+            read_bounded_file(&mut file, handle.name, size_limit, modified, |file| {
+                if first_check {
+                    first_check = false;
+                    initial_regular_len
+                } else {
+                    file.metadata()
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| m.len())
+                }
+            })
         })
         .collect();
     nsh_core::picker::finish_files(request, raw)
@@ -1491,8 +1485,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn image_picker_passes_request_to_preparer_and_preserves_modified_and_order() {
-        use std::{fs::File, os::fd::AsRawFd};
         use nsh_core::geometry::{DevicePixels, Percentage};
+        use std::{fs::File, os::fd::AsRawFd};
         let dir = std::env::temp_dir().join(format!("nsh-picked-img-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();

@@ -468,22 +468,35 @@ mod tests {
         let mut spec = Accessibility::default();
         spec.state.pressed = Some(Checked::True);
         assert_eq!(spoken_value(&spec).as_deref(), Some("pressed"));
-        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("已按下"));
+        assert_eq!(
+            spoken_value_for_locale(&spec, "zh-CN").as_deref(),
+            Some("已按下")
+        );
 
         spec.state.pressed = Some(Checked::False);
         assert_eq!(spoken_value(&spec).as_deref(), Some("not pressed"));
-        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("未按下"));
+        assert_eq!(
+            spoken_value_for_locale(&spec, "zh-CN").as_deref(),
+            Some("未按下")
+        );
 
         spec.state.pressed = Some(Checked::Mixed);
         assert_eq!(spoken_value(&spec).as_deref(), Some("mixed"));
-        assert_eq!(spoken_value_for_locale(&spec, "zh-CN").as_deref(), Some("部分按下"));
+        assert_eq!(
+            spoken_value_for_locale(&spec, "zh-CN").as_deref(),
+            Some("部分按下")
+        );
 
         spec.state.pressed = None;
         for (variant, en, zh) in [
             (AccessibilityCurrent::True, "current", "当前项"),
             (AccessibilityCurrent::Page, "current page", "当前页面"),
             (AccessibilityCurrent::Step, "current step", "当前步骤"),
-            (AccessibilityCurrent::Location, "current location", "当前位置"),
+            (
+                AccessibilityCurrent::Location,
+                "current location",
+                "当前位置",
+            ),
             (AccessibilityCurrent::Date, "current date", "当前日期"),
             (AccessibilityCurrent::Time, "current time", "当前时间"),
         ] {

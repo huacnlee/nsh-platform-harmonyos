@@ -205,7 +205,14 @@ mod tests {
         use nsh_core::keymap::{Key, Modifiers};
 
         assert_eq!(
-            typing_text(Some(Key::Char('a')), 0, Modifiers::default(), Some(false), None).as_deref(),
+            typing_text(
+                Some(Key::Char('a')),
+                0,
+                Modifiers::default(),
+                Some(false),
+                None
+            )
+            .as_deref(),
             Some("a")
         );
         assert_eq!(
@@ -251,7 +258,13 @@ mod tests {
             None
         );
         assert_eq!(
-            typing_text(Some(Key::Enter), 0, Modifiers::default(), Some(false), Some("\n")),
+            typing_text(
+                Some(Key::Enter),
+                0,
+                Modifiers::default(),
+                Some(false),
+                Some("\n")
+            ),
             None
         );
         assert_eq!(

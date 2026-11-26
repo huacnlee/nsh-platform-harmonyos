@@ -374,12 +374,8 @@ impl Touches {
                     parent = node.parent_node.borrow().upgrade();
                 }
                 if !consumes {
-                    self.pan_tracker.down(
-                        id,
-                        page,
-                        (sf.width, sf.height),
-                        tracker_candidates,
-                    );
+                    self.pan_tracker
+                        .down(id, page, (sf.width, sf.height), tracker_candidates);
                 }
                 if !path.is_empty() && !consumes {
                     self.fingers.push(Finger {
@@ -472,10 +468,7 @@ impl Touches {
                         *failed = true;
                         continue;
                     };
-                    let decision = self
-                        .pan_tracker
-                        .decision(node.id)
-                        .map(|(state, _)| state);
+                    let decision = self.pan_tracker.decision(node.id).map(|(state, _)| state);
                     match decision {
                         Some(crate::input::pan::PanDecision::Failed) => *failed = true,
                         Some(crate::input::pan::PanDecision::Activated) => {

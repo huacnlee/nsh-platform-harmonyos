@@ -400,7 +400,15 @@ mod tests {
             box_sq,
         )
         .unwrap();
-        assert_eq!(top, Rect { x: 0.0, y: 0.0, width: 100.0, height: 300.0 });
+        assert_eq!(
+            top,
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 300.0
+            }
+        );
 
         let bottom = image_fit(
             ResizeMode::Cover,
@@ -411,13 +419,23 @@ mod tests {
         .unwrap();
         assert_eq!(
             bottom,
-            Rect { x: 0.0, y: -200.0, width: 100.0, height: 300.0 }
+            Rect {
+                x: 0.0,
+                y: -200.0,
+                width: 100.0,
+                height: 300.0
+            }
         );
 
         let center = image_fit(ResizeMode::Cover, ObjectPosition::default(), tall, box_sq).unwrap();
         assert_eq!(
             center,
-            Rect { x: 0.0, y: -100.0, width: 100.0, height: 300.0 }
+            Rect {
+                x: 0.0,
+                y: -100.0,
+                width: 100.0,
+                height: 300.0
+            }
         );
 
         // Contain with right-edge length offset: 100x200 in 200x200 -> 100x200; right 10px -> x = 90.
@@ -430,7 +448,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             contain,
-            Rect { x: 90.0, y: 0.0, width: 100.0, height: 200.0 }
+            Rect {
+                x: 90.0,
+                y: 0.0,
+                width: 100.0,
+                height: 200.0
+            }
         );
 
         // Stretch fills container regardless of position.
@@ -443,7 +466,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             stretch,
-            Rect { x: 0.0, y: 0.0, width: 100.0, height: 100.0 }
+            Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0
+            }
         );
 
         // Unknown natural size or empty container yields None.

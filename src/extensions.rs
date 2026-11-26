@@ -1130,7 +1130,8 @@ mod ohos {
             .unwrap_or("application/octet-stream");
         let encoding = request.needs_encoding(source_mime, display_size);
         let Some((out_mime, quality)) = encode_mime_and_quality(encoding, request) else {
-            let mut picked = PickedFile::new(name, source_mime, ImageData::from(bytes.into_owned()));
+            let mut picked =
+                PickedFile::new(name, source_mime, ImageData::from(bytes.into_owned()));
             picked.size = display_size;
             return Some(picked);
         };
