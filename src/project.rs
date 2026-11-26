@@ -5,19 +5,27 @@
 //! files.
 
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs, io,
     path::{Path, PathBuf},
 };
 
 use anyhow::{Context as _, bail};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use serde_json::{Map, Value, json};
 
 use crate::{
-    module_meta::{HarmonyMeta, OhpmDep, Permission, UsedScene, permission_reason_key},
+    module_meta::{HarmonyMeta, OhpmDep, Permission, permission_reason_key},
     paths::{join_all, join_relative},
     sdk::{ApiLevel, Arch},
 };
+
+/// Result of writing the DevEco Studio project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProjectOutput {
+    /// Whether product `"default"` in `build-profile.json5` references a signing config.
+    pub(crate) signed: bool,
+}
 
 /// What the project takes from the app's `nsh.json`.
 #[derive(Debug, Clone, PartialEq)]
@@ -36,8 +44,8 @@ pub(crate) struct AppConfig {
     pub(crate) schemes: Vec<String>,
     /// `"links"`: verified HTTPS domains and paths that open the app (`https://...`).
     pub(crate) links: Vec<nsh_core::url_scheme::WebLink>,
-    /// Explicit `capabilities.speech` opt-in to `ohos.permission.MICROPHONE`.
-    pub(crate) speech: bool,
+    /// `"fileTypes"`: file types the app declares for system Open With / share delivery.
+    pub(crate) file_types: Vec<nsh_core::file_type::FileType>,
     /// Standalone apps declaring WebView can initialize ArkWeb before accepting input.
     webview: bool,
     /// HarmonyOS packaging declarations from `nsh.json` `"harmonyos"` merged
@@ -68,11 +76,16 @@ impl AppConfig {
         let app_links = nsh_core::url_scheme::AppLinks::from_json(json);
         let schemes = app_links.schemes().to_vec();
         let links = app_links.web().to_vec();
-        let speech = json
-            .get("capabilities")
-            .and_then(|capabilities| capabilities.get("speech"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let file_types = match json.get("fileTypes") {
+            Some(raw) => {
+                let (parsed, ignored) = nsh_core::file_type::parse_file_types(raw);
+                for warning in ignored {
+                    eprintln!("warning: {warning}");
+                }
+                parsed
+            }
+            None => Vec::new(),
+        };
         let harmonyos = HarmonyMeta::from_app_json(app, json)?;
         Ok(AppConfig {
             name: json["name"]
@@ -92,7 +105,7 @@ impl AppConfig {
                 }),
             schemes,
             links,
-            speech,
+            file_types,
             webview: json["capabilities"]["webview"].is_object(),
             harmonyos,
         })
@@ -178,44 +191,172 @@ pub(crate) struct Contents<'a> {
     pub(crate) compile_api: u32,
 }
 
-/// The `"signingConfigs": [...]` array of an existing `build-profile.json5`,
-/// so signing set up in DevEco Studio survives packaging again.
-fn signing_configs(profile: &str) -> Option<&str> {
-    let start = profile.find("\"signingConfigs\"")?;
-    let open = start + profile[start..].find('[')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in profile[open..].char_indices() {
-        if in_string {
-            match c {
-                _ if escaped => escaped = false,
-                '\\' => escaped = true,
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => in_string = true,
-            '[' | '{' => depth += 1,
-            ']' | '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&profile[open..=open + i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+/// Signing settings preserved from an existing `build-profile.json5`.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct PreservedSigning {
+    signing_configs: Vec<Value>,
+    product_signing_config: Option<String>,
 }
 
-/// The first signing config's `"name"`.
-fn signing_name(configs: &str) -> Option<&str> {
-    let rest = &configs[configs.find("\"name\"")? + 6..];
-    let rest = &rest[rest.find('"')? + 1..];
-    Some(&rest[..rest.find('"')?])
+/// Reads `app.signingConfigs` and the target product's `signingConfig`
+/// reference from an existing `build-profile.json5`, distinguishing:
+/// 1. First-time generation (`NotFound`) -> empty signing config.
+/// 2. Valid existing profile -> preserved `signingConfigs` array and target
+///    product's explicit `signingConfig` reference (if configured).
+/// 3. Unparseable profile or invalid/dangling signing reference -> returns an
+///    error naming the file, key, and product so the original file stays intact.
+fn read_preserved_signing(
+    profile_path: &Path,
+    target_product: &str,
+) -> anyhow::Result<PreservedSigning> {
+    let text = match fs::read_to_string(profile_path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Ok(PreservedSigning::default());
+        }
+        Err(err) => {
+            return Err(err).with_context(|| format!("reading {}", profile_path.display()));
+        }
+    };
+    let root = json5::from_str::<Value>(&text)
+        .map_err(|err| anyhow::anyhow!("invalid JSON5 in {}: {err}", profile_path.display()))?;
+    let root_obj = root.as_object().with_context(|| {
+        format!(
+            "{}: root value must be an object (preserving signing config for product `{target_product}`)",
+            profile_path.display()
+        )
+    })?;
+    let Some(app_val) = root_obj.get("app") else {
+        return Ok(PreservedSigning::default());
+    };
+    let app = app_val.as_object().with_context(|| {
+        format!(
+            "{}: key `app` must be an object (product `{target_product}`)",
+            profile_path.display()
+        )
+    })?;
+
+    let mut signing_configs = Vec::new();
+    let mut known_names = BTreeSet::new();
+    if let Some(raw_configs) = app.get("signingConfigs")
+        && !raw_configs.is_null()
+    {
+        let list = raw_configs.as_array().with_context(|| {
+            format!(
+                "{}: key `app.signingConfigs` must be an array (product `{target_product}`)",
+                profile_path.display()
+            )
+        })?;
+        for (idx, item) in list.iter().enumerate() {
+            let obj = item.as_object().with_context(|| {
+                format!(
+                    "{}: key `app.signingConfigs[{idx}]` must be an object (product `{target_product}`)",
+                    profile_path.display()
+                )
+            })?;
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .with_context(|| {
+                    format!(
+                        "{}: key `app.signingConfigs[{idx}].name` must be a non-empty string (product `{target_product}`)",
+                        profile_path.display()
+                    )
+                })?;
+            known_names.insert(name.to_owned());
+            signing_configs.push(item.clone());
+        }
+    }
+
+    let mut product_signing_config = None;
+    if let Some(raw_products) = app.get("products")
+        && !raw_products.is_null()
+    {
+        let products = raw_products.as_array().with_context(|| {
+            format!(
+                "{}: key `app.products` must be an array (product `{target_product}`)",
+                profile_path.display()
+            )
+        })?;
+        for (idx, item) in products.iter().enumerate() {
+            let obj = item.as_object().with_context(|| {
+                format!(
+                    "{}: key `app.products[{idx}]` must be an object (product `{target_product}`)",
+                    profile_path.display()
+                )
+            })?;
+            if obj.get("name").and_then(Value::as_str) != Some(target_product) {
+                continue;
+            }
+            if let Some(raw_ref) = obj.get("signingConfig")
+                && !raw_ref.is_null()
+            {
+                let name = raw_ref
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "{}: key `app.products[name=\"{target_product}\"].signingConfig` must be a non-empty string",
+                            profile_path.display()
+                        )
+                    })?;
+                if !known_names.contains(name) {
+                    bail!(
+                        "{}: product `{target_product}` references `app.products[name=\"{target_product}\"].signingConfig` = `{name}`, which is not defined in `app.signingConfigs`",
+                        profile_path.display()
+                    );
+                }
+                product_signing_config = Some(name.to_owned());
+            }
+            break;
+        }
+    }
+
+    Ok(PreservedSigning {
+        signing_configs,
+        product_signing_config,
+    })
+}
+
+/// Verifies the rendered `build-profile.json5` in memory before touching the
+/// existing file on disk.
+fn validate_build_profile(
+    rendered: &str,
+    expected: &PreservedSigning,
+    target_product: &str,
+) -> anyhow::Result<()> {
+    let parsed: Value = serde_json::from_str(rendered)
+        .context("generated build-profile.json5 is not valid JSON")?;
+    let actual_configs = parsed
+        .pointer("/app/signingConfigs")
+        .and_then(Value::as_array)
+        .context("generated build-profile.json5 is missing `app.signingConfigs`")?;
+    if actual_configs != &expected.signing_configs {
+        bail!(
+            "generated build-profile.json5 `app.signingConfigs` does not match preserved signing configs"
+        );
+    }
+    let product = parsed
+        .pointer("/app/products")
+        .and_then(Value::as_array)
+        .and_then(|products| {
+            products
+                .iter()
+                .find(|p| p.get("name").and_then(Value::as_str) == Some(target_product))
+        })
+        .with_context(|| {
+            format!("generated build-profile.json5 is missing product `{target_product}`")
+        })?;
+    let actual_ref = product.get("signingConfig").and_then(Value::as_str);
+    if actual_ref != expected.product_signing_config.as_deref() {
+        bail!(
+            "generated build-profile.json5 product `{target_product}` signingConfig mismatch"
+        );
+    }
+    Ok(())
 }
 
 /// Escapes `value` for a JSON string's contents.
@@ -238,7 +379,7 @@ fn indent_json(value: &Value, indent: usize) -> String {
     out
 }
 
-fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (String, String) {
+fn build_permissions_and_strings(harmonyos: &HarmonyMeta) -> (String, String) {
     // Haptics has no nsh capability; VIBRATE is a normal permission for every app.
     let mut permissions = vec![
         Permission {
@@ -257,16 +398,6 @@ fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (Stri
             used_scene: None,
         },
     ];
-    if speech {
-        permissions.push(Permission {
-            name: "ohos.permission.MICROPHONE".to_owned(),
-            reason: Some("$string:nsh_microphone_reason".to_owned()),
-            used_scene: Some(UsedScene {
-                abilities: vec!["EntryAbility".to_owned()],
-                when: "inuse".to_owned(),
-            }),
-        });
-    }
     for extra in &harmonyos.permissions {
         match permissions.iter_mut().find(|p| p.name == extra.name) {
             None => permissions.push(extra.clone()),
@@ -329,7 +460,388 @@ fn build_permissions_and_strings(speech: bool, harmonyos: &HarmonyMeta) -> (Stri
     )
 }
 
-fn ability_skills_value(schemes: &[String], links: &[nsh_core::url_scheme::WebLink]) -> Value {
+/// Characters percent-encoded in RFC 3986 URI path segments (along with all
+/// non-ASCII UTF-8 bytes) for OpenHarmony `skill.cpp` raw byte matching.
+const LINK_PATH_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'<')
+    .add(b'>')
+    .add(b'?')
+    .add(b'`')
+    .add(b'{')
+    .add(b'}')
+    .add(b'^')
+    .add(b'|')
+    .add(b'\\')
+    .add(b'[')
+    .add(b']');
+
+/// Maximum number of `linkFeature` declarations allowed per OpenHarmony bundle.
+const MAX_LINK_FEATURES: usize = 150;
+
+fn push_unique_value(list: &mut Vec<Value>, value: Value) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+fn push_unique_string(list: &mut Vec<String>, value: String) {
+    if !list.contains(&value) {
+        list.push(value);
+    }
+}
+
+/// Translates one NSH [`WebLink`](nsh_core::url_scheme::WebLink) into
+/// OpenHarmony `module.json5` skill URI entries.
+///
+/// OpenHarmony's `Skill::MatchUri` concatenates `scheme://host` + `/` +
+/// `path|pathStartWith|pathRegex` verbatim and compares `host` literally without
+/// subdomain wildcard matching:
+/// - Wildcard hosts (`*.example.com`) cannot be faithfully expressed and fail
+///   packaging with a clear diagnostic naming the host.
+/// - `paths: []` or `/*` emits a host-only URI matching every path on the host.
+/// - Exact root `"/"` uses `"pathRegex": "$"` (never empty `"path": ""`, which
+///   OpenHarmony treats as matching every path).
+/// - Prefix and exact paths strip only the single leading `/` inserted by the
+///   system matcher while preserving meaningful trailing `/` (so `/items/*`
+///   becomes `pathStartWith: "items/"` and rejects `/items2/a`).
+fn web_link_uris(link: &nsh_core::url_scheme::WebLink) -> anyhow::Result<Vec<Value>> {
+    let host = link.host();
+    if host.starts_with("*.") {
+        bail!(
+            "nsh.json links: HarmonyOS App Linking does not support wildcard subdomain host `{host}`; list each explicit subdomain host instead"
+        );
+    }
+    if link.paths().is_empty() || link.paths().iter().any(|p| p == "/*") {
+        return Ok(vec![json!({
+            "scheme": "https",
+            "host": host,
+        })]);
+    }
+    let mut uris = Vec::new();
+    for path in link.paths() {
+        if path == "/" {
+            push_unique_value(
+                &mut uris,
+                json!({
+                    "scheme": "https",
+                    "host": host,
+                    "pathRegex": "$",
+                }),
+            );
+            continue;
+        }
+        let (field, raw_rel) = if let Some(prefix) = path.strip_suffix('*') {
+            ("pathStartWith", prefix.strip_prefix('/').unwrap_or(prefix))
+        } else {
+            ("path", path.strip_prefix('/').unwrap_or(path))
+        };
+        let encoded = utf8_percent_encode(raw_rel, LINK_PATH_ENCODE_SET).to_string();
+        push_unique_value(
+            &mut uris,
+            json!({
+                "scheme": "https",
+                "host": host,
+                field: encoded,
+            }),
+        );
+        if encoded != raw_rel {
+            push_unique_value(
+                &mut uris,
+                json!({
+                    "scheme": "https",
+                    "host": host,
+                    field: raw_rel,
+                }),
+            );
+        }
+    }
+    Ok(uris)
+}
+
+/// Maps a lowercase file extension (without leading dot) to an OpenHarmony
+/// preset Uniform Type Descriptor (UTD) when one exists.
+fn preset_utd_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "txt" | "log" | "ini" | "cfg" | "conf" => Some("general.plain-text"),
+        "md" | "markdown" => Some("general.markdown"),
+        "html" | "htm" => Some("general.html"),
+        "xml" => Some("general.xml"),
+        "json" => Some("general.json"),
+        "yaml" | "yml" => Some("general.yaml"),
+        "csv" => Some("general.comma-separated-values-text"),
+        "tsv" => Some("general.tab-separated-values-text"),
+        "css" => Some("general.css"),
+        "js" | "mjs" | "cjs" => Some("general.java-script"),
+        "ts" | "mts" | "cts" => Some("general.type-script"),
+        "rtf" => Some("general.rtf"),
+        "pdf" => Some("com.adobe.pdf"),
+        "doc" => Some("com.microsoft.word.doc"),
+        "docx" => Some("org.openxmlformats.wordprocessingml.document"),
+        "xls" => Some("com.microsoft.excel.xls"),
+        "xlsx" => Some("org.openxmlformats.spreadsheetml.sheet"),
+        "ppt" => Some("com.microsoft.powerpoint.ppt"),
+        "pptx" => Some("org.openxmlformats.presentationml.presentation"),
+        "epub" => Some("org.idpf.epub-container"),
+        "png" => Some("general.png"),
+        "jpg" | "jpeg" | "jpe" => Some("general.jpeg"),
+        "gif" => Some("general.gif"),
+        "webp" => Some("org.webmproject.webp"),
+        "bmp" => Some("com.microsoft.bmp"),
+        "svg" => Some("general.svg"),
+        "ico" => Some("com.microsoft.ico"),
+        "tif" | "tiff" => Some("general.tiff"),
+        "heic" => Some("general.heic"),
+        "heif" => Some("general.heif"),
+        "avif" => Some("general.avif"),
+        "mp4" | "m4v" => Some("general.mpeg-4"),
+        "mov" => Some("com.apple.quicktime-movie"),
+        "avi" => Some("general.avi"),
+        "mkv" => Some("org.matroska.mkv"),
+        "webm" => Some("org.webmproject.webm"),
+        "3gp" => Some("general.3gpp"),
+        "mp3" => Some("general.mp3"),
+        "wav" => Some("com.microsoft.waveform-audio"),
+        "aac" => Some("general.aac"),
+        "m4a" => Some("general.mpeg-4-audio"),
+        "flac" => Some("general.flac"),
+        "ogg" | "oga" => Some("general.ogg"),
+        "opus" => Some("general.opus"),
+        "zip" => Some("general.zip-archive"),
+        "tar" => Some("general.tar-archive"),
+        "gz" | "gzip" => Some("org.gnu.gnu-zip-archive"),
+        "bz2" => Some("general.bz2-archive"),
+        "7z" => Some("general.7z-archive"),
+        "rar" => Some("general.rar-archive"),
+        _ => None,
+    }
+}
+
+/// Maps a MIME type (including wildcards like `video/*`, which OpenHarmony's
+/// `Skill::MatchUtd` rejects if passed literally) to a preset OpenHarmony UTD.
+fn preset_utd_for_mime(mime: &str) -> Option<&'static str> {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/*" => Some("general.image"),
+        "video/*" => Some("general.video"),
+        "audio/*" => Some("general.audio"),
+        "text/*" => Some("general.text"),
+        "*/*" | "application/octet-stream" => Some("general.file"),
+        "text/plain" => Some("general.plain-text"),
+        "text/markdown" => Some("general.markdown"),
+        "text/html" => Some("general.html"),
+        "text/xml" | "application/xml" => Some("general.xml"),
+        "application/json" | "text/json" => Some("general.json"),
+        "text/csv" => Some("general.comma-separated-values-text"),
+        "text/css" => Some("general.css"),
+        "text/javascript" | "application/javascript" => Some("general.java-script"),
+        "application/pdf" => Some("com.adobe.pdf"),
+        "image/png" => Some("general.png"),
+        "image/jpeg" => Some("general.jpeg"),
+        "image/gif" => Some("general.gif"),
+        "image/webp" => Some("org.webmproject.webp"),
+        "image/bmp" => Some("com.microsoft.bmp"),
+        "image/svg+xml" => Some("general.svg"),
+        "image/tiff" => Some("general.tiff"),
+        "image/heic" => Some("general.heic"),
+        "image/heif" => Some("general.heif"),
+        "video/mp4" => Some("general.mpeg-4"),
+        "video/quicktime" => Some("com.apple.quicktime-movie"),
+        "video/x-msvideo" => Some("general.avi"),
+        "video/x-matroska" => Some("org.matroska.mkv"),
+        "video/webm" => Some("org.webmproject.webm"),
+        "audio/mpeg" => Some("general.mp3"),
+        "audio/wav" | "audio/x-wav" => Some("com.microsoft.waveform-audio"),
+        "audio/aac" => Some("general.aac"),
+        "audio/mp4" => Some("general.mpeg-4-audio"),
+        "audio/flac" => Some("general.flac"),
+        "audio/ogg" => Some("general.ogg"),
+        "application/zip" => Some("general.zip-archive"),
+        "application/gzip" => Some("org.gnu.gnu-zip-archive"),
+        "application/epub+zip" => Some("org.idpf.epub-container"),
+        _ => None,
+    }
+}
+
+/// Maps common Apple UTIs (`contentTypes`) to OpenHarmony preset UTDs.
+fn preset_utd_for_content_type(uti: &str) -> Option<&'static str> {
+    match uti.to_ascii_lowercase().as_str() {
+        "public.plain-text" => Some("general.plain-text"),
+        "public.text" | "public.utf8-plain-text" => Some("general.text"),
+        "public.html" => Some("general.html"),
+        "public.xml" => Some("general.xml"),
+        "public.json" => Some("general.json"),
+        "public.comma-separated-values-text" => Some("general.comma-separated-values-text"),
+        "com.adobe.pdf" => Some("com.adobe.pdf"),
+        "public.image" => Some("general.image"),
+        "public.png" => Some("general.png"),
+        "public.jpeg" => Some("general.jpeg"),
+        "com.compuserve.gif" => Some("general.gif"),
+        "public.svg-image" => Some("general.svg"),
+        "public.heic" => Some("general.heic"),
+        "public.heif" => Some("general.heif"),
+        "public.movie" | "public.video" => Some("general.video"),
+        "public.mpeg-4" => Some("general.mpeg-4"),
+        "com.apple.quicktime-movie" => Some("com.apple.quicktime-movie"),
+        "public.audio" => Some("general.audio"),
+        "public.mp3" => Some("general.mp3"),
+        "public.mpeg-4-audio" => Some("general.mpeg-4-audio"),
+        "com.microsoft.waveform-audio" => Some("com.microsoft.waveform-audio"),
+        "public.zip-archive" => Some("general.zip-archive"),
+        "public.data" | "public.content" | "public.item" => Some("general.file"),
+        _ => None,
+    }
+}
+
+fn sanitize_utd_prefix(bundle_id: &str) -> String {
+    let sanitized: String = bundle_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "com.example.app".to_owned()
+    } else {
+        sanitized
+    }
+}
+
+/// Builds OpenHarmony `viewData` / `sendData` skills and optional custom
+/// `arkdata/utd/utd.json5` declarations from `nsh.json` `"fileTypes"`.
+fn build_file_type_skills(
+    bundle_id: &str,
+    file_types: &[nsh_core::file_type::FileType],
+) -> anyhow::Result<(Vec<Value>, Option<String>)> {
+    if file_types.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+    let utd_prefix = sanitize_utd_prefix(bundle_id);
+    let mut view_types: Vec<String> = Vec::new();
+    let mut send_utds: Vec<String> = Vec::new();
+    let mut custom_utds: Vec<Value> = Vec::new();
+
+    for (index, ft) in file_types.iter().enumerate() {
+        let mut custom_exts: Vec<String> = Vec::new();
+        for ext in &ft.extensions {
+            if let Some(utd) = preset_utd_for_extension(ext) {
+                push_unique_string(&mut view_types, utd.to_owned());
+                push_unique_string(&mut send_utds, utd.to_owned());
+            } else {
+                custom_exts.push(format!(".{ext}"));
+            }
+        }
+        let mut exact_mimes: Vec<String> = Vec::new();
+        for mime in &ft.mime_types {
+            if let Some(utd) = preset_utd_for_mime(mime) {
+                push_unique_string(&mut view_types, utd.to_owned());
+                push_unique_string(&mut send_utds, utd.to_owned());
+            } else if !mime.contains('*') {
+                let lowered = mime.to_ascii_lowercase();
+                push_unique_string(&mut exact_mimes, lowered.clone());
+                if custom_exts.is_empty() {
+                    push_unique_string(&mut view_types, lowered);
+                }
+            }
+        }
+        for uti in &ft.content_types {
+            if let Some(utd) = preset_utd_for_content_type(uti) {
+                push_unique_string(&mut view_types, utd.to_owned());
+                push_unique_string(&mut send_utds, utd.to_owned());
+            }
+        }
+        if !custom_exts.is_empty() {
+            let type_id = format!("{utd_prefix}.nsh_filetype_{index}");
+            let mut decl = Map::new();
+            decl.insert("TypeId".to_owned(), Value::String(type_id.clone()));
+            decl.insert(
+                "BelongingToTypes".to_owned(),
+                json!(["general.file"]),
+            );
+            decl.insert(
+                "FilenameExtensions".to_owned(),
+                Value::Array(custom_exts.into_iter().map(Value::String).collect()),
+            );
+            if !exact_mimes.is_empty() {
+                decl.insert(
+                    "MIMETypes".to_owned(),
+                    Value::Array(exact_mimes.into_iter().map(Value::String).collect()),
+                );
+            }
+            decl.insert("Description".to_owned(), Value::String(ft.name.clone()));
+            decl.insert("ReferenceURL".to_owned(), Value::String(String::new()));
+            decl.insert("IconFile".to_owned(), Value::String(String::new()));
+            custom_utds.push(Value::Object(decl));
+            push_unique_string(&mut view_types, type_id.clone());
+            push_unique_string(&mut send_utds, type_id);
+        }
+    }
+
+    if view_types.len() > MAX_LINK_FEATURES {
+        bail!(
+            "nsh.json fileTypes expands to {} HarmonyOS FileOpen entries (limit is {MAX_LINK_FEATURES})",
+            view_types.len()
+        );
+    }
+
+    let mut skills = Vec::new();
+    if !view_types.is_empty() {
+        let uris: Vec<Value> = view_types
+            .iter()
+            .map(|ty| {
+                json!({
+                    "scheme": "file",
+                    "type": ty,
+                    "linkFeature": "FileOpen",
+                })
+            })
+            .collect();
+        skills.push(json!({
+            "actions": ["ohos.want.action.viewData"],
+            "uris": uris,
+        }));
+    }
+    if !send_utds.is_empty() {
+        let uris: Vec<Value> = send_utds
+            .iter()
+            .map(|utd| {
+                json!({
+                    "scheme": "file",
+                    "utd": utd,
+                    "maxFileSupported": 16,
+                })
+            })
+            .collect();
+        skills.push(json!({
+            "actions": ["ohos.want.action.sendData"],
+            "uris": uris,
+        }));
+    }
+    let utd_json = if custom_utds.is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::to_string_pretty(&json!({
+                "UniformDataTypeDeclarations": custom_utds,
+            }))
+            .expect("serializing custom utd.json5"),
+        )
+    };
+    Ok((skills, utd_json))
+}
+
+fn ability_skills_value(
+    bundle_id: &str,
+    schemes: &[String],
+    links: &[nsh_core::url_scheme::WebLink],
+    file_types: &[nsh_core::file_type::FileType],
+) -> anyhow::Result<(Value, Option<String>)> {
     let mut skills = vec![json!({
         "entities": ["entity.system.home"],
         "actions": ["action.system.home"],
@@ -345,27 +857,8 @@ fn ability_skills_value(schemes: &[String], links: &[nsh_core::url_scheme::WebLi
     if !links.is_empty() {
         let mut uris = Vec::new();
         for link in links {
-            if link.paths().is_empty() {
-                uris.push(json!({
-                    "scheme": "https",
-                    "host": link.host(),
-                }));
-            } else {
-                for path in link.paths() {
-                    if let Some(prefix) = path.strip_suffix('*') {
-                        uris.push(json!({
-                            "scheme": "https",
-                            "host": link.host(),
-                            "pathStartWith": prefix,
-                        }));
-                    } else {
-                        uris.push(json!({
-                            "scheme": "https",
-                            "host": link.host(),
-                            "path": path,
-                        }));
-                    }
-                }
+            for uri in web_link_uris(link)? {
+                push_unique_value(&mut uris, uri);
             }
         }
         skills.push(json!({
@@ -375,14 +868,19 @@ fn ability_skills_value(schemes: &[String], links: &[nsh_core::url_scheme::WebLi
             "uris": uris,
         }));
     }
-    Value::Array(skills)
+    let (file_skills, custom_utd) = build_file_type_skills(bundle_id, file_types)?;
+    skills.extend(file_skills);
+    Ok((Value::Array(skills), custom_utd))
 }
 
 fn build_abilities(
+    bundle_id: &str,
     schemes: &[String],
     links: &[nsh_core::url_scheme::WebLink],
+    file_types: &[nsh_core::file_type::FileType],
     extra: &[Map<String, Value>],
-) -> String {
+) -> anyhow::Result<(String, Option<String>)> {
+    let (skills, custom_utd) = ability_skills_value(bundle_id, schemes, links, file_types)?;
     let mut abilities = vec![json!({
         "name": "EntryAbility",
         "srcEntry": "./ets/entryability/EntryAbility.ets",
@@ -391,7 +889,7 @@ fn build_abilities(
         "startWindowIcon": "$media:app_icon",
         "startWindowBackground": "$color:start_window_background",
         "exported": true,
-        "skills": ability_skills_value(schemes, links),
+        "skills": skills,
     })];
     for ability in extra {
         let mut obj = ability.clone();
@@ -405,7 +903,7 @@ fn build_abilities(
             .or_insert_with(|| Value::String("$color:start_window_background".to_owned()));
         abilities.push(Value::Object(obj));
     }
-    indent_json(&Value::Array(abilities), 4)
+    Ok((indent_json(&Value::Array(abilities), 4), custom_utd))
 }
 
 fn build_module_extras(harmonyos: &HarmonyMeta) -> String {
@@ -497,14 +995,101 @@ fn copy_ohpm_dir(from: &Path, to: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn existing_har_module_name(module_json: &Path) -> Option<String> {
-    let text = fs::read_to_string(module_json).ok()?;
-    let value: Value = serde_json::from_str(&text).ok()?;
-    let name = value.get("module")?.get("name")?.as_str()?.trim();
-    (!name.is_empty()).then(|| name.to_owned())
+fn read_existing_har_module_name(
+    manifest: &Path,
+    display_path: &Path,
+    pkg: &str,
+) -> anyhow::Result<Option<String>> {
+    match fs::read_to_string(manifest) {
+        Ok(text) => {
+            let value = json5::from_str::<Value>(&text).map_err(|err| {
+                anyhow::anyhow!(
+                    "harmonyos.dependencies.{pkg}: invalid JSON5 in {}: {err}",
+                    display_path.display()
+                )
+            })?;
+            let module = value
+                .get("module")
+                .and_then(Value::as_object)
+                .with_context(|| {
+                    format!(
+                        "harmonyos.dependencies.{pkg}: {} is missing object `module`",
+                        display_path.display()
+                    )
+                })?;
+            let name = module
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .with_context(|| {
+                    format!(
+                        "harmonyos.dependencies.{pkg}: {} has missing or empty `module.name`",
+                        display_path.display()
+                    )
+                })?;
+            Ok(Some(name.to_owned()))
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "harmonyos.dependencies.{pkg}: reading {}",
+                display_path.display()
+            )
+        }),
+    }
 }
 
-fn ensure_har_module_files(dest_root: &Path, default_name: &str) -> anyhow::Result<String> {
+/// Pre-validates local ohpm dependencies (existence, HAR JSON5 `module.json5`
+/// syntax/name, and module name collisions) before removing any generated files.
+fn validate_ohpm_dependencies(harmonyos: &HarmonyMeta) -> anyhow::Result<()> {
+    let mut seen_module_names: BTreeMap<String, String> = BTreeMap::from([
+        ("entry".to_owned(), "built-in module `entry`".to_owned()),
+        (
+            "nsh_harmonyos".to_owned(),
+            "built-in module `nsh_harmonyos`".to_owned(),
+        ),
+    ]);
+    for (pkg, dep) in &harmonyos.dependencies {
+        let OhpmDep::LocalPath(src) = dep else {
+            continue;
+        };
+        if !src.exists() {
+            bail!(
+                "harmonyos.dependencies.{pkg}: local package not found at {}",
+                src.display()
+            );
+        }
+        if src.is_file() {
+            continue;
+        }
+        if !src.is_dir() {
+            bail!(
+                "harmonyos.dependencies.{pkg}: {} is neither a file nor a directory",
+                src.display()
+            );
+        }
+        let hash = fnv1a_32(pkg);
+        let default_mod_name = format!("nshm_{hash:08x}");
+        let src_manifest = join_all(src, ["src", "main", "module.json5"]);
+        let mod_name = read_existing_har_module_name(&src_manifest, &src_manifest, pkg)?
+            .unwrap_or(default_mod_name);
+        if let Some(other) = seen_module_names.get(&mod_name) {
+            bail!(
+                "harmonyos.dependencies.{pkg}: HAR module name `{mod_name}` collides with {other} in build-profile.json5"
+            );
+        }
+        seen_module_names.insert(mod_name, format!("harmonyos.dependencies.{pkg}"));
+    }
+    Ok(())
+}
+
+fn ensure_har_module_files(
+    dest_root: &Path,
+    src_root: &Path,
+    pkg: &str,
+    default_name: &str,
+) -> anyhow::Result<String> {
     let build_profile = dest_root.join("build-profile.json5");
     if !build_profile.exists() {
         write_file(
@@ -520,16 +1105,15 @@ fn ensure_har_module_files(dest_root: &Path, default_name: &str) -> anyhow::Resu
         )?;
     }
     let module_json = join_all(dest_root, ["src", "main", "module.json5"]);
-    if let Some(existing) = existing_har_module_name(&module_json) {
+    let display_manifest = join_all(src_root, ["src", "main", "module.json5"]);
+    if let Some(existing) = read_existing_har_module_name(&module_json, &display_manifest, pkg)? {
         return Ok(existing);
     }
-    if !module_json.exists() {
-        let content = format!(
-            "{{ \"module\": {{ \"name\": \"{}\", \"type\": \"har\", \"deviceTypes\": [\"default\", \"tablet\", \"2in1\"] }} }}\n",
-            json_text(default_name),
-        );
-        write_file(&module_json, content.as_bytes())?;
-    }
+    let content = format!(
+        "{{ \"module\": {{ \"name\": \"{}\", \"type\": \"har\", \"deviceTypes\": [\"default\", \"tablet\", \"2in1\"] }} }}\n",
+        json_text(default_name),
+    );
+    write_file(&module_json, content.as_bytes())?;
     Ok(default_name.to_owned())
 }
 
@@ -547,7 +1131,13 @@ fn stage_ohpm_dependencies(
         Value::String("file:../nsh".to_owned()),
     );
     let mut extra_modules = String::new();
-    let mut seen_module_names = vec!["entry".to_owned(), "nsh_harmonyos".to_owned()];
+    let mut seen_module_names: BTreeMap<String, String> = BTreeMap::from([
+        ("entry".to_owned(), "built-in module `entry`".to_owned()),
+        (
+            "nsh_harmonyos".to_owned(),
+            "built-in module `nsh_harmonyos`".to_owned(),
+        ),
+    ]);
     for (pkg, dep) in &harmonyos.dependencies {
         let spec = match dep {
             OhpmDep::Version(version) => version.clone(),
@@ -587,13 +1177,14 @@ fn stage_ohpm_dependencies(
                         )
                     })?;
                     let default_mod_name = format!("nshm_{hash:08x}");
-                    let mod_name = ensure_har_module_files(&dest_root, &default_mod_name)?;
-                    if seen_module_names.iter().any(|seen| seen == &mod_name) {
+                    let mod_name =
+                        ensure_har_module_files(&dest_root, src, pkg, &default_mod_name)?;
+                    if let Some(other) = seen_module_names.get(&mod_name) {
                         bail!(
-                            "harmonyos.dependencies.{pkg}: HAR module name `{mod_name}` collides with another module in build-profile.json5"
+                            "harmonyos.dependencies.{pkg}: HAR module name `{mod_name}` collides with {other} in build-profile.json5"
                         );
                     }
-                    seen_module_names.push(mod_name.clone());
+                    seen_module_names.insert(mod_name.clone(), format!("harmonyos.dependencies.{pkg}"));
                     extra_modules.push_str(&format!(
                         "\n    {{\n      \"name\": \"{}\",\n      \"srcPath\": \"./nshm-deps/{}\"\n    }},",
                         json_text(&mod_name),
@@ -636,7 +1227,11 @@ fn build_entry_build_option(harmonyos: &HarmonyMeta) -> String {
 }
 
 /// Writes the project to `out`.
-pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> anyhow::Result<()> {
+pub(crate) fn write(
+    out: &Path,
+    config: &AppConfig,
+    contents: &Contents<'_>,
+) -> anyhow::Result<ProjectOutput> {
     if config.id.split('.').count() < 3 {
         println!(
             "! nsh.json \"id\" {:?} is the bundle name: HarmonyOS asks for a reverse domain of at \
@@ -644,10 +1239,22 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
             config.id
         );
     }
-    let previous = fs::read_to_string(out.join("build-profile.json5")).unwrap_or_default();
-    let signing = signing_configs(&previous).unwrap_or("[]").to_owned();
-    let product_signing = match signing_name(&signing) {
-        Some(name) => format!("\"signingConfig\": \"{}\",", json_text(name)),
+    // Validate existing signing config, links/fileTypes, and local HAR manifests
+    // BEFORE removing any previously generated directories or files.
+    let profile_path = out.join("build-profile.json5");
+    let preserved_signing = read_preserved_signing(&profile_path, "default")?;
+    let (abilities, custom_utd) = build_abilities(
+        &config.id,
+        &config.schemes,
+        &config.links,
+        &config.file_types,
+        &config.harmonyos.abilities,
+    )?;
+    validate_ohpm_dependencies(&config.harmonyos)?;
+
+    let signing = indent_json(&Value::Array(preserved_signing.signing_configs.clone()), 4);
+    let product_signing = match &preserved_signing.product_signing_config {
+        Some(name) => format!("\n        \"signingConfig\": \"{}\",", json_text(name)),
         None => String::new(),
     };
     let (runtime_os, sdk_versions) = contents
@@ -669,9 +1276,7 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
         }
     }
 
-    let (request_permissions, entry_strings) =
-        build_permissions_and_strings(config.speech, &config.harmonyos);
-    let abilities = build_abilities(&config.schemes, &config.links, &config.harmonyos.abilities);
+    let (request_permissions, entry_strings) = build_permissions_and_strings(&config.harmonyos);
     let module_extras = build_module_extras(&config.harmonyos);
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
@@ -707,11 +1312,23 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
             continue;
         }
         let target = join_relative(out, path);
-        let bytes = match std::str::from_utf8(bytes) {
-            Ok(text) if text.contains("{{") => render_template(text, &substitutions).into_bytes(),
-            _ => bytes.to_vec(),
+        let rendered = match std::str::from_utf8(bytes) {
+            Ok(text) if text.contains("{{") => Some(render_template(text, &substitutions)),
+            _ => None,
         };
-        write_file(&target, &bytes)?;
+        if *path == "build-profile.json5" {
+            let text = rendered
+                .as_deref()
+                .context("build-profile.json5 template was not rendered")?;
+            validate_build_profile(text, &preserved_signing, "default")?;
+            write_file_atomic(&target, text.as_bytes())?;
+            continue;
+        }
+        let out_bytes = match rendered {
+            Some(text) => text.into_bytes(),
+            None => bytes.to_vec(),
+        };
+        write_file(&target, &out_bytes)?;
     }
     for (dest_rel, src_file) in &config.harmonyos.ability_sources {
         let dest = join_relative(join_all(out, ["entry", "src", "main"]), dest_rel);
@@ -741,6 +1358,10 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
 
     let rawfile = join_all(out, ["entry", "src", "main", "resources", "rawfile"]);
     fs::create_dir_all(&rawfile)?;
+    if let Some(utd_json) = custom_utd {
+        let utd_path = join_all(&rawfile, ["arkdata", "utd", "utd.json5"]);
+        write_file(&utd_path, utd_json.as_bytes())?;
+    }
     for name in ["app.json", "capabilities.json"] {
         let source = contents.build.join(name);
         if source.is_file() {
@@ -766,6 +1387,18 @@ pub(crate) fn write(out: &Path, config: &AppConfig, contents: &Contents<'_>) -> 
     if assets.is_dir() {
         copy_dir(&assets, &rawfile.join("assets"))?;
     }
+    Ok(ProjectOutput {
+        signed: preserved_signing.product_signing_config.is_some(),
+    })
+}
+
+fn write_file_atomic(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!("json5.tmp.{}", std::process::id()));
+    fs::write(&tmp, bytes).with_context(|| format!("writing {}", tmp.display()))?;
+    fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
     Ok(())
 }
 
@@ -843,16 +1476,11 @@ mod tests {
         assert_eq!(config.links.len(), 2);
         assert_eq!(config.links[0].host(), "example.com");
         assert_eq!(config.links[1].paths(), ["/orders/*", "/checkout"]);
-        assert!(!config.speech);
+        assert!(config.file_types.is_empty());
         let bare = AppConfig::from_json(&app_root, &serde_json::json!({})).unwrap();
         assert_eq!(
-            (
-                bare.name.as_str(),
-                bare.id.as_str(),
-                bare.build,
-                bare.speech
-            ),
-            ("counter", "com.example.counter", 1, false)
+            (bare.name.as_str(), bare.id.as_str(), bare.build),
+            ("counter", "com.example.counter", 1)
         );
         assert!(bare.schemes.is_empty());
         assert!(!bare.webview);
@@ -861,7 +1489,6 @@ mod tests {
             &serde_json::json!({ "capabilities": { "speech": true, "webview": {} } }),
         )
         .unwrap();
-        assert!(speech.speech);
         assert!(speech.webview);
     }
 
@@ -928,33 +1555,76 @@ mod tests {
     }
 
     #[test]
-    fn keeps_signing_set_up_in_deveco() {
+    fn keeps_signing_set_up_in_deveco_including_json5_and_selected_product() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-signing-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let profile_path = dir.join("build-profile.json5");
+
+        // Missing file -> first-time generation (empty, unsigned).
+        let fresh = read_preserved_signing(&profile_path, "default").unwrap();
+        assert!(fresh.signing_configs.is_empty());
+        assert_eq!(fresh.product_signing_config, None);
+
+        // JSON5 bare keys, single quotes, comments, trailing commas, `]` in string,
+        // two signing configs (`debug`, `release`) and two products (`staging -> debug`, `default -> release`).
         let profile = r#"{
-  "app": {
-    "signingConfigs": [
+  // Top-level comment
+  app: {
+    signingConfigs: [
       {
-        "name": "default",
-        "type": "HarmonyOS",
-        "material": { "storePassword": "a]b", "certpath": "/Users/me/.ohos/config/default.cer" }
-      }
+        name: 'debug',
+        type: 'HarmonyOS',
+        material: { storePassword: 'a]b', certpath: '/Users/me/.ohos/debug.cer', },
+      },
+      {
+        name: "release",
+        type: "HarmonyOS",
+        /* block comment */
+        material: { storePassword: "secret]pass", certpath: "/Users/me/.ohos/release.cer", },
+      },
     ],
-    "products": []
+    products: [
+      { name: 'staging', signingConfig: 'debug', },
+      { name: 'default', signingConfig: 'release', },
+    ],
+  },
+}"#;
+        fs::write(&profile_path, profile).unwrap();
+        let preserved = read_preserved_signing(&profile_path, "default").unwrap();
+        assert_eq!(preserved.signing_configs.len(), 2);
+        assert_eq!(preserved.product_signing_config.as_deref(), Some("release"));
+
+        // Dangling signingConfig reference errors with file + product + key, never leaking secrets.
+        let dangling = r#"{
+  app: {
+    signingConfigs: [{ name: 'debug', material: { storePassword: 'TOP_SECRET_VALUE' } }],
+    products: [{ name: 'default', signingConfig: 'release' }],
   }
 }"#;
-        let configs = signing_configs(profile).unwrap();
-        assert!(
-            configs.starts_with('[') && configs.ends_with(']'),
-            "{configs}"
-        );
-        assert!(configs.contains("default.cer"));
-        assert_eq!(signing_name(configs), Some("default"));
-        assert_eq!(signing_configs("{}"), None);
-        assert_eq!(signing_name("[]"), None);
+        fs::write(&profile_path, dangling).unwrap();
+        let err = read_preserved_signing(&profile_path, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("build-profile.json5"), "{err}");
+        assert!(err.contains("default"), "{err}");
+        assert!(err.contains("release"), "{err}");
+        assert!(!err.contains("TOP_SECRET_VALUE"), "{err}");
+
+        // Malformed JSON5 errors without leaking secrets.
+        fs::write(&profile_path, "{ app: { signingConfigs: [ broken } }").unwrap();
+        let err = read_preserved_signing(&profile_path, "default")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("build-profile.json5"), "{err}");
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn writes_the_project() {
         let dir = std::env::temp_dir().join(format!("nsh-hm-project-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
         let build = dir.join("build");
         fs::create_dir_all(build.join("assets")).unwrap();
         fs::write(build.join("bundle.js"), "export default 1").unwrap();
@@ -969,7 +1639,7 @@ mod tests {
                 "schemes": ["counterapp"],
                 "links": [
                     { "host": "example.com" },
-                    { "host": "*.sub.example.com", "paths": ["/items/*", "/exact"] }
+                    { "host": "shop.example.com", "paths": ["/items/*", "/exact", "/"] }
                 ]
             }),
         )
@@ -983,7 +1653,8 @@ mod tests {
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
         };
-        write(&out, &config, &contents).unwrap();
+        let written = write(&out, &config, &contents).unwrap();
+        assert!(!written.signed);
         let index = join_relative(&out, "entry/src/main/ets/pages/Index.ets");
         let index_source = fs::read_to_string(&index).unwrap();
         assert!(index_source.contains("if (false) {\n      prepareWebEngine();"));
@@ -1034,15 +1705,12 @@ mod tests {
         assert!(module.contains("\"scheme\": \"counterapp\""), "{module}");
         assert!(module.contains("\"domainVerify\": true"), "{module}");
         assert!(module.contains("\"host\": \"example.com\""), "{module}");
-        assert!(
-            module.contains("\"host\": \"*.sub.example.com\""),
-            "{module}"
-        );
-        assert!(
-            module.contains("\"pathStartWith\": \"/items/\""),
-            "{module}"
-        );
-        assert!(module.contains("\"path\": \"/exact\""), "{module}");
+        assert!(module.contains("\"host\": \"shop.example.com\""), "{module}");
+        assert!(module.contains("\"pathStartWith\": \"items/\""), "{module}");
+        assert!(module.contains("\"path\": \"exact\""), "{module}");
+        assert!(module.contains("\"pathRegex\": \"$\""), "{module}");
+        assert!(!module.contains("\"pathStartWith\": \"/"), "{module}");
+        assert!(!module.contains("\"path\": \"/"), "{module}");
         assert!(!module.contains("{{"), "{module}");
         assert!(profile.contains("\"signingConfigs\": []"));
         assert!(!profile.contains("{{"), "{profile}");
@@ -1103,26 +1771,50 @@ mod tests {
             .is_file()
         );
 
-        // Signing set up in DevEco survives packaging again.
-        let signed = profile.replace(
-            "\"signingConfigs\": []",
-            "\"signingConfigs\": [{ \"name\": \"release\", \"material\": {} }]",
-        );
+        // Signing set up in DevEco (JSON5, two configs, default -> release) survives packaging twice.
+        let signed = r#"{
+  // DevEco signing
+  app: {
+    products: [
+      { name: 'staging', signingConfig: 'debug' },
+      { name: 'default', signingConfig: 'release', runtimeOS: 'HarmonyOS' },
+    ],
+    signingConfigs: [
+      { name: 'debug', material: { cert: 'debug.cer' } },
+      { name: 'release', material: { cert: 'release.cer' } },
+    ],
+  },
+}"#;
         fs::write(out.join("build-profile.json5"), signed).unwrap();
-        write(&out, &config, &contents).unwrap();
-        let profile = fs::read_to_string(out.join("build-profile.json5")).unwrap();
-        assert!(
-            profile.contains("\"signingConfig\": \"release\","),
-            "{profile}"
-        );
-        assert!(profile.contains("{ \"name\": \"release\", \"material\": {} }"));
+        for _ in 0..2 {
+            let result = write(&out, &config, &contents).unwrap();
+            assert!(result.signed);
+            let parsed: Value =
+                serde_json::from_str(&fs::read_to_string(out.join("build-profile.json5")).unwrap())
+                    .unwrap();
+            assert_eq!(parsed["app"]["products"][0]["signingConfig"], "release");
+            assert_eq!(parsed["app"]["signingConfigs"].as_array().unwrap().len(), 2);
+            assert_eq!(parsed["app"]["signingConfigs"][1]["material"]["cert"], "release.cer");
+        }
 
-        let speech = AppConfig::from_json(
+        // Corrupt existing build-profile.json5 fails without overwriting the original file.
+        let broken = "{ app: { signingConfigs: [ broken } }";
+        fs::write(out.join("build-profile.json5"), broken).unwrap();
+        assert!(write(&out, &config, &contents).is_err());
+        assert_eq!(
+            fs::read_to_string(out.join("build-profile.json5")).unwrap(),
+            broken
+        );
+        fs::remove_file(out.join("build-profile.json5")).unwrap();
+
+        // `capabilities.speech: true` alone does NOT emit MICROPHONE in NSH 0.7
+        // (MICROPHONE comes from `nsh-extra`'s `speech` feature or explicit `harmonyos.permissions`).
+        let webview_only = AppConfig::from_json(
             &dir.join("speech"),
             &serde_json::json!({ "capabilities": { "speech": true, "webview": {} } }),
         )
         .unwrap();
-        write(&out, &speech, &contents).unwrap();
+        write(&out, &webview_only, &contents).unwrap();
         assert!(
             fs::read_to_string(index)
                 .unwrap()
@@ -1131,7 +1823,7 @@ mod tests {
         let module =
             fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap();
         let parsed: Value = serde_json::from_str(&module).unwrap();
-        assert!(module.contains("ohos.permission.MICROPHONE"), "{module}");
+        assert!(!module.contains("ohos.permission.MICROPHONE"), "{module}");
         assert!(module.contains("ohos.permission.VIBRATE"), "{module}");
         assert!(parsed["module"].get("querySchemes").is_none());
         assert!(parsed["module"].get("metadata").is_none());
@@ -1459,6 +2151,309 @@ mod tests {
                 ]
             )
             .is_file()
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn har_json5_module_name_errors_and_collisions() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-har-json5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let app_dir = dir.join("app");
+        let har = app_dir.join("vendor").join("scanner_pkg");
+        fs::create_dir_all(join_all(&har, ["src", "main"])).unwrap();
+        fs::write(har.join("oh-package.json5"), "{ name: '@acme/scanner' }").unwrap();
+        fs::write(
+            join_all(&har, ["src", "main", "module.json5"]),
+            r#"{
+  // Comment and trailing comma in valid JSON5
+  module: {
+    name: 'scanner_har_mod',
+    type: 'har',
+  },
+}"#,
+        )
+        .unwrap();
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+        let config = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "name": "HarTest",
+                "id": "com.example.hartest",
+                "harmonyos": {
+                    "dependencies": {
+                        "@acme/scanner": "file:vendor/scanner_pkg"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let out = dir.join("project");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+        write(&out, &config, &contents).unwrap();
+        let root_profile: Value =
+            serde_json::from_str(&fs::read_to_string(out.join("build-profile.json5")).unwrap())
+                .unwrap();
+        let modules = root_profile["modules"].as_array().unwrap();
+        assert!(
+            modules
+                .iter()
+                .any(|m| m["name"] == "scanner_har_mod"
+                    && m["srcPath"].as_str().is_some_and(|p| p.starts_with("./nshm-deps/"))),
+            "{root_profile}"
+        );
+
+        // Two local HARs declaring the same module name fail naming both dependencies.
+        let har2 = app_dir.join("vendor").join("dup_pkg");
+        fs::create_dir_all(join_all(&har2, ["src", "main"])).unwrap();
+        fs::write(
+            join_all(&har2, ["src", "main", "module.json5"]),
+            "{ module: { name: 'scanner_har_mod', type: 'har' } }",
+        )
+        .unwrap();
+        let dup_config = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "name": "DupHar",
+                "id": "com.example.duphar",
+                "harmonyos": {
+                    "dependencies": {
+                        "@acme/scanner": "file:vendor/scanner_pkg",
+                        "@acme/dup": "file:vendor/dup_pkg"
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        let err = write(&out, &dup_config, &contents).unwrap_err().to_string();
+        assert!(err.contains("scanner_har_mod"), "{err}");
+        assert!(err.contains("@acme/scanner") && err.contains("@acme/dup"), "{err}");
+
+        // Broken JSON5 in HAR manifest reports package and path.
+        fs::write(
+            join_all(&har, ["src", "main", "module.json5"]),
+            "{ module: { name: } }",
+        )
+        .unwrap();
+        let err = write(&out, &config, &contents).unwrap_err().to_string();
+        assert!(err.contains("@acme/scanner"), "{err}");
+        assert!(err.contains("module.json5"), "{err}");
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn https_links_match_openharmony_skill_semantics_and_reject_wildcards() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-links-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+
+        // Wildcard subdomain host fails with a diagnostic naming the host.
+        let wildcard = AppConfig::from_json(
+            &dir.join("app"),
+            &json!({
+                "name": "Wildcard",
+                "id": "com.example.wildcard",
+                "links": [{ "host": "*.sub.example.com", "paths": ["/items/*"] }]
+            }),
+        )
+        .unwrap();
+        let err = write(&dir.join("out-wild"), &wildcard, &contents)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("*.sub.example.com"), "{err}");
+
+        // Exact, prefix (with and without trailing /), root-only, all-paths, and UTF-8 paths.
+        let config = AppConfig::from_json(
+            &dir.join("app"),
+            &json!({
+                "name": "Links",
+                "id": "com.example.links",
+                "links": [
+                    { "host": "all.example.com", "paths": ["/*"] },
+                    { "host": "root.example.com", "paths": ["/"] },
+                    { "host": "shop.example.com", "paths": ["/items/*", "/items*", "/exact", "/文档/*"] }
+                ]
+            }),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        write(&out, &config, &contents).unwrap();
+        let module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap(),
+        )
+        .unwrap();
+        let skills = module["module"]["abilities"][0]["skills"]
+            .as_array()
+            .unwrap();
+        let link_skill = skills
+            .iter()
+            .find(|s| s.get("domainVerify") == Some(&Value::Bool(true)))
+            .unwrap();
+        let uris = link_skill["uris"].as_array().unwrap();
+        assert!(uris.contains(&json!({ "scheme": "https", "host": "all.example.com" })));
+        assert!(uris.contains(&json!({
+            "scheme": "https",
+            "host": "root.example.com",
+            "pathRegex": "$"
+        })));
+        assert!(uris.contains(&json!({
+            "scheme": "https",
+            "host": "shop.example.com",
+            "pathStartWith": "items/"
+        })));
+        assert!(uris.contains(&json!({
+            "scheme": "https",
+            "host": "shop.example.com",
+            "pathStartWith": "items"
+        })));
+        assert!(uris.contains(&json!({
+            "scheme": "https",
+            "host": "shop.example.com",
+            "path": "exact"
+        })));
+        assert!(uris.contains(&json!({
+            "scheme": "https",
+            "host": "shop.example.com",
+            "pathStartWith": "%E6%96%87%E6%A1%A3/"
+        })));
+
+        // Simulate OpenHarmony 6.0 `Skill::MatchUri`: `scheme://host/` + pathStartWith.
+        let items_prefix = format!("https://shop.example.com/{}", "items/");
+        assert!("https://shop.example.com/items/a".starts_with(&items_prefix));
+        assert!(!"https://shop.example.com/items2/a".starts_with(&items_prefix));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_file_types_skills_and_custom_utd_declarations() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-filetypes-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+        let config = AppConfig::from_json(
+            &dir.join("app"),
+            &json!({
+                "name": "Reader",
+                "id": "com.example.reader",
+                "fileTypes": [
+                    { "name": "Documents", "extensions": ["md", "pdf"], "mimeTypes": ["video/*"] },
+                    { "name": "Custom Note", "extensions": ["nshnote"], "mimeTypes": ["application/x-nsh-note"] },
+                    { "name": "Movie UTI", "contentTypes": ["public.movie"] }
+                ]
+            }),
+        )
+        .unwrap();
+        let out = dir.join("out");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+        write(&out, &config, &contents).unwrap();
+
+        let module: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(&out, ["entry", "src", "main", "module.json5"])).unwrap(),
+        )
+        .unwrap();
+        let skills = module["module"]["abilities"][0]["skills"]
+            .as_array()
+            .unwrap();
+        let view_skill = skills
+            .iter()
+            .find(|s| {
+                s["actions"] == json!(["ohos.want.action.viewData"])
+                    && s["uris"]
+                        .as_array()
+                        .is_some_and(|u| u.iter().any(|x| x["scheme"] == "file"))
+            })
+            .unwrap();
+        let view_uris = view_skill["uris"].as_array().unwrap();
+        assert!(view_uris.contains(&json!({
+            "scheme": "file",
+            "type": "general.markdown",
+            "linkFeature": "FileOpen"
+        })));
+        assert!(view_uris.contains(&json!({
+            "scheme": "file",
+            "type": "com.adobe.pdf",
+            "linkFeature": "FileOpen"
+        })));
+        // Wildcard MIME `video/*` maps to preset UTD `general.video`.
+        assert!(view_uris.contains(&json!({
+            "scheme": "file",
+            "type": "general.video",
+            "linkFeature": "FileOpen"
+        })));
+        assert!(view_uris.contains(&json!({
+            "scheme": "file",
+            "type": "com.example.reader.nsh_filetype_1",
+            "linkFeature": "FileOpen"
+        })));
+        let send_skill = skills
+            .iter()
+            .find(|s| s["actions"] == json!(["ohos.want.action.sendData"]))
+            .unwrap();
+        let send_uris = send_skill["uris"].as_array().unwrap();
+        assert!(send_uris.contains(&json!({
+            "scheme": "file",
+            "utd": "com.example.reader.nsh_filetype_1",
+            "maxFileSupported": 16
+        })));
+
+        let utd_path = join_all(
+            &out,
+            [
+                "entry",
+                "src",
+                "main",
+                "resources",
+                "rawfile",
+                "arkdata",
+                "utd",
+                "utd.json5",
+            ],
+        );
+        let utd: Value = serde_json::from_str(&fs::read_to_string(&utd_path).unwrap()).unwrap();
+        assert_eq!(
+            utd["UniformDataTypeDeclarations"][0]["TypeId"],
+            "com.example.reader.nsh_filetype_1"
+        );
+        assert_eq!(
+            utd["UniformDataTypeDeclarations"][0]["FilenameExtensions"],
+            json!([".nshnote"])
+        );
+        assert_eq!(
+            utd["UniformDataTypeDeclarations"][0]["MIMETypes"],
+            json!(["application/x-nsh-note"])
         );
 
         fs::remove_dir_all(&dir).unwrap();

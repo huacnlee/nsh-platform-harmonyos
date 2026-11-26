@@ -2,8 +2,7 @@
   "app": {
     "products": [
       {
-        "name": "default",
-        {{productSigning}}
+        "name": "default",{{productSigning}}
         {{sdkVersions}}
         "runtimeOS": "{{runtimeOS}}",
         "buildOption": {

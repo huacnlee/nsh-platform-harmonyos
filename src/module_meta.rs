@@ -155,6 +155,8 @@ impl std::fmt::Display for Clash {
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct ModuleMeta {
     pub(crate) meta: HarmonyMeta,
+    /// Whether `nsh-extra` is resolved with its `speech` feature enabled.
+    pub(crate) speech_enabled: bool,
     owners: BTreeMap<String, String>,
     clashes: Vec<Clash>,
 }
@@ -218,33 +220,62 @@ impl ModuleMeta {
             let Some(package) = node["id"].as_str().and_then(|id| packages.get(id)) else {
                 continue;
             };
-            let Some(nsh) = package["metadata"]["nsh"].as_object() else {
-                continue;
-            };
             let name = package["name"].as_str().unwrap_or("?");
-            let dir = package["manifest_path"]
-                .as_str()
-                .and_then(|manifest| Path::new(manifest).parent());
-            if let Some(hm) = nsh.get("harmonyos") {
-                collected.merge_harmonyos(
-                    name,
-                    dir,
-                    "[package.metadata.nsh]",
-                    hm,
-                    false,
-                    &mut warnings,
-                )?;
+            let enabled: Vec<&str> = node["features"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            let is_extra_speech = name == "nsh-extra" && enabled.contains(&"speech");
+            if is_extra_speech {
+                collected.speech_enabled = true;
             }
-            let features = nsh.get("features").and_then(Value::as_object);
-            let enabled = node["features"].as_array().into_iter().flatten();
-            for feature in enabled.filter_map(Value::as_str) {
-                if let Some(hm) = features
-                    .and_then(|f| f.get(feature))
-                    .and_then(|f| f.get("harmonyos"))
-                {
-                    let at = format!("[package.metadata.nsh.features.{feature}]");
-                    collected.merge_harmonyos(name, dir, &at, hm, false, &mut warnings)?;
+            if let Some(nsh) = package["metadata"]["nsh"].as_object() {
+                let dir = package["manifest_path"]
+                    .as_str()
+                    .and_then(|manifest| Path::new(manifest).parent());
+                if let Some(hm) = nsh.get("harmonyos") {
+                    collected.merge_harmonyos(
+                        name,
+                        dir,
+                        "[package.metadata.nsh]",
+                        hm,
+                        false,
+                        &mut warnings,
+                    )?;
                 }
+                let features = nsh.get("features").and_then(Value::as_object);
+                for feature in &enabled {
+                    if let Some(hm) = features
+                        .and_then(|f| f.get(*feature))
+                        .and_then(|f| f.get("harmonyos"))
+                    {
+                        let at = format!("[package.metadata.nsh.features.{feature}]");
+                        collected.merge_harmonyos(name, dir, &at, hm, false, &mut warnings)?;
+                    }
+                }
+            }
+            if is_extra_speech
+                && !collected
+                    .meta
+                    .permissions
+                    .iter()
+                    .any(|p| p.name == "ohos.permission.MICROPHONE")
+            {
+                let perm = Permission {
+                    name: "ohos.permission.MICROPHONE".to_owned(),
+                    reason: Some("$string:nsh_microphone_reason".to_owned()),
+                    used_scene: Some(UsedScene {
+                        abilities: vec!["EntryAbility".to_owned()],
+                        when: "inuse".to_owned(),
+                    }),
+                };
+                collected.owners.insert(
+                    "harmonyos.permissions.ohos.permission.MICROPHONE".to_owned(),
+                    name.to_owned(),
+                );
+                collected.meta.permissions.push(perm);
             }
         }
         Ok((collected, warnings))
@@ -1248,11 +1279,36 @@ mod tests {
         let (off, _) = ModuleMeta::from_metadata(&metadata(&[(
             "nsh-extra",
             "/work/nsh-extra/Cargo.toml",
-            extra,
+            extra.clone(),
             &[],
         )]))
         .unwrap();
         assert_eq!(off.meta, HarmonyMeta::default());
+        assert!(!off.speech_enabled);
+
+        let (speech, warnings) = ModuleMeta::from_metadata(&metadata(&[(
+            "nsh-extra",
+            "/work/nsh-extra/Cargo.toml",
+            extra,
+            &["speech"],
+        )]))
+        .unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(speech.speech_enabled);
+        let mic = speech
+            .meta
+            .permissions
+            .iter()
+            .find(|p| p.name == "ohos.permission.MICROPHONE")
+            .unwrap();
+        assert_eq!(mic.reason.as_deref(), Some("$string:nsh_microphone_reason"));
+        assert_eq!(
+            mic.used_scene,
+            Some(UsedScene {
+                abilities: vec!["EntryAbility".into()],
+                when: "inuse".into(),
+            })
+        );
     }
 
     #[test]
