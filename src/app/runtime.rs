@@ -121,6 +121,7 @@ pub(crate) enum Message {
         image: Option<String>,
         image_too_large: Option<u64>,
         report_only: bool,
+        expected_edit_gen: u64,
     },
     DialogResult {
         id: u32,
@@ -550,6 +551,7 @@ impl State {
                 image,
                 image_too_large,
                 report_only,
+                expected_edit_gen,
             } => self.mounter.as_ref().unwrap().input_paste(
                 id,
                 text,
@@ -558,6 +560,7 @@ impl State {
                 image,
                 image_too_large,
                 report_only,
+                expected_edit_gen,
             )?,
             Message::ReconcileNavigation => {
                 let mounter = self.mounter.as_mut().unwrap();
@@ -1684,6 +1687,8 @@ impl Runtime {
             compositor: std::cell::RefCell::default(),
             composite_nodes: std::cell::RefCell::default(),
             key_focus: RefCell::default(),
+            nodes_index: RefCell::default(),
+            modals_index: RefCell::default(),
             selected_text: RefCell::default(),
             accessibility_dirty: RefCell::default(),
             accessibility_focus: RefCell::default(),

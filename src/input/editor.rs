@@ -209,6 +209,37 @@ impl Input {
     pub(crate) fn report_paste(&self) -> bool {
         self.config.borrow().paste_behavior == nsh_core::PasteBehavior::Report
     }
+    pub(crate) fn paste_edit_gen(&self) -> u64 {
+        self.state.borrow().edit_gen
+    }
+    pub(crate) fn plan_insert(
+        &self,
+        current: &str,
+        start: u32,
+        end: u32,
+        inserted: &str,
+        normalize_paste: bool,
+    ) -> editor_state::PlannedEdit {
+        let config = self.config.borrow();
+        let multiline = config.multiline && !config.secure;
+        let digits_only = config.keyboard == KeyboardType::Number;
+        editor_state::plan_insert(
+            current,
+            start,
+            end,
+            inserted,
+            config.max_length,
+            multiline,
+            normalize_paste,
+            digits_only,
+        )
+    }
+    pub(crate) fn plan_replace(&self, previous: &str, candidate: &str) -> editor_state::PlannedEdit {
+        let config = self.config.borrow();
+        let multiline = config.multiline && !config.secure;
+        let digits_only = config.keyboard == KeyboardType::Number;
+        editor_state::plan_replace(previous, candidate, config.max_length, multiline, digits_only)
+    }
     pub(crate) fn is_ime_cursor_sink(&self) -> bool {
         let config = self.config.borrow();
         !config.secure
@@ -258,6 +289,7 @@ impl Input {
                         owner.id,
                         config.paste_behavior == nsh_core::PasteBehavior::Report,
                         config.paste_max_size,
+                        self.paste_edit_gen(),
                     )?;
                 } else {
                     owner.emit(
@@ -602,8 +634,10 @@ impl Input {
             editable: config.editable,
             auto_correct: config.auto_correct,
             report_paste: config.paste_behavior == nsh_core::PasteBehavior::Report,
+            listens_paste: owner.interaction.mask().contains(EventKind::Paste),
             paste_max_size: config.paste_max_size.map(|m| m as f64),
             edit_actions: Some(owner.interaction.mask().contains(EventKind::EditAction)),
+            select_text_on_focus: config.select_text_on_focus,
             scrollbar_visible: config.scrollbar_visible,
             hit_test: self.hit_test.get(),
             align: match config.align {
@@ -726,18 +760,22 @@ impl Input {
         Ok(())
     }
     pub(crate) fn insert_text(&self, text: String) -> Result<()> {
+        self.insert_text_kind("insert", text)
+    }
+    fn insert_text_kind(&self, kind: &str, text: String) -> Result<()> {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(target_id) = self.target_id()
         {
             owner.editor_command(EditorCommand {
                 target_id,
-                kind: "insert".into(),
+                kind: kind.into(),
                 text: Some(text),
                 ..Default::default()
             });
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn complete_paste(
         &self,
         text: String,
@@ -745,21 +783,42 @@ impl Input {
         files: Option<String>,
         image: Option<String>,
         image_too_large: Option<u64>,
-        report_only: bool,
+        _report_only: bool,
+        expected_edit_gen: u64,
     ) -> Result<()> {
-        if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) {
-            let paste = build_paste_event(
-                text.clone(),
-                html,
-                files,
-                image,
-                image_too_large,
-                self.config.borrow().paste_max_size,
-            );
-            owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
-            if !report_only && self.config.borrow().editable && !text.is_empty() {
-                self.insert_text(text)?;
-            }
+        let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get()) else {
+            return Ok(());
+        };
+        // Reject stale async clipboard completions if the editor's text changed
+        // or another input took focus while reading the clipboard.
+        if self.state.borrow().edit_gen != expected_edit_gen {
+            return Ok(());
+        }
+        if let Some(route) = owner.dispatcher.upgrade()
+            && let Some(active_input) = route.keyboard.lock().unwrap().input
+            && active_input != owner.id
+        {
+            return Ok(());
+        }
+        let (report_only, editable, paste_max_size) = {
+            let config = self.config.borrow();
+            (
+                config.paste_behavior == nsh_core::PasteBehavior::Report,
+                config.editable,
+                config.paste_max_size,
+            )
+        };
+        let paste = build_paste_event(
+            text.clone(),
+            html,
+            files,
+            image,
+            image_too_large,
+            paste_max_size,
+        );
+        owner.emit(EventKind::Paste, EventPayload::Paste(Box::new(paste)));
+        if !report_only && editable && !text.is_empty() {
+            self.insert_text_kind("paste-insert", text)?;
         }
         Ok(())
     }

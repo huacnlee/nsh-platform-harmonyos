@@ -266,6 +266,7 @@ impl Clipboard {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn paste_to_input(
         &self,
         host: Arc<Services>,
@@ -273,6 +274,7 @@ impl Clipboard {
         node_id: u32,
         report_only: bool,
         paste_max_size: Option<u64>,
+        expected_edit_gen: u64,
     ) -> napi_ohos::Result<()> {
         self.enqueue(move || {
             let max_bytes = paste_max_size.map_or(MAX_IMAGE_BYTES, |m| {
@@ -285,7 +287,7 @@ impl Clipboard {
                 route,
                 0,
                 "clipboard-paste",
-                Some((node_id, report_only, paste_max_size)),
+                Some((node_id, report_only, paste_max_size, expected_edit_gen)),
                 |board, _| board.has_data(),
                 move |data, d| {
                     let text = extract_plain_text(data).unwrap_or_default();
@@ -313,6 +315,7 @@ impl Clipboard {
                             image,
                             image_too_large,
                             report_only,
+                            expected_edit_gen,
                         });
                     }
                 },
@@ -383,7 +386,7 @@ fn read_with_fallback(
     route: Weak<Dispatcher>,
     id: u32,
     fallback_op: &str,
-    paste: Option<(u32, bool, Option<u64>)>,
+    paste: Option<(u32, bool, Option<u64>, u64)>,
     precheck: impl FnOnce(&Pasteboard, &Dispatcher) -> bool,
     on_data: impl FnOnce(&mut UdmfData, &Dispatcher),
 ) {

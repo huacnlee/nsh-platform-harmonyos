@@ -104,6 +104,8 @@ pub(crate) struct UiContext {
         std::cell::RefCell<Option<Rc<crate::render::composition::worker::Worker>>>,
     pub(crate) composite_nodes: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) key_focus: std::cell::RefCell<std::rc::Weak<Node>>,
+    pub(crate) nodes_index: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, std::rc::Weak<Node>>>,
+    pub(crate) modals_index: std::cell::RefCell<Vec<std::rc::Weak<crate::navigation::modal::Modal>>>,
     pub(crate) selected_text: std::cell::RefCell<Option<std::rc::Weak<Node>>>,
     pub(crate) accessibility_dirty: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) accessibility_focus: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
@@ -145,6 +147,39 @@ impl UiContext {
             .unwrap_or_else(|| self.platform.get().locale)
     }
 
+    pub(crate) fn node_by_id(&self, id: NodeId) -> Option<Rc<Node>> {
+        self.nodes_index
+            .borrow()
+            .get(&id)
+            .and_then(std::rc::Weak::upgrade)
+            .filter(|node| node.active.get() && !node.pending_delete.get())
+    }
+
+    /// Returns the newest visible non-closing overlay modal that covers
+    /// `window` (forming its active focus scope), if any.
+    pub(crate) fn focus_scope_modal(&self, window: NodeId) -> Option<Rc<Node>> {
+        let modals = self.modals_index.borrow();
+        modals
+            .iter()
+            .rev()
+            .filter_map(std::rc::Weak::upgrade)
+            .find_map(|modal| {
+                if !modal.is_visible()
+                    || modal.closing()
+                    || modal.is_desktop_window()
+                    || modal.is_main_window_host()
+                {
+                    return None;
+                }
+                let node = modal.node_id().and_then(|id| self.node_by_id(id))?;
+                let belongs = if window == nsh_core::ROOT_ID {
+                    !modal.is_sub_window_modal()
+                } else {
+                    modal.host_sub_window_id() == Some(window)
+                };
+                belongs.then_some(node)
+            })
+    }
 }
 
 struct BatchGuard(Rc<UiContext>, bool);
@@ -1668,6 +1703,7 @@ impl Mounter {
                                     input_id,
                                     input.report_paste(),
                                     input.paste_max_size(),
+                                    input.paste_edit_gen(),
                                 )?;
                                 return Ok(());
                             }
@@ -2149,6 +2185,7 @@ impl Mounter {
             return Ok(());
         }
         self.orphan_subtree(id)?;
+        self.nodes_index.borrow_mut().remove(&id);
         if let Some(node) = self.nodes.remove(&id) {
             if node.kind == ViewKind::Stack
                 && let Ok(index) = self.stacks.binary_search(&id)
@@ -2380,6 +2417,9 @@ impl Mounter {
                         {
                             scroll.size(size)?;
                         }
+                        self.nodes_index
+                            .borrow_mut()
+                            .insert(id, Rc::downgrade(&created));
                         self.nodes.insert(id, created);
                         motion.note_created(id);
                         if kind == ViewKind::Stack {
@@ -2388,6 +2428,7 @@ impl Mounter {
                         }
                         let modal = self.node(id)?.modal.borrow().as_ref().map(Rc::downgrade);
                         if let Some(modal) = modal {
+                            self.modals_index.borrow_mut().push(modal.clone());
                             self.modals.push(modal);
                         }
                     }
@@ -3287,6 +3328,9 @@ impl Mounter {
         }
         demand = demand.merge(UiDemand::from_animation(self.shaders.frame()?, None));
         self.modals.retain(|modal| modal.strong_count() > 0);
+        self.modals_index
+            .borrow_mut()
+            .retain(|modal| modal.strong_count() > 0);
         let closing_modals_before = self
             .modals
             .iter()
@@ -3407,11 +3451,20 @@ impl Mounter {
         image: Option<String>,
         image_too_large: Option<u64>,
         report_only: bool,
+        expected_edit_gen: u64,
     ) -> Result<()> {
         if let Some(node) = self.nodes.get(&id)
             && let Some(input) = node.input.borrow().as_ref()
         {
-            input.complete_paste(text, html, files, image, image_too_large, report_only)?;
+            input.complete_paste(
+                text,
+                html,
+                files,
+                image,
+                image_too_large,
+                report_only,
+                expected_edit_gen,
+            )?;
         }
         Ok(())
     }

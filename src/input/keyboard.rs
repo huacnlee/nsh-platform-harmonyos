@@ -135,7 +135,7 @@ struct KeyInput<'a> {
     action: i32,
     code: N,
     unicode: u32,
-    caps_lock: bool,
+    caps_lock: Option<bool>,
     key_text: &'a str,
     pressed_keys: Option<&'a [i32]>,
     explicit_modifiers: Option<Modifiers>,
@@ -190,7 +190,7 @@ impl KeyboardWindow {
                 action,
                 code: event.key_code(),
                 unicode: event.unicode(),
-                caps_lock: event.caps_lock_on().unwrap_or(false),
+                caps_lock: event.caps_lock_on().ok(),
                 key_text: &key_text,
                 pressed_keys,
                 explicit_modifiers: None,
@@ -217,7 +217,7 @@ impl KeyboardWindow {
                 action: event.action,
                 code,
                 unicode: event.unicode,
-                caps_lock: false,
+                caps_lock: event.caps_lock,
                 key_text: &event.key_text,
                 pressed_keys: None,
                 explicit_modifiers: Some(Modifiers {
@@ -287,6 +287,7 @@ impl KeyboardWindow {
         let held_before = held.keys.iter().any(|(old, _)| *old == code);
         let modifiers = held.modifiers();
         let stroke = key(code).map(|key| Keystroke { key, modifiers });
+        let repeat = action == 1 && held_before;
         let kind = if action == 1 {
             nsh_core::EventKind::KeyDown
         } else {
@@ -298,24 +299,53 @@ impl KeyboardWindow {
             .borrow()
             .upgrade()
             .filter(|node| node.visible_in_tree() && node.key_window_id() == window);
-        let target = focus.as_ref().unwrap_or(owner);
-        let mut ancestor = Some(target.clone());
-        let (mut observes, mut captures) = (false, false);
-        while let Some(node) = ancestor {
-            let (listens, prevents) = node.interaction.key_interest(kind, stroke.as_ref());
-            observes |= listens;
-            captures |= prevents;
-            if node
-                .modal
-                .borrow()
+        let scope_modal = owner.focus_scope_modal(window);
+        let covered = scope_modal.as_ref().is_some_and(|modal| {
+            focus
                 .as_ref()
-                .is_some_and(|modal| !modal.is_main_window_host())
-            {
-                break;
-            }
-            ancestor = node.parent_node.borrow().upgrade();
-        }
-        if (observes || captures) && !route.keyboard.lock().unwrap().composing {
+                .is_some_and(|node| !node.is_descendant_of(modal.id))
+        });
+        let (composing, snapshot_editing) = {
+            let snapshot = route.keyboard.lock().unwrap();
+            let editing_in_window = snapshot.focused.is_some_and(|id| {
+                owner
+                    .node_by_id(id)
+                    .is_none_or(|node| node.key_window_id() == window)
+            });
+            (snapshot.composing, editing_in_window)
+        };
+        let editing = input.from_editor
+            || (!covered
+                && (focus.as_ref().is_some_and(|node| native_owns(node)) || snapshot_editing));
+        // Native inputs, web views, video players and hosted native views own
+        // their own editing keys: ancestor `captureKeys` and raw key listeners
+        // must not intercept them; only keymap bindings allowed while editing
+        // (`KeyFocus::editing = true`) apply.
+        let native_owned = input.from_editor || editing;
+        let focused_control = (!native_owned && !covered)
+            .then(|| {
+                focus.as_ref().filter(|node| {
+                    !native_owns(node)
+                        && !node.accessibility_state.spec.borrow().state.disabled
+                        && node.interaction.mask().contains(nsh_core::EventKind::Press)
+                })
+            })
+            .flatten()
+            .cloned();
+        let mut key_focus = nsh_core::keymap::KeyFocus::default();
+        key_focus.editing = editing;
+        key_focus.control = focused_control.is_some();
+        key_focus.covered = covered;
+
+        let raw_target = if native_owned {
+            None
+        } else if covered {
+            Some(key_start(scope_modal.as_ref().unwrap_or(owner), window))
+        } else {
+            Some(key_start(focus.as_ref().unwrap_or(owner), window))
+        };
+
+        let build_key_event = |default_prevented: bool, held: &Held| {
             let mut details = nsh_core::KeyEvent::default();
             details.key = logical_key(
                 code,
@@ -358,157 +388,251 @@ impl KeyboardWindow {
                 }
                 _ => {}
             }
-            details.repeat = action == 1 && held_before;
-            details.default_prevented = captures;
-            target
-                .control
-                .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
-        } else {
-            captures = false;
-        }
+            details.repeat = repeat;
+            details.default_prevented = default_prevented;
+            details
+        };
+
         let alt_released_alone = held.track_alt_alone(action, code, held_before);
-        let allow_key_scroll = !observes
-            && focus
-                .as_ref()
-                .is_none_or(|node| node.scroll.borrow().is_some());
-        let shortcut = held.event(action, code, captures, |stroke, repeat| {
-            let snapshot = route.keyboard.lock().unwrap();
-            if snapshot.composing {
-                return false;
-            }
-            if !repeat
-                && snapshot.desktop
-                && window == nsh_core::ROOT_ID
-                && stroke.key == Key::Escape
-                && stroke.modifiers == Modifiers::default()
-                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
-                && snapshot.menu_bar_revealed
+
+        if action == 2 {
+            let (mut observes, mut captures) = (false, false);
+            if !composing
+                && let Some(target) = &raw_target
             {
-                route.send(crate::app::runtime::Message::DesktopMenuBar(
-                    crate::services::desktop::MenuBarKeyAction::Hide,
-                ));
-                return true;
+                walk_keyboard_ancestors(
+                    target.clone(),
+                    |node| keyboard_parent(node, window),
+                    |node| {
+                        let (listens, prevents) =
+                            node.interaction.key_interest(kind, stroke.as_ref());
+                        observes |= listens;
+                        captures |= prevents;
+                        false
+                    },
+                );
+                if observes || captures {
+                    let details = build_key_event(captures, &held);
+                    target
+                        .control
+                        .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
+                } else {
+                    captures = false;
+                }
             }
-            if !repeat
-                && snapshot.desktop
-                && snapshot.menu_bar_available
-                && window == nsh_core::ROOT_ID
-                && stroke.key == Key::F(10)
-                && stroke.modifiers == Modifiers::default()
-                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
-            {
-                route.send(crate::app::runtime::Message::DesktopMenuBar(
-                    crate::services::desktop::MenuBarKeyAction::ToggleF10,
-                ));
-                return true;
-            }
-            if snapshot.focused.is_none()
-                && let Some(id) = snapshot.selection
-            {
-                use crate::text::selection::controller::Command;
-                let command = match stroke.key {
-                    Key::Escape if stroke.modifiers == Modifiers::default() => Some(Command::Clear),
-                    Key::Char('c')
-                        if stroke.modifiers.ctrl
-                            && !stroke.modifiers.alt
-                            && !stroke.modifiers.shift
-                            && !stroke.modifiers.cmd =>
-                    {
-                        Some(Command::Copy)
-                    }
-                    Key::Char('a')
-                        if stroke.modifiers.ctrl
-                            && !stroke.modifiers.alt
-                            && !stroke.modifiers.shift
-                            && !stroke.modifiers.cmd =>
-                    {
-                        Some(Command::SelectAll)
-                    }
-                    _ => None,
-                };
-                if let Some(command) = command {
-                    if !repeat {
-                        route.send(crate::app::runtime::Message::TextSelection(id, command));
-                    }
+            let down_consumed = held.release(code);
+            if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
+                let snapshot = route.keyboard.lock().unwrap();
+                if snapshot.desktop
+                    && snapshot.menu_bar_available
+                    && !snapshot.composing
+                    && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                    && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuBar(
+                        crate::services::desktop::MenuBarKeyAction::ToggleAlt,
+                    ));
                     return true;
                 }
             }
-            let keymap_window = snapshot.keymap_window(window);
-            let matched =
-                snapshot
-                    .map
-                    .find_in(keymap_window, stroke, snapshot.focused.is_some(), repeat);
-            if let Some(id) = matched.fired() {
-                route.send(crate::app::runtime::Message::HostEvent(
-                    nsh_core::EventKind::KeyCommand,
-                    nsh_core::EventPayload::Value(nsh_core::PayloadValue::Number(id as f64)),
-                ));
-            }
-            if matched.consumed() {
-                return true;
-            }
-            if !repeat
-                && snapshot.desktop
-                && let Some(menu) = snapshot.menu.as_deref()
-                && let Some(shortcut) = crate::services::desktop::shortcut_from_keystroke(stroke)
-                && let Some(action) = nsh_core::desktop::MenuItem::find_shortcut(menu, &shortcut)
-                && (snapshot.focused.is_none() || action.fires_while_editing())
-            {
-                route.send(crate::app::runtime::Message::DesktopMenuAction {
-                    id: action.id,
-                    role: action.role,
-                });
-                return true;
-            }
-            if !repeat
-                && snapshot.desktop
-                && snapshot.menu_bar_available
-                && window == nsh_core::ROOT_ID
-                && snapshot.focused.is_none()
-                && stroke.modifiers
-                    == (Modifiers {
-                        alt: true,
-                        ..Modifiers::default()
-                    })
-                && let Key::Char(ch) = stroke.key
-                && ch.is_ascii_alphabetic()
-                && let Some(menu) = snapshot.menu.as_deref()
-                && crate::services::desktop::menu_bar_has_initial(menu, ch, &snapshot.menu_labels)
-            {
-                route.send(crate::app::runtime::Message::DesktopMenuBar(
-                    crate::services::desktop::MenuBarKeyAction::OpenInitial(ch),
-                ));
-                return true;
-            }
-            if !repeat
-                && snapshot.desktop
-                && stroke.key == Key::Char('q')
-                && stroke.modifiers
-                    == (Modifiers {
-                        ctrl: true,
-                        ..Modifiers::default()
-                    })
-            {
-                route.send(crate::app::runtime::Message::DesktopMenuAction {
-                    id: 0,
-                    role: Some(nsh_core::desktop::MenuRole::Quit),
-                });
-                return true;
-            }
-            if !repeat {
-                if stroke.key == Key::Escape && stroke.modifiers == Modifiers::default() {
-                    if snapshot.input.is_some() {
-                        if !snapshot.desktop {
-                            route.send(crate::app::runtime::Message::DismissKeyboard);
-                            return true;
+            return down_consumed || captures;
+        }
+
+        let mut consumed = false;
+        let mut observes = false;
+        let mut captures = false;
+
+        if !composing {
+            // 1. App/system bindings (`Keymap::find_with`, menu bar toggles, text selection).
+            if let Some(stroke) = stroke {
+                let snapshot = route.keyboard.lock().unwrap();
+                if !repeat
+                    && snapshot.desktop
+                    && window == nsh_core::ROOT_ID
+                    && stroke.key == Key::Escape
+                    && stroke.modifiers == Modifiers::default()
+                    && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
+                    && snapshot.menu_bar_revealed
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuBar(
+                        crate::services::desktop::MenuBarKeyAction::Hide,
+                    ));
+                    consumed = true;
+                } else if !repeat
+                    && snapshot.desktop
+                    && snapshot.menu_bar_available
+                    && window == nsh_core::ROOT_ID
+                    && stroke.key == Key::F(10)
+                    && stroke.modifiers == Modifiers::default()
+                    && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuBar(
+                        crate::services::desktop::MenuBarKeyAction::ToggleF10,
+                    ));
+                    consumed = true;
+                } else if !editing
+                    && !covered
+                    && let Some(id) = snapshot.selection
+                {
+                    use crate::text::selection::controller::Command;
+                    let command = match stroke.key {
+                        Key::Escape if stroke.modifiers == Modifiers::default() => {
+                            Some(Command::Clear)
                         }
-                        drop(snapshot);
-                        return back(route);
+                        Key::Char('c')
+                            if stroke.modifiers.ctrl
+                                && !stroke.modifiers.alt
+                                && !stroke.modifiers.shift
+                                && !stroke.modifiers.cmd =>
+                        {
+                            Some(Command::Copy)
+                        }
+                        Key::Char('a')
+                            if stroke.modifiers.ctrl
+                                && !stroke.modifiers.alt
+                                && !stroke.modifiers.shift
+                                && !stroke.modifiers.cmd =>
+                        {
+                            Some(Command::SelectAll)
+                        }
+                        _ => None,
+                    };
+                    if let Some(command) = command {
+                        if !repeat {
+                            route.send(crate::app::runtime::Message::TextSelection(id, command));
+                        }
+                        consumed = true;
                     }
-                    drop(snapshot);
-                    return back(route);
                 }
-                if snapshot.focused.is_none()
+                if !consumed {
+                    let keymap_window = snapshot.keymap_window(window);
+                    let matched = snapshot
+                        .map
+                        .find_with(keymap_window, stroke, key_focus, repeat);
+                    if let Some(id) = matched.fired() {
+                        route.send(crate::app::runtime::Message::HostEvent(
+                            nsh_core::EventKind::KeyCommand,
+                            nsh_core::EventPayload::Value(nsh_core::PayloadValue::Number(
+                                id as f64,
+                            )),
+                        ));
+                    }
+                    if matched.consumed() {
+                        consumed = true;
+                    }
+                }
+            }
+
+            // 2. Raw key listeners & `captureKeys` on non-native views (following `key_parent`).
+            if !consumed
+                && let Some(target) = &raw_target
+            {
+                walk_keyboard_ancestors(
+                    target.clone(),
+                    |node| keyboard_parent(node, window),
+                    |node| {
+                        let (listens, prevents) =
+                            node.interaction.key_interest(kind, stroke.as_ref());
+                        observes |= listens;
+                        captures |= prevents;
+                        false
+                    },
+                );
+                if observes || captures {
+                    let details = build_key_event(captures, &held);
+                    target
+                        .control
+                        .dispatch_event(target.id, kind, nsh_core::EventPayload::Key(details));
+                } else {
+                    captures = false;
+                }
+                if captures {
+                    consumed = true;
+                }
+            }
+
+            // 3. Return/Space press on a focused control (once keymap & captureKeys passed).
+            if !consumed
+                && !repeat
+                && let Some(control) = &focused_control
+                && let Some(stroke) = stroke
+                && nsh_core::input::presses_focused_control(stroke.key, stroke.modifiers)
+            {
+                control.control.dispatch_event(
+                    control.id,
+                    nsh_core::EventKind::Press,
+                    nsh_core::EventPayload::None,
+                );
+                consumed = true;
+            }
+
+            // 4. Desktop menu shortcuts, Back navigation, and keyboard scrolling.
+            if !consumed && let Some(stroke) = stroke {
+                let allow_key_scroll = !observes
+                    && focus
+                        .as_ref()
+                        .is_none_or(|node| node.scroll.borrow().is_some());
+                let snapshot = route.keyboard.lock().unwrap();
+                if !repeat
+                    && snapshot.desktop
+                    && let Some(menu) = snapshot.menu.as_deref()
+                    && let Some(shortcut) = crate::services::desktop::shortcut_from_keystroke(stroke)
+                    && let Some(action) =
+                        nsh_core::desktop::MenuItem::find_shortcut(menu, &shortcut)
+                    && (!editing || action.fires_while_editing())
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuAction {
+                        id: action.id,
+                        role: action.role,
+                    });
+                    consumed = true;
+                } else if !repeat
+                    && snapshot.desktop
+                    && snapshot.menu_bar_available
+                    && window == nsh_core::ROOT_ID
+                    && !editing
+                    && stroke.modifiers
+                        == (Modifiers {
+                            alt: true,
+                            ..Modifiers::default()
+                        })
+                    && let Key::Char(ch) = stroke.key
+                    && ch.is_ascii_alphabetic()
+                    && let Some(menu) = snapshot.menu.as_deref()
+                    && crate::services::desktop::menu_bar_has_initial(
+                        menu,
+                        ch,
+                        &snapshot.menu_labels,
+                    )
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuBar(
+                        crate::services::desktop::MenuBarKeyAction::OpenInitial(ch),
+                    ));
+                    consumed = true;
+                } else if !repeat
+                    && snapshot.desktop
+                    && stroke.key == Key::Char('q')
+                    && stroke.modifiers
+                        == (Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        })
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuAction {
+                        id: 0,
+                        role: Some(nsh_core::desktop::MenuRole::Quit),
+                    });
+                    consumed = true;
+                } else if !repeat && stroke.key == Key::Escape && stroke.modifiers == Modifiers::default() {
+                    if snapshot.input.is_some() && !snapshot.desktop {
+                        route.send(crate::app::runtime::Message::DismissKeyboard);
+                        consumed = true;
+                    } else {
+                        drop(snapshot);
+                        consumed = back(route);
+                    }
+                } else if !repeat
+                    && !editing
                     && ((stroke.key == Key::Left
                         && stroke.modifiers
                             == Modifiers {
@@ -523,103 +647,150 @@ impl KeyboardWindow {
                                 }))
                 {
                     drop(snapshot);
-                    return back(route);
-                }
-            }
-            if snapshot.desktop
-                && snapshot.focused.is_none()
-                && snapshot.selection.is_none()
-                && allow_key_scroll
-            {
-                use nsh_core::scroll::KeyMove;
-                let scroll_move = if stroke.modifiers == Modifiers::default() {
-                    match stroke.key {
-                        Key::PageUp => Some((KeyMove::Pages(-1.0), false)),
-                        Key::PageDown => Some((KeyMove::Pages(1.0), false)),
-                        Key::Home => Some((KeyMove::Start, false)),
-                        Key::End => Some((KeyMove::End, false)),
-                        Key::Up => Some((
-                            KeyMove::Points(nsh_core::Points(-KEY_SCROLL_LINE_STEP_VP)),
-                            false,
-                        )),
-                        Key::Down => Some((
-                            KeyMove::Points(nsh_core::Points(KEY_SCROLL_LINE_STEP_VP)),
-                            false,
-                        )),
-                        Key::Char(' ') => Some((KeyMove::Pages(1.0), false)),
-                        _ => None,
-                    }
-                } else if stroke.modifiers
-                    == (Modifiers {
-                        shift: true,
-                        ..Modifiers::default()
-                    })
-                    && stroke.key == Key::Char(' ')
+                    consumed = back(route);
+                } else if snapshot.desktop
+                    && !editing
+                    && !covered
+                    && snapshot.selection.is_none()
+                    && allow_key_scroll
                 {
-                    Some((KeyMove::Pages(-1.0), false))
-                } else {
-                    None
-                };
-                if let Some((key_move, horizontal)) = scroll_move {
-                    route.send(crate::app::runtime::Message::KeyScroll {
-                        window,
-                        key_move,
-                        horizontal,
-                    });
-                    return true;
+                    use nsh_core::scroll::KeyMove;
+                    let scroll_move = if stroke.modifiers == Modifiers::default() {
+                        match stroke.key {
+                            Key::PageUp => Some((KeyMove::Pages(-1.0), false)),
+                            Key::PageDown => Some((KeyMove::Pages(1.0), false)),
+                            Key::Home => Some((KeyMove::Start, false)),
+                            Key::End => Some((KeyMove::End, false)),
+                            Key::Up => Some((
+                                KeyMove::Points(nsh_core::Points(-KEY_SCROLL_LINE_STEP_VP)),
+                                false,
+                            )),
+                            Key::Down => Some((
+                                KeyMove::Points(nsh_core::Points(KEY_SCROLL_LINE_STEP_VP)),
+                                false,
+                            )),
+                            Key::Char(' ') => Some((KeyMove::Pages(1.0), false)),
+                            _ => None,
+                        }
+                    } else if stroke.modifiers
+                        == (Modifiers {
+                            shift: true,
+                            ..Modifiers::default()
+                        })
+                        && stroke.key == Key::Char(' ')
+                    {
+                        Some((KeyMove::Pages(-1.0), false))
+                    } else {
+                        None
+                    };
+                    if let Some((key_move, horizontal)) = scroll_move {
+                        route.send(crate::app::runtime::Message::KeyScroll {
+                            window,
+                            key_move,
+                            horizontal,
+                        });
+                        consumed = true;
+                    }
                 }
             }
-            false
-        });
-        let is_modifier_or_lock = matches!(
-            code,
-            N::ShiftLeft
-                | N::ShiftRight
-                | N::CtrlLeft
-                | N::CtrlRight
-                | N::AltLeft
-                | N::AltRight
-                | N::MetaLeft
-                | N::MetaRight
-                | N::CapsLock
-                | N::NumLock
-                | N::ScrollLock
-        );
-        if !shortcut
-            && !captures
-            && !is_modifier_or_lock
-            && action == 1
-            && !route.keyboard.lock().unwrap().composing
-            && let Some(container) = text_capture_container(target)
-            && let Some(text) = crate::input::intercept::typing_text(
-                stroke.as_ref().map(|s| s.key),
-                input.unicode,
-                modifiers,
-                input.caps_lock,
-                (!input.key_text.is_empty()).then_some(input.key_text),
-            )
-            && let Some(dest_input) = first_enabled_input(&container)
-        {
-            let _ = dest_input.focus(true);
-            let _ = dest_input.insert_text(text);
-            return true;
-        }
-        if alt_released_alone && !captures && window == nsh_core::ROOT_ID {
-            let snapshot = route.keyboard.lock().unwrap();
-            if snapshot.desktop
-                && snapshot.menu_bar_available
-                && !snapshot.composing
-                && snapshot.menu_bar_mode == nsh_core::desktop::MenuBarMode::AutoHide
-                && snapshot.menu.as_ref().is_some_and(|menu| !menu.is_empty())
+
+            // 5. `captureKeys="text"` typing redirect into the first enabled Input.
+            let is_modifier_or_lock = matches!(
+                code,
+                N::ShiftLeft
+                    | N::ShiftRight
+                    | N::CtrlLeft
+                    | N::CtrlRight
+                    | N::AltLeft
+                    | N::AltRight
+                    | N::MetaLeft
+                    | N::MetaRight
+                    | N::CapsLock
+                    | N::NumLock
+                    | N::ScrollLock
+            );
+            if !consumed
+                && !is_modifier_or_lock
+                && let Some(target) = &raw_target
+                && let Some(container) = text_capture_container(target, window)
+                && let Some(text) = crate::input::intercept::typing_text(
+                    stroke.as_ref().map(|s| s.key),
+                    input.unicode,
+                    modifiers,
+                    input.caps_lock,
+                    (!input.key_text.is_empty()).then_some(input.key_text),
+                )
+                && let Some(dest_input) = first_enabled_input(&container)
             {
-                route.send(crate::app::runtime::Message::DesktopMenuBar(
-                    crate::services::desktop::MenuBarKeyAction::ToggleAlt,
-                ));
-                return true;
+                let _ = dest_input.focus(true);
+                let _ = dest_input.insert_text(text);
+                consumed = true;
             }
         }
-        shortcut || captures
+
+        held.record_down(code, consumed);
+        consumed
     }
+}
+
+fn native_owns(node: &crate::render::node::Node) -> bool {
+    matches!(
+        node.kind,
+        nsh_core::ViewKind::Input
+            | nsh_core::ViewKind::WebView
+            | nsh_core::ViewKind::Native
+            | nsh_core::ViewKind::Video
+    )
+}
+
+fn key_start(
+    node: &std::rc::Rc<crate::render::node::Node>,
+    window: NodeId,
+) -> std::rc::Rc<crate::render::node::Node> {
+    node.interaction
+        .key_content()
+        .and_then(|id| node.node_by_id(id))
+        .filter(|content| content.key_window_id() == window)
+        .unwrap_or_else(|| node.clone())
+}
+
+fn keyboard_parent(
+    node: &std::rc::Rc<crate::render::node::Node>,
+    window: NodeId,
+) -> Option<std::rc::Rc<crate::render::node::Node>> {
+    if let Some(id) = node.interaction.key_parent() {
+        return node
+            .node_by_id(id)
+            .filter(|parent| parent.id != node.id && parent.key_window_id() == window);
+    }
+    if node
+        .modal
+        .borrow()
+        .as_ref()
+        .is_some_and(|modal| !modal.is_main_window_host())
+    {
+        return None;
+    }
+    node.parent_node
+        .borrow()
+        .upgrade()
+        .filter(|parent| parent.key_window_id() == window)
+}
+
+fn walk_keyboard_ancestors<T>(
+    start: T,
+    mut parent: impl FnMut(&T) -> Option<T>,
+    mut visit: impl FnMut(&T) -> bool,
+) -> Option<T> {
+    let mut current = Some(start);
+    for _ in 0..1024 {
+        let node = current?;
+        if visit(&node) {
+            return Some(node);
+        }
+        current = parent(&node);
+    }
+    None
 }
 
 fn back(route: &crate::app::runtime::Dispatcher) -> bool {
@@ -633,26 +804,16 @@ fn back(route: &crate::app::runtime::Dispatcher) -> bool {
 
 fn text_capture_container(
     target: &std::rc::Rc<crate::render::node::Node>,
+    window: NodeId,
 ) -> Option<std::rc::Rc<crate::render::node::Node>> {
-    if target.input.borrow().is_some() {
+    if native_owns(target) || target.input.borrow().is_some() {
         return None;
     }
-    let mut ancestor = Some(target.clone());
-    while let Some(node) = ancestor {
-        if node.interaction.types_into_input() {
-            return Some(node);
-        }
-        if node
-            .modal
-            .borrow()
-            .as_ref()
-            .is_some_and(|modal| !modal.is_main_window_host())
-        {
-            break;
-        }
-        ancestor = node.parent_node.borrow().upgrade();
-    }
-    None
+    walk_keyboard_ancestors(
+        target.clone(),
+        |node| keyboard_parent(node, window),
+        |node| node.interaction.types_into_input(),
+    )
 }
 
 fn first_enabled_input(
@@ -780,6 +941,7 @@ impl Held {
             ..Modifiers::default()
         }
     }
+    #[cfg(test)]
     fn cancel(&mut self, action: i32) -> bool {
         if action == 0 {
             self.keys.clear();
@@ -826,6 +988,24 @@ impl Held {
             }
         }
     }
+    fn record_down(&mut self, code: N, consumed: bool) {
+        if let Some(index) = self
+            .keys
+            .iter()
+            .position(|(held_code, _)| *held_code == code)
+        {
+            self.keys[index].1 |= consumed;
+        } else {
+            self.keys.push((code, consumed));
+        }
+    }
+    fn release(&mut self, code: N) -> bool {
+        self.keys
+            .iter()
+            .position(|(held_code, _)| *held_code == code)
+            .is_some_and(|index| self.keys.swap_remove(index).1)
+    }
+    #[cfg(test)]
     fn event(
         &mut self,
         action: i32,
@@ -849,11 +1029,7 @@ impl Held {
         let modifiers = self.modifiers();
         let consumed = captured
             || key(code).is_some_and(|key| fire(Keystroke { key, modifiers }, old.is_some()));
-        if let Some(index) = old {
-            self.keys[index].1 |= consumed;
-        } else {
-            self.keys.push((code, consumed));
-        }
+        self.record_down(code, consumed);
         consumed
     }
     fn has(&self, left: N, right: N) -> bool {
@@ -862,7 +1038,13 @@ impl Held {
             .any(|(code, _)| *code == left || *code == right)
     }
 }
-fn logical_key(code: N, unicode: u32, shift: bool, caps_lock: bool, key_text: &str) -> String {
+fn logical_key(
+    code: N,
+    unicode: u32,
+    shift: bool,
+    caps_lock: Option<bool>,
+    key_text: &str,
+) -> String {
     let named = match code {
         N::ShiftLeft | N::ShiftRight => "Shift",
         N::AltLeft | N::AltRight => "Alt",
@@ -888,23 +1070,29 @@ fn logical_key(code: N, unicode: u32, shift: bool, caps_lock: bool, key_text: &s
     if !named.is_empty() {
         return named.to_owned();
     }
-    let uppercase = shift ^ caps_lock;
     let mapped = key(code);
     if let Some(ch) = char::from_u32(unicode).filter(|ch| !ch.is_control()) {
         let ch = match mapped {
             Some(Key::Char(base))
                 if base.is_ascii_alphabetic() && ch.eq_ignore_ascii_case(&base) =>
             {
-                if uppercase {
-                    base.to_ascii_uppercase()
+                if let Some(caps_lock) = caps_lock {
+                    if shift ^ caps_lock {
+                        base.to_ascii_uppercase()
+                    } else {
+                        base.to_ascii_lowercase()
+                    }
                 } else {
-                    base.to_ascii_lowercase()
+                    // When Caps Lock state is unavailable, preserve the OS-produced
+                    // character case rather than forcing lowercase.
+                    ch
                 }
             }
             _ => ch,
         };
         return ch.to_string();
     }
+    let uppercase = shift ^ caps_lock.unwrap_or(false);
     if let Some(mapped) = mapped {
         match mapped {
             Key::Char(ch) => {
@@ -1074,21 +1262,107 @@ mod tests {
     }
     #[test]
     fn logical_key_maps_space_and_letters_when_unicode_is_zero() {
-        assert_eq!(logical_key(N::Space, 0, true, false, "KEYCODE_SPACE"), " ");
-        assert_eq!(logical_key(N::A, 0, false, false, "KEYCODE_A"), "a");
-        assert_eq!(logical_key(N::A, 0, true, false, "KEYCODE_A"), "A");
         assert_eq!(
-            logical_key(N::A, 'A' as u32, false, false, "KEYCODE_A"),
+            logical_key(N::Space, 0, true, Some(false), "KEYCODE_SPACE"),
+            " "
+        );
+        assert_eq!(logical_key(N::A, 0, false, Some(false), "KEYCODE_A"), "a");
+        assert_eq!(logical_key(N::A, 0, true, Some(false), "KEYCODE_A"), "A");
+        assert_eq!(
+            logical_key(N::A, 'A' as u32, false, Some(false), "KEYCODE_A"),
             "a"
         );
-        assert_eq!(logical_key(N::A, 'A' as u32, false, true, "KEYCODE_A"), "A");
-        assert_eq!(logical_key(N::A, 'A' as u32, true, true, "KEYCODE_A"), "a");
-        assert_eq!(logical_key(N::F5, 0, false, false, "KEYCODE_F5"), "F5");
         assert_eq!(
-            logical_key(N::A, 'ä' as u32, false, false, "KEYCODE_A"),
+            logical_key(N::A, 'A' as u32, false, Some(true), "KEYCODE_A"),
+            "A"
+        );
+        assert_eq!(
+            logical_key(N::A, 'A' as u32, true, Some(true), "KEYCODE_A"),
+            "a"
+        );
+        // When Caps Lock state is unavailable, preserve the OS-produced case.
+        assert_eq!(
+            logical_key(N::A, 'A' as u32, false, None, "KEYCODE_A"),
+            "A"
+        );
+        assert_eq!(
+            logical_key(N::A, 'a' as u32, true, None, "KEYCODE_A"),
+            "a"
+        );
+        assert_eq!(logical_key(N::F5, 0, false, Some(false), "KEYCODE_F5"), "F5");
+        assert_eq!(
+            logical_key(N::A, 'ä' as u32, false, Some(false), "KEYCODE_A"),
             "ä"
         );
-        assert_eq!(logical_key(N::NumpadEnter, 0, false, false, ""), "Enter");
+        assert_eq!(
+            logical_key(N::NumpadEnter, 0, false, Some(false), ""),
+            "Enter"
+        );
+    }
+    #[test]
+    fn walk_keyboard_ancestors_follows_override_and_breaks_cycles() {
+        // Portal node 5 mounts under root 1, but its logical key_parent is 3 -> 2 -> 1.
+        let mut visited = Vec::new();
+        walk_keyboard_ancestors(
+            5u32,
+            |&id| match id {
+                5 => Some(3),
+                3 => Some(2),
+                2 => Some(1),
+                _ => None,
+            },
+            |&id| {
+                visited.push(id);
+                false
+            },
+        );
+        assert_eq!(visited, vec![5, 3, 2, 1]);
+
+        // Cycle terminates cleanly at the 1024-step bound.
+        let mut count = 0usize;
+        let hit = walk_keyboard_ancestors(
+            1u32,
+            |&id| Some(if id == 1 { 2 } else { 1 }),
+            |_| {
+                count += 1;
+                false
+            },
+        );
+        assert_eq!(hit, None);
+        assert_eq!(count, 1024);
+    }
+    #[test]
+    fn key_focus_controls_and_covered_modals_match_core_rules() {
+        use nsh_core::keymap::{KeyBinding, KeyFocus, KeyMatch, When};
+        let enter = Keystroke {
+            key: Key::Enter,
+            modifiers: Modifiers::default(),
+        };
+        let table = Keymap::new(vec![
+            KeyBinding::new(1, enter, When::NotEditing, false),
+            KeyBinding::new(2, enter, When::NotEditing, false).focus_keys(true),
+        ]);
+        // Focused pressable control: its own `for_focus` binding wins; non-focus bindings give way.
+        let mut control = KeyFocus::default();
+        control.control = true;
+        assert_eq!(
+            table.find_with(nsh_core::ROOT_ID, enter, control, false),
+            KeyMatch::Fire(2)
+        );
+        // Same control covered by a newer modal: `for_focus` is ignored, dialog binding wins.
+        let mut covered = KeyFocus::default();
+        covered.covered = true;
+        assert_eq!(
+            table.find_with(nsh_core::ROOT_ID, enter, covered, false),
+            KeyMatch::Fire(1)
+        );
+        // Native editor: `When::NotEditing` is skipped so editor handles Enter natively.
+        let mut editing = KeyFocus::default();
+        editing.editing = true;
+        assert_eq!(
+            table.find_with(nsh_core::ROOT_ID, enter, editing, false),
+            KeyMatch::None
+        );
     }
     #[test]
     fn sync_modifiers_tracks_external_state_without_overwriting_active_modifier() {

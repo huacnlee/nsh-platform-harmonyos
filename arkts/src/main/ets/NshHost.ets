@@ -20,6 +20,7 @@ import pointer from "@ohos.multimodalInput.pointer";
 import {
   EditorEventPayload,
   EditorKeyEventPayload,
+  EditorPlannedEdit,
   EditorReceipt,
   MenuActionPayload,
   NshRuntimeContext,
@@ -169,6 +170,19 @@ interface NshNativeModule {
   nshRetireNativeNode(targetId: number): void;
   nshEditorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   nshEditorKeyEvent(targetId: number, event: EditorKeyEventPayload): boolean;
+  nshEditorPlanEdit(
+    targetId: number,
+    current: string,
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit;
+  nshEditorPlanReplace(
+    targetId: number,
+    previous: string,
+    candidate: string,
+  ): EditorPlannedEdit;
   nshViewAction(action: MenuActionPayload): boolean;
   nshWebControllerAttached(targetId: number, nativeTag: string): boolean;
   nshWebNavigate(targetId: number, url: string): boolean;
@@ -379,6 +393,46 @@ class ComponentRuntimeContext implements NshRuntimeContext {
       return this.mod.nshEditorKeyEvent(targetId, event);
     } catch {
       return false;
+    }
+  }
+
+  editorPlanEdit(
+    targetId: number,
+    current: string,
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit {
+    if (!this.active) {
+      return { text: current, clipped: "", caret: start, changed: false };
+    }
+    try {
+      return this.mod.nshEditorPlanEdit(
+        targetId,
+        current,
+        start,
+        end,
+        inserted,
+        normalizePaste,
+      );
+    } catch {
+      return { text: current, clipped: "", caret: start, changed: false };
+    }
+  }
+
+  editorPlanReplace(
+    targetId: number,
+    previous: string,
+    candidate: string,
+  ): EditorPlannedEdit {
+    if (!this.active) {
+      return { text: previous, clipped: "", caret: previous.length, changed: false };
+    }
+    try {
+      return this.mod.nshEditorPlanReplace(targetId, previous, candidate);
+    } catch {
+      return { text: previous, clipped: "", caret: previous.length, changed: false };
     }
   }
 

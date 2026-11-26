@@ -77,7 +77,15 @@ export interface EditorKeyEvent {
   alt: boolean
   shift: boolean
   cmd: boolean
+  capsLock?: boolean
   timestamp: number
+}
+
+export interface EditorPlannedEdit {
+  text: string
+  clipped: string
+  caret: number
+  changed: boolean
 }
 
 export interface EditorReceipt {
@@ -106,8 +114,10 @@ export interface EditorSettings {
   editable: boolean
   autoCorrect: boolean
   reportPaste: boolean
+  listensPaste: boolean
   pasteMaxSize?: number
   editActions?: boolean
+  selectTextOnFocus: boolean
   scrollbarVisible: boolean
   hitTest: number
   align: number
@@ -502,6 +512,10 @@ export declare function nshDesktopEvent(sessionId: number, kind: string, payload
 export declare function nshEditorEvent(targetId: number, event: EditorEvent): EditorReceipt
 
 export declare function nshEditorKeyEvent(targetId: number, event: EditorKeyEvent): boolean
+
+export declare function nshEditorPlanEdit(targetId: number, current: string, start: number, end: number, inserted: string, normalizePaste: boolean): EditorPlannedEdit
+
+export declare function nshEditorPlanReplace(targetId: number, previous: string, candidate: string): EditorPlannedEdit
 
 export declare function nshOpenUrlResult(sessionId: number, openId: number, opened: boolean): void
 

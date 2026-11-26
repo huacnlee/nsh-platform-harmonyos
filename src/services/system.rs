@@ -23,7 +23,7 @@ struct Request<R> {
     id: u32,
     stream: bool,
     answer: bool,
-    paste: Option<(u32, bool, Option<u64>)>,
+    paste: Option<(u32, bool, Option<u64>, u64)>,
 }
 
 impl<R> Clone for Request<R> {
@@ -300,6 +300,7 @@ impl System {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn paste_to_input(
         &self,
         host: &std::sync::Arc<Services>,
@@ -307,9 +308,16 @@ impl System {
         node_id: u32,
         report_only: bool,
         paste_max_size: Option<u64>,
+        expected_edit_gen: u64,
     ) -> napi_ohos::Result<()> {
-        self.clipboard
-            .paste_to_input(host.clone(), route, node_id, report_only, paste_max_size)
+        self.clipboard.paste_to_input(
+            host.clone(),
+            route,
+            node_id,
+            report_only,
+            paste_max_size,
+            expected_edit_gen,
+        )
     }
 
     pub(crate) fn file_request(
@@ -410,7 +418,7 @@ impl System {
         route: Weak<Dispatcher>,
         id: u32,
         op: &str,
-        paste: Option<(u32, bool, Option<u64>)>,
+        paste: Option<(u32, bool, Option<u64>, u64)>,
     ) -> napi_ohos::Result<()> {
         self.submit(
             host,
@@ -500,7 +508,7 @@ impl System {
         else {
             return;
         };
-        if let Some((node_id, report_only, _paste_max_size)) = request.paste {
+        if let Some((node_id, report_only, _paste_max_size, expected_edit_gen)) = request.paste {
             let text = value.text.unwrap_or_default();
             let html = value.html.filter(|s| !s.is_empty());
             let files = value.files.filter(|s| !s.is_empty());
@@ -523,6 +531,7 @@ impl System {
                     image,
                     image_too_large,
                     report_only,
+                    expected_edit_gen,
                 });
             }
             return;

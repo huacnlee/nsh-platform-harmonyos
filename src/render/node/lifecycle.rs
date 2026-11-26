@@ -200,6 +200,22 @@ impl Node {
     pub(crate) fn self_ref(&self) -> Option<Rc<Self>> {
         self.weak.upgrade()
     }
+    pub(crate) fn is_descendant_of(&self, ancestor_id: NodeId) -> bool {
+        if self.id == ancestor_id {
+            return true;
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        for _ in 0..1024 {
+            let Some(node) = parent else {
+                return false;
+            };
+            if node.id == ancestor_id {
+                return true;
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        false
+    }
     pub(crate) fn flush_deferred_native(self: &Rc<Self>) -> Result<()> {
         if self.style_deferred.replace(false) {
             if (self.style.borrow().effects.is_some() || !self.shader_layers.borrow().is_empty())

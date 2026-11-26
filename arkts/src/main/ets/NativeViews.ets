@@ -157,7 +157,7 @@ class ViewModifier implements AttributeModifier<StackAttribute> {
     const keyFocusable = s.keyFocusable === true && !s.disabled;
     node
       .enabled(!s.disabled)
-      .onClick(s.clickable || keyFocusable || s.menu != null ? (): void => {} : undefined)
+      .onClick(s.clickable || s.menu != null ? (): void => {} : undefined)
       .focusOnTouch(keyFocusable);
     // Do not call `.focusable(false)` on the wrapper `Stack`: in ArkUI that
     // disables focus for the entire descendant subtree (including child editors).

@@ -258,6 +258,12 @@ impl Interaction {
             self.props.borrow().pan_activation,
         )
     }
+    pub(crate) fn key_parent(&self) -> Option<nsh_core::NodeId> {
+        self.props.borrow().key_parent
+    }
+    pub(crate) fn key_content(&self) -> Option<nsh_core::NodeId> {
+        self.props.borrow().key_content
+    }
     pub(crate) fn types_into_input(&self) -> bool {
         let props = self.props.borrow();
         !props.accessibility.state.disabled && props.key_capture.types_into_input()
@@ -352,7 +358,13 @@ impl Interaction {
         self.events.get()
     }
     pub(crate) fn events(&self, owner: &Rc<Node>, events: EventMask) -> Result<()> {
-        self.events.set(events);
+        let old = self.events.replace(events);
+        if (old.contains(EventKind::Paste) != events.contains(EventKind::Paste)
+            || old.contains(EventKind::EditAction) != events.contains(EventKind::EditAction))
+            && let Some(input) = owner.input.borrow().as_ref()
+        {
+            input.update();
+        }
         self.sync_key_focus(owner)?;
         if let Some(scroll) = owner.scroll.borrow().as_ref() {
             scroll.refreshable(events.contains(EventKind::Refresh))?;

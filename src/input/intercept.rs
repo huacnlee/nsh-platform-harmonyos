@@ -30,11 +30,16 @@ pub(crate) fn viewport_px_to_root_vp(point_px: (f32, f32), scale: f32) -> Option
 
 /// Returns the text a key press would type for `captureKeys="text"`, or `None`
 /// for Space, non-character keys, or Control/Alt/Command-modified chords.
+///
+/// When `caps_lock` is `Some(on)`, ASCII letters from OHOS's uppercase keycap
+/// unicode values are normalized via `shift ^ on`. When `caps_lock` is `None`
+/// (SDK did not expose lock state), the OS-provided logical character is
+/// preserved rather than forced to lowercase.
 pub(crate) fn typing_text(
     key: Option<nsh_core::keymap::Key>,
     unicode: u32,
     modifiers: nsh_core::keymap::Modifiers,
-    caps_lock: bool,
+    caps_lock: Option<bool>,
     key_text: Option<&str>,
 ) -> Option<String> {
     if modifiers.ctrl || modifiers.alt || modifiers.cmd {
@@ -45,7 +50,6 @@ pub(crate) fn typing_text(
         Some(nsh_core::keymap::Key::Char(_)) | None => {}
         Some(_) => return None,
     }
-    let uppercase = modifiers.shift ^ caps_lock;
     if unicode != 0
         && let Some(ch) = char::from_u32(unicode)
         && !ch.is_control()
@@ -53,12 +57,13 @@ pub(crate) fn typing_text(
     {
         // ArkUI's `OH_ArkUI_KeyEvent_GetUnicode` reports uppercase ASCII
         // letters ('A'..'Z') for letter keycodes even when Shift and CapsLock
-        // are both off; normalize matching ASCII letter case via shift ^ caps_lock.
-        let ch = match key {
-            Some(nsh_core::keymap::Key::Char(base))
+        // are both off; normalize matching ASCII letter case when lock state is
+        // known, and keep the OS character as-is when lock state is unavailable.
+        let ch = match (key, caps_lock) {
+            (Some(nsh_core::keymap::Key::Char(base)), Some(caps))
                 if base.is_ascii_alphabetic() && ch.eq_ignore_ascii_case(&base) =>
             {
-                if uppercase {
+                if modifiers.shift ^ caps {
                     base.to_ascii_uppercase()
                 } else {
                     base.to_ascii_lowercase()
@@ -68,6 +73,7 @@ pub(crate) fn typing_text(
         };
         return Some(ch.to_string());
     }
+    let uppercase = modifiers.shift ^ caps_lock.unwrap_or(false);
     if let Some(text) = key_text
         && !text.is_empty()
         && !text.starts_with("KEYCODE_")
@@ -199,7 +205,7 @@ mod tests {
         use nsh_core::keymap::{Key, Modifiers};
 
         assert_eq!(
-            typing_text(Some(Key::Char('a')), 0, Modifiers::default(), false, None).as_deref(),
+            typing_text(Some(Key::Char('a')), 0, Modifiers::default(), Some(false), None).as_deref(),
             Some("a")
         );
         assert_eq!(
@@ -210,7 +216,7 @@ mod tests {
                     shift: true,
                     ..Modifiers::default()
                 },
-                false,
+                Some(false),
                 None
             )
             .as_deref(),
@@ -224,14 +230,14 @@ mod tests {
                     alt_graph: true,
                     ..Modifiers::default()
                 },
-                false,
+                Some(false),
                 Some("á")
             )
             .as_deref(),
             Some("á")
         );
         assert_eq!(
-            typing_text(None, '中' as u32, Modifiers::default(), false, None).as_deref(),
+            typing_text(None, '中' as u32, Modifiers::default(), Some(false), None).as_deref(),
             Some("中")
         );
         assert_eq!(
@@ -239,13 +245,13 @@ mod tests {
                 Some(Key::Char(' ')),
                 ' ' as u32,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some(" ")
             ),
             None
         );
         assert_eq!(
-            typing_text(Some(Key::Enter), 0, Modifiers::default(), false, Some("\n")),
+            typing_text(Some(Key::Enter), 0, Modifiers::default(), Some(false), Some("\n")),
             None
         );
         assert_eq!(
@@ -256,7 +262,7 @@ mod tests {
                     ctrl: true,
                     ..Modifiers::default()
                 },
-                false,
+                Some(false),
                 Some("a")
             ),
             None
@@ -268,7 +274,7 @@ mod tests {
                 None,
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_CTRL_LEFT")
             ),
             None
@@ -278,7 +284,7 @@ mod tests {
                 None,
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_SHIFT_LEFT")
             ),
             None
@@ -288,7 +294,7 @@ mod tests {
                 Some(Key::Char('a')),
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_A")
             )
             .as_deref(),
@@ -302,7 +308,7 @@ mod tests {
                     shift: true,
                     ..Modifiers::default()
                 },
-                false,
+                Some(false),
                 Some("KEYCODE_A")
             )
             .as_deref(),
@@ -313,7 +319,7 @@ mod tests {
                 Some(Key::Char('a')),
                 'ä' as u32,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_A")
             )
             .as_deref(),
@@ -324,20 +330,20 @@ mod tests {
                 Some(Key::Char(' ')),
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_SPACE")
             ),
             None
         );
         // ArkUI reports uppercase keycap labels and uppercase ASCII unicode
         // (e.g. 'K' / "K") even when Shift and CapsLock are off; normalize via
-        // shift ^ caps_lock.
+        // shift ^ caps_lock when lock state is known.
         assert_eq!(
             typing_text(
                 Some(Key::Char('k')),
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("K")
             )
             .as_deref(),
@@ -348,7 +354,7 @@ mod tests {
                 Some(Key::Char('k')),
                 'K' as u32,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("KEYCODE_K")
             )
             .as_deref(),
@@ -359,7 +365,7 @@ mod tests {
                 Some(Key::Char('k')),
                 'K' as u32,
                 Modifiers::default(),
-                true,
+                Some(true),
                 Some("KEYCODE_K")
             )
             .as_deref(),
@@ -373,11 +379,23 @@ mod tests {
                     shift: true,
                     ..Modifiers::default()
                 },
-                true,
+                Some(true),
                 Some("KEYCODE_K")
             )
             .as_deref(),
             Some("k")
+        );
+        // When SDK does not report Caps Lock (`None`), preserve system unicode case.
+        assert_eq!(
+            typing_text(
+                Some(Key::Char('k')),
+                'K' as u32,
+                Modifiers::default(),
+                None,
+                Some("KEYCODE_K")
+            )
+            .as_deref(),
+            Some("K")
         );
         assert_eq!(
             typing_text(
@@ -387,7 +405,7 @@ mod tests {
                     shift: true,
                     ..Modifiers::default()
                 },
-                false,
+                Some(false),
                 Some("K")
             )
             .as_deref(),
@@ -398,7 +416,7 @@ mod tests {
                 Some(Key::Char('k')),
                 'k' as u32,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("K")
             )
             .as_deref(),
@@ -409,14 +427,14 @@ mod tests {
                 Some(Key::Char('1')),
                 0,
                 Modifiers::default(),
-                false,
+                Some(false),
                 Some("!")
             )
             .as_deref(),
             Some("!")
         );
         assert_eq!(
-            typing_text(None, 0, Modifiers::default(), false, Some("VolumeUp")),
+            typing_text(None, 0, Modifiers::default(), Some(false), Some("VolumeUp")),
             None
         );
     }

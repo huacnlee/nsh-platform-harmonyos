@@ -27,8 +27,10 @@ export interface EditorSettings {
   editable: boolean;
   autoCorrect: boolean;
   reportPaste: boolean;
+  listensPaste: boolean;
   pasteMaxSize?: number | null;
   editActions?: boolean;
+  selectTextOnFocus: boolean;
   scrollbarVisible: boolean;
   hitTest: number;
   align: number;
@@ -96,7 +98,17 @@ export interface EditorKeyEventPayload {
   alt: boolean;
   shift: boolean;
   cmd: boolean;
+  capsLock?: boolean;
   timestamp: number;
+}
+export interface EditorPlannedEdit {
+  text: string;
+  clipped: string;
+  caret: number;
+  changed: boolean;
+}
+interface KeyEventLockState {
+  isCapsLockOn?: boolean;
 }
 export interface MenuActionPayload {
   targetId: number;
@@ -141,6 +153,19 @@ export interface NshRuntimeContext {
   retireNativeNode(targetId: number): boolean;
   editorEvent(targetId: number, event: EditorEventPayload): EditorReceipt;
   editorKeyEvent?(targetId: number, event: EditorKeyEventPayload): boolean;
+  editorPlanEdit?(
+    targetId: number,
+    current: string,
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit;
+  editorPlanReplace?(
+    targetId: number,
+    previous: string,
+    candidate: string,
+  ): EditorPlannedEdit;
   viewAction(action: MenuActionPayload): boolean;
   webControllerAttached(targetId: number, nativeTag: string): boolean;
   webNavigate(targetId: number, url: string): boolean;
@@ -360,7 +385,9 @@ class EditorModifier implements AttributeModifier<TextInputAttribute | TextAreaA
       .direction(s.rtl ? Direction.Rtl : Direction.Ltr)
       .autoCapitalizationMode(s.capitalize as AutoCapitalizationMode)
       .enterKeyType(enterType(s.enterKey))
-      .maxLength(s.maxLength ?? 2147483647)
+      // Enforce maxLength via Rust Unicode-scalar + grapheme-boundary logic
+      // (`willChange` / `insertText`) instead of ArkUI's UTF-16 code-unit limit.
+      .maxLength(2147483647)
       .enableAutoFill(s.autoFill)
       .contentType(contentType(s.contentType))
       .hitTestBehavior(s.hitTest as HitTestMode);
@@ -431,14 +458,8 @@ function editorContent(params: EditorContentParams) {
         .onTextSelectionChange((start: number, end: number) => params.entry.selection(start, end))
         .onContentScroll(() => params.entry.scrolled())
         .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
-        .onWillChange(() => params.entry.canEdit())
-        .onWillInsert((value: InsertValue): boolean => {
-          if (!params.entry.canEdit()) return false;
-          if (!params.entry.isSink()) {
-            params.entry.editKey(value.insertValue);
-          }
-          return true;
-        })
+        .onWillChange((info: EditableTextChangeValue): boolean => params.entry.willChange(info))
+        .onWillInsert((value: InsertValue): boolean => params.entry.willInsert(value))
         .onWillDelete((): boolean => {
           if (!params.entry.canEdit()) return false;
           if (!params.entry.isSink() || params.entry.text.length === 0) {
@@ -446,6 +467,8 @@ function editorContent(params: EditorContentParams) {
           }
           return true;
         })
+        .onMouse((event: MouseEvent): void => params.entry.handleMouse(event))
+        .onTouch((event: TouchEvent): void => params.entry.handleTouch(event))
         .onAppear(() => params.entry.appeared())
     }
     .width(params.entry.settings.width)
@@ -473,17 +496,15 @@ function editorContent(params: EditorContentParams) {
         .onTextSelectionChange((start: number, end: number) => params.entry.selection(start, end))
         .onContentScroll(() => params.entry.scrolled())
         .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
-        .onWillChange(() => params.entry.canEdit())
-        .onWillInsert((value: InsertValue): boolean => {
-          if (!params.entry.canEdit()) return false;
-          params.entry.editKey(value.insertValue);
-          return true;
-        })
+        .onWillChange((info: EditableTextChangeValue): boolean => params.entry.willChange(info))
+        .onWillInsert((value: InsertValue): boolean => params.entry.willInsert(value))
         .onWillDelete((): boolean => {
           if (!params.entry.canEdit()) return false;
           params.entry.editKey("Backspace");
           return true;
         })
+        .onMouse((event: MouseEvent): void => params.entry.handleMouse(event))
+        .onTouch((event: TouchEvent): void => params.entry.handleTouch(event))
         .onAppear(() => params.entry.appeared());
     }
     .width(params.entry.settings.width)
@@ -684,6 +705,18 @@ class EditorSizeCallback extends FrameCallback {
     this.entry.measureSize();
   }
 }
+class EditorSelectAllCallback extends FrameCallback {
+  private entry: EditorEntry;
+  private gen: number;
+  constructor(entry: EditorEntry, gen: number) {
+    super();
+    this.entry = entry;
+    this.gen = gen;
+  }
+  onIdle(_timeLeft: number): void {
+    this.entry.applySelectAllOnFocus(this.gen);
+  }
+}
 class EditorEntry {
   readonly node: BuilderNode<[EditorContentParams]>;
   readonly scroller: Scroller = new Scroller();
@@ -727,6 +760,21 @@ class EditorEntry {
   private consumedPasteKey: boolean = false;
   private rustText: string = "";
   private rustEmptied: string = "";
+  private focusGen: number = 0;
+  private userContextVersion: number = 0;
+  private applyingPaste: boolean = false;
+  private pasteQueue: Promise<void> = Promise.resolve();
+  private pointerFocusing: boolean = false;
+  private pointerActive: boolean = false;
+  private pointerMoved: boolean = false;
+  private pointerSuppressSelect: boolean = false;
+  private pointerDownX: number = 0;
+  private pointerDownY: number = 0;
+  private lastClickTime: number = 0;
+  private lastClickX: number = 0;
+  private lastClickY: number = 0;
+  private pendingSelectAllGen: number = 0;
+  private explicitSelectionAfterFocusGen: number = 0;
   constructor(settings: EditorSettings, context: NshRuntimeContext) {
     this.context = context;
     this.settings = settings;
@@ -818,6 +866,9 @@ class EditorEntry {
         }
       } else {
         const prevLen = this.text.length;
+        if (this.text !== settings.text) {
+          this.userContextVersion += 1;
+        }
         this.text = settings.text;
         if (this.selStart >= prevLen && this.selEnd >= prevLen) {
           this.selStart = this.text.length;
@@ -865,6 +916,282 @@ class EditorEntry {
       this.updating || (this.settings.editable && this.settings.accessibility?.disabled !== true)
     );
   }
+  private planEdit(
+    start: number,
+    end: number,
+    inserted: string,
+    normalizePaste: boolean,
+  ): EditorPlannedEdit {
+    if (this.context.editorPlanEdit) {
+      return this.context.editorPlanEdit(
+        this.settings.targetId,
+        this.text,
+        start,
+        end,
+        inserted,
+        normalizePaste,
+      );
+    }
+    const clampedStart = Math.max(0, Math.min(this.text.length, start));
+    const clampedEnd = Math.max(clampedStart, Math.min(this.text.length, end));
+    let normalized = inserted;
+    if (normalizePaste) {
+      normalized = normalized.replace(/\r\n?/g, "\n");
+      if (!(this.settings.multiline && !this.settings.secure)) {
+        normalized = normalized.replace(/\n/g, " ");
+      }
+    }
+    if (digitsOnly(this.settings.keyboard)) {
+      normalized = normalized.replace(/\D/g, "");
+    }
+    const prefix = this.text.slice(0, clampedStart);
+    const suffix = this.text.slice(clampedEnd);
+    const maxLen = this.settings.maxLength;
+    let clipped = normalized;
+    if (maxLen != null) {
+      const existing = Array.from(prefix).length + Array.from(suffix).length;
+      const room = Math.max(0, maxLen - existing);
+      clipped = Array.from(normalized).slice(0, room).join("");
+    }
+    const next = prefix + clipped + suffix;
+    const caret = clampedStart + clipped.length;
+    return { text: next, clipped, caret, changed: next !== this.text };
+  }
+  private planReplace(previous: string, candidate: string): EditorPlannedEdit {
+    if (this.context.editorPlanReplace) {
+      return this.context.editorPlanReplace(this.settings.targetId, previous, candidate);
+    }
+    const maxLen = this.settings.maxLength;
+    if (maxLen == null || Array.from(candidate).length <= maxLen) {
+      return {
+        text: candidate,
+        clipped: candidate,
+        caret: candidate.length,
+        changed: candidate !== previous,
+      };
+    }
+    const trimmed = Array.from(candidate).slice(0, maxLen).join("");
+    return {
+      text: trimmed,
+      clipped: trimmed,
+      caret: trimmed.length,
+      changed: trimmed !== previous,
+    };
+  }
+  willChange(info: EditableTextChangeValue): boolean {
+    if (!this.canEdit()) {
+      return false;
+    }
+    if (this.updating || this.isSink()) {
+      return true;
+    }
+    // Preserve IME pre-edit composition; enforce maxLength once committed.
+    if (info.previewText && info.previewText.value.length > 0) {
+      return true;
+    }
+    if (this.settings.maxLength == null) {
+      return true;
+    }
+    const previous = this.text;
+    const planned = this.planReplace(previous, info.content);
+    if (planned.text === info.content) {
+      return true;
+    }
+    if (planned.changed) {
+      const expectedVersion = this.userContextVersion;
+      const expectedFocusGen = this.focusGen;
+      Promise.resolve().then((): void => {
+        if (
+          this.closed ||
+          !this.context.isActive() ||
+          this.text !== previous ||
+          this.userContextVersion !== expectedVersion ||
+          this.focusGen !== expectedFocusGen
+        ) {
+          return;
+        }
+        this.pushUndoState(this.text);
+        this.applyProgrammaticText(planned.text, planned.caret);
+      });
+    }
+    return false;
+  }
+  willInsert(value: InsertValue): boolean {
+    if (!this.canEdit()) {
+      return false;
+    }
+    if (!this.isSink()) {
+      if (this.preview.length === 0 && this.settings.maxLength != null) {
+        const start =
+          this.selEnd > this.selStart
+            ? Math.min(this.text.length, this.selStart)
+            : Math.max(0, Math.min(this.text.length, value.insertOffset));
+        const end =
+          this.selEnd > this.selStart ? Math.min(this.text.length, this.selEnd) : start;
+        const planned = this.planEdit(start, end, value.insertValue, false);
+        if (planned.clipped.length === 0) {
+          return true;
+        }
+      }
+      this.editKey(value.insertValue);
+    }
+    return true;
+  }
+  handleMouse(event: MouseEvent): void {
+    if (event.button !== MouseButton.Left || this.isSink()) {
+      return;
+    }
+    if (event.action === MouseAction.Press) {
+      const now = Date.now();
+      const dx = event.x - this.lastClickX;
+      const dy = event.y - this.lastClickY;
+      const isDoubleClick = now - this.lastClickTime <= 500 && dx * dx + dy * dy <= 144;
+      this.lastClickTime = now;
+      this.lastClickX = event.x;
+      this.lastClickY = event.y;
+      let shift = false;
+      try {
+        shift = event.getModifierKeyState ? event.getModifierKeyState(["Shift"]) : false;
+      } catch {}
+      if (!this.focused && this.settings.selectTextOnFocus) {
+        this.pointerFocusing = true;
+        this.pointerActive = true;
+        this.pointerMoved = false;
+        this.pointerSuppressSelect = shift || isDoubleClick;
+        this.pointerDownX = event.x;
+        this.pointerDownY = event.y;
+      }
+    } else if (event.action === MouseAction.Move) {
+      if (this.pointerActive && !this.pointerMoved) {
+        const dx = event.x - this.pointerDownX;
+        const dy = event.y - this.pointerDownY;
+        if (dx * dx + dy * dy > 16) {
+          this.pointerMoved = true;
+          this.pointerSuppressSelect = true;
+          this.pendingSelectAllGen = 0;
+        }
+      }
+    } else if (event.action === MouseAction.Release) {
+      if (this.pointerActive) {
+        this.pointerActive = false;
+        const shouldSelect =
+          this.pointerFocusing && !this.pointerSuppressSelect && !this.pointerMoved;
+        this.pointerFocusing = false;
+        if (
+          shouldSelect &&
+          this.focused &&
+          this.pendingSelectAllGen === this.focusGen &&
+          this.explicitSelectionAfterFocusGen !== this.focusGen
+        ) {
+          this.scheduleSelectAllOnFocus(this.focusGen);
+        } else {
+          this.pendingSelectAllGen = 0;
+        }
+      }
+    }
+  }
+  handleTouch(event: TouchEvent): void {
+    // Mouse clicks already go through `handleMouse` (with Shift & button info).
+    if (event.source === SourceType.Mouse || this.isSink()) {
+      return;
+    }
+    const touch = event.touches.length > 0 ? event.touches[0] : undefined;
+    if (event.type === TouchType.Down) {
+      if (touch && event.touches.length === 1) {
+        const now = Date.now();
+        const dx = touch.x - this.lastClickX;
+        const dy = touch.y - this.lastClickY;
+        const isDoubleTap = now - this.lastClickTime <= 500 && dx * dx + dy * dy <= 576;
+        this.lastClickTime = now;
+        this.lastClickX = touch.x;
+        this.lastClickY = touch.y;
+        if (!this.focused && this.settings.selectTextOnFocus) {
+          this.pointerFocusing = true;
+          this.pointerActive = true;
+          this.pointerMoved = false;
+          this.pointerSuppressSelect = isDoubleTap;
+          this.pointerDownX = touch.x;
+          this.pointerDownY = touch.y;
+        }
+      }
+    } else if (event.type === TouchType.Move) {
+      if (this.pointerActive && !this.pointerMoved && touch) {
+        const dx = touch.x - this.pointerDownX;
+        const dy = touch.y - this.pointerDownY;
+        if (dx * dx + dy * dy > 64) {
+          this.pointerMoved = true;
+          this.pointerSuppressSelect = true;
+          this.pendingSelectAllGen = 0;
+        }
+      }
+    } else if (event.type === TouchType.Up) {
+      if (this.pointerActive) {
+        this.pointerActive = false;
+        const shouldSelect =
+          this.pointerFocusing && !this.pointerSuppressSelect && !this.pointerMoved;
+        this.pointerFocusing = false;
+        if (
+          shouldSelect &&
+          this.focused &&
+          this.pendingSelectAllGen === this.focusGen &&
+          this.explicitSelectionAfterFocusGen !== this.focusGen
+        ) {
+          this.scheduleSelectAllOnFocus(this.focusGen);
+        } else {
+          this.pendingSelectAllGen = 0;
+        }
+      }
+    } else if (event.type === TouchType.Cancel) {
+      this.pointerActive = false;
+      this.pointerFocusing = false;
+      this.pointerMoved = false;
+      this.pointerSuppressSelect = false;
+      this.pendingSelectAllGen = 0;
+    }
+  }
+  private scheduleSelectAllOnFocus(gen: number): void {
+    if (this.closed || !this.context.isActive()) {
+      return;
+    }
+    try {
+      this.editorUIContext().postFrameCallback(new EditorSelectAllCallback(this, gen));
+    } catch {
+      setTimeout((): void => {
+        this.applySelectAllOnFocus(gen);
+      }, 0);
+    }
+  }
+  applySelectAllOnFocus(gen: number): void {
+    if (
+      this.closed ||
+      !this.context.isActive() ||
+      !this.focused ||
+      this.focusGen !== gen ||
+      !this.settings.selectTextOnFocus ||
+      this.isSink() ||
+      this.pointerActive ||
+      this.pointerSuppressSelect ||
+      this.explicitSelectionAfterFocusGen === gen ||
+      this.text.length === 0
+    ) {
+      return;
+    }
+    const end = this.text.length;
+    this.selStart = 0;
+    this.selEnd = end;
+    this.updating = true;
+    try {
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(0, end);
+      } else {
+        this.line.setTextSelection(0, end);
+      }
+    } catch {
+    } finally {
+      this.updating = false;
+    }
+    this.selection(0, end);
+  }
   colorMode(): ThemeColorMode {
     return this.context.colorMode ? this.context.colorMode() : ThemeColorMode.SYSTEM;
   }
@@ -896,6 +1223,77 @@ class EditorEntry {
       return false;
     }
   }
+  private finishPaste(
+    text: string,
+    html?: string | null,
+    files?: string | null,
+    image?: string | null,
+    tooLarge?: number | null,
+  ): void {
+    this.applyingPaste = true;
+    try {
+      this.emit("paste", text, 0, 0, 0, 0, 0, 0, html, files, image, tooLarge);
+      if (!this.settings.reportPaste && this.canEdit() && text.length > 0) {
+        this.insertText(text, true);
+      }
+    } finally {
+      this.applyingPaste = false;
+    }
+  }
+  private enqueuePaste(
+    dataPromise: Promise<pasteboard.PasteData>,
+    fallbackPlain: string | undefined,
+    fallbackEditAction: boolean,
+  ): void {
+    const expectedFocusGen = this.focusGen;
+    const expectedUserVersion = this.userContextVersion;
+    const stillValid = (): boolean =>
+      !this.closed &&
+      this.context.isActive() &&
+      this.focused &&
+      this.focusGen === expectedFocusGen &&
+      this.userContextVersion === expectedUserVersion;
+    this.pasteQueue = this.pasteQueue
+      .then(async (): Promise<void> => {
+        let data: pasteboard.PasteData | undefined = undefined;
+        try {
+          data = await dataPromise;
+        } catch {
+          data = undefined;
+        }
+        if (!stillValid()) {
+          return;
+        }
+        if (!data || data.getRecordCount() === 0) {
+          if (fallbackPlain !== undefined) {
+            this.finishPaste(fallbackPlain);
+          } else if (fallbackEditAction) {
+            this.emit("edit-action", "paste");
+          }
+          return;
+        }
+        let rich: ExtractedPasteData | undefined = undefined;
+        try {
+          rich = await extractPasteData(data, this.settings.pasteMaxSize ?? undefined);
+        } catch {
+          rich = undefined;
+        }
+        if (!stillValid()) {
+          return;
+        }
+        if (!rich) {
+          if (fallbackPlain !== undefined) {
+            this.finishPaste(fallbackPlain);
+          } else if (fallbackEditAction) {
+            this.emit("edit-action", "paste");
+          }
+          return;
+        }
+        const pastedText = rich.text.length > 0 ? rich.text : (fallbackPlain ?? "");
+        this.finishPaste(pastedText, rich.html, rich.files, rich.image, rich.tooLarge);
+      })
+      .catch((): void => {});
+  }
   private pasteFromShortcut(): void {
     try {
       const board = pasteboard.getSystemPasteboard();
@@ -904,46 +1302,7 @@ class EditorEntry {
       }
       // Consume HarmonyOS pasteboard_service's one-shot Ctrl+V read grant
       // directly before TextArea's built-in handler reads plain text only.
-      board
-        .getData()
-        .then((data: pasteboard.PasteData): void => {
-          if (this.closed || !this.context.isActive()) {
-            return;
-          }
-          if (data.getRecordCount() === 0) {
-            this.emit("edit-action", "paste");
-            return;
-          }
-          extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
-            .then((rich: ExtractedPasteData): void => {
-              if (this.closed || !this.context.isActive()) {
-                return;
-              }
-              this.emit(
-                "paste",
-                rich.text,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                rich.html,
-                rich.files,
-                rich.image,
-                rich.tooLarge,
-              );
-              if (!this.settings.reportPaste && this.canEdit() && rich.text.length > 0) {
-                this.insertText(rich.text);
-              }
-            })
-            .catch((): void => {
-              this.emit("edit-action", "paste");
-            });
-        })
-        .catch((): void => {
-          this.emit("edit-action", "paste");
-        });
+      this.enqueuePaste(board.getData(), undefined, true);
     } catch {
       this.emit("edit-action", "paste");
     }
@@ -956,6 +1315,9 @@ class EditorEntry {
     if (action === 0) {
       return false;
     }
+    const lockState = event as KeyEventLockState;
+    const capsLock =
+      typeof lockState.isCapsLockOn === "boolean" ? lockState.isCapsLockOn : undefined;
     const consumed = this.context.editorKeyEvent(this.settings.targetId, {
       action,
       keyCode: event.keyCode,
@@ -965,6 +1327,7 @@ class EditorEntry {
       alt: modifierPressed(event, "Alt"),
       shift: modifierPressed(event, "Shift"),
       cmd: event.metaKey === 1,
+      capsLock,
       timestamp: event.timestamp ?? 0,
     });
     if (consumed) {
@@ -980,58 +1343,20 @@ class EditorEntry {
   }
   paste(text: string, event: PasteEvent): void {
     event.preventDefault?.();
-    const finishPlain = (): void => {
-      this.emit("paste", text);
-      if (!this.settings.reportPaste && this.canEdit() && text.length > 0) {
-        this.insertText(text);
+    // Synchronous fast path when no Paste listener is attached and default
+    // paste mode only needs the plain text ArkUI already supplied.
+    if (!this.settings.reportPaste && !this.settings.listensPaste && !this.isSink()) {
+      if (this.canEdit() && text.length > 0) {
+        this.insertText(text, true);
       }
-    };
+      return;
+    }
     try {
-      pasteboard
-        .getSystemPasteboard()
-        .getData()
-        .then((data: pasteboard.PasteData): void => {
-          if (this.closed || !this.context.isActive()) {
-            return;
-          }
-          if (data.getRecordCount() === 0) {
-            finishPlain();
-            return;
-          }
-          extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
-            .then((rich: ExtractedPasteData): void => {
-              if (this.closed || !this.context.isActive()) {
-                return;
-              }
-              const pastedText = rich.text.length > 0 ? rich.text : text;
-              this.emit(
-                "paste",
-                pastedText,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                rich.html,
-                rich.files,
-                rich.image,
-                rich.tooLarge,
-              );
-              if (!this.settings.reportPaste && this.canEdit() && pastedText.length > 0) {
-                this.insertText(pastedText);
-              }
-            })
-            .catch((): void => {
-              finishPlain();
-            });
-        })
-        .catch((): void => {
-          finishPlain();
-        });
+      const dataPromise = pasteboard.getSystemPasteboard().getData();
+      this.enqueuePaste(dataPromise, text, false);
       return;
     } catch {}
-    finishPlain();
+    this.finishPaste(text);
   }
   selection(start: number, end: number): void {
     if (this.isSink()) {
@@ -1045,8 +1370,18 @@ class EditorEntry {
       }
       return;
     }
-    this.selStart = Math.max(0, start);
-    this.selEnd = Math.max(this.selStart, end);
+    const clampedStart = Math.max(0, start);
+    const clampedEnd = Math.max(clampedStart, end);
+    const changed = clampedStart !== this.selStart || clampedEnd !== this.selEnd;
+    if (this.pointerActive && clampedEnd > clampedStart) {
+      this.pointerSuppressSelect = true;
+      this.pendingSelectAllGen = 0;
+    }
+    this.selStart = clampedStart;
+    this.selEnd = clampedEnd;
+    if (changed && !this.applyingPaste) {
+      this.userContextVersion += 1;
+    }
     this.emit("selection", "", start, end);
     this.imeCursorKey = "";
     this.revealCaret = true;
@@ -1119,6 +1454,7 @@ class EditorEntry {
     if (this.text !== next) {
       this.pushUndoState(this.text);
       this.text = next;
+      this.userContextVersion += 1;
       this.emit("change", next);
     }
     if (wasComposing && composed.length === 0) {
@@ -1398,6 +1734,7 @@ class EditorEntry {
     this.selStart = clamped;
     this.selEnd = clamped;
     this.text = next;
+    this.userContextVersion += 1;
     this.emit("change", next);
     this.selection(clamped, clamped);
     this.refresh();
@@ -1475,8 +1812,35 @@ class EditorEntry {
         previous.blurFromOther();
       }
       activeEditorsByContext.set(this.context, this);
+      const wasFocused = this.focused;
       this.focused = true;
       this.imeCursorKey = "";
+      if (!wasFocused) {
+        this.focusGen += 1;
+        this.explicitSelectionAfterFocusGen = 0;
+        if (this.settings.selectTextOnFocus && !this.isSink() && this.text.length > 0) {
+          if (this.pointerFocusing) {
+            this.pendingSelectAllGen = this.pointerSuppressSelect ? 0 : this.focusGen;
+          } else {
+            this.pendingSelectAllGen = this.focusGen;
+            this.scheduleSelectAllOnFocus(this.focusGen);
+          }
+        } else {
+          this.pendingSelectAllGen = 0;
+        }
+      } else if (
+        this.pendingSelectAllGen === this.focusGen &&
+        this.explicitSelectionAfterFocusGen !== this.focusGen &&
+        !this.pointerActive &&
+        !this.pointerSuppressSelect &&
+        this.settings.selectTextOnFocus &&
+        !this.isSink() &&
+        this.text.length > 0
+      ) {
+        // Native onFocus arrived after programmatic command("focus"); re-apply
+        // select-all post-frame so ArkUI's default caret placement does not win.
+        this.scheduleSelectAllOnFocus(this.focusGen);
+      }
       if (this.isSink() && this.preview.length === 0) {
         this.pinSinkCaret();
       }
@@ -1486,7 +1850,16 @@ class EditorEntry {
       if (activeEditorsByContext.get(this.context) === this) {
         activeEditorsByContext.delete(this.context);
       }
+      if (this.focused) {
+        this.focusGen += 1;
+      }
       this.focused = false;
+      this.pointerFocusing = false;
+      this.pointerActive = false;
+      this.pointerMoved = false;
+      this.pointerSuppressSelect = false;
+      this.pendingSelectAllGen = 0;
+      this.explicitSelectionAfterFocusGen = 0;
       this.imeCursorKey = "";
       this.consumedPasteKey = false;
       this.closeEditMenu();
@@ -1570,8 +1943,11 @@ class EditorEntry {
       }
     } else if (command.kind === "selection") {
       try {
+        this.explicitSelectionAfterFocusGen = this.focusGen;
+        this.pendingSelectAllGen = 0;
         this.selStart = Math.max(0, command.start);
         this.selEnd = Math.max(this.selStart, command.end);
+        this.userContextVersion += 1;
         if (this.settings.multiline && !this.settings.secure) {
           this.area.setTextSelection(command.start, command.end);
         } else {
@@ -1586,6 +1962,7 @@ class EditorEntry {
       const end = this.text.length;
       this.selStart = 0;
       this.selEnd = end;
+      this.userContextVersion += 1;
       this.updating = true;
       try {
         if (this.settings.multiline && !this.settings.secure) {
@@ -1600,6 +1977,13 @@ class EditorEntry {
       this.selection(0, end);
     } else if (command.kind === "insert") {
       this.insertText(command.text ?? "");
+    } else if (command.kind === "paste-insert") {
+      this.applyingPaste = true;
+      try {
+        this.insertText(command.text ?? "", true);
+      } finally {
+        this.applyingPaste = false;
+      }
     } else if (command.kind === "type") {
       if (!this.canEdit() || this.closed) {
         return;
@@ -1686,7 +2070,7 @@ class EditorEntry {
       throw new Error(`Unsupported editor command '${command.kind}'`);
     }
   }
-  insertText(inserted: string): void {
+  insertText(inserted: string, normalizePaste = false): void {
     if (!this.canEdit() || this.closed) {
       return;
     }
@@ -1702,23 +2086,31 @@ class EditorEntry {
     }
     const controller: TextContentControllerBase =
       this.settings.multiline && !this.settings.secure ? this.area : this.line;
-    const start = Math.min(this.text.length, this.selStart);
-    const end = Math.min(this.text.length, Math.max(start, this.selEnd));
-    const maxLen = this.settings.maxLength;
-    const room =
-      maxLen != null ? Math.max(0, maxLen - (this.text.length - (end - start))) : inserted.length;
-    const clipped = inserted.slice(0, room);
-    const next = this.text.slice(0, start) + clipped + this.text.slice(end);
-    const caret = start + clipped.length;
+    const prev = this.text;
+    const start = Math.min(prev.length, this.selStart);
+    const end = Math.min(prev.length, Math.max(start, this.selEnd));
+    const planned = this.planEdit(start, end, inserted, normalizePaste);
+    if (!planned.changed) {
+      return;
+    }
+    const next = planned.text;
+    const caret = Math.max(0, Math.min(next.length, planned.caret));
     this.selStart = caret;
     this.selEnd = caret;
+    this.pushUndoState(prev);
+    this.text = next;
+    if (!this.applyingPaste) {
+      this.userContextVersion += 1;
+    }
     this.updating = true;
     try {
-      if (end > start) {
-        controller.deleteText({ start, end });
-      }
-      if (clipped.length > 0) {
-        controller.addText(clipped, { offset: start });
+      if (next === prev.slice(0, start) + planned.clipped + prev.slice(end)) {
+        if (end > start) {
+          controller.deleteText({ start, end });
+        }
+        if (planned.clipped.length > 0) {
+          controller.addText(planned.clipped, { offset: start });
+        }
       }
       if (this.settings.multiline && !this.settings.secure) {
         this.area.setTextSelection(caret, caret);
@@ -1729,13 +2121,16 @@ class EditorEntry {
     } finally {
       this.updating = false;
     }
-    if (this.text !== next) {
-      this.pushUndoState(this.text);
-      this.text = next;
-      this.emit("change", next);
-    }
+    this.emit("change", next);
     this.selection(caret, caret);
     this.refresh();
+    try {
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(caret, caret);
+      } else {
+        this.line.setTextSelection(caret, caret);
+      }
+    } catch {}
   }
   deleteBackward(): void {
     if (!this.canEdit() || this.closed) {
@@ -1781,6 +2176,7 @@ class EditorEntry {
     if (this.text !== next) {
       this.pushUndoState(this.text);
       this.text = next;
+      this.userContextVersion += 1;
       this.emit("change", next);
     }
     this.selection(delStart, delStart);
@@ -1801,45 +2197,7 @@ class EditorEntry {
         // before disposing the overlay ComponentContent.
         const dataPromise = pasteboard.getSystemPasteboard().getData();
         this.closeEditMenu();
-        dataPromise
-          .then((data: pasteboard.PasteData): void => {
-            if (this.closed || !this.context.isActive()) {
-              return;
-            }
-            if (data.getRecordCount() === 0 && pasteboard.getSystemPasteboard().hasDataSync()) {
-              this.emit("edit-action", "paste");
-              return;
-            }
-            extractPasteData(data, this.settings.pasteMaxSize ?? undefined)
-              .then((rich: ExtractedPasteData): void => {
-                if (this.closed || !this.context.isActive()) {
-                  return;
-                }
-                this.emit(
-                  "paste",
-                  rich.text,
-                  0,
-                  0,
-                  0,
-                  0,
-                  0,
-                  0,
-                  rich.html,
-                  rich.files,
-                  rich.image,
-                  rich.tooLarge,
-                );
-                if (!this.settings.reportPaste && this.canEdit() && rich.text.length > 0) {
-                  this.insertText(rich.text);
-                }
-              })
-              .catch((): void => {
-                this.emit("edit-action", "paste");
-              });
-          })
-          .catch((): void => {
-            this.emit("edit-action", "paste");
-          });
+        this.enqueuePaste(dataPromise, undefined, true);
       } catch {
         this.closeEditMenu();
         this.emit("edit-action", "paste");
