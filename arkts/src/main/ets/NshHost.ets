@@ -612,13 +612,6 @@ class HostSession {
     if (this.closed || !this.isDesktop) {
       return;
     }
-    if (this.desktop) {
-      this.desktop.revealMainWindow();
-    } else {
-      try {
-        this.mainWindow.showWindow().catch((): void => {});
-      } catch {}
-    }
     const args: string[] = [];
     if (Array.isArray(rawArgs)) {
       for (let i = 0; i < rawArgs.length; i++) {
@@ -626,6 +619,16 @@ class HostSession {
           args.push(rawArgs[i]);
         }
       }
+    }
+    if (args.length === 0 && this.desktop?.shouldSuppressSecondInstance()) {
+      return;
+    }
+    if (this.desktop) {
+      this.desktop.revealMainWindow();
+    } else {
+      try {
+        this.mainWindow.showWindow().catch((): void => {});
+      } catch {}
     }
     try {
       this.mod.nshDesktopEvent(

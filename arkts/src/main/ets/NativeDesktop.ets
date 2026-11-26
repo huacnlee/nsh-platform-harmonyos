@@ -1160,6 +1160,9 @@ class SubWindowHost {
   }
 
   private async openInternal(cmd: WireCommand): Promise<void> {
+    if (this.destroyed) {
+      return;
+    }
     this.isModal = cmd.modal === true;
     this.frameNone = cmd.frame === "none";
     this.transparent = cmd.transparent === true;
@@ -1175,183 +1178,186 @@ class SubWindowHost {
     this.minimizable = cmd.minimizable !== false;
     this.closable = cmd.closable !== false;
 
-    const initialRect = await this.computeInitialRect(cmd);
-    if (this.destroyed) {
-      return;
-    }
-    const parentSub =
-      this.parentWindowId !== undefined
-        ? this.owner.getSubWindowRef(this.parentWindowId)
-        : undefined;
-    const createdOnMain = parentSub === undefined;
-    const decorEnabled = !this.frameNone;
-    const options: window.SubWindowOptions = {
-      title: cmd.title ?? "",
-      decorEnabled,
-    };
-    if (this.isModal) {
-      options.isModal = true;
-      if (deviceInfo.sdkApiVersion >= 14) {
-        options.modalityType = window.ModalityType.WINDOW_MODALITY;
+    await this.owner.runWithAbilityVisibleForSubWindow(async (): Promise<void> => {
+      if (this.destroyed) {
+        return;
       }
-    } else if (deviceInfo.sdkApiVersion >= 18) {
-      options.zLevel = resolveSubWindowZLevel(cmd.kind, cmd.level);
-      if (
-        createdOnMain &&
-        deviceInfo.sdkApiVersion >= 26 &&
-        this.parentWindowId === undefined
-      ) {
-        // Only supported when the parent is the main window. Loosening the
-        // z-level restriction lets independent subwindows stack and survive
-        // independently of the parked/minimized main window.
-        const rawOptions: ESObject = options;
-        rawOptions["zLevelAboveParentLoosened"] = true;
+      const initialRect = await this.computeInitialRect(cmd);
+      if (this.destroyed) {
+        return;
       }
-    }
-    if (deviceInfo.sdkApiVersion >= 18) {
-      options.windowRect = initialRect;
-    }
-    if (deviceInfo.sdkApiVersion >= 19) {
-      options.maximizeSupported =
-        this.maximizable &&
-        cmd.kind !== "dialog" &&
-        cmd.kind !== "popup" &&
-        cmd.kind !== "overlay";
-    }
-    if (deviceInfo.sdkApiVersion >= 20) {
-      options.outlineEnabled = !this.transparent && cmd.shadow !== false;
-    }
+      const parentSub =
+        this.parentWindowId !== undefined
+          ? this.owner.getSubWindowRef(this.parentWindowId)
+          : undefined;
+      const createdOnMain = parentSub === undefined;
+      const decorEnabled = !this.frameNone;
+      const options: window.SubWindowOptions = {
+        title: cmd.title ?? "",
+        decorEnabled,
+      };
+      if (this.isModal) {
+        options.isModal = true;
+        if (deviceInfo.sdkApiVersion >= 14) {
+          options.modalityType = window.ModalityType.WINDOW_MODALITY;
+        }
+      } else if (deviceInfo.sdkApiVersion >= 18) {
+        options.zLevel = resolveSubWindowZLevel(cmd.kind, cmd.level);
+        if (
+          createdOnMain &&
+          deviceInfo.sdkApiVersion >= 26 &&
+          this.parentWindowId === undefined
+        ) {
+          // Only supported when the parent is the main window. Loosening the
+          // z-level restriction lets independent subwindows stack and survive
+          // independently of the parked/minimized main window.
+          const rawOptions: ESObject = options;
+          rawOptions["zLevelAboveParentLoosened"] = true;
+        }
+      }
+      if (deviceInfo.sdkApiVersion >= 18) {
+        options.windowRect = initialRect;
+      }
+      if (deviceInfo.sdkApiVersion >= 19) {
+        options.maximizeSupported =
+          this.maximizable &&
+          cmd.kind !== "dialog" &&
+          cmd.kind !== "popup" &&
+          cmd.kind !== "overlay";
+      }
+      if (deviceInfo.sdkApiVersion >= 20) {
+        options.outlineEnabled = !this.transparent && cmd.shadow !== false;
+      }
 
-    const subName = `nsh_sub_${this.windowId}_${Date.now()}`;
-    let sub: window.Window;
-    if (parentSub !== undefined) {
-      try {
-        sub = await parentSub.createSubWindowWithOptions(subName, options);
-      } catch {
+      const subName = `nsh_sub_${this.windowId}_${Date.now()}`;
+      let sub: window.Window;
+      if (parentSub !== undefined) {
+        try {
+          sub = await parentSub.createSubWindowWithOptions(subName, options);
+        } catch {
+          sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
+        }
+      } else {
         sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
       }
-    } else {
-      sub = await this.owner.mainWindowRef().createSubWindowWithOptions(subName, options);
-    }
-    if (this.destroyed) {
+      if (this.destroyed) {
+        try {
+          await sub.destroyWindow();
+        } catch {}
+        return;
+      }
+      this.win = sub;
       try {
-        await sub.destroyWindow();
+        this.defaultLimits = sub.getWindowLimits();
       } catch {}
-      return;
-    }
-    this.win = sub;
-    try {
-      this.defaultLimits = sub.getWindowLimits();
-    } catch {}
-    this.subscribe(sub);
+      this.subscribe(sub);
 
-    if (cmd.display && deviceInfo.sdkApiVersion >= 15) {
+      if (cmd.display && deviceInfo.sdkApiVersion >= 15) {
+        try {
+          const targetScreen = await resolveTargetDisplay(cmd.display);
+          await sub.moveWindowToGlobal(initialRect.left, initialRect.top, {
+            displayId: targetScreen.id,
+          });
+        } catch {}
+      } else if (deviceInfo.sdkApiVersion < 18) {
+        try {
+          await sub.moveWindowTo(initialRect.left, initialRect.top);
+        } catch {}
+        try {
+          await sub.resize(initialRect.width, initialRect.height);
+        } catch {}
+      }
+
+      const content = new NodeContent();
+      const bridge = new SubWindowPageBridge(content, this.backdrop, this.owner.activeColorMode());
+      this.pageBridge = bridge;
+      const storage = new LocalStorage();
+      storage.setOrCreate(NSH_SUBWINDOW_BRIDGE_KEY, bridge);
+      await sub.loadContentByName(NSH_SUBWINDOW_ROUTE, storage);
+      if (this.destroyed) {
+        this.unsubscribe(sub);
+        this.win = undefined;
+        this.pageBridge = undefined;
+        try {
+          await sub.destroyWindow();
+        } catch {}
+        return;
+      }
+
+      this.subscribeContentEvents(sub);
+
       try {
-        const targetScreen = await resolveTargetDisplay(cmd.display);
-        await sub.moveWindowToGlobal(initialRect.left, initialRect.top, {
-          displayId: targetScreen.id,
-        });
+        this.ui = sub.getUIContext();
       } catch {}
-    } else if (deviceInfo.sdkApiVersion < 18) {
+
+      let platformWindowId = 0;
       try {
-        await sub.moveWindowTo(initialRect.left, initialRect.top);
+        platformWindowId = sub.getWindowProperties().id;
       } catch {}
-      try {
-        await sub.resize(initialRect.width, initialRect.height);
-      } catch {}
-    }
 
-    const content = new NodeContent();
-    const bridge = new SubWindowPageBridge(content, this.backdrop, this.owner.activeColorMode());
-    this.pageBridge = bridge;
-    const storage = new LocalStorage();
-    storage.setOrCreate(NSH_SUBWINDOW_BRIDGE_KEY, bridge);
-    await sub.loadContentByName(NSH_SUBWINDOW_ROUTE, storage);
-    if (this.destroyed) {
-      this.unsubscribe(sub);
-      this.win = undefined;
-      this.pageBridge = undefined;
-      try {
-        await sub.destroyWindow();
-      } catch {}
-      return;
-    }
+      if (this.transparent || this.frameNone || this.backdrop !== "none") {
+        this.backgroundOverridden = true;
+        try {
+          sub.setWindowBackgroundColor("#00000000");
+        } catch {}
+      }
+      if (this.transparent && cmd.shadow === undefined && deviceInfo.sdkApiVersion >= 17) {
+        this.shadowDisabled = true;
+        try {
+          sub.setWindowShadowRadius(0);
+        } catch {}
+      }
+      await this.applyAttributesInternal(cmd);
+      if (this.destroyed) {
+        return;
+      }
 
-    this.subscribeContentEvents(sub);
+      const attached = this.owner.attachSubWindow(this.windowId, content, platformWindowId);
+      if (!attached || this.destroyed) {
+        this.destroyed = true;
+        this.closingByHost = true;
+        this.pageBridge = undefined;
+        this.owner.onSubWindowRemoved(this.windowId);
+        this.unsubscribe(sub);
+        this.win = undefined;
+        this.ui = undefined;
+        try {
+          await sub.destroyWindow();
+        } catch {}
+        return;
+      }
 
-    try {
-      this.ui = sub.getUIContext();
-    } catch {}
-
-    let platformWindowId = 0;
-    try {
-      platformWindowId = sub.getWindowProperties().id;
-    } catch {}
-
-    if (this.transparent || this.frameNone || this.backdrop !== "none") {
-      this.backgroundOverridden = true;
-      try {
-        sub.setWindowBackgroundColor("#00000000");
-      } catch {}
-    }
-    if (this.transparent && cmd.shadow === undefined && deviceInfo.sdkApiVersion >= 17) {
-      this.shadowDisabled = true;
-      try {
-        sub.setWindowShadowRadius(0);
-      } catch {}
-    }
-    await this.applyAttributesInternal(cmd);
-    if (this.destroyed) {
-      return;
-    }
-
-    const attached = this.owner.attachSubWindow(this.windowId, content, platformWindowId);
-    if (!attached || this.destroyed) {
-      this.destroyed = true;
-      this.closingByHost = true;
-      this.pageBridge = undefined;
-      this.owner.onSubWindowRemoved(this.windowId);
-      this.unsubscribe(sub);
-      this.win = undefined;
-      this.ui = undefined;
-      try {
-        await sub.destroyWindow();
-      } catch {}
-      return;
-    }
-
-    if (deviceInfo.sdkApiVersion >= 20 && cmd.activate === false && !this.isModal) {
-      try {
-        await sub.showWindow({ focusOnShow: false });
-      } catch {
+      if (deviceInfo.sdkApiVersion >= 20 && cmd.activate === false && !this.isModal) {
+        try {
+          await sub.showWindow({ focusOnShow: false });
+        } catch {
+          await sub.showWindow();
+        }
+      } else {
         await sub.showWindow();
       }
-    } else {
-      await sub.showWindow();
-    }
-    if (this.destroyed) {
-      return;
-    }
-
-    if (this.transparent || this.frameNone || this.backdrop !== "none") {
-      try {
-        sub.setWindowBackgroundColor("#00000000");
-      } catch {}
-    }
-    try {
-      this.visible = sub.isWindowShowing();
-      this.focused = sub.isFocused();
-      if (this.focused) {
-        this.hadFocus = true;
+      if (this.destroyed) {
+        return;
       }
-      this.applyWindowStatus(sub.getWindowStatus());
-    } catch {}
-    this.flushPendingFocus();
-    if (cmd.mode && cmd.mode !== "normal") {
-      await this.setModeInternal(cmd.mode);
+
+      if (this.transparent || this.frameNone || this.backdrop !== "none") {
+        try {
+          sub.setWindowBackgroundColor("#00000000");
+        } catch {}
+      }
+      this.flushPendingFocus();
+      if (cmd.mode && cmd.mode !== "normal") {
+        await this.setModeInternal(cmd.mode);
+      }
+      this.syncTitleBar();
+    });
+    if (!this.destroyed) {
+      this.refreshWindowProps();
+      this.syncState();
+      if (this.win !== undefined && (cmd.activate !== false || this.isModal)) {
+        this.scheduleTrayMenuFocusRestore(this.win);
+      }
     }
-    this.syncTitleBar();
-    this.syncState();
   }
 
   private subscribe(sub: window.Window): void {
@@ -1555,6 +1561,43 @@ class SubWindowHost {
     }
   }
 
+  private refreshWindowProps(): void {
+    const sub = this.win;
+    if (!sub || this.destroyed) {
+      return;
+    }
+    try {
+      this.visible = sub.isWindowShowing();
+      this.focused = sub.isFocused();
+      if (this.focused) {
+        this.hadFocus = true;
+      }
+      this.applyWindowStatus(sub.getWindowStatus());
+    } catch {}
+  }
+
+  private scheduleTrayMenuFocusRestore(sub: window.Window): void {
+    if (!this.owner.wasTrayMenuClickedRecently()) {
+      return;
+    }
+    setTimeout((): void => {
+      if (
+        this.destroyed ||
+        this.hiddenByApp ||
+        this.minimized ||
+        this.win !== sub ||
+        !this.owner.wasTrayMenuClickedRecently()
+      ) {
+        return;
+      }
+      try {
+        if (!sub.isFocused()) {
+          sub.showWindow().catch((): void => {});
+        }
+      } catch {}
+    }, 180);
+  }
+
   private async applyRequestInternal(cmd: WireCommand): Promise<void> {
     const sub = this.win;
     if (!sub || this.destroyed) {
@@ -1563,27 +1606,44 @@ class SubWindowHost {
     switch (cmd.action) {
       case "show":
         this.hiddenByApp = false;
-        if (deviceInfo.sdkApiVersion >= 20) {
-          try {
-            await sub.showWindow({ focusOnShow: false });
-          } catch {
+        await this.owner.runWithAbilityVisibleForSubWindow(async (): Promise<void> => {
+          if (this.destroyed) {
+            return;
+          }
+          if (deviceInfo.sdkApiVersion >= 20) {
+            try {
+              await sub.showWindow({ focusOnShow: false });
+            } catch {
+              try {
+                await sub.showWindow();
+              } catch {}
+            }
+          } else {
             try {
               await sub.showWindow();
             } catch {}
           }
-        } else {
-          try {
-            await sub.showWindow();
-          } catch {}
+        });
+        if (!this.destroyed) {
+          this.refreshWindowProps();
+          this.syncState();
         }
-        this.syncState();
         break;
       case "focus":
         this.hiddenByApp = false;
-        try {
-          await sub.showWindow();
-        } catch {}
-        this.syncState();
+        await this.owner.runWithAbilityVisibleForSubWindow(async (): Promise<void> => {
+          if (this.destroyed) {
+            return;
+          }
+          try {
+            await sub.showWindow();
+          } catch {}
+        });
+        if (!this.destroyed) {
+          this.refreshWindowProps();
+          this.syncState();
+          this.scheduleTrayMenuFocusRestore(sub);
+        }
         break;
       case "hide":
         this.hiddenByApp = true;
@@ -1592,6 +1652,8 @@ class SubWindowHost {
           // hiddenByApp keeps hidden distinct from minimized in state reports to Rust.
           await sub.minimize();
         } catch {}
+        this.visible = false;
+        this.focused = false;
         this.syncState();
         break;
       case "minimize":
@@ -1599,21 +1661,38 @@ class SubWindowHost {
         try {
           await sub.minimize();
         } catch {}
+        this.refreshWindowProps();
         this.syncState();
         break;
       case "restore":
         this.hiddenByApp = false;
-        try {
-          await sub.restore();
-        } catch {
+        await this.owner.runWithAbilityVisibleForSubWindow(async (): Promise<void> => {
+          if (this.destroyed) {
+            return;
+          }
           try {
-            await sub.recover();
+            await sub.showWindow();
           } catch {}
+          try {
+            if (sub.getWindowStatus() === window.WindowStatusType.MINIMIZE) {
+              try {
+                await sub.restore();
+              } catch {
+                try {
+                  await sub.recover();
+                } catch {}
+              }
+              try {
+                await sub.showWindow();
+              } catch {}
+            }
+          } catch {}
+        });
+        if (!this.destroyed) {
+          this.refreshWindowProps();
+          this.syncState();
+          this.scheduleTrayMenuFocusRestore(sub);
         }
-        try {
-          await sub.showWindow();
-        } catch {}
-        this.syncState();
         break;
       case "setMode":
         await this.setModeInternal(cmd.mode ?? "normal");
@@ -1899,6 +1978,13 @@ export class NativeDesktop {
   private minimized: boolean = false;
   private hiddenByApp: boolean = false;
   private hiddenByAbility: boolean = false;
+  private suppressMainShowEvents: number = 0;
+  private suppressSecondInstanceUntilMs: number = 0;
+  private trayMenuSuppressed: boolean = false;
+  private trayMenuSuppressGen: number = 0;
+  private trayMenuSuppressTimer?: number = undefined;
+  private lastTrayMenuClickMs: number = 0;
+  private mainWindowActivationWaiters: Array<() => void> = [];
   private normalBounds?: WireBoundsPayload;
   private defaultLimits?: window.WindowLimits;
   private mainQueue: Promise<void> = Promise.resolve();
@@ -1952,6 +2038,9 @@ export class NativeDesktop {
     if (target === undefined) {
       return;
     }
+    this.lastTrayMenuClickMs = Date.now();
+    this.noteInternalAbilityTransition(800);
+    this.beginTrayMenuMainHideGuard();
     this.emit(
       "menu-select",
       JSON.stringify({ generation: TRAY_MENU_GENERATION, id: target.id, role: target.role }),
@@ -1975,6 +2064,9 @@ export class NativeDesktop {
       return;
     }
     this.applyWindowStatus(status);
+    if (this.suppressMainShowEvents > 0) {
+      return;
+    }
     this.syncWindowState();
     if (!this.frameNone && this.titleBarHidden) {
       this.syncTitleBar();
@@ -1982,6 +2074,24 @@ export class NativeDesktop {
   };
 
   private readonly onWindowEvent = (event: window.WindowEventType): void => {
+    if (event === window.WindowEventType.WINDOW_ACTIVE) {
+      this.flushMainWindowActivationWaiters();
+    }
+    if (
+      this.suppressMainShowEvents > 0 &&
+      (event === window.WindowEventType.WINDOW_SHOWN ||
+        event === window.WindowEventType.WINDOW_ACTIVE)
+    ) {
+      return;
+    }
+    if (
+      (this.hiddenByApp || this.mainParked) &&
+      (event === window.WindowEventType.WINDOW_SHOWN ||
+        event === window.WindowEventType.WINDOW_ACTIVE) &&
+      this.isMainWindowCurrentlyMinimized()
+    ) {
+      return;
+    }
     if (this.mainParked) {
       if (
         event === window.WindowEventType.WINDOW_SHOWN ||
@@ -2135,6 +2245,38 @@ export class NativeDesktop {
     if (this.popupLease !== undefined && this.popupLease.windowId === windowId) {
       this.popupLease.disappeared = true;
       this.closePopupMenuOnly();
+    }
+    if (
+      !this.closed &&
+      this.subWindows.size === 0 &&
+      this.trayAdded &&
+      (this.hiddenByApp || this.mainParked) &&
+      !this.hiddenByAbility
+    ) {
+      this.enqueueMain(async (): Promise<void> => {
+        await this.trayQueue.catch((): void => {});
+        if (
+          this.closed ||
+          this.subWindows.size > 0 ||
+          !this.trayAdded ||
+          (!this.hiddenByApp && !this.mainParked) ||
+          this.hiddenByAbility
+        ) {
+          return;
+        }
+        try {
+          await this.abilityContext.hideAbility();
+          this.hiddenByAbility = true;
+          if (!this.trayAdded || this.subWindows.size > 0) {
+            await this.transitionAbilityToMinimizedMainAsync();
+          }
+          if (!this.mainParked) {
+            this.visible = false;
+            this.focused = false;
+            this.syncWindowState();
+          }
+        } catch {}
+      });
     }
   }
 
@@ -2293,15 +2435,15 @@ export class NativeDesktop {
       case "quit":
         this.removeMenuBar();
         this.closePopupMenuOnly();
-        this.closeAllSubWindows();
         this.removeTraySync();
+        this.closeAllSubWindows();
         this.abilityContext.terminateSelf().catch((): void => {});
         break;
       case "restart":
         this.removeMenuBar();
         this.closePopupMenuOnly();
-        this.closeAllSubWindows();
         this.removeTraySync();
+        this.closeAllSubWindows();
         try {
           const bundleName = this.abilityContext.abilityInfo?.bundleName ?? "";
           const abilityName = this.abilityContext.abilityInfo?.name ?? "EntryAbility";
@@ -2541,6 +2683,8 @@ export class NativeDesktop {
       return;
     }
     this.closed = true;
+    this.cancelTrayMenuMainHideGuard();
+    this.flushMainWindowActivationWaiters();
     this.removeMenuBar();
     this.closePopupMenuOnly();
     void this.popupMenus.settled();
@@ -2713,8 +2857,8 @@ export class NativeDesktop {
     }
   }
 
-  private enqueueMain(task: () => Promise<void>): void {
-    this.mainQueue = this.mainQueue
+  private enqueueMain(task: () => Promise<void>): Promise<void> {
+    const next = this.mainQueue
       .then(async (): Promise<void> => {
         if (this.closed) {
           return;
@@ -2724,25 +2868,349 @@ export class NativeDesktop {
       .catch((error: Object): void => {
         console.warn(`[NSH] main window command failed: ${String(error)}`);
       });
+    this.mainQueue = next;
+    return next;
   }
 
   revealMainWindow(): void {
     if (this.closed || this.mainParked) {
       return;
     }
+    this.cancelTrayMenuMainHideGuard();
     this.enqueueMain(async (): Promise<void> => {
       await this.revealMainWindowAsync();
     });
   }
 
-  private isMainWindowMinimized(): boolean {
-    if (this.minimized) {
-      return true;
-    }
+  private isMainWindowCurrentlyMinimized(): boolean {
     try {
       return this.mainWindow.getWindowStatus() === window.WindowStatusType.MINIMIZE;
     } catch {
+      return this.minimized;
+    }
+  }
+
+  private isMainWindowMinimized(): boolean {
+    return this.minimized || this.isMainWindowCurrentlyMinimized();
+  }
+
+  private hasAnyVisibleWindow(): boolean {
+    if (!this.hiddenByAbility && !this.isMainWindowCurrentlyMinimized()) {
+      try {
+        if (this.mainWindow.isWindowShowing()) {
+          return true;
+        }
+      } catch {}
+    }
+    const hosts = Array.from(this.subWindows.values());
+    for (let i = 0; i < hosts.length; i++) {
+      const subWin = hosts[i].windowRef();
+      if (subWin === undefined) {
+        continue;
+      }
+      try {
+        if (
+          subWin.isWindowShowing() &&
+          subWin.getWindowStatus() !== window.WindowStatusType.MINIMIZE
+        ) {
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  }
+
+  private noteInternalAbilityTransition(durationMs: number = 600): void {
+    this.suppressSecondInstanceUntilMs = Math.max(
+      this.suppressSecondInstanceUntilMs,
+      Date.now() + durationMs,
+    );
+  }
+
+  shouldSuppressSecondInstance(): boolean {
+    return this.suppressMainShowEvents > 0 || Date.now() < this.suppressSecondInstanceUntilMs;
+  }
+
+  wasTrayMenuClickedRecently(): boolean {
+    return Date.now() - this.lastTrayMenuClickMs < 800;
+  }
+
+  private async showAbilityInternal(): Promise<boolean> {
+    this.noteInternalAbilityTransition();
+    try {
+      await this.abilityContext.showAbility();
+      this.noteInternalAbilityTransition();
+      return true;
+    } catch {
       return false;
+    }
+  }
+
+  private beginTrayMenuMainHideGuard(): void {
+    if (this.closed || (!this.hiddenByApp && !this.mainParked)) {
+      return;
+    }
+    const gen = ++this.trayMenuSuppressGen;
+    if (!this.trayMenuSuppressed) {
+      this.trayMenuSuppressed = true;
+      this.suppressMainShowEvents++;
+    }
+    if (this.trayMenuSuppressTimer !== undefined) {
+      clearTimeout(this.trayMenuSuppressTimer);
+    }
+    this.trayMenuSuppressTimer = setTimeout((): void => {
+      this.trayMenuSuppressTimer = undefined;
+      this.finishTrayMenuMainHideGuard(gen);
+    }, 250);
+  }
+
+  private cancelTrayMenuMainHideGuard(): void {
+    this.trayMenuSuppressGen++;
+    this.lastTrayMenuClickMs = 0;
+    if (this.trayMenuSuppressTimer !== undefined) {
+      clearTimeout(this.trayMenuSuppressTimer);
+      this.trayMenuSuppressTimer = undefined;
+    }
+    if (this.trayMenuSuppressed) {
+      this.trayMenuSuppressed = false;
+      this.suppressMainShowEvents = Math.max(0, this.suppressMainShowEvents - 1);
+    }
+  }
+
+  private finishTrayMenuMainHideGuard(gen: number): void {
+    this.enqueueMain(async (): Promise<void> => {
+      if (gen !== this.trayMenuSuppressGen) {
+        return;
+      }
+      try {
+        await this.trayQueue.catch((): void => {});
+        if (gen !== this.trayMenuSuppressGen || this.closed || (!this.hiddenByApp && !this.mainParked)) {
+          return;
+        }
+        if (this.subWindows.size > 0) {
+          this.hiddenByAbility = false;
+          await this.minimizeMainWindowSettledAsync();
+          if (!this.mainParked) {
+            this.visible = false;
+            this.focused = false;
+            this.syncWindowState();
+          }
+          return;
+        }
+        if (this.trayAdded) {
+          let mainShowing = false;
+          try {
+            mainShowing = this.mainWindow.isWindowShowing();
+          } catch {}
+          if (!this.hiddenByAbility || mainShowing) {
+            try {
+              await this.abilityContext.hideAbility();
+              this.hiddenByAbility = true;
+              if (!this.trayAdded || this.subWindows.size > 0) {
+                await this.transitionAbilityToMinimizedMainAsync();
+              }
+            } catch {
+              await this.minimizeMainWindowSettledAsync();
+            }
+          }
+          if (!this.mainParked) {
+            this.visible = false;
+            this.focused = false;
+            this.syncWindowState();
+          }
+          return;
+        }
+        this.hiddenByAbility = false;
+        await this.minimizeMainWindowSettledAsync();
+        if (!this.mainParked) {
+          this.visible = false;
+          this.focused = false;
+          this.syncWindowState();
+        }
+      } finally {
+        if (gen === this.trayMenuSuppressGen && this.trayMenuSuppressed) {
+          this.trayMenuSuppressed = false;
+          this.suppressMainShowEvents = Math.max(0, this.suppressMainShowEvents - 1);
+        }
+      }
+    });
+  }
+
+  private flushMainWindowActivationWaiters(): void {
+    if (this.mainWindowActivationWaiters.length === 0) {
+      return;
+    }
+    const waiters = this.mainWindowActivationWaiters.splice(
+      0,
+      this.mainWindowActivationWaiters.length,
+    );
+    for (let i = 0; i < waiters.length; i++) {
+      waiters[i]();
+    }
+  }
+
+  private waitForMainWindowActivation(timeoutMs: number): Promise<void> {
+    if (this.closed) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      let timerId: number | undefined;
+      const done = (): void => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        if (timerId !== undefined) {
+          clearTimeout(timerId);
+          timerId = undefined;
+        }
+        const idx = this.mainWindowActivationWaiters.indexOf(done);
+        if (idx >= 0) {
+          this.mainWindowActivationWaiters.splice(idx, 1);
+        }
+        resolve();
+      };
+      this.mainWindowActivationWaiters.push(done);
+      timerId = setTimeout(done, timeoutMs);
+    });
+  }
+
+  private async minimizeMainWindowSettledAsync(): Promise<void> {
+    if (this.closed || (!this.hiddenByApp && !this.mainParked) || this.hiddenByAbility) {
+      return;
+    }
+    if (!this.isMainWindowCurrentlyMinimized()) {
+      try {
+        await this.mainWindow.minimize();
+      } catch {}
+    }
+    // SceneBoard can briefly re-raise the parent main window during
+    // showAbility / createContainerForNoParentSubWindow; verify once more
+    // after a short settle delay while main show events remain suppressed.
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, 100);
+    });
+    if (
+      !this.closed &&
+      (this.hiddenByApp || this.mainParked) &&
+      !this.hiddenByAbility &&
+      !this.isMainWindowCurrentlyMinimized()
+    ) {
+      try {
+        await this.mainWindow.minimize();
+      } catch {}
+    }
+  }
+
+  private async transitionAbilityToMinimizedMainAsync(
+    duringVisible?: () => Promise<void>,
+  ): Promise<void> {
+    const wasHiddenByAbility = this.hiddenByAbility;
+    this.hiddenByAbility = false;
+    // Temporarily reveal the Ability without emitting a spurious show/reopen,
+    // wait for SceneBoard's foreground activation, run any foreground-only
+    // work (such as removeFromStatusBar), then minimize the main window so
+    // the subsequent minimize() is not overridden by showAbility().
+    this.suppressMainShowEvents++;
+    try {
+      const activated = this.waitForMainWindowActivation(400);
+      let showOk = false;
+      if (wasHiddenByAbility) {
+        showOk = await this.showAbilityInternal();
+      }
+      if (duringVisible !== undefined && this.isMainWindowCurrentlyMinimized()) {
+        try {
+          await this.mainWindow.restore();
+          showOk = true;
+        } catch {
+          try {
+            await this.mainWindow.recover();
+            showOk = true;
+          } catch {}
+        }
+        try {
+          await this.mainWindow.showWindow();
+          showOk = true;
+        } catch {}
+      }
+      if (showOk && !this.closed) {
+        await activated;
+        if (duringVisible !== undefined) {
+          await duringVisible();
+        }
+        if (!this.closed && (this.hiddenByApp || this.mainParked)) {
+          await this.minimizeMainWindowSettledAsync();
+        }
+      } else {
+        this.flushMainWindowActivationWaiters();
+        if (duringVisible !== undefined) {
+          await duringVisible();
+        }
+      }
+      if (!this.closed && !this.mainParked && this.hiddenByApp) {
+        this.visible = false;
+        this.focused = false;
+        this.syncWindowState();
+      }
+    } finally {
+      this.noteInternalAbilityTransition();
+      this.suppressMainShowEvents--;
+    }
+  }
+
+  async runWithAbilityVisibleForSubWindow(work: () => Promise<void>): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    let keepMainHidden = false;
+    let showedAbility = false;
+    let activationWait: Promise<void> | undefined = undefined;
+    await this.enqueueMain(async (): Promise<void> => {
+      await this.trayQueue.catch((): void => {});
+      if (this.closed) {
+        return;
+      }
+      keepMainHidden = this.hiddenByApp || this.mainParked;
+      if (keepMainHidden) {
+        this.suppressMainShowEvents++;
+      }
+      if (this.hiddenByAbility) {
+        this.hiddenByAbility = false;
+        showedAbility = true;
+        activationWait = this.waitForMainWindowActivation(400);
+        const showOk = await this.showAbilityInternal();
+        if (!showOk) {
+          this.flushMainWindowActivationWaiters();
+          activationWait = undefined;
+        }
+      }
+    });
+    try {
+      await work();
+    } finally {
+      if (keepMainHidden) {
+        await this.enqueueMain(async (): Promise<void> => {
+          try {
+            if (!this.closed && (this.hiddenByApp || this.mainParked) && !this.hiddenByAbility) {
+              if (activationWait !== undefined) {
+                await activationWait;
+              }
+              await this.minimizeMainWindowSettledAsync();
+              if (!this.mainParked) {
+                this.visible = false;
+                this.focused = false;
+                this.syncWindowState();
+              }
+            }
+          } finally {
+            if (showedAbility) {
+              this.noteInternalAbilityTransition();
+            }
+            this.suppressMainShowEvents--;
+          }
+        });
+      }
     }
   }
 
@@ -2759,6 +3227,9 @@ export class NativeDesktop {
       try {
         await this.abilityContext.hideAbility();
         this.hiddenByAbility = true;
+        if (!this.trayAdded || this.subWindows.size > 0) {
+          await this.transitionAbilityToMinimizedMainAsync();
+        }
         this.visible = false;
         this.focused = false;
         this.syncWindowState();
@@ -2774,6 +3245,7 @@ export class NativeDesktop {
   }
 
   private async revealMainWindowAsync(): Promise<void> {
+    await this.trayQueue.catch((): void => {});
     if (this.closed || this.mainParked) {
       return;
     }
@@ -2782,9 +3254,7 @@ export class NativeDesktop {
     this.hiddenByApp = false;
     this.hiddenByAbility = false;
     if (wasHiddenByAbility) {
-      try {
-        await this.abilityContext.showAbility();
-      } catch {}
+      await this.showAbilityInternal();
     }
     if (wasMinimized || this.isMainWindowMinimized()) {
       try {
@@ -2832,6 +3302,7 @@ export class NativeDesktop {
       case "show":
       case "focus":
       case "restore":
+        this.cancelTrayMenuMainHideGuard();
         this.enqueueMain(async (): Promise<void> => {
           await this.revealMainWindowAsync();
         });
@@ -2930,6 +3401,9 @@ export class NativeDesktop {
         try {
           await this.abilityContext.hideAbility();
           this.hiddenByAbility = true;
+          if (!this.trayAdded || this.subWindows.size > 0) {
+            await this.transitionAbilityToMinimizedMainAsync();
+          }
           return;
         } catch {}
       }
@@ -2941,6 +3415,7 @@ export class NativeDesktop {
 
   private unparkMainWindow(): void {
     const wasParked = this.mainParked;
+    this.cancelTrayMenuMainHideGuard();
     this.mainParked = false;
     this.reopenEmittedWhileParked = false;
     this.hiddenByApp = false;
@@ -2951,12 +3426,11 @@ export class NativeDesktop {
       return;
     }
     this.enqueueMain(async (): Promise<void> => {
-      if (this.mainParked) {
+      await this.trayQueue.catch((): void => {});
+      if (this.mainParked || this.closed) {
         return;
       }
-      try {
-        await this.abilityContext.showAbility();
-      } catch {}
+      await this.showAbilityInternal();
       if (this.isMainWindowMinimized()) {
         try {
           await this.mainWindow.restore();
@@ -3757,6 +4231,46 @@ export class NativeDesktop {
     }
   }
 
+  private async removeFromStatusBarOnceAsync(): Promise<number> {
+    const kit = await import("@hms.pcService.statusBarManager");
+    return await new Promise<number>((resolve) => {
+      try {
+        if (deviceInfo.sdkApiVersion >= 14) {
+          kit.default.removeFromStatusBar(this.abilityContext, (err): void => {
+            if (err) {
+              resolve(err.code ?? -1);
+            } else {
+              resolve(0);
+            }
+          });
+        } else {
+          kit.default.removeFromStatusBar(this.abilityContext);
+          resolve(0);
+        }
+      } catch (error) {
+        console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
+        resolve(-1);
+      }
+    });
+  }
+
+  private async removeFromStatusBarAsync(retryOnBackground: boolean): Promise<void> {
+    try {
+      let code = await this.removeFromStatusBarOnceAsync();
+      if (code === 1010710004 && retryOnBackground && !this.closed) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, 100);
+        });
+        code = await this.removeFromStatusBarOnceAsync();
+      }
+      if (code > 0) {
+        console.warn(`[NSH] removeFromStatusBar failed: code=${code}`);
+      }
+    } catch (error) {
+      console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
+    }
+  }
+
   private async applyRemoveTray(): Promise<void> {
     this.trayClickId = 0;
     this.trayMenuTargets.clear();
@@ -3767,34 +4281,16 @@ export class NativeDesktop {
     this.trayAdded = false;
     this.trayLastIconKey = "";
     this.trayLastHoverTips = "";
-    if (!this.closed && this.hiddenByAbility && !this.mainParked) {
-      this.hiddenByAbility = false;
-      try {
-        await this.abilityContext.showAbility();
-      } catch {}
-    }
-    try {
-      const kit = await import("@hms.pcService.statusBarManager");
-      await new Promise<void>((resolve, reject) => {
-        try {
-          if (deviceInfo.sdkApiVersion >= 14) {
-            kit.default.removeFromStatusBar(this.abilityContext, (err): void => {
-              if (err) {
-                reject(err);
-              } else {
-                resolve();
-              }
-            });
-          } else {
-            kit.default.removeFromStatusBar(this.abilityContext);
-            resolve();
-          }
-        } catch (error) {
-          reject(error);
-        }
+    const needsForegroundBridge =
+      !this.closed &&
+      (this.hiddenByAbility ||
+        ((this.hiddenByApp || this.mainParked) && !this.hasAnyVisibleWindow()));
+    if (needsForegroundBridge) {
+      await this.transitionAbilityToMinimizedMainAsync(async (): Promise<void> => {
+        await this.removeFromStatusBarAsync(true);
       });
-    } catch (error) {
-      console.warn(`[NSH] removeFromStatusBar failed: ${String(error)}`);
+    } else {
+      await this.removeFromStatusBarAsync(false);
     }
     this.unsubscribeTray();
   }
