@@ -128,6 +128,7 @@ pub(crate) struct Context {
 pub(crate) struct Registry {
     factories: FxHashMap<Arc<str>, Rc<Factory>>,
     contexts: FxHashMap<u32, Context>,
+    gpu_surfaces: Vec<std::rc::Weak<crate::interop::gpu_surface::GpuSurfaceInstance>>,
     next: u32,
 }
 #[derive(Clone, Default)]
@@ -149,6 +150,61 @@ impl Components {
     pub(crate) fn clear(&self) {
         self.0.borrow_mut().factories.clear();
     }
+    pub(crate) fn tick_gpu_surfaces(&self, timestamp_ns: u64) {
+        let live: Vec<_> = {
+            let mut registry = self.0.borrow_mut();
+            let mut live = Vec::new();
+            registry.gpu_surfaces.retain(|weak| {
+                if let Some(surface) = weak.upgrade() {
+                    live.push(surface);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for surface in live {
+            surface.on_vsync(timestamp_ns);
+        }
+    }
+    pub(crate) fn set_gpu_surfaces_active(&self, active: bool) {
+        let live: Vec<_> = {
+            let mut registry = self.0.borrow_mut();
+            let mut live = Vec::new();
+            registry.gpu_surfaces.retain(|weak| {
+                if let Some(surface) = weak.upgrade() {
+                    live.push(surface);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for surface in live {
+            surface.set_host_active(active);
+            surface.sync_xcomponent_rate();
+        }
+    }
+    pub(crate) fn sync_gpu_surface_rates(&self) {
+        let live: Vec<_> = {
+            let mut registry = self.0.borrow_mut();
+            let mut live = Vec::new();
+            registry.gpu_surfaces.retain(|weak| {
+                if let Some(surface) = weak.upgrade() {
+                    live.push(surface);
+                    true
+                } else {
+                    false
+                }
+            });
+            live
+        };
+        for surface in live {
+            surface.sync_xcomponent_rate();
+        }
+    }
     pub(crate) fn context(&self, handle: u32) -> napi_ohos::Result<Context> {
         self.0
             .borrow()
@@ -158,6 +214,7 @@ impl Components {
             .cloned()
             .ok_or_else(|| napi_ohos::Error::from_reason("native component is disposed"))
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn make(
         &self,
         env: Env,
@@ -165,6 +222,9 @@ impl Components {
         node: NodeId,
         control: EngineControl,
         host: &crate::app::session::Services,
+        scale: f32,
+        frame_rate: Arc<crate::app::frame_rate::FrameRate>,
+        dispatcher: std::sync::Weak<crate::app::runtime::Dispatcher>,
     ) -> Result<Option<Instance>> {
         let (factory, handle, context) = {
             let mut registry = self.0.borrow_mut();
@@ -172,6 +232,30 @@ impl Components {
             if factory.is_none() && name == nsh_core::platform::SWITCH_COMPONENT {
                 drop(registry);
                 return Ok(Some(Instance::native_switch(node, control)?));
+            }
+            if factory.is_none()
+                && let Some(registered) = crate::interop::gpu_surface::lookup_gpu_surface(name)
+            {
+                drop(registry);
+                let surface = crate::interop::gpu_surface::GpuSurfaceInstance::new(
+                    registered,
+                    node,
+                    control,
+                    scale,
+                    frame_rate,
+                    dispatcher,
+                    host.max_refresh_rate(),
+                )?;
+                let native = surface.native.clone();
+                self.0
+                    .borrow_mut()
+                    .gpu_surfaces
+                    .push(Rc::downgrade(&surface));
+                return Ok(Some(Instance {
+                    native,
+                    kind: InstanceKind::GpuSurface(surface),
+                    disposed: Cell::new(false),
+                }));
             }
             if factory.is_none()
                 && !matches!(
@@ -306,6 +390,7 @@ enum InstanceKind {
         registration: Registration,
     },
     NativeSwitch(NativeSwitchState),
+    GpuSurface(Rc<crate::interop::gpu_surface::GpuSurfaceInstance>),
 }
 
 pub(crate) struct Instance {
@@ -389,15 +474,39 @@ impl Instance {
             InstanceKind::NativeSwitch(_) => Err(napi_ohos::Error::from_reason(
                 "native switch has no JS object",
             )),
+            InstanceKind::GpuSurface(_) => Err(napi_ohos::Error::from_reason(
+                "native GPU surface has no JS object",
+            )),
+        }
+    }
+    pub(crate) fn set_frame(&self, width: f32, height: f32, scale: f32) -> Result<()> {
+        match &self.kind {
+            InstanceKind::GpuSurface(surface) => surface.set_frame(width, height, scale),
+            InstanceKind::Host { .. } | InstanceKind::NativeSwitch(_) => {
+                let node = self.native.borrow();
+                node.width(width)?;
+                node.height(height)?;
+                Ok(())
+            }
+        }
+    }
+    pub(crate) fn density_changed(&self, scale: f32) {
+        if let InstanceKind::GpuSurface(surface) = &self.kind {
+            surface.density_changed(scale);
         }
     }
     pub(crate) fn deactivate(&self) {
         match &self.kind {
             InstanceKind::Host { registration, .. } => registration.context.active.set(false),
             InstanceKind::NativeSwitch(state) => state.active.set(false),
+            InstanceKind::GpuSurface(surface) => surface.deactivate(),
         }
     }
     pub(crate) fn props(&self, props: Vec<(Arc<str>, Option<JsonValue>)>) -> Result<()> {
+        if let InstanceKind::GpuSurface(surface) = &self.kind {
+            surface.props(props);
+            return Ok(());
+        }
         if let InstanceKind::NativeSwitch(state) = &self.kind {
             let borrowed = self.native.borrow();
             for (name, value) in props {
@@ -457,6 +566,10 @@ impl Instance {
         Ok(())
     }
     pub(crate) fn command(&self, name: &str, args: &JsonValue) -> Result<()> {
+        if let InstanceKind::GpuSurface(surface) = &self.kind {
+            surface.command(name, args);
+            return Ok(());
+        }
         if matches!(self.kind, InstanceKind::NativeSwitch(_)) {
             return Ok(());
         }
@@ -492,6 +605,10 @@ impl Instance {
                     self.native.borrow_mut().dispose()?;
                 }
                 self.disposed.set(true);
+            }
+            InstanceKind::GpuSurface(surface) => {
+                self.disposed.set(true);
+                surface.dispose()?;
             }
         }
         Ok(())

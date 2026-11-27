@@ -34,9 +34,11 @@ pub use app::{
     NshScrollHandle, NshSurface, NshTrust, get_capabilities, init_logging,
 };
 pub use extensions::{
-    AbilityError, AbilityResult, AbilityWantEvent, AbilityWantKind, ExtensionError, UiThread, Want,
-    WantObserverGuard, ability, cache_dir, files_dir, launch_want, on_ability_want, prepare_image,
-    prepare_image_bytes, run_on_ui_thread,
+    AbilityError, AbilityResult, AbilityWantEvent, AbilityWantKind, ExtensionError, GpuSurfaceHost,
+    GpuSurfaceOptions, GpuSurfaceProperty, GpuSurfaceRenderer, UiThread, Want, WantObserverGuard,
+    ability, cache_dir, files_dir, has_gpu_surface, launch_want, on_ability_want, prepare_image,
+    prepare_image_bytes, register_gpu_surface, register_gpu_surface_with_options, run_on_ui_thread,
+    unregister_gpu_surface,
 };
 pub use interop::NshNativeProperty;
 pub use linked::LinkedApp;

@@ -2423,6 +2423,9 @@ impl Mounter {
                             id,
                             self.control.clone(),
                             &self.host,
+                            self.scale.get(),
+                            self.shaders.frame_rate(),
+                            self.dispatcher.clone(),
                         )? {
                             let node = self.node(id)?;
                             node.component_animated.borrow_mut().clear();

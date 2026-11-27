@@ -22,6 +22,9 @@ impl Node {
         if let Some(video) = self.video.borrow().as_ref() {
             video.density_changed(self.scale.get())?;
         }
+        if let Some(component) = self.component.borrow().as_ref() {
+            component.density_changed(self.scale.get());
+        }
         if let Some(self_rc) = self.self_ref() {
             self.interaction.sync_gestures(&self_rc)?;
         }

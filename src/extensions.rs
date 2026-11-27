@@ -1305,6 +1305,11 @@ mod ohos {
 }
 
 #[cfg(target_env = "ohos")]
+pub use crate::interop::{
+    GpuSurfaceHost, GpuSurfaceOptions, GpuSurfaceProperty, GpuSurfaceRenderer, has_gpu_surface,
+    register_gpu_surface, register_gpu_surface_with_options, unregister_gpu_surface,
+};
+#[cfg(target_env = "ohos")]
 pub(crate) use ohos::prepare_image_owned;
 #[cfg(target_env = "ohos")]
 pub use ohos::{

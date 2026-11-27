@@ -134,3 +134,7 @@ mod pan;
 #[path = "../../src/input/wheel.rs"]
 #[allow(dead_code)]
 mod wheel;
+
+#[path = "../../src/interop/gpu_surface.rs"]
+#[allow(dead_code, unreachable_pub)]
+mod gpu_surface;

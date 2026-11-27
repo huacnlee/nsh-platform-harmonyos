@@ -525,8 +525,7 @@ impl Node {
             old.dispose()?;
         }
         let frame = self.frame.get();
-        component.native.borrow().width(frame.width)?;
-        component.native.borrow().height(frame.height)?;
+        component.set_frame(frame.width, frame.height, self.scale.get())?;
         self.promote_direct_paint()?;
         self.native
             .borrow_mut()

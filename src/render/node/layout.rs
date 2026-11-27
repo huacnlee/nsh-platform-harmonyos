@@ -135,8 +135,7 @@ impl Node {
             self.update_wrapper()?;
             self.interaction.hit_region(self)?;
             if let Some(component) = self.component.borrow().as_ref() {
-                component.native.borrow().width(frame.width)?;
-                component.native.borrow().height(frame.height)?;
+                component.set_frame(frame.width, frame.height, self.scale.get())?;
             }
             if let Some(image) = self.image.borrow().as_ref() {
                 image.frame(Size::new(frame.width, frame.height))?;

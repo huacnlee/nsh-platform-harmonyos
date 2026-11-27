@@ -745,7 +745,12 @@ impl State {
                 self.engine_in_flight = self.engine_in_flight.saturating_sub(1);
                 self.schedule_frame()?;
             }
-            Message::CompositeDemand => self.schedule_frame()?,
+            Message::CompositeDemand => {
+                if let Some(mounter) = &self.mounter {
+                    mounter.components.sync_gpu_surface_rates();
+                }
+                self.schedule_frame()?;
+            }
             Message::ShadersUnavailable => {
                 if let Some(engine) = &self.engine {
                     engine.control().shaders_unavailable();
@@ -823,6 +828,7 @@ impl State {
             if was_active != active {
                 if let Some(mounter) = &self.mounter {
                     mounter.shaders.wake();
+                    mounter.components.set_gpu_surfaces_active(active);
                 }
                 // Preserve outstanding engine requests across background and
                 // detach; native state gets one sample when it becomes visible.
@@ -921,10 +927,11 @@ impl State {
         self.frame_wanted = false;
         let mounter = self.mounter.as_mut().unwrap();
         let sampled = mounter.frame(Some(timestamp));
-        if self.frame_rate.has_shader_demand()
-            && let Some(worker) = mounter.compositor.borrow().as_ref()
-        {
-            worker.frame(timestamp);
+        if self.frame_rate.has_shader_demand() {
+            if let Some(worker) = mounter.compositor.borrow().as_ref() {
+                worker.frame(timestamp);
+            }
+            mounter.components.tick_gpu_surfaces(timestamp);
         }
         self.native_demand = sampled.as_ref().copied().unwrap_or_default();
         if self.native_demand != super::frame_rate::UiDemand::Idle {
