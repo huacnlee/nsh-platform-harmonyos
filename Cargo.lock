@@ -3424,9 +3424,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-accessibility-binding"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "627d99fc7c5e585c3a482a6b8d54cf8e6f7c737117ede592100089f65bfe6e44"
+checksum = "b800bc49aee1baaca065f88b855afba6428ae0c4a8f87722a074cc2716952be3"
 dependencies = [
  "bitflags 2.13.2",
  "ohos-accessibility-sys",
@@ -3445,9 +3445,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-arkui-binding"
-version = "0.6.4"
+version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45da7d96c299b1dc69b4190e382379d570222d21fb5412a21898b498253d7d4f"
+checksum = "adc0b5210ef7ea8afcc65d60b50da2635ff0b9bac6af35fd17379614ee31edee"
 dependencies = [
  "bitflags 2.13.2",
  "log",
@@ -3467,9 +3467,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-arkui-input-binding"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed7306bd8aa8ea2d5b93d7a518db84cf584f1c53b6dbcbf3b42f4d7ed1372d2d"
+checksum = "5a408a0c69b298e58549205fd471f2f7268185fd3cec12eecbb299980baca411"
 dependencies = [
  "ohos-arkui-input-sys",
  "ohos-enum-derive",
@@ -3502,9 +3502,9 @@ checksum = "8de392280d7e0680131908f179a7dc32530f1d018744d8d5439f3e3471b91539"
 
 [[package]]
 name = "ohos-audio-binding"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95b6bd181a8118193d1cc778bdabe925fba6ccd222aab902154c7f495a7d7165"
+checksum = "204321aee10efb375053c62d1467ef4b3fb3f912cc4c40768d26841c1be1d679"
 dependencies = [
  "ohos-audio-base-sys",
  "ohos-audio-sys",
@@ -3522,9 +3522,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-avplayer-binding"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2302d6740c1f2d8cf2446e406d26d46faa50a02358235cf8ac9a611346365f91"
+checksum = "d3c1394a68716507abb95c81d77be5f58a39b3054bd1cb2f4f24554f90998ea4"
 dependencies = [
  "log",
  "ohos-avplayer-sys",
@@ -3557,9 +3557,9 @@ checksum = "be3125873f2c81c78eccc7b2f2a32e37943e1d2a35132848173ad783d5320b14"
 
 [[package]]
 name = "ohos-display-binding"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c2fc1ce5637ca0308c4314bb05750a83de4d8878cbf829bb5c10cf237a0c2fc"
+checksum = "a9cf91200042b54f6fff99ebce9eb3b2d137aac393a069cd3181b7c7df69bbbd"
 dependencies = [
  "ohos-display-sys",
  "ohos-enum-derive",
@@ -3573,9 +3573,9 @@ checksum = "fa6cca5bbc6612f386af26a41f458913aa6b9a06b90bcff36fb8a436f6996e7c"
 
 [[package]]
 name = "ohos-drawing-binding"
-version = "0.2.9"
+version = "0.2.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e5885e777bd6add829225ea046210d617f90481de49bedb366f4d0fe45724a79"
+checksum = "ce5678a5ac351cf9c2fc5014b087cf54e38394a43f828f1ac90d0c15f37fc4e7"
 dependencies = [
  "ohos-enum-derive",
  "ohos-native-drawing-sys",
@@ -3583,9 +3583,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-enum-derive"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2988e3067c0c79d34254847f0ecce89ff7fea9a6bf45aa3874e192662ae1581"
+checksum = "0751bfcba57423d5550396ef59a1f8d740f89e091143136b89f4a5a023d600a1"
 dependencies = [
  "convert_case 0.6.0",
  "proc-macro2",
@@ -3595,9 +3595,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-hilog-binding"
-version = "0.2.5"
+version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dce895ad9a0dc93e065fb519d637806653d56ad29d0cc00d05f723c4ebabc83e"
+checksum = "2de3051922d923427c513ec67c132e6ed88ab6e2cb8c3fd3ff2cfb5ea289ef82"
 dependencies = [
  "env_filter 0.1.4",
  "log",
@@ -3613,9 +3613,9 @@ checksum = "186ff2f4c7c551fdc3497d2e814744e723850651ceba1fdcf988bcf9b29cf7cb"
 
 [[package]]
 name = "ohos-image-binding"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a035db0f0e3d523be43952ae203042bbd5fff10f8f4fecb488a2340574dfd86"
+checksum = "bae31b3124f6b43ac26632df51c0b1ea708e13b86f43f26fe9ba98970f99c4c2"
 dependencies = [
  "napi-ohos",
  "napi-sys-ohos",
@@ -3626,9 +3626,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-image-native-binding"
-version = "0.0.8"
+version = "0.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "99ea00b7c1ea1e69b9c147ebeab54926fb576a81bcdada0fff11b76b40da1a3d"
+checksum = "66d88d7fd8ce37985cecdadcf9cf22cd84ee72a25e9442572ad1b6f78b626e4f"
 dependencies = [
  "libc",
  "napi-sys-ohos",
@@ -3662,9 +3662,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-multi-modal-input-binding"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec27a01bd57af716628817267ce770ec0377b44112720dfcb63e3e8d5153bd61"
+checksum = "673e405cb28881ed2dd2192ab90cddde53586ac16452e96fccd63c6cc0843b11"
 dependencies = [
  "ohos-enum-derive",
  "ohos-image-native-binding",
@@ -3746,9 +3746,9 @@ checksum = "70cfdeabda5019a58836025428639e8267b7b040166c8673ea03ae81e1b75582"
 
 [[package]]
 name = "ohos-native-window-binding"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46d41177deb792f0c3c7d28270d47d02f08258334174d6d3741e6524ea34bc0b"
+checksum = "81f7fdcce44d401fd1b604f26549e3a7df2b69eddbb812d7a3434573a805b71c"
 dependencies = [
  "libc",
  "ohos-enum-derive",
@@ -3791,9 +3791,9 @@ checksum = "c26f5e6de9d49e4d8655c133011d3aafa99e4725d0884ce25db1033716503859"
 
 [[package]]
 name = "ohos-pasteboard-binding"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ecfec9146c480e259a4fdd9d082087648a07a2be3b12d789ee807d79d71b9a7"
+checksum = "fcf242d5350960cf490abd9109f46f4faf20953f9967b2b2ec29616b97d017f3"
 dependencies = [
  "ohos-enum-derive",
  "ohos-native-pasteboard-sys",
@@ -3821,9 +3821,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-udmf-binding"
-version = "0.1.0"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "928b95dabd4c49ce40ad2b1621929a5b186414620028dfe813353ace590eeec8"
+checksum = "155f550c2a502008f6f34dbdcd09bb75ab09458dbcfb2d48777e58074691a405"
 dependencies = [
  "ohos-enum-derive",
  "ohos-image-native-binding",
@@ -3841,9 +3841,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-vibrator-binding"
-version = "0.2.4"
+version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "59a848e90ec930ed2e0c4895996d3f17b38be13f00c3c735475bc0290a7dcc33"
+checksum = "a62fb9393b70d23ec46b8224ac263172334481a7c7831b65eb8a992ca96d650d"
 dependencies = [
  "ohos-enum-derive",
  "ohos-vibrator-sys",
@@ -3866,9 +3866,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-web-binding"
-version = "0.3.3"
+version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad91a940c35bc3aad773db6385f209ec2aa772bb17007977494b8ea4d32c3c39"
+checksum = "73b30bbc77a5afb2a1b1caa9c51a65667f13d105035c18d26aa03238ca047ebd"
 dependencies = [
  "bitflags 2.13.2",
  "ohos-enum-derive",
@@ -3883,9 +3883,9 @@ checksum = "73adcdcaf4b87350273fc1eb4fff459923b983717f494037293d283a89885c26"
 
 [[package]]
 name = "ohos-window-manager-binding"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a9e09753a593f8163428320183715d7856d23a2402a6124a10df5c6ea46b8dd5"
+checksum = "4805554ccc240c42f664fffa4239e02f0f58ea7bd30cb62512685b944a93ad24"
 dependencies = [
  "ohos-enum-derive",
  "ohos-image-native-binding",
@@ -3895,9 +3895,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-xcomponent-binding"
-version = "0.6.1"
+version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f3a188784b1b208b7a10966235d51dfbae26f86bad71b1c24a0e621a8536fccd"
+checksum = "e9e8c7a0ed9c40af653e27091d86b02f3fd7bfafee9c0d66b97e93c3e4429399"
 dependencies = [
  "napi-derive-ohos",
  "napi-ohos",

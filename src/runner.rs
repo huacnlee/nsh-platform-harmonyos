@@ -356,7 +356,7 @@ pub(crate) fn write(
              [package]\nname = \"nsh-harmonyos-runner\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n\n\
              [lib]\nname = \"nsh_platform_harmonyos\"\npath = \"lib.rs\"\ncrate-type = [\"cdylib\"]\n\n\
              [dependencies]\nbackend = {}\n{app_dependency}\n\
-             [build-dependencies]\nnapi-build-ohos = \"1.2.0\"\n\n\
+             [build-dependencies]\nnapi-build-ohos = \"1.2\"\n\n\
              [profile.release]\nlto = \"fat\"\ncodegen-units = 1\nstrip = true\n\n\
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\

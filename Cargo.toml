@@ -195,30 +195,33 @@ glow = "0.18"
 khronos-egl = { version = "6", default-features = false, features = ["static", "no-pkg-config", "1_5"] }
 
 # HarmonyOS / OpenHarmony: N-API and the NDK's C APIs.
-napi-ohos = { version = "1.2.0", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
-napi-derive-ohos = "1.2.0"
-napi-build-ohos = "1.2.0"
-ohos-arkui-binding = { version = "0.6.4", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
-ohos-accessibility-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
-ohos-display-binding = { version = "0.2.0", default-features = false, features = ["api-20"] }
-ohos-device-binding = { version = "0.1.0", default-features = false }
-ohos-drawing-binding = { version = "0.2.9", default-features = false, features = ["api-20"] }
-ohos-native-image-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
+# Bare `0.x.y` in Cargo is `^0.x.y` (`>=0.x.y, <0.(x+1).0`): it allows newer `0.x.*`
+# patch releases automatically while enforcing the minimum bugfix/API floor in app
+# runner `Cargo.lock` files. `0.0.z` uses `>=0.0.z, <0.1` so patches are not locked.
+napi-ohos = { version = "1.2", default-features = false, features = ["napi8", "serde-json", "tokio_rt"] }
+napi-derive-ohos = "1.2"
+napi-build-ohos = "1.2"
+ohos-arkui-binding = { version = "0.6.5", default-features = false, features = ["napi", "drawing", "xcomponent", "api-20"] }
+ohos-accessibility-binding = { version = "0.2.1", default-features = false, features = ["api-20"] }
+ohos-display-binding = { version = "0.2.1", default-features = false, features = ["api-20"] }
+ohos-device-binding = { version = "0.1", default-features = false }
+ohos-drawing-binding = { version = "0.2.10", default-features = false, features = ["api-20"] }
+ohos-native-image-binding = { version = "0.1", default-features = false, features = ["api-20"] }
 ohos-resource-manager-binding = { version = "0.3.6", default-features = false, features = ["napi", "api-20"] }
 ohos-vsync-binding = { version = "0.3.2", default-features = false, features = ["api-20"] }
-ohos-web-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
-ohos-window-manager-binding = { version = "0.1.2", default-features = false, features = ["input", "api-20"] }
-ohos-image-native-binding = { version = "0.0.8", default-features = false, features = ["api-20"] }
-ohos-pasteboard-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-udmf-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-avplayer-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
-ohos-audio-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-multi-modal-input-binding = { version = "0.1.0", default-features = false, features = ["api-20"] }
-ohos-xcomponent-binding = { version = "0.6", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
-ohos-native-window-binding = { version = "0.3.3", default-features = false, features = ["api-20"] }
-ohos-hilog-binding = { version = "0.2.5", features = ["log"] }
+ohos-web-binding = { version = "0.3.4", default-features = false, features = ["api-20"] }
+ohos-window-manager-binding = { version = "0.1.3", default-features = false, features = ["input", "api-20"] }
+ohos-image-native-binding = { version = ">=0.0.9, <0.1", default-features = false, features = ["api-20"] }
+ohos-pasteboard-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
+ohos-udmf-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
+ohos-avplayer-binding = { version = "0.1.2", default-features = false, features = ["api-20"] }
+ohos-audio-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
+ohos-multi-modal-input-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
+ohos-xcomponent-binding = { version = "0.6.2", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
+ohos-native-window-binding = { version = "0.3.4", default-features = false, features = ["api-20"] }
+ohos-hilog-binding = { version = "0.2.6", features = ["log"] }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
-ohos-vibrator-binding = { version = "0.2.4", default-features = false, features = ["api-20"] }
+ohos-vibrator-binding = { version = "0.2.5", default-features = false, features = ["api-20"] }
 
 [profile.release]
 opt-level = 3
