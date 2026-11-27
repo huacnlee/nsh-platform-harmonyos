@@ -472,6 +472,41 @@ impl FrameRate {
             log::error!("OHOS VSync rate publisher stopped");
         }
     }
+
+    #[cfg(all(test, not(target_env = "ohos")))]
+    pub(crate) fn start_for_test(
+        sink: Arc<dyn RateSink>,
+    ) -> (Arc<Self>, std::thread::JoinHandle<()>) {
+        let state = Arc::new(Mutex::new(State {
+            shader_votes: 0,
+            ui_demand: UiDemand::Idle,
+            hz: normalize_display_hz(sink.read_display_hz()),
+            applied: None,
+            pending: PendingRates::default(),
+        }));
+        let counters = Arc::new(RateCounters::default());
+        let (updates, worker) =
+            RateUpdates::spawn(sink.clone(), state.clone(), counters.clone()).unwrap();
+        let rate = Arc::new(Self {
+            sink,
+            state,
+            updates,
+            counters,
+        });
+        assert_eq!(rate.apply_initial(), 0);
+        (rate, worker)
+    }
+
+    #[cfg(all(test, not(target_env = "ohos")))]
+    pub(crate) fn finish_for_test(
+        rate: Arc<Self>,
+        worker: std::thread::JoinHandle<()>,
+    ) -> Option<RateRange> {
+        let state = rate.state.clone();
+        drop(rate);
+        worker.join().unwrap();
+        state.lock().unwrap().applied
+    }
 }
 
 pub(crate) struct Vote {

@@ -135,6 +135,7 @@ impl Node {
                 *node.canvas.borrow_mut() = Some(crate::render::canvas::CanvasView::new(
                     Rc::downgrade(&node),
                     node.canvas_bytes.clone(),
+                    node.shaders.frame_rate(),
                 ));
             }
             ViewKind::Video => {
@@ -434,6 +435,9 @@ impl Node {
                 keyboard.input = None;
                 keyboard.composing = false;
             }
+        }
+        if let Some(canvas) = self.canvas.borrow().as_ref() {
+            canvas.release_vote();
         }
         if let Some(component) = self.component.borrow().as_ref() {
             component.deactivate();

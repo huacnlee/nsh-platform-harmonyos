@@ -26,7 +26,16 @@ use ohos_drawing_binding::{
 };
 
 use crate::{
-    render::node::{Error, Node, Result},
+    app::{
+        frame_rate::{FrameRate, Vote},
+        runtime::Message,
+    },
+    render::{
+        canvas_cache::{
+            CanvasActivity, DEFAULT_TEXT_CACHE_CAPACITY, ShapedTextCache, TextCacheKeyRef,
+        },
+        node::{Error, Node, Result},
+    },
     text::typography::argb,
 };
 
@@ -44,12 +53,18 @@ pub(crate) struct CanvasView {
     generation: Cell<u64>,
     scheduled: Cell<bool>,
     isolated: Cell<bool>,
-    texts: RefCell<Vec<ShapedText>>,
+    texts: RefCell<ShapedTextCache<ShapedText>>,
+    activity: RefCell<CanvasActivity>,
+    vote: RefCell<Vote>,
     budget: std::rc::Rc<Cell<usize>>,
     image_bytes: Cell<usize>,
 }
 impl CanvasView {
-    pub(crate) fn new(owner: Weak<Node>, budget: std::rc::Rc<Cell<usize>>) -> Self {
+    pub(crate) fn new(
+        owner: Weak<Node>,
+        budget: std::rc::Rc<Cell<usize>>,
+        rate: Arc<FrameRate>,
+    ) -> Self {
         Self {
             owner,
             drawing: RefCell::new(Arc::default()),
@@ -58,7 +73,9 @@ impl CanvasView {
             generation: Cell::new(0),
             scheduled: Cell::new(false),
             isolated: Cell::new(false),
-            texts: RefCell::default(),
+            texts: RefCell::new(ShapedTextCache::new(DEFAULT_TEXT_CACHE_CAPACITY)),
+            activity: RefCell::default(),
+            vote: RefCell::new(rate.vote()),
             budget,
             image_bytes: Cell::new(0),
         }
@@ -73,7 +90,18 @@ impl CanvasView {
             .checked_add(1)
             .ok_or(Error::Unsupported("exhausted canvas generation"))?;
         self.generation.set(generation);
-        self.texts.borrow_mut().clear();
+        let became_active = self
+            .activity
+            .borrow_mut()
+            .record_redraw(std::time::Instant::now());
+        if became_active {
+            owner.register_active_canvas(&owner);
+            if self.vote.borrow_mut().update(true)
+                && let Some(route) = owner.dispatcher.upgrade()
+            {
+                route.send(Message::CompositeDemand);
+            }
+        }
         let mut images = self.images.borrow_mut();
         for image in images.iter() {
             if let Some(job) = &image.job {
@@ -201,6 +229,17 @@ impl CanvasView {
         }
         Ok(())
     }
+    pub(crate) fn check_idle(&self, now: std::time::Instant) -> bool {
+        let still_active = self.activity.borrow_mut().check_idle(now);
+        if !still_active {
+            self.vote.borrow_mut().update(false);
+        }
+        still_active
+    }
+    pub(crate) fn release_vote(&self) {
+        self.activity.borrow_mut().reset();
+        self.vote.borrow_mut().update(false);
+    }
     pub(crate) fn invalidate(&self) -> Result<()> {
         if let Some(owner) = self.owner.upgrade() {
             let frame = owner.frame.get();
@@ -247,7 +286,6 @@ impl CanvasView {
             images: ImageLookup::Live(&images),
             fonts: &owner.fonts,
             texts: &mut self.texts.borrow_mut(),
-            text_index: 0,
             rtl: owner.platform.get().rtl,
             state: State::default(),
             saved: Vec::new(),
@@ -277,7 +315,7 @@ pub(crate) fn replay_offscreen(
     fonts: &Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     rtl: bool,
 ) {
-    let mut texts = Vec::new();
+    let mut texts = ShapedTextCache::new(DEFAULT_TEXT_CACHE_CAPACITY);
     let mut replay = Replay {
         canvas,
         matrix: RefCell::new(Matrix::new()),
@@ -286,7 +324,6 @@ pub(crate) fn replay_offscreen(
         images: ImageLookup::Offscreen(images),
         fonts,
         texts: &mut texts,
-        text_index: 0,
         rtl,
         state: State::default(),
         saved: Vec::new(),
@@ -407,8 +444,7 @@ struct Replay<'a> {
     slots: &'a [AnimationValue],
     images: ImageLookup<'a>,
     fonts: &'a Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
-    texts: &'a mut Vec<ShapedText>,
-    text_index: usize,
+    texts: &'a mut ShapedTextCache<ShapedText>,
     rtl: bool,
     state: State,
     saved: Vec<State>,
@@ -812,21 +848,14 @@ impl Replay<'_> {
     }
     fn text(&mut self, text: &str, x: f32, y: f32, max_width: Option<f32>, stroke: bool) {
         let font = self.state.font.with_numeric(self.state.numeric);
-        let index = self.text_index;
-        self.text_index += 1;
         let mut fonts = self.fonts.lock().expect("font collection");
-        if self.texts.get(index).is_none_or(|shaped| {
-            shaped.font != font || shaped.rtl != self.rtl || shaped.generation != fonts.generation
-        }) {
-            let shaped = ShapedText::new(text, font, self.rtl, &mut fonts);
-            if index == self.texts.len() {
-                self.texts.push(shaped);
-            } else {
-                self.texts[index] = shaped;
-            }
-        }
+        let key = TextCacheKeyRef::new(text, &font, self.rtl, fonts.generation);
+        let family = font.family.clone();
+        let entry_idx = self.texts.ensure_with(key, family, || {
+            ShapedText::new(text, &font, self.rtl, &mut fonts)
+        });
         drop(fonts);
-        let shaped = &self.texts[index];
+        let shaped = self.texts.entry(entry_idx);
         let width = shaped.width;
         let fit = max_width.map_or(1.0, |v| (v / width.max(0.001)).clamp(0.0, 1.0));
         let right = match self.state.align {
@@ -1408,19 +1437,21 @@ fn sample(stops: &[(f32, Color)], t: f32) -> Color {
     stops.last().unwrap().1
 }
 
-// One shaped result per immutable drawing text operation; paint, transforms and
-// animation slots stay live. A new drawing or newly registered font replaces it.
+// One cached shaped text entry shared across frames; paint, transforms,
+// alignment, baseline, max_width, and animation slots stay live at draw time.
 struct ShapedText {
-    font: CanvasFont,
-    rtl: bool,
-    generation: u64,
     width: f32,
     ascent: f32,
     height: f32,
     blobs: Vec<(TextBlob, f32)>,
 }
 impl ShapedText {
-    fn new(text: &str, font: CanvasFont, rtl: bool, fonts: &mut crate::text::fonts::Fonts) -> Self {
+    fn new(
+        text: &str,
+        font: &CanvasFont,
+        rtl: bool,
+        fonts: &mut crate::text::fonts::Fonts,
+    ) -> Self {
         let mut style = TypographyStyle::new();
         style.set_max_lines(1);
         style.set_text_direction(if rtl {
@@ -1482,9 +1513,6 @@ impl ShapedText {
             }
         }
         Self {
-            font,
-            rtl,
-            generation: fonts.generation,
             width,
             ascent,
             height,

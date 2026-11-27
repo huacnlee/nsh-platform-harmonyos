@@ -137,6 +137,7 @@ pub(crate) struct UiContext {
     pub(crate) touches: crate::input::touch::State,
     pub(crate) fonts: Arc<std::sync::Mutex<crate::text::fonts::Fonts>>,
     pub(crate) canvas_bytes: Rc<std::cell::Cell<usize>>,
+    pub(crate) active_canvases: std::cell::RefCell<Vec<std::rc::Weak<Node>>>,
     pub(crate) platform: std::cell::Cell<nsh_engine::Environment>,
     pub(crate) text_locale: std::cell::Cell<Option<nsh_core::platform::Locale>>,
     pub(crate) main_window: std::cell::RefCell<crate::services::desktop::MainWindowState>,
@@ -148,6 +149,17 @@ impl UiContext {
         self.text_locale
             .get()
             .unwrap_or_else(|| self.platform.get().locale)
+    }
+
+    pub(crate) fn register_active_canvas(&self, node: &Rc<Node>) {
+        let mut active = self.active_canvases.borrow_mut();
+        if !active.iter().any(|existing| {
+            existing
+                .upgrade()
+                .is_some_and(|other| Rc::ptr_eq(&other, node))
+        }) {
+            active.push(Rc::downgrade(node));
+        }
     }
 
     pub(crate) fn clear_axis_router(&self, surface_id: NodeId) {
@@ -352,6 +364,13 @@ impl Mounter {
         let background = environment.lifecycle == nsh_engine::Lifecycle::Background;
         if background {
             result = result.and(self.shaders.cancel_navigation("background"));
+            for weak in std::mem::take(&mut *self.active_canvases.borrow_mut()) {
+                if let Some(node) = weak.upgrade()
+                    && let Some(canvas) = node.canvas.borrow().as_ref()
+                {
+                    canvas.release_vote();
+                }
+            }
         }
         if reduce_motion_changed || background || was_background {
             result = result.and(self.reconcile_navigation_capture());
@@ -3402,6 +3421,17 @@ impl Mounter {
             }
         }
         demand = demand.merge(UiDemand::from_animation(self.shaders.frame()?, None));
+        if !self.active_canvases.borrow().is_empty() {
+            let now = std::time::Instant::now();
+            self.active_canvases.borrow_mut().retain(|weak| {
+                weak.upgrade().is_some_and(|node| {
+                    node.canvas
+                        .borrow()
+                        .as_ref()
+                        .is_some_and(|canvas| canvas.check_idle(now))
+                })
+            });
+        }
         self.modals.retain(|modal| modal.strong_count() > 0);
         self.modals_index
             .borrow_mut()

@@ -1721,6 +1721,7 @@ impl Runtime {
             components,
             touches: RefCell::default(),
             canvas_bytes: Rc::new(Cell::new(0)),
+            active_canvases: RefCell::default(),
             fonts: booted.fonts.clone(),
             platform: Cell::new(environment),
             text_locale: Cell::new(None),
