@@ -1,6 +1,9 @@
 //! Signed delivery uses the shared verifier. File IO, hashing, extraction and
 //! persistent rollback/revocation state all run off the ArkUI thread.
 
+#[cfg(not(feature = "js"))]
+use std::sync::Mutex;
+#[cfg(feature = "js")]
 use std::{
     io::Read,
     path::PathBuf,
@@ -15,8 +18,11 @@ use napi_ohos::{
 
 use crate::services::assets::AssetDirectory;
 
+#[cfg(feature = "js")]
 const MAX_PACKAGE: usize = 256 << 20;
+#[cfg(feature = "js")]
 type DirectoryLocks = Vec<(PathBuf, Weak<Mutex<()>>)>;
+#[cfg(feature = "js")]
 static DIRECTORIES: LazyLock<Mutex<DirectoryLocks>> = LazyLock::new(Mutex::default);
 
 /// Verified package metadata. Build numbers are decimal strings to preserve u64 precision.
@@ -75,8 +81,11 @@ impl NshPackage {
 /// A persistent trust store. Each method that accesses its state runs on a worker.
 #[napi]
 pub struct NshTrust {
+    #[cfg(feature = "js")]
     store: Arc<Mutex<nsh_package::TrustStore>>,
+    #[cfg(feature = "js")]
     assets: PathBuf,
+    #[cfg(feature = "js")]
     directory_lock: Arc<Mutex<()>>,
 }
 
@@ -85,87 +94,119 @@ impl NshTrust {
     /// Opens a private state directory and installs the host's root public keys (base64).
     #[napi(factory)]
     pub async fn open(state_directory: String, roots: Vec<String>) -> Result<Self> {
-        blocking(move || {
-            let path = PathBuf::from(state_directory);
-            std::fs::create_dir_all(&path).map_err(error)?;
-            let path = path.canonicalize().map_err(error)?;
-            let mut store = nsh_package::TrustStore::open(&path).map_err(error)?;
-            for root in roots {
-                store.add_root(nsh_package::PublicKey::from_base64(&root).map_err(error)?);
-            }
-            let directory_lock = {
-                let mut directories = DIRECTORIES.lock().unwrap();
-                directories.retain(|(_, lock)| lock.strong_count() > 0);
-                if let Some(lock) = directories
-                    .iter()
-                    .find_map(|(dir, lock)| (dir == &path).then(|| lock.upgrade()).flatten())
-                {
-                    lock
-                } else {
-                    let lock = Arc::new(Mutex::new(()));
-                    directories.push((path.clone(), Arc::downgrade(&lock)));
-                    lock
+        #[cfg(feature = "js")]
+        {
+            blocking(move || {
+                let path = PathBuf::from(state_directory);
+                std::fs::create_dir_all(&path).map_err(error)?;
+                let path = path.canonicalize().map_err(error)?;
+                let mut store = nsh_package::TrustStore::open(&path).map_err(error)?;
+                for root in roots {
+                    store.add_root(nsh_package::PublicKey::from_base64(&root).map_err(error)?);
                 }
-            };
-            Ok(Self {
-                store: Arc::new(Mutex::new(store)),
-                assets: path.join("packages"),
-                directory_lock,
+                let directory_lock = {
+                    let mut directories = DIRECTORIES.lock().unwrap();
+                    directories.retain(|(_, lock)| lock.strong_count() > 0);
+                    if let Some(lock) = directories
+                        .iter()
+                        .find_map(|(dir, lock)| (dir == &path).then(|| lock.upgrade()).flatten())
+                    {
+                        lock
+                    } else {
+                        let lock = Arc::new(Mutex::new(()));
+                        directories.push((path.clone(), Arc::downgrade(&lock)));
+                        lock
+                    }
+                };
+                Ok(Self {
+                    store: Arc::new(Mutex::new(store)),
+                    assets: path.join("packages"),
+                    directory_lock,
+                })
             })
-        })
-        .await
+            .await
+        }
+        #[cfg(not(feature = "js"))]
+        {
+            let _ = (state_directory, roots);
+            Err(no_js())
+        }
     }
 
     /// Adds a root public key without waiting for an in-progress verification on the UI thread.
     #[napi]
     pub async fn add_root(&self, root: String) -> Result<()> {
-        let store = self.store.clone();
-        blocking(move || {
-            let root = nsh_package::PublicKey::from_base64(&root).map_err(error)?;
-            store.lock().unwrap().add_root(root);
-            Ok(())
-        })
-        .await
+        #[cfg(feature = "js")]
+        {
+            let store = self.store.clone();
+            blocking(move || {
+                let root = nsh_package::PublicKey::from_base64(&root).map_err(error)?;
+                store.lock().unwrap().add_root(root);
+                Ok(())
+            })
+            .await
+        }
+        #[cfg(not(feature = "js"))]
+        {
+            let _ = root;
+            Err(no_js())
+        }
     }
 
     /// Verifies and persists a newer signed revocation list. Returns its exact sequence number.
     #[napi]
     pub async fn update_revocations(&self, json: String) -> Result<String> {
-        let store = self.store.clone();
-        let assets = self.assets.clone();
-        let directory_lock = self.directory_lock.clone();
-        blocking(move || {
-            let list = nsh_package::Revocations::from_json(&json).map_err(error)?;
-            let _directory = directory_lock.lock().unwrap();
-            let mut store = store.lock().unwrap();
-            Self::refresh(&mut store, &assets)?;
-            store
-                .update_revocations(list)
-                .map(|n| n.to_string())
-                .map_err(error)
-        })
-        .await
+        #[cfg(feature = "js")]
+        {
+            let store = self.store.clone();
+            let assets = self.assets.clone();
+            let directory_lock = self.directory_lock.clone();
+            blocking(move || {
+                let list = nsh_package::Revocations::from_json(&json).map_err(error)?;
+                let _directory = directory_lock.lock().unwrap();
+                let mut store = store.lock().unwrap();
+                Self::refresh(&mut store, &assets)?;
+                store
+                    .update_revocations(list)
+                    .map(|n| n.to_string())
+                    .map_err(error)
+            })
+            .await
+        }
+        #[cfg(not(feature = "js"))]
+        {
+            let _ = json;
+            Err(no_js())
+        }
     }
 
     /// Verifies a downloaded package, extracts assets and persists rollback protection.
     /// Rejection leaves every running surface unchanged.
     #[napi]
     pub async fn open_package(&self, path: String) -> Result<NshPackage> {
-        let store = self.store.clone();
-        let assets = self.assets.clone();
-        let directory_lock = self.directory_lock.clone();
-        blocking(move || {
-            let file = std::fs::File::open(PathBuf::from(path)).map_err(error)?;
-            let mut bytes = Vec::new();
-            file.take(MAX_PACKAGE as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(error)?;
-            if bytes.len() > MAX_PACKAGE {
-                return Err(error("package exceeds 256 MiB"));
-            }
-            Self::prepare(&directory_lock, &store, &assets, &bytes)
-        })
-        .await
+        #[cfg(feature = "js")]
+        {
+            let store = self.store.clone();
+            let assets = self.assets.clone();
+            let directory_lock = self.directory_lock.clone();
+            blocking(move || {
+                let file = std::fs::File::open(PathBuf::from(path)).map_err(error)?;
+                let mut bytes = Vec::new();
+                file.take(MAX_PACKAGE as u64 + 1)
+                    .read_to_end(&mut bytes)
+                    .map_err(error)?;
+                if bytes.len() > MAX_PACKAGE {
+                    return Err(error("package exceeds 256 MiB"));
+                }
+                Self::prepare(&directory_lock, &store, &assets, &bytes)
+            })
+            .await
+        }
+        #[cfg(not(feature = "js"))]
+        {
+            let _ = path;
+            Err(no_js())
+        }
     }
 
     /// Verifies a signed HAP rawfile using `uiContext`, or the sole active NSH session when omitted.
@@ -178,22 +219,32 @@ impl NshTrust {
             Object<'env>,
         >,
     ) -> Result<PromiseRaw<'env, NshPackage>> {
-        crate::app::session::resource_name(&name)?;
-        let host = crate::app::session::resolve_context(env, ui_context.as_ref())?;
-        let permit = host.reserve_load()?;
-        let store = self.store.clone();
-        let assets = self.assets.clone();
-        let directory_lock = self.directory_lock.clone();
-        env.spawn_future(async move {
-            blocking(move || {
-                let _permit = permit;
-                let bytes = host.resource_with_limit(&name, MAX_PACKAGE)?;
-                Self::prepare(&directory_lock, &store, &assets, &bytes)
+        #[cfg(feature = "js")]
+        {
+            crate::app::session::resource_name(&name)?;
+            let host = crate::app::session::resolve_context(env, ui_context.as_ref())?;
+            let permit = host.reserve_load()?;
+            let store = self.store.clone();
+            let assets = self.assets.clone();
+            let directory_lock = self.directory_lock.clone();
+            env.spawn_future(async move {
+                blocking(move || {
+                    let _permit = permit;
+                    let bytes = host.resource_with_limit(&name, MAX_PACKAGE)?;
+                    Self::prepare(&directory_lock, &store, &assets, &bytes)
+                })
+                .await
             })
-            .await
-        })
+        }
+        #[cfg(not(feature = "js"))]
+        {
+            let _ = (name, ui_context);
+            env.spawn_future(async move { Err(no_js()) })
+        }
     }
 }
+
+#[cfg(feature = "js")]
 impl NshTrust {
     fn refresh(store: &mut nsh_package::TrustStore, assets: &std::path::Path) -> Result<()> {
         // Separate store objects may share persisted rollback/revocation state,
@@ -235,11 +286,17 @@ impl NshTrust {
     }
 }
 
+#[cfg(feature = "js")]
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
     tokio::task::spawn_blocking(work).await.map_err(error)?
 }
+#[cfg(feature = "js")]
 fn error(value: impl std::fmt::Display) -> Error {
     Error::from_reason(value.to_string())
+}
+#[cfg(not(feature = "js"))]
+fn no_js() -> Error {
+    Error::from_reason("signed JS packages require the `js` feature")
 }

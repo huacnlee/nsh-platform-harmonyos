@@ -68,9 +68,28 @@ fn ui_sets() -> Vec<nsh_core::element::Registry> {
 
 #[doc(hidden)]
 pub mod __private {
-    /// `nsh/base`'s UI set, for a TSX app's runner.
+    pub use nsh_base::parts;
+
+    /// `nsh/base`'s full UI set, for a TSX app's runner.
     pub fn nsh_base_registry() -> nsh_core::element::Registry {
         nsh_base::registry()
+    }
+
+    /// Selected parts of `nsh/base`, for a pruned TSX runner.
+    pub fn nsh_base_registry_of(parts: &[nsh_base::parts::Part]) -> nsh_core::element::Registry {
+        nsh_base::registry_of(parts.iter().copied())
+    }
+
+    /// `nsh/base`'s core part followed by a Rust app's own crate UI sets, so
+    /// unused `nsh/base` components are dead-stripped by LTO.
+    pub fn rust_ui_sets(
+        app_sets: fn() -> Vec<nsh_core::element::Registry>,
+    ) -> Vec<nsh_core::element::Registry> {
+        let mut sets = vec![nsh_base::registry_of([
+            nsh_base::parts::core as nsh_base::parts::Part
+        ])];
+        sets.extend(app_sets());
+        sets
     }
 
     /// Referenced by the runner so the linker keeps this library's objects

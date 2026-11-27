@@ -489,6 +489,7 @@ pub(crate) struct TextureContext {
     readback_program: Rc<std::cell::RefCell<Option<Rc<ReadbackProgram>>>>,
     pub(super) filter_program: Rc<std::cell::RefCell<Option<Rc<super::gles::FilterProgram>>>>,
     binary_store: Rc<std::cell::RefCell<Option<super::precompile::BinaryStore>>>,
+    #[cfg_attr(not(feature = "shader"), allow(dead_code))]
     pub(super) supports_program_binary: bool,
     max_texture_size: u32,
     pub(super) programs:
@@ -510,6 +511,7 @@ impl TextureContext {
     pub(super) fn attach_binary_store(&self, store: super::precompile::BinaryStore) {
         *self.binary_store.borrow_mut() = Some(store);
     }
+    #[cfg(feature = "shader")]
     pub(super) fn take_program_binary(&self, hash: u64) -> Option<glow::ProgramBinary> {
         self.binary_store
             .borrow()

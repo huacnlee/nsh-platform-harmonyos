@@ -1273,15 +1273,6 @@ checksum = "869b0adbda23651a9c5c0c3d270aac9fcb52e8622a8f2b17e57802d7791962f2"
 
 [[package]]
 name = "env_filter"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bf3c259d255ca70051b30e2e95b5446cdb8949ac4cd22c0d7fd634d89f568e2"
-dependencies = [
- "log",
-]
-
-[[package]]
-name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "900d271a03799a1ee8d1ca9b19893b48ca674a9284fefcfb85f05e74ed314217"
@@ -2964,7 +2955,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "70103d046b643549dbdaa81da88aeb9ea59c631f1cc94c07e533eb33261944db"
 dependencies = [
  "crossbeam-channel",
- "env_filter 2.0.0",
+ "env_filter",
  "libc",
  "log",
  "nsh-core",
@@ -3121,7 +3112,7 @@ name = "nsh-platform-harmonyos"
 version = "0.7.0"
 dependencies = [
  "anyhow",
- "base64 0.22.1",
+ "base64 0.23.1",
  "ctrlc",
  "getrandom 0.3.4",
  "glow",
@@ -3133,6 +3124,7 @@ dependencies = [
  "napi-derive-ohos",
  "napi-ohos",
  "nsh-base",
+ "nsh-bundler",
  "nsh-core",
  "nsh-dev",
  "nsh-engine",
@@ -3167,7 +3159,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
- "ttf-parser",
  "unicode-segmentation",
  "ureq",
  "url",
@@ -3599,8 +3590,6 @@ version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2de3051922d923427c513ec67c132e6ed88ab6e2cb8c3fd3ff2cfb5ea289ef82"
 dependencies = [
- "env_filter 0.1.4",
- "log",
  "ohos-enum-derive",
  "ohos-hilogs-sys",
 ]

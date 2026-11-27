@@ -182,6 +182,7 @@ pub(crate) fn any_active_session(
 
 /// Resolves an explicit window or the sole active UI session. Multiple active
 /// windows require a context so a package never reads another Ability's resources.
+#[cfg(feature = "js")]
 pub(crate) fn resolve_context(
     env: &Env,
     context: Option<&napi_ohos::bindgen_prelude::Object<'_>>,

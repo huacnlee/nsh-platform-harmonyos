@@ -27,10 +27,18 @@ pub(crate) trait StreamAssets: nsh_engine::Assets {
 /// `nsh_engine::BYTECODE_VERSION` names (`…/bc<N>/…`); source text never
 /// starts with a control character.
 pub(crate) fn is_bytecode(bytes: &[u8]) -> bool {
-    let version = nsh_engine::BYTECODE_VERSION
-        .split('/')
-        .find_map(|part| part.strip_prefix("bc")?.parse::<u8>().ok());
-    version.is_some_and(|version| bytes.first() == Some(&version))
+    #[cfg(feature = "js")]
+    {
+        let version = nsh_engine::BYTECODE_VERSION
+            .split('/')
+            .find_map(|part| part.strip_prefix("bc")?.parse::<u8>().ok());
+        version.is_some_and(|version| bytes.first() == Some(&version))
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = bytes;
+        false
+    }
 }
 
 pub(crate) struct HostAssets {

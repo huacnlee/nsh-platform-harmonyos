@@ -63,8 +63,35 @@ macro_rules! app {
     () => {
         $crate::app!(@define || ::std::vec![$crate::__private::nsh_base_registry()], None);
     };
+    (parts = [$($part:ident),* $(,)?]) => {
+        $crate::app!(
+            @define
+            || {
+                const PARTS: &[$crate::__private::parts::Part] = &[
+                    $($crate::__private::parts::$part as $crate::__private::parts::Part),*
+                ];
+                ::std::vec![$crate::__private::nsh_base_registry_of(PARTS)]
+            },
+            None
+        );
+    };
+    (parts = [$($part:ident),* $(,)?], sets = [$($registry:path),* $(,)?]) => {
+        $crate::app!(
+            @define
+            || {
+                const PARTS: &[$crate::__private::parts::Part] = &[
+                    $($crate::__private::parts::$part as $crate::__private::parts::Part),*
+                ];
+                ::std::vec![$crate::__private::nsh_base_registry_of(PARTS), $($registry()),*]
+            },
+            None
+        );
+    };
     (sets = [$($registry:path),* $(,)?]) => {
         $crate::app!(@define || ::std::vec![$crate::__private::nsh_base_registry(), $($registry()),*], None);
+    };
+    (rust = $app_ui_sets:path, $root:path) => {
+        $crate::app!(@define || $crate::__private::rust_ui_sets($app_ui_sets), Some($root));
     };
     ($ui_sets:path, $root:path) => {
         $crate::app!(@define $ui_sets, Some($root));

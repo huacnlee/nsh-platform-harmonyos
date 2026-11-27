@@ -237,6 +237,7 @@ mod tests {
     use nsh_core::{Color, Points, TransformKind};
 
     use super::*;
+    #[cfg(feature = "shader")]
     #[test]
     fn shader_capture_uses_maximum_nonnegative_overflow() {
         use nsh_core::shader::{Shader, ShaderLayer};

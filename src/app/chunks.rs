@@ -155,24 +155,32 @@ pub(crate) fn load_resource_bundle(
         .map_err(napi_ohos::Error::from_reason)?;
     bundle.policy.granted = granted;
     let updater = chunks.read_optional("assets/nsh-updater.json");
-    let package = if !has_custom_assets {
-        nsh_engine::updates::package_to_run(&mut bundle, updater, Some(&host.data_directory()))
-    } else {
-        bundle.updater_config = updater.map(Arc::from);
-        None
-    };
-    if let Some(run) = package {
-        match crate::services::assets::AssetDirectory::from_path(&run.assets) {
-            Ok(dir) => {
-                let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
-                    crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
-                );
-                return Ok((run.bundle, Some(assets)));
-            }
-            Err(err) => {
-                log::warn!("cannot set the package's assets, running the app's own: {err}");
+    #[cfg(feature = "js")]
+    {
+        let package = if !has_custom_assets {
+            nsh_engine::updates::package_to_run(&mut bundle, updater, Some(&host.data_directory()))
+        } else {
+            bundle.updater_config = updater.map(Arc::from);
+            None
+        };
+        if let Some(run) = package {
+            match crate::services::assets::AssetDirectory::from_path(&run.assets) {
+                Ok(dir) => {
+                    let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
+                        crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
+                    );
+                    return Ok((run.bundle, Some(assets)));
+                }
+                Err(err) => {
+                    log::warn!("cannot set the package's assets, running the app's own: {err}");
+                }
             }
         }
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = (host, has_custom_assets);
+        bundle.updater_config = updater.map(Arc::from);
     }
     Ok((bundle, None))
 }

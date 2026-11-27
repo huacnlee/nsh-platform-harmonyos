@@ -23,9 +23,11 @@ struct State {
 
 #[derive(Clone)]
 pub(super) struct BinaryStore {
+    #[cfg_attr(not(feature = "shader"), allow(dead_code))]
     state: Arc<Mutex<State>>,
 }
 impl BinaryStore {
+    #[cfg(feature = "shader")]
     pub(super) fn take(&self, hash: u64) -> Option<glow::ProgramBinary> {
         self.state.lock().unwrap().binaries.remove(&hash)
     }
