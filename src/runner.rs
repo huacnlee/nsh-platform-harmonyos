@@ -24,28 +24,11 @@ use crate::{
 /// crate's name, so the library must carry the same one.
 pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 
-/// The repository URL of `nsh-platform-harmonyos` for unifying git-sourced
-/// `nshm` dependencies with a local checkout.
-const PLATFORM_REPO_URL: &str = "https://github.com/huacnlee/nsh-platform-harmonyos";
-
-/// Resolves the local checkout directory for `nsh-platform-harmonyos` when
-/// `NSH_HARMONYOS_SOURCE` is set or this CLI was built from a source checkout.
-fn backend_checkout() -> Option<PathBuf> {
-    std::env::var_os("NSH_HARMONYOS_SOURCE")
-        .map(PathBuf::from)
-        .or_else(|| {
-            // This repository: the nshm's directory `nsh` builds it in.
-            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
-        })
-        .filter(|dir| join_all(dir, ["src", "lib.rs"]).is_file())
-        .map(|dir| dir.canonicalize().unwrap_or(dir))
-}
-
 /// The backend this CLI was built with: `NSH_HARMONYOS_SOURCE` (a checkout)
 /// when set, else this package's own source (the nshm's directory, a
 /// checkout or crates.io's copy) when it is still there, else this version
 /// from crates.io.
-fn backend(dev: bool, speech: bool, api: ApiLevel, checkout: Option<&Path>) -> String {
+fn backend(dev: bool, speech: bool, api: ApiLevel) -> String {
     let mut enabled = vec!["\"backend\""];
     if dev {
         enabled.push("\"dev\"");
@@ -61,6 +44,13 @@ fn backend(dev: bool, speech: bool, api: ApiLevel, checkout: Option<&Path>) -> S
         });
     }
     let features = format!(", features = [{}]", enabled.join(", "));
+    let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            // This repository: the nshm's directory `nsh` builds it in.
+            Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        })
+        .filter(|dir| join_all(dir, ["src", "lib.rs"]).is_file());
     match checkout {
         Some(dir) => format!(
             "{{ package = \"nsh-platform-harmonyos\", path = {}{features} }}",
@@ -71,30 +61,6 @@ fn backend(dev: bool, speech: bool, api: ApiLevel, checkout: Option<&Path>) -> S
             env!("CARGO_PKG_VERSION")
         ),
     }
-}
-
-/// Ensures any linked `nshm` crate depending on `nsh-platform-harmonyos` (from
-/// crates.io or the upstream GitHub repository) resolves to the exact same
-/// local checkout as the runner's `backend`, avoiding duplicate crate instances
-/// and split process-wide extension registries.
-fn patch_platform_backend(base: &str, checkout: Option<&Path>) -> String {
-    let Some(dir) = checkout else {
-        return base.to_owned();
-    };
-    let mut sections = parse_patch_sections(base);
-    let line = format!(
-        "nsh-platform-harmonyos = {{ path = {} }}",
-        toml_string(&dir.to_string_lossy())
-    );
-    upsert_patch_line(
-        &mut sections,
-        "[patch.crates-io]",
-        "nsh-platform-harmonyos",
-        line.clone(),
-    );
-    let git_header = format!("[patch.{}]", toml_string(PLATFORM_REPO_URL));
-    upsert_patch_line(&mut sections, &git_header, "nsh-platform-harmonyos", line);
-    format_patch_sections(sections)
 }
 
 /// The value of `key = "…"` on a line of `manifest` that starts with
@@ -244,28 +210,6 @@ fn insert_patch_line(
     }
 }
 
-fn upsert_patch_line(
-    sections: &mut Vec<(String, Vec<String>)>,
-    header: &str,
-    pkg_key: &str,
-    line: String,
-) {
-    if let Some((_, lines)) = sections.iter_mut().find(|(h, _)| h == header) {
-        if let Some(existing) = lines.iter_mut().find(|existing| {
-            existing
-                .trim()
-                .split_once('=')
-                .is_some_and(|(k, _)| unquote_toml_key(k) == pkg_key)
-        }) {
-            *existing = line;
-        } else {
-            lines.push(line);
-        }
-    } else {
-        sections.push((header.to_owned(), vec![line]));
-    }
-}
-
 fn has_patch_package(sections: &[(String, Vec<String>)], header: &str, pkg_key: &str) -> bool {
     sections
         .iter()
@@ -335,7 +279,6 @@ pub(crate) fn write(
     speech: bool,
     api: ApiLevel,
 ) -> anyhow::Result<()> {
-    let checkout = backend_checkout();
     let (app_dependency, patch, lib) = match app {
         App::Rust(rust_app) => {
             let manifest = fs::read_to_string(rust_app.join("Cargo.toml"))
@@ -352,7 +295,6 @@ pub(crate) fn write(
             if speech {
                 patches = sibling_nsh_patch(&patches, Some(&manifest), "nsh-extra");
             }
-            patches = patch_platform_backend(&patches, checkout.as_deref());
             (
                 format!(
                     "nsh_rust_app = {{ package = {}, path = {} }}\n",
@@ -387,7 +329,6 @@ pub(crate) fn write(
             if speech {
                 patches = sibling_nsh_patch(&patches, None, "nsh-extra");
             }
-            patches = patch_platform_backend(&patches, checkout.as_deref());
             (
                 dependencies,
                 patches,
@@ -420,7 +361,7 @@ pub(crate) fn write(
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\
              {patch}\n[workspace]\n",
-            backend(dev, speech, api, checkout.as_deref()),
+            backend(dev, speech, api),
         ),
     )?;
     fs::write(
@@ -891,11 +832,9 @@ mod tests {
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"backend\", \"dev\"]"));
-        let expected_patches =
-            patch_platform_backend(crate::embedded::NSH_PATCH, backend_checkout().as_deref());
         assert_eq!(
             workspace_patches(&dev_manifest).trim(),
-            expected_patches.trim(),
+            crate::embedded::NSH_PATCH.trim(),
             "{dev_manifest}",
         );
         if crate::embedded::NSH_PATCH.contains("git = \"https://github.com/longbridge/nsh\"") {
@@ -911,45 +850,6 @@ mod tests {
             );
         }
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn unifies_platform_backend_patch_for_checkout() {
-        let base = "[patch.crates-io]\nnsh-core = { path = \"/src/nsh-core\" }\n";
-        let checkout = Path::new("/tmp/nsh-platform-harmonyos-dev");
-        let patched = patch_platform_backend(base, Some(checkout));
-        assert_eq!(patched.matches("[patch.crates-io]").count(), 1, "{patched}");
-        assert!(
-            patched.contains(
-                "nsh-platform-harmonyos = { path = \"/tmp/nsh-platform-harmonyos-dev\" }"
-            ),
-            "{patched}"
-        );
-        assert!(
-            patched.contains(&format!("[patch.{}]", toml_string(PLATFORM_REPO_URL))),
-            "{patched}"
-        );
-
-        // Replacing an older checkout path updates both tables in place cleanly.
-        let replaced = patch_platform_backend(&patched, Some(Path::new("/tmp/newer-checkout")));
-        assert_eq!(
-            replaced.matches("[patch.crates-io]").count(),
-            1,
-            "{replaced}"
-        );
-        assert_eq!(
-            replaced.matches("nsh-platform-harmonyos =").count(),
-            2,
-            "{replaced}"
-        );
-        assert!(replaced.contains("/tmp/newer-checkout"), "{replaced}");
-        assert!(
-            !replaced.contains("/tmp/nsh-platform-harmonyos-dev"),
-            "{replaced}"
-        );
-
-        // Without a local checkout, patches stay untouched.
-        assert_eq!(patch_platform_backend(base, None), base);
     }
 
     #[cfg(unix)]

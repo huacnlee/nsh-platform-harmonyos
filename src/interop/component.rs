@@ -150,58 +150,32 @@ impl Components {
     pub(crate) fn clear(&self) {
         self.0.borrow_mut().factories.clear();
     }
+    fn live_gpu_surfaces(&self) -> Vec<Rc<crate::interop::gpu_surface::GpuSurfaceInstance>> {
+        let mut registry = self.0.borrow_mut();
+        let mut live = Vec::new();
+        registry.gpu_surfaces.retain(|weak| {
+            if let Some(surface) = weak.upgrade() {
+                live.push(surface);
+                true
+            } else {
+                false
+            }
+        });
+        live
+    }
     pub(crate) fn tick_gpu_surfaces(&self, timestamp_ns: u64) {
-        let live: Vec<_> = {
-            let mut registry = self.0.borrow_mut();
-            let mut live = Vec::new();
-            registry.gpu_surfaces.retain(|weak| {
-                if let Some(surface) = weak.upgrade() {
-                    live.push(surface);
-                    true
-                } else {
-                    false
-                }
-            });
-            live
-        };
-        for surface in live {
+        for surface in self.live_gpu_surfaces() {
             surface.on_vsync(timestamp_ns);
         }
     }
     pub(crate) fn set_gpu_surfaces_active(&self, active: bool) {
-        let live: Vec<_> = {
-            let mut registry = self.0.borrow_mut();
-            let mut live = Vec::new();
-            registry.gpu_surfaces.retain(|weak| {
-                if let Some(surface) = weak.upgrade() {
-                    live.push(surface);
-                    true
-                } else {
-                    false
-                }
-            });
-            live
-        };
-        for surface in live {
+        for surface in self.live_gpu_surfaces() {
             surface.set_host_active(active);
             surface.sync_xcomponent_rate();
         }
     }
     pub(crate) fn sync_gpu_surface_rates(&self) {
-        let live: Vec<_> = {
-            let mut registry = self.0.borrow_mut();
-            let mut live = Vec::new();
-            registry.gpu_surfaces.retain(|weak| {
-                if let Some(surface) = weak.upgrade() {
-                    live.push(surface);
-                    true
-                } else {
-                    false
-                }
-            });
-            live
-        };
-        for surface in live {
+        for surface in self.live_gpu_surfaces() {
             surface.sync_xcomponent_rate();
         }
     }

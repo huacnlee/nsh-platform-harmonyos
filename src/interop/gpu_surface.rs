@@ -10,22 +10,43 @@
 //! affinity and integrates with [`crate::app::frame_rate::FrameRate`].
 
 use std::{
+    cell::{Cell, RefCell},
     collections::VecDeque,
     ffi::c_void,
     fmt,
     panic::{AssertUnwindSafe, catch_unwind},
+    ptr::NonNull,
+    rc::Rc,
     sync::{
-        Arc, Condvar, LazyLock, Mutex, RwLock,
-        atomic::{AtomicU32, Ordering},
+        Arc, Condvar, LazyLock, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
 
-use nsh_core::JsonValue;
+use nsh_core::{JsonValue, NodeId};
+use nsh_engine::EngineControl;
+use ohos_arkui_binding::{
+    component::{attribute::ArkUICommonAttribute, built_in_component::XComponent},
+    types::{
+        advanced::LengthMetricUnit,
+        attribute::ArkUINodeAttributeType as A,
+        view::{AccessibilityMode, HitTestMode},
+    },
+};
+use ohos_native_window_binding::NativeWindow;
+use ohos_xcomponent_binding::{NativeXComponent, WindowRaw, XComponentRaw};
 use rustc_hash::FxHashMap;
 
-use crate::extensions::ExtensionError;
+use crate::{
+    app::{
+        frame_rate::{FrameRate, Vote, normalize_display_hz},
+        runtime::{Dispatcher, Message},
+    },
+    extensions::ExtensionError,
+    render::node::{NativeNode, Result as NodeResult},
+};
 
 /// Maximum interval between event-driven frame renders to treat a GPU surface
 /// as actively streaming (keeping the 120 Hz vote steady without IPC churn).
@@ -34,6 +55,8 @@ const STREAM_BURST_WINDOW: Duration = Duration::from_millis(50);
 /// Hold duration after the last event-driven render before dropping the
 /// high-refresh vote and parking the render thread indefinitely.
 const STREAM_IDLE_HOLD: Duration = Duration::from_millis(200);
+
+static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One changed property delivered directly from the NSH engine to a
 /// [`GpuSurfaceRenderer`] without crossing ArkTS or JSON strings.
@@ -141,16 +164,13 @@ impl GpuSurfaceOptions {
     }
 }
 
-type EventCallback = Arc<dyn Fn(Arc<str>, JsonValue) + Send + Sync>;
-type SizeCallback = Arc<dyn Fn(f32, f32) + Send + Sync>;
-type WakeCallback = Arc<dyn Fn() + Send + Sync>;
-
 struct HostInner {
     surface_id: Arc<str>,
+    node_id: NodeId,
+    control: EngineControl,
+    active: Arc<AtomicBool>,
     scale_bits: Arc<AtomicU32>,
-    wake: WakeCallback,
-    dispatch_event: Option<EventCallback>,
-    set_intrinsic_size: Option<SizeCallback>,
+    shared: Arc<WorkerShared>,
 }
 
 /// Thread-safe handle handed to a [`GpuSurfaceRenderer`] factory.
@@ -173,24 +193,6 @@ impl fmt::Debug for GpuSurfaceHost {
 }
 
 impl GpuSurfaceHost {
-    pub(crate) fn new(
-        surface_id: Arc<str>,
-        scale_bits: Arc<AtomicU32>,
-        wake: WakeCallback,
-        dispatch_event: Option<EventCallback>,
-        set_intrinsic_size: Option<SizeCallback>,
-    ) -> Self {
-        Self {
-            inner: Arc::new(HostInner {
-                surface_id,
-                scale_bits,
-                wake,
-                dispatch_event,
-                set_intrinsic_size,
-            }),
-        }
-    }
-
     /// Returns the unique ArkUI `XComponent` surface identifier for this instance.
     #[inline]
     pub fn surface_id(&self) -> &str {
@@ -207,14 +209,21 @@ impl GpuSurfaceHost {
     /// runs promptly. Multiple calls coalesce cheaply.
     #[inline]
     pub fn request_frame(&self) {
-        (self.inner.wake)();
+        self.inner.shared.wake_frame();
     }
 
     /// Dispatches an NSH `NativeEvent` (`name`, `data`) back to the mounted NSH
     /// component node from any thread.
     pub fn dispatch_event(&self, name: impl Into<Arc<str>>, data: JsonValue) {
-        if let Some(callback) = &self.inner.dispatch_event {
-            callback(name.into(), data);
+        if self.inner.active.load(Ordering::Acquire) {
+            self.inner.control.dispatch_event(
+                self.inner.node_id,
+                nsh_core::EventKind::NativeEvent,
+                nsh_core::EventPayload::Native {
+                    name: name.into(),
+                    data,
+                },
+            );
         }
     }
 
@@ -225,9 +234,12 @@ impl GpuSurfaceHost {
             && height.is_finite()
             && (0.0..=16384.0).contains(&width)
             && (0.0..=16384.0).contains(&height)
-            && let Some(callback) = &self.inner.set_intrinsic_size
+            && self.inner.active.load(Ordering::Acquire)
         {
-            callback(width, height);
+            self.inner.control.set_component_size(
+                self.inner.node_id,
+                nsh_core::Size::new(nsh_core::Points(width), nsh_core::Points(height)),
+            );
         }
     }
 }
@@ -300,14 +312,16 @@ pub trait GpuSurfaceRenderer: 'static {
     fn on_surface_destroyed(&mut self) {}
 }
 
-pub(crate) type RendererFactory =
-    Arc<dyn Fn(GpuSurfaceHost) -> Box<dyn GpuSurfaceRenderer> + Send + Sync>;
+type RendererFactory = Arc<dyn Fn(GpuSurfaceHost) -> Box<dyn GpuSurfaceRenderer> + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct RegisteredGpuSurface {
     pub(crate) options: GpuSurfaceOptions,
     pub(crate) factory: RendererFactory,
 }
+
+static GLOBAL_GPU_SURFACES: LazyLock<RwLock<FxHashMap<Arc<str>, RegisteredGpuSurface>>> =
+    LazyLock::new(RwLock::default);
 
 fn validate_surface_name(name: &str) -> Result<(), ExtensionError> {
     if name.trim().is_empty() {
@@ -323,77 +337,13 @@ fn validate_surface_name(name: &str) -> Result<(), ExtensionError> {
     Ok(())
 }
 
-/// Process-wide (or test-isolated) registry of pure-Rust GPU surface factories.
-#[derive(Default)]
-pub(crate) struct GpuSurfaceRegistry {
-    entries: RwLock<FxHashMap<Arc<str>, RegisteredGpuSurface>>,
-}
-
-impl GpuSurfaceRegistry {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    pub(crate) fn register<F, R>(
-        &self,
-        name: impl Into<String>,
-        options: GpuSurfaceOptions,
-        factory: F,
-    ) -> Result<(), ExtensionError>
-    where
-        F: Fn(GpuSurfaceHost) -> R + Send + Sync + 'static,
-        R: GpuSurfaceRenderer + 'static,
-    {
-        let name = name.into();
-        validate_surface_name(&name)?;
-        let boxed: RendererFactory = Arc::new(move |host| Box::new(factory(host)));
-        self.entries
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                Arc::from(name),
-                RegisteredGpuSurface {
-                    options,
-                    factory: boxed,
-                },
-            );
-        Ok(())
-    }
-
-    pub(crate) fn unregister(&self, name: &str) -> bool {
-        self.entries
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(name)
-            .is_some()
-    }
-
-    pub(crate) fn contains(&self, name: &str) -> bool {
-        self.entries
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains_key(name)
-    }
-
-    pub(crate) fn get(&self, name: &str) -> Option<RegisteredGpuSurface> {
-        self.entries
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(name)
-            .cloned()
-    }
-}
-
-static GLOBAL_GPU_SURFACES: LazyLock<GpuSurfaceRegistry> = LazyLock::new(GpuSurfaceRegistry::new);
-
 /// Registers a pure-Rust HarmonyOS GPU `XComponent` surface component under
 /// `name` with [`GpuSurfaceOptions::default()`].
 ///
 /// Typically invoked once inside an `nshm` crate's `#[native_module]`
-/// registration function on `#[cfg(target_env = "ohos")]`. When NSH mounts
-/// `native(name)`, `nsh-platform-harmonyos` creates the ArkUI `XComponent`
-/// directly in Rust and drives the returned [`GpuSurfaceRenderer`] on a
-/// dedicated render thread.
+/// registration function. When NSH mounts `native(name)`,
+/// `nsh-platform-harmonyos` creates the ArkUI `XComponent` directly in Rust
+/// and drives the returned [`GpuSurfaceRenderer`] on a dedicated render thread.
 pub fn register_gpu_surface<F, R>(name: impl Into<String>, factory: F) -> Result<(), ExtensionError>
 where
     F: Fn(GpuSurfaceHost) -> R + Send + Sync + 'static,
@@ -413,7 +363,20 @@ where
     F: Fn(GpuSurfaceHost) -> R + Send + Sync + 'static,
     R: GpuSurfaceRenderer + 'static,
 {
-    GLOBAL_GPU_SURFACES.register(name, options, factory)
+    let name = name.into();
+    validate_surface_name(&name)?;
+    let boxed: RendererFactory = Arc::new(move |host| Box::new(factory(host)));
+    GLOBAL_GPU_SURFACES
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            Arc::from(name),
+            RegisteredGpuSurface {
+                options,
+                factory: boxed,
+            },
+        );
+    Ok(())
 }
 
 /// Unregisters a previously registered pure-Rust GPU surface component.
@@ -421,24 +384,28 @@ where
 /// Returns `true` if a factory was registered under `name`. Existing mounted
 /// instances continue running until unmounted.
 pub fn unregister_gpu_surface(name: &str) -> bool {
-    GLOBAL_GPU_SURFACES.unregister(name)
+    GLOBAL_GPU_SURFACES
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(name)
+        .is_some()
 }
 
 /// Returns `true` if a pure-Rust GPU surface factory is currently registered
 /// under `name`.
 pub fn has_gpu_surface(name: &str) -> bool {
-    GLOBAL_GPU_SURFACES.contains(name)
+    GLOBAL_GPU_SURFACES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains_key(name)
 }
 
-#[cfg(target_env = "ohos")]
 pub(crate) fn lookup_gpu_surface(name: &str) -> Option<RegisteredGpuSurface> {
-    GLOBAL_GPU_SURFACES.get(name)
-}
-
-/// Abstraction over a retained native window handle (`NativeWindow` on OHOS,
-/// drop-tracked mock handle in host unit tests).
-pub(crate) trait SurfaceWindowHandle: Send + 'static {
-    fn raw_ptr(&self) -> *mut c_void;
+    GLOBAL_GPU_SURFACES
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(name)
+        .cloned()
 }
 
 struct SyncBarrier {
@@ -468,9 +435,9 @@ impl SyncBarrier {
     }
 }
 
-enum SurfaceCommand<W> {
+enum SurfaceCommand {
     Created {
-        window: W,
+        window: NativeWindow,
         width_px: u32,
         height_px: u32,
         scale: f32,
@@ -485,8 +452,8 @@ enum SurfaceCommand<W> {
     Destroy(Arc<SyncBarrier>),
 }
 
-struct WorkerState<W> {
-    commands: VecDeque<SurfaceCommand<W>>,
+struct WorkerState {
+    commands: VecDeque<SurfaceCommand>,
     frame_requested: bool,
     vsync_timestamp_ns: Option<u64>,
     host_active: bool,
@@ -494,7 +461,7 @@ struct WorkerState<W> {
     exited: bool,
 }
 
-impl<W> WorkerState<W> {
+impl WorkerState {
     fn new(host_active: bool) -> Self {
         Self {
             commands: VecDeque::new(),
@@ -507,12 +474,12 @@ impl<W> WorkerState<W> {
     }
 }
 
-struct WorkerShared<W> {
-    state: Mutex<WorkerState<W>>,
+struct WorkerShared {
+    state: Mutex<WorkerState>,
     cv: Condvar,
 }
 
-impl<W> WorkerShared<W> {
+impl WorkerShared {
     fn wake_frame(&self) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited {
@@ -568,43 +535,56 @@ impl StreamBurst {
     }
 }
 
-struct RateGuard<F: FnMut(bool)> {
+struct RateGuard {
     active: bool,
-    callback: F,
+    vote: Vote,
+    rate_active: Arc<AtomicBool>,
+    dispatcher: Weak<Dispatcher>,
 }
 
-impl<F: FnMut(bool)> RateGuard<F> {
-    fn new(callback: F) -> Self {
+impl RateGuard {
+    fn new(vote: Vote, rate_active: Arc<AtomicBool>, dispatcher: Weak<Dispatcher>) -> Self {
         Self {
             active: false,
-            callback,
+            vote,
+            rate_active,
+            dispatcher,
         }
     }
 
     fn set(&mut self, active: bool) {
         if self.active != active {
             self.active = active;
-            (self.callback)(active);
+            self.apply(active);
+        }
+    }
+
+    fn apply(&mut self, active: bool) {
+        self.rate_active.store(active, Ordering::Release);
+        if self.vote.update(active)
+            && let Some(route) = self.dispatcher.upgrade()
+        {
+            route.send(Message::CompositeDemand);
         }
     }
 }
 
-impl<F: FnMut(bool)> Drop for RateGuard<F> {
+impl Drop for RateGuard {
     fn drop(&mut self) {
         if self.active {
             self.active = false;
-            (self.callback)(false);
+            self.apply(false);
         }
     }
 }
 
 /// Ensures any waiting `Destroy` barriers are released even if the render
 /// thread exits unexpectedly or a renderer callback panics.
-struct ExitGuard<W> {
-    shared: Arc<WorkerShared<W>>,
+struct ExitGuard {
+    shared: Arc<WorkerShared>,
 }
 
-impl<W> Drop for ExitGuard<W> {
+impl Drop for ExitGuard {
     fn drop(&mut self) {
         let pending = {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -619,41 +599,47 @@ impl<W> Drop for ExitGuard<W> {
     }
 }
 
+struct WorkerLaunch {
+    surface_id: Arc<str>,
+    node_id: NodeId,
+    control: EngineControl,
+    active: Arc<AtomicBool>,
+    scale_bits: Arc<AtomicU32>,
+    host_active: bool,
+    factory: RendererFactory,
+    rate: RateGuard,
+}
+
 /// Dedicated single-thread render loop owning a [`GpuSurfaceRenderer`] and its
-/// retained native window handle.
-pub(crate) struct GpuSurfaceWorker<W: SurfaceWindowHandle> {
-    shared: Arc<WorkerShared<W>>,
+/// retained [`NativeWindow`] handle.
+struct GpuSurfaceWorker {
+    shared: Arc<WorkerShared>,
     thread: Option<JoinHandle<()>>,
 }
 
-impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
-    pub(crate) fn spawn(
-        surface_id: Arc<str>,
-        scale_bits: Arc<AtomicU32>,
-        host_active: bool,
-        factory: RendererFactory,
-        dispatch_event: Option<EventCallback>,
-        set_intrinsic_size: Option<SizeCallback>,
-        rate_callback: impl FnMut(bool) + Send + 'static,
-    ) -> std::io::Result<Self> {
+impl GpuSurfaceWorker {
+    fn spawn(launch: WorkerLaunch) -> std::io::Result<Self> {
         let shared = Arc::new(WorkerShared {
-            state: Mutex::new(WorkerState::new(host_active)),
+            state: Mutex::new(WorkerState::new(launch.host_active)),
             cv: Condvar::new(),
         });
-        let wake_shared = shared.clone();
-        let wake: WakeCallback = Arc::new(move || wake_shared.wake_frame());
-        let host = GpuSurfaceHost::new(
-            surface_id.clone(),
-            scale_bits,
-            wake,
-            dispatch_event,
-            set_intrinsic_size,
-        );
+        let host = GpuSurfaceHost {
+            inner: Arc::new(HostInner {
+                surface_id: launch.surface_id.clone(),
+                node_id: launch.node_id,
+                control: launch.control,
+                active: launch.active,
+                scale_bits: launch.scale_bits,
+                shared: shared.clone(),
+            }),
+        };
         let worker_shared = shared.clone();
+        let factory = launch.factory;
+        let rate = launch.rate;
         let thread = std::thread::Builder::new()
-            .name(format!("nsh-gpu-{}", surface_id))
+            .name(format!("nsh-gpu-{}", launch.surface_id))
             .spawn(move || {
-                run_render_thread(worker_shared, host, factory, rate_callback);
+                run_render_thread(worker_shared, host, factory, rate);
             })?;
         Ok(Self {
             shared,
@@ -661,7 +647,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         })
     }
 
-    pub(crate) fn surface_created(&self, window: W, width_px: u32, height_px: u32, scale: f32) {
+    fn surface_created(&self, window: NativeWindow, width_px: u32, height_px: u32, scale: f32) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited {
             return;
@@ -675,7 +661,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         self.shared.cv.notify_one();
     }
 
-    pub(crate) fn surface_resized(&self, width_px: u32, height_px: u32, scale: f32) {
+    fn surface_resized(&self, width_px: u32, height_px: u32, scale: f32) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited {
             return;
@@ -701,7 +687,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         self.shared.cv.notify_one();
     }
 
-    pub(crate) fn props(&self, props: Vec<GpuSurfaceProperty>) {
+    fn props(&self, props: Vec<GpuSurfaceProperty>) {
         if props.is_empty() {
             return;
         }
@@ -717,7 +703,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         self.shared.cv.notify_one();
     }
 
-    pub(crate) fn command(&self, name: String, args: JsonValue) {
+    fn command(&self, name: String, args: JsonValue) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited {
             return;
@@ -728,7 +714,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         self.shared.cv.notify_one();
     }
 
-    pub(crate) fn on_vsync(&self, timestamp_ns: u64) {
+    fn on_vsync(&self, timestamp_ns: u64) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited {
             return;
@@ -737,7 +723,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
         self.shared.cv.notify_one();
     }
 
-    pub(crate) fn set_host_active(&self, active: bool) {
+    fn set_host_active(&self, active: bool) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.shutdown || state.exited || state.host_active == active {
             return;
@@ -749,7 +735,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
     /// Synchronously destroys the currently attached native window on the render
     /// thread so `on_surface_destroyed()` completes before ArkUI tears down the
     /// underlying `OHNativeWindow`.
-    pub(crate) fn surface_destroyed_sync(&self) {
+    fn surface_destroyed_sync(&self) {
         let barrier = SyncBarrier::new();
         {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -767,7 +753,7 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
     /// Shuts down the render thread and joins it, guaranteeing
     /// `on_surface_destroyed()` -> `drop(renderer)` -> `drop(window)` all
     /// complete before returning.
-    pub(crate) fn shutdown(&mut self) {
+    fn shutdown(&mut self) {
         {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
             state.shutdown = true;
@@ -779,22 +765,21 @@ impl<W: SurfaceWindowHandle> GpuSurfaceWorker<W> {
     }
 }
 
-impl<W: SurfaceWindowHandle> Drop for GpuSurfaceWorker<W> {
+impl Drop for GpuSurfaceWorker {
     fn drop(&mut self) {
         self.shutdown();
     }
 }
 
-fn run_render_thread<W: SurfaceWindowHandle>(
-    shared: Arc<WorkerShared<W>>,
+fn run_render_thread(
+    shared: Arc<WorkerShared>,
     host: GpuSurfaceHost,
     factory: RendererFactory,
-    rate_callback: impl FnMut(bool) + Send + 'static,
+    mut rate: RateGuard,
 ) {
     let _exit_guard = ExitGuard {
         shared: shared.clone(),
     };
-    let mut rate = RateGuard::new(rate_callback);
     let mut renderer = match catch_unwind(AssertUnwindSafe(|| factory(host))) {
         Ok(renderer) => renderer,
         Err(_) => {
@@ -804,7 +789,7 @@ fn run_render_thread<W: SurfaceWindowHandle>(
     };
 
     let epoch = Instant::now();
-    let mut active_window: Option<W> = None;
+    let mut active_window: Option<NativeWindow> = None;
     let mut continuous = false;
     let mut burst = StreamBurst::new();
 
@@ -865,7 +850,7 @@ fn run_render_thread<W: SurfaceWindowHandle>(
                         }));
                         drop(old);
                     }
-                    let ptr = window.raw_ptr();
+                    let ptr = window.raw().cast();
                     active_window = Some(window);
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         renderer.on_surface_created(ptr, width_px, height_px, scale);
@@ -952,707 +937,288 @@ fn run_render_thread<W: SurfaceWindowHandle>(
     rate.set(false);
 }
 
-#[cfg(target_env = "ohos")]
-mod ohos {
-    use std::{
-        cell::{Cell, RefCell},
-        ffi::c_void,
-        ptr::NonNull,
-        rc::Rc,
-        sync::{
-            Arc, Weak,
-            atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
-        },
-    };
+/// Mounted pure-Rust HarmonyOS `XComponent` GPU surface instance.
+pub(crate) struct GpuSurfaceInstance {
+    pub(crate) native: NativeNode,
+    xcomponent: NativeXComponent,
+    worker: RefCell<Option<GpuSurfaceWorker>>,
+    scale_bits: Arc<AtomicU32>,
+    frame_vp: Rc<Cell<(f32, f32)>>,
+    active_flag: Arc<AtomicBool>,
+    rate_active: Arc<AtomicBool>,
+    applied_rate_active: Cell<Option<bool>>,
+    target_hz: i32,
+    idle_hz: i32,
+    disposed: Cell<bool>,
+}
 
-    use nsh_core::{JsonValue, NodeId};
-    use nsh_engine::EngineControl;
-    use ohos_arkui_binding::{
-        component::{attribute::ArkUICommonAttribute, built_in_component::XComponent},
-        types::{
-            advanced::LengthMetricUnit,
-            attribute::ArkUINodeAttributeType as A,
-            view::{AccessibilityMode, HitTestMode},
-        },
-    };
-    use ohos_native_window_binding::NativeWindow;
-    use ohos_xcomponent_binding::NativeXComponent;
+impl GpuSurfaceInstance {
+    pub(crate) fn new(
+        registered: RegisteredGpuSurface,
+        node_id: NodeId,
+        control: EngineControl,
+        scale: f32,
+        frame_rate: Arc<FrameRate>,
+        dispatcher: Weak<Dispatcher>,
+        panel_hz: u32,
+    ) -> NodeResult<Rc<Self>> {
+        let options: GpuSurfaceOptions = registered.options;
+        let panel_hz = normalize_display_hz(panel_hz) as i32;
+        let target_hz = if options.preferred_frame_rate > 0 {
+            (options.preferred_frame_rate as i32).clamp(30, panel_hz)
+        } else {
+            panel_hz
+        };
+        let idle_hz = target_hz.min(60);
 
-    use super::{
-        EventCallback, GpuSurfaceOptions, GpuSurfaceProperty, GpuSurfaceWorker,
-        RegisteredGpuSurface, SizeCallback, SurfaceWindowHandle,
-    };
-    use crate::{
-        app::{
-            frame_rate::{FrameRate, normalize_display_hz},
-            runtime::{Dispatcher, Message},
-        },
-        render::node::{NativeNode, Result},
-    };
-
-    static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
-
-    impl SurfaceWindowHandle for NativeWindow {
-        fn raw_ptr(&self) -> *mut c_void {
-            self.raw().cast()
-        }
-    }
-
-    /// Mounted pure-Rust HarmonyOS `XComponent` GPU surface instance.
-    pub(crate) struct GpuSurfaceInstance {
-        pub(crate) native: NativeNode,
-        xcomponent: NativeXComponent,
-        worker: RefCell<Option<GpuSurfaceWorker<NativeWindow>>>,
-        scale_bits: Arc<AtomicU32>,
-        frame_vp: Rc<Cell<(f32, f32)>>,
-        active_flag: Arc<AtomicBool>,
-        rate_active: Arc<AtomicBool>,
-        applied_rate_active: Cell<Option<bool>>,
-        target_hz: i32,
-        idle_hz: i32,
-        disposed: Cell<bool>,
-    }
-
-    impl GpuSurfaceInstance {
-        pub(crate) fn new(
-            registered: RegisteredGpuSurface,
-            node_id: NodeId,
-            control: EngineControl,
-            scale: f32,
-            frame_rate: Arc<FrameRate>,
-            dispatcher: Weak<Dispatcher>,
-            panel_hz: u32,
-        ) -> Result<Rc<Self>> {
-            let options: GpuSurfaceOptions = registered.options;
-            let panel_hz = normalize_display_hz(panel_hz) as i32;
-            let target_hz = if options.preferred_frame_rate > 0 {
-                (options.preferred_frame_rate as i32).clamp(30, panel_hz)
-            } else {
-                panel_hz
-            };
-            let idle_hz = target_hz.min(60);
-
-            let seq = NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
-            let surface_id: Arc<str> = Arc::from(format!("nsh-gpu-{seq}"));
-            let native = XComponent::new()?.into_node();
-            {
-                let node = native.borrow();
-                node.set_length_metric_unit(LengthMetricUnit::Vp)?;
-                node.set_string_attribute(A::XComponentId, &surface_id)?;
-                if options.hit_test_passthrough {
-                    node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
-                    node.set_i32_attribute(
-                        A::AccessibilityMode,
-                        AccessibilityMode::Disabled.into(),
-                    )?;
-                }
-                node.set_bool_attribute(A::Clip, options.clip)?;
-                node.background_color(0)?;
+        let seq = NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
+        let surface_id: Arc<str> = Arc::from(format!("nsh-gpu-{seq}"));
+        let native = XComponent::new()?.into_node();
+        {
+            let node = native.borrow();
+            node.set_length_metric_unit(LengthMetricUnit::Vp)?;
+            node.set_string_attribute(A::XComponentId, &surface_id)?;
+            if options.hit_test_passthrough {
+                node.set_i32_attribute(A::HitTestBehavior, HitTestMode::None.into())?;
+                node.set_i32_attribute(A::AccessibilityMode, AccessibilityMode::Disabled.into())?;
             }
-            let xcomponent = native.borrow().native_xcomponent().ok_or_else(|| {
-                napi_ohos::Error::from_reason("GPU surface XComponent is unavailable")
-            })?;
+            node.set_bool_attribute(A::Clip, options.clip)?;
+            node.background_color(0)?;
+        }
+        let xcomponent = native.borrow().native_xcomponent().ok_or_else(|| {
+            napi_ohos::Error::from_reason("GPU surface XComponent is unavailable")
+        })?;
 
-            let scale_bits = Arc::new(AtomicU32::new(scale.clamp(0.5, 4.0).to_bits()));
-            let frame_vp = Rc::new(Cell::new((0.0f32, 0.0f32)));
-            let active_flag = Arc::new(AtomicBool::new(true));
-            let rate_active = Arc::new(AtomicBool::new(false));
+        let scale_bits = Arc::new(AtomicU32::new(scale.clamp(0.5, 4.0).to_bits()));
+        let frame_vp = Rc::new(Cell::new((0.0f32, 0.0f32)));
+        let active_flag = Arc::new(AtomicBool::new(true));
+        let rate_active = Arc::new(AtomicBool::new(false));
+        let host_active = dispatcher
+            .upgrade()
+            .is_none_or(|route| route.active.load(Ordering::Acquire));
 
-            let event_active = active_flag.clone();
-            let event_control = control.clone();
-            let dispatch_event: EventCallback = Arc::new(move |name, data| {
-                if event_active.load(Ordering::Acquire) {
-                    event_control.dispatch_event(
-                        node_id,
-                        nsh_core::EventKind::NativeEvent,
-                        nsh_core::EventPayload::Native { name, data },
-                    );
-                }
-            });
+        let worker = GpuSurfaceWorker::spawn(WorkerLaunch {
+            surface_id,
+            node_id,
+            control,
+            active: active_flag.clone(),
+            scale_bits: scale_bits.clone(),
+            host_active,
+            factory: registered.factory,
+            rate: RateGuard::new(frame_rate.vote(), rate_active.clone(), dispatcher),
+        })
+        .map_err(|error| {
+            napi_ohos::Error::from_reason(format!(
+                "failed to spawn OHOS GPU surface worker: {error}"
+            ))
+        })?;
 
-            let size_active = active_flag.clone();
-            let size_control = control;
-            let set_intrinsic_size: SizeCallback = Arc::new(move |width, height| {
-                if size_active.load(Ordering::Acquire) {
-                    size_control.set_component_size(
-                        node_id,
-                        nsh_core::Size::new(nsh_core::Points(width), nsh_core::Points(height)),
-                    );
-                }
-            });
+        let instance = Rc::new(Self {
+            native,
+            xcomponent,
+            worker: RefCell::new(Some(worker)),
+            scale_bits,
+            frame_vp,
+            active_flag,
+            rate_active,
+            applied_rate_active: Cell::new(None),
+            target_hz,
+            idle_hz,
+            disposed: Cell::new(false),
+        });
 
-            let host_active = dispatcher
-                .upgrade()
-                .is_none_or(|route| route.active.load(Ordering::Acquire));
-
-            let mut vote = frame_rate.vote();
-            let vote_flag = rate_active.clone();
-            let vote_dispatcher = dispatcher.clone();
-            let worker = GpuSurfaceWorker::spawn(
-                surface_id,
-                scale_bits.clone(),
-                host_active,
-                registered.factory,
-                Some(dispatch_event),
-                Some(set_intrinsic_size),
-                move |active| {
-                    vote_flag.store(active, Ordering::Release);
-                    if vote.update(active)
-                        && let Some(route) = vote_dispatcher.upgrade()
-                    {
-                        route.send(Message::CompositeDemand);
-                    }
-                },
-            )
-            .map_err(|error| {
-                napi_ohos::Error::from_reason(format!(
-                    "failed to spawn OHOS GPU surface worker: {error}"
-                ))
-            })?;
-
-            let instance = Rc::new(Self {
-                native,
-                xcomponent,
-                worker: RefCell::new(Some(worker)),
-                scale_bits,
-                frame_vp,
-                active_flag,
-                rate_active,
-                applied_rate_active: Cell::new(None),
-                target_hz,
-                idle_hz,
-                disposed: Cell::new(false),
-            });
-
-            let created_weak = Rc::downgrade(&instance);
-            instance
-                .xcomponent
-                .on_surface_created(move |xc_raw, window_raw| {
-                    let Some(inst) = created_weak.upgrade() else {
-                        return Ok(());
-                    };
-                    let raw = NonNull::new(window_raw.0).ok_or_else(|| {
-                        napi_ohos::Error::from_reason("GPU surface native window is null")
-                    })?;
-                    // SAFETY: ArkUI lends a live OHNativeWindow* for this callback;
-                    // `retain_from_ptr` acquires our own reference and we guarantee
-                    // `on_surface_destroyed` drops the window before XComponent disposal.
-                    let retained = unsafe { NativeWindow::retain_from_ptr(raw) }
-                        .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
-                    let scale = inst.current_scale();
-                    let (w, h) = inst.resolve_pixel_size(&xc_raw, window_raw, scale);
-                    let _ = inst
-                        .xcomponent
-                        .set_frame_rate(0, inst.target_hz, inst.target_hz);
-                    inst.applied_rate_active.set(Some(false));
-                    if let Some(worker) = inst.worker.borrow().as_ref() {
-                        worker.surface_created(retained, w, h, scale);
-                    }
-                    Ok(())
-                });
-
-            let changed_weak = Rc::downgrade(&instance);
-            instance
-                .xcomponent
-                .on_surface_changed(move |xc_raw, window_raw| {
-                    let Some(inst) = changed_weak.upgrade() else {
-                        return Ok(());
-                    };
-                    let scale = inst.current_scale();
-                    let (w, h) = inst.resolve_pixel_size(&xc_raw, window_raw, scale);
-                    if let Some(worker) = inst.worker.borrow().as_ref() {
-                        worker.surface_resized(w, h, scale);
-                    }
-                    Ok(())
-                });
-
-            let destroyed_weak = Rc::downgrade(&instance);
-            instance.xcomponent.on_surface_destroyed(move |_, _| {
-                if let Some(inst) = destroyed_weak.upgrade()
-                    && let Some(worker) = inst.worker.borrow().as_ref()
-                {
-                    worker.surface_destroyed_sync();
+        let created_weak = Rc::downgrade(&instance);
+        instance
+            .xcomponent
+            .on_surface_created(move |xc_raw, window_raw| {
+                let Some(inst) = created_weak.upgrade() else {
+                    return Ok(());
+                };
+                let raw = NonNull::new(window_raw.0).ok_or_else(|| {
+                    napi_ohos::Error::from_reason("GPU surface native window is null")
+                })?;
+                // SAFETY: ArkUI lends a live OHNativeWindow* for this callback;
+                // `retain_from_ptr` acquires our own reference and we guarantee
+                // `on_surface_destroyed` drops the window before XComponent disposal.
+                let retained = unsafe { NativeWindow::retain_from_ptr(raw) }
+                    .map_err(|error| napi_ohos::Error::from_reason(error.to_string()))?;
+                let scale = inst.current_scale();
+                let (w, h) = inst.resolve_pixel_size(&xc_raw, window_raw, scale);
+                let _ = inst
+                    .xcomponent
+                    .set_frame_rate(0, inst.target_hz, inst.target_hz);
+                inst.applied_rate_active.set(Some(false));
+                if let Some(worker) = inst.worker.borrow().as_ref() {
+                    worker.surface_created(retained, w, h, scale);
                 }
                 Ok(())
             });
 
-            instance.xcomponent.register_callback()?;
-            Ok(instance)
-        }
+        let changed_weak = Rc::downgrade(&instance);
+        instance
+            .xcomponent
+            .on_surface_changed(move |xc_raw, window_raw| {
+                let Some(inst) = changed_weak.upgrade() else {
+                    return Ok(());
+                };
+                let scale = inst.current_scale();
+                let (w, h) = inst.resolve_pixel_size(&xc_raw, window_raw, scale);
+                if let Some(worker) = inst.worker.borrow().as_ref() {
+                    worker.surface_resized(w, h, scale);
+                }
+                Ok(())
+            });
 
-        fn current_scale(&self) -> f32 {
-            f32::from_bits(self.scale_bits.load(Ordering::Relaxed)).clamp(0.5, 4.0)
-        }
-
-        fn resolve_pixel_size(
-            &self,
-            xc_raw: &ohos_xcomponent_binding::XComponentRaw,
-            window_raw: ohos_xcomponent_binding::WindowRaw,
-            scale: f32,
-        ) -> (u32, u32) {
-            if let Ok(size) = xc_raw.size(window_raw)
-                && size.width > 0
-                && size.height > 0
+        let destroyed_weak = Rc::downgrade(&instance);
+        instance.xcomponent.on_surface_destroyed(move |_, _| {
+            if let Some(inst) = destroyed_weak.upgrade()
+                && let Some(worker) = inst.worker.borrow().as_ref()
             {
-                return (
-                    size.width.min(u64::from(u32::MAX)) as u32,
-                    size.height.min(u64::from(u32::MAX)) as u32,
-                );
+                worker.surface_destroyed_sync();
             }
+            Ok(())
+        });
+
+        instance.xcomponent.register_callback()?;
+        Ok(instance)
+    }
+
+    fn current_scale(&self) -> f32 {
+        f32::from_bits(self.scale_bits.load(Ordering::Relaxed)).clamp(0.5, 4.0)
+    }
+
+    fn resolve_pixel_size(
+        &self,
+        xc_raw: &XComponentRaw,
+        window_raw: WindowRaw,
+        scale: f32,
+    ) -> (u32, u32) {
+        if let Ok(size) = xc_raw.size(window_raw)
+            && size.width > 0
+            && size.height > 0
+        {
+            return (
+                size.width.min(u64::from(u32::MAX)) as u32,
+                size.height.min(u64::from(u32::MAX)) as u32,
+            );
+        }
+        let (fw, fh) = self.frame_vp.get();
+        (
+            (fw * scale).round().max(1.0) as u32,
+            (fh * scale).round().max(1.0) as u32,
+        )
+    }
+
+    pub(crate) fn set_frame(&self, width: f32, height: f32, scale: f32) -> NodeResult<()> {
+        self.frame_vp.set((width, height));
+        self.scale_bits
+            .store(scale.clamp(0.5, 4.0).to_bits(), Ordering::Relaxed);
+        let node = self.native.borrow();
+        node.width(width)?;
+        node.height(height)?;
+        Ok(())
+    }
+
+    pub(crate) fn density_changed(&self, scale: f32) {
+        let clamped = scale.clamp(0.5, 4.0);
+        let old = self.scale_bits.swap(clamped.to_bits(), Ordering::Relaxed);
+        if old != clamped.to_bits()
+            && let Some(worker) = self.worker.borrow().as_ref()
+        {
             let (fw, fh) = self.frame_vp.get();
-            (
-                (fw * scale).round().max(1.0) as u32,
-                (fh * scale).round().max(1.0) as u32,
-            )
-        }
-
-        pub(crate) fn set_frame(&self, width: f32, height: f32, scale: f32) -> Result<()> {
-            self.frame_vp.set((width, height));
-            self.scale_bits
-                .store(scale.clamp(0.5, 4.0).to_bits(), Ordering::Relaxed);
-            let node = self.native.borrow();
-            node.width(width)?;
-            node.height(height)?;
-            Ok(())
-        }
-
-        pub(crate) fn density_changed(&self, scale: f32) {
-            let clamped = scale.clamp(0.5, 4.0);
-            let old = self.scale_bits.swap(clamped.to_bits(), Ordering::Relaxed);
-            if old != clamped.to_bits()
-                && let Some(worker) = self.worker.borrow().as_ref()
-            {
-                let (fw, fh) = self.frame_vp.get();
-                let w = (fw * clamped).round().max(1.0) as u32;
-                let h = (fh * clamped).round().max(1.0) as u32;
-                worker.surface_resized(w, h, clamped);
-            }
-        }
-
-        pub(crate) fn props(&self, props: Vec<(Arc<str>, Option<JsonValue>)>) {
-            if self.disposed.get() {
-                return;
-            }
-            if let Some(worker) = self.worker.borrow().as_ref() {
-                let converted = props
-                    .into_iter()
-                    .map(|(name, value)| GpuSurfaceProperty { name, value })
-                    .collect();
-                worker.props(converted);
-            }
-        }
-
-        pub(crate) fn command(&self, name: &str, args: &JsonValue) {
-            if self.disposed.get() {
-                return;
-            }
-            if let Some(worker) = self.worker.borrow().as_ref() {
-                worker.command(name.to_owned(), args.clone());
-            }
-        }
-
-        pub(crate) fn on_vsync(&self, timestamp_ns: u64) {
-            if self.disposed.get() {
-                return;
-            }
-            if let Some(worker) = self.worker.borrow().as_ref() {
-                worker.on_vsync(timestamp_ns);
-            }
-        }
-
-        pub(crate) fn set_host_active(&self, active: bool) {
-            if self.disposed.get() {
-                return;
-            }
-            if let Some(worker) = self.worker.borrow().as_ref() {
-                worker.set_host_active(active);
-            }
-        }
-
-        /// Synchronizes `OH_NativeXComponent_SetExpectedFrameRateRange` on the
-        /// UI thread whenever the render thread's high-refresh vote transitions.
-        pub(crate) fn sync_xcomponent_rate(&self) {
-            if self.disposed.get() {
-                return;
-            }
-            let active = self.rate_active.load(Ordering::Acquire);
-            if self.applied_rate_active.get() == Some(active) {
-                return;
-            }
-            let result = if active {
-                self.xcomponent
-                    .set_frame_rate(self.target_hz, self.target_hz, self.target_hz)
-            } else {
-                self.xcomponent
-                    .set_frame_rate(0, self.target_hz, self.idle_hz)
-            };
-            if result.is_ok() {
-                self.applied_rate_active.set(Some(active));
-            }
-        }
-
-        pub(crate) fn deactivate(&self) {
-            self.active_flag.store(false, Ordering::Release);
-            if let Some(worker) = self.worker.borrow().as_ref() {
-                worker.set_host_active(false);
-            }
-        }
-
-        pub(crate) fn dispose(&self) -> Result<()> {
-            self.deactivate();
-            if self.disposed.replace(true) {
-                return Ok(());
-            }
-            self.xcomponent.unregister_callbacks();
-            if let Some(mut worker) = self.worker.borrow_mut().take() {
-                worker.shutdown();
-            }
-            if self.native.borrow().is_owned() {
-                self.native.borrow_mut().dispose()?;
-            }
-            Ok(())
+            let w = (fw * clamped).round().max(1.0) as u32;
+            let h = (fh * clamped).round().max(1.0) as u32;
+            worker.surface_resized(w, h, clamped);
         }
     }
 
-    impl Drop for GpuSurfaceInstance {
-        fn drop(&mut self) {
-            let _ = self.dispose();
+    pub(crate) fn props(&self, props: Vec<(Arc<str>, Option<JsonValue>)>) {
+        if self.disposed.get() {
+            return;
         }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            let converted = props
+                .into_iter()
+                .map(|(name, value)| GpuSurfaceProperty { name, value })
+                .collect();
+            worker.props(converted);
+        }
+    }
+
+    pub(crate) fn command(&self, name: &str, args: &JsonValue) {
+        if self.disposed.get() {
+            return;
+        }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.command(name.to_owned(), args.clone());
+        }
+    }
+
+    pub(crate) fn on_vsync(&self, timestamp_ns: u64) {
+        if self.disposed.get() {
+            return;
+        }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.on_vsync(timestamp_ns);
+        }
+    }
+
+    pub(crate) fn set_host_active(&self, active: bool) {
+        if self.disposed.get() {
+            return;
+        }
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.set_host_active(active);
+        }
+    }
+
+    /// Synchronizes `OH_NativeXComponent_SetExpectedFrameRateRange` on the
+    /// UI thread whenever the render thread's high-refresh vote transitions.
+    pub(crate) fn sync_xcomponent_rate(&self) {
+        if self.disposed.get() {
+            return;
+        }
+        let active = self.rate_active.load(Ordering::Acquire);
+        if self.applied_rate_active.get() == Some(active) {
+            return;
+        }
+        let result = if active {
+            self.xcomponent
+                .set_frame_rate(self.target_hz, self.target_hz, self.target_hz)
+        } else {
+            self.xcomponent
+                .set_frame_rate(0, self.target_hz, self.idle_hz)
+        };
+        if result.is_ok() {
+            self.applied_rate_active.set(Some(active));
+        }
+    }
+
+    pub(crate) fn deactivate(&self) {
+        self.active_flag.store(false, Ordering::Release);
+        if let Some(worker) = self.worker.borrow().as_ref() {
+            worker.set_host_active(false);
+        }
+    }
+
+    pub(crate) fn dispose(&self) -> NodeResult<()> {
+        self.deactivate();
+        if self.disposed.replace(true) {
+            return Ok(());
+        }
+        self.xcomponent.unregister_callbacks();
+        if let Some(mut worker) = self.worker.borrow_mut().take() {
+            worker.shutdown();
+        }
+        if self.native.borrow().is_owned() {
+            self.native.borrow_mut().dispose()?;
+        }
+        Ok(())
     }
 }
 
-#[cfg(target_env = "ohos")]
-pub(crate) use ohos::GpuSurfaceInstance;
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::AtomicUsize;
-
-    use serde_json::json;
-
-    use super::*;
-
-    struct MockWindow {
-        ptr: usize,
-        dropped: Arc<AtomicUsize>,
-        events: Arc<Mutex<Vec<String>>>,
-    }
-
-    impl SurfaceWindowHandle for MockWindow {
-        fn raw_ptr(&self) -> *mut c_void {
-            self.ptr as *mut c_void
-        }
-    }
-
-    impl Drop for MockWindow {
-        fn drop(&mut self) {
-            self.dropped.fetch_add(1, Ordering::SeqCst);
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("window_drop:{:#x}", self.ptr));
-        }
-    }
-
-    struct RecordingRenderer {
-        host: GpuSurfaceHost,
-        thread_id: std::thread::ThreadId,
-        events: Arc<Mutex<Vec<String>>>,
-        continuous_remaining: usize,
-        frames_seen: Arc<AtomicUsize>,
-        frame_cv: Arc<(Mutex<usize>, Condvar)>,
-    }
-
-    impl RecordingRenderer {
-        fn assert_same_thread(&self) {
-            assert_eq!(
-                std::thread::current().id(),
-                self.thread_id,
-                "GpuSurfaceRenderer must preserve single-thread affinity"
-            );
-        }
-    }
-
-    impl GpuSurfaceRenderer for RecordingRenderer {
-        fn on_surface_created(
-            &mut self,
-            native_window: *mut c_void,
-            width_px: u32,
-            height_px: u32,
-            scale: f32,
-        ) {
-            self.assert_same_thread();
-            self.events.lock().unwrap().push(format!(
-                "created:{:#x}:{width_px}x{height_px}@{scale:.2}",
-                native_window as usize
-            ));
-        }
-
-        fn on_surface_resized(&mut self, width_px: u32, height_px: u32, scale: f32) {
-            self.assert_same_thread();
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("resized:{width_px}x{height_px}@{scale:.2}"));
-        }
-
-        fn on_props(&mut self, props: &[GpuSurfaceProperty]) {
-            self.assert_same_thread();
-            for prop in props {
-                self.events.lock().unwrap().push(format!(
-                    "prop:{}={:?}",
-                    prop.name,
-                    prop.value.as_ref()
-                ));
-            }
-        }
-
-        fn on_command(&mut self, name: &str, args: &JsonValue) {
-            self.assert_same_thread();
-            self.events
-                .lock()
-                .unwrap()
-                .push(format!("cmd:{name}:{args}"));
-        }
-
-        fn on_frame(&mut self, _timestamp_ns: u64) -> bool {
-            self.assert_same_thread();
-            let count = self.frames_seen.fetch_add(1, Ordering::SeqCst) + 1;
-            self.events.lock().unwrap().push(format!("frame:{count}"));
-            let (lock, cv) = &*self.frame_cv;
-            let mut seen = lock.lock().unwrap();
-            *seen = count;
-            cv.notify_all();
-            if self.continuous_remaining > 0 {
-                self.continuous_remaining -= 1;
-                true
-            } else {
-                false
-            }
-        }
-
-        fn on_surface_destroyed(&mut self) {
-            self.assert_same_thread();
-            let _ = self.host.surface_id();
-            self.events.lock().unwrap().push("destroyed".into());
-        }
-    }
-
-    impl Drop for RecordingRenderer {
-        fn drop(&mut self) {
-            self.assert_same_thread();
-            self.events.lock().unwrap().push("renderer_drop".into());
-        }
-    }
-
-    fn wait_frames(frame_cv: &(Mutex<usize>, Condvar), expected: usize) {
-        let mut seen = frame_cv.0.lock().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while *seen < expected {
-            let rem = deadline.saturating_duration_since(Instant::now());
-            assert!(
-                !rem.is_zero(),
-                "timed out waiting for frame {expected} (saw {})",
-                *seen
-            );
-            let (next, _) = frame_cv.1.wait_timeout(seen, rem).unwrap();
-            seen = next;
-        }
-    }
-
-    #[test]
-    fn registry_validates_names_and_supports_register_lookup_unregister() {
-        let registry = GpuSurfaceRegistry::new();
-        assert!(!registry.contains("nsh-ghostty.surface"));
-        assert!(
-            registry
-                .register("", GpuSurfaceOptions::default(), |_| DummyRenderer)
-                .is_err()
-        );
-        assert!(
-            registry
-                .register("NshReserved", GpuSurfaceOptions::default(), |_| {
-                    DummyRenderer
-                })
-                .is_err()
-        );
-
-        let opts = GpuSurfaceOptions::new()
-            .with_hit_test_passthrough(false)
-            .with_clip(false)
-            .with_preferred_frame_rate(120);
-        registry
-            .register("nsh-ghostty.surface", opts, |_| DummyRenderer)
-            .unwrap();
-        assert!(registry.contains("nsh-ghostty.surface"));
-        let entry = registry.get("nsh-ghostty.surface").unwrap();
-        assert_eq!(entry.options, opts);
-
-        assert!(registry.unregister("nsh-ghostty.surface"));
-        assert!(!registry.unregister("nsh-ghostty.surface"));
-        assert!(!registry.contains("nsh-ghostty.surface"));
-    }
-
-    struct DummyRenderer;
-    impl GpuSurfaceRenderer for DummyRenderer {
-        fn on_surface_created(&mut self, _: *mut c_void, _: u32, _: u32, _: f32) {}
-        fn on_frame(&mut self, _: u64) -> bool {
-            false
-        }
-    }
-
-    #[test]
-    fn worker_preserves_thread_affinity_lifecycle_order_and_teardown_before_window_drop() {
-        let events = Arc::new(Mutex::new(Vec::<String>::new()));
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let frames_seen = Arc::new(AtomicUsize::new(0));
-        let frame_cv = Arc::new((Mutex::new(0usize), Condvar::new()));
-        let rate_transitions = Arc::new(Mutex::new(Vec::<bool>::new()));
-
-        let ev_factory = events.clone();
-        let frames_factory = frames_seen.clone();
-        let cv_factory = frame_cv.clone();
-        let factory: RendererFactory = Arc::new(move |host| {
-            Box::new(RecordingRenderer {
-                host,
-                thread_id: std::thread::current().id(),
-                events: ev_factory.clone(),
-                continuous_remaining: 1,
-                frames_seen: frames_factory.clone(),
-                frame_cv: cv_factory.clone(),
-            })
-        });
-
-        let rates_cb = rate_transitions.clone();
-        let mut worker = GpuSurfaceWorker::<MockWindow>::spawn(
-            Arc::from("test-1"),
-            Arc::new(AtomicU32::new(2.0f32.to_bits())),
-            true,
-            factory,
-            None,
-            None,
-            move |active| {
-                rates_cb.lock().unwrap().push(active);
-            },
-        )
-        .unwrap();
-
-        // Props arriving before OnSurfaceCreated are delivered first without rendering.
-        worker.props(vec![GpuSurfaceProperty {
-            name: Arc::from("sessionId"),
-            value: Some(json!(42)),
-        }]);
-        worker.command("setPostProcess".into(), json!("crt"));
-
-        worker.surface_created(
-            MockWindow {
-                ptr: 0x1000,
-                dropped: dropped.clone(),
-                events: events.clone(),
-            },
-            1600,
-            1000,
-            2.0,
-        );
-        wait_frames(&frame_cv, 1);
-
-        // First frame returned true (continuous), so VSync drives frame 2 and high refresh is on.
-        worker.on_vsync(16_666_667);
-        wait_frames(&frame_cv, 2);
-
-        worker.surface_resized(1920, 1200, 2.0);
-        wait_frames(&frame_cv, 3);
-
-        // Synchronous surface destroy must complete on_surface_destroyed BEFORE window drop.
-        worker.surface_destroyed_sync();
-        assert_eq!(dropped.load(Ordering::SeqCst), 1);
-
-        // Recreate surface on the exact same render thread, then shutdown directly.
-        worker.surface_created(
-            MockWindow {
-                ptr: 0x2000,
-                dropped: dropped.clone(),
-                events: events.clone(),
-            },
-            800,
-            600,
-            1.5,
-        );
-        wait_frames(&frame_cv, 4);
-        worker.shutdown();
-        assert_eq!(dropped.load(Ordering::SeqCst), 2);
-
-        let log = events.lock().unwrap().clone();
-        let pos = |needle: &str| {
-            log.iter()
-                .position(|entry| entry == needle)
-                .unwrap_or_else(|| panic!("missing {needle} in {log:?}"))
-        };
-        assert!(pos("prop:sessionId=Some(Number(42))") < pos("created:0x1000:1600x1000@2.00"));
-        assert!(pos("cmd:setPostProcess:\"crt\"") < pos("created:0x1000:1600x1000@2.00"));
-        assert!(pos("created:0x1000:1600x1000@2.00") < pos("frame:1"));
-        assert!(pos("resized:1920x1200@2.00") < pos("frame:3"));
-        assert!(pos("destroyed") < pos("window_drop:0x1000"));
-        assert!(pos("window_drop:0x1000") < pos("created:0x2000:800x600@1.50"));
-
-        // Final shutdown order: destroyed -> renderer_drop -> window_drop:0x2000.
-        let last_destroyed = log.iter().rposition(|e| e == "destroyed").unwrap();
-        let renderer_drop = pos("renderer_drop");
-        let second_win_drop = pos("window_drop:0x2000");
-        assert!(last_destroyed < renderer_drop, "{log:?}");
-        assert!(renderer_drop < second_win_drop, "{log:?}");
-
-        let rates = rate_transitions.lock().unwrap().clone();
-        assert!(rates.first().copied() == Some(true), "{rates:?}");
-        assert!(rates.last().copied() == Some(false), "{rates:?}");
-    }
-
-    #[test]
-    fn property_helpers_and_host_waker_work_cleanly() {
-        let p_str = GpuSurfaceProperty {
-            name: Arc::from("shader"),
-            value: Some(json!("crt")),
-        };
-        assert!(!p_str.is_removed());
-        assert_eq!(p_str.as_str(), Some("crt"));
-
-        let p_num = GpuSurfaceProperty {
-            name: Arc::from("sessionId"),
-            value: Some(json!(7.0)),
-        };
-        assert_eq!(p_num.as_u64(), Some(7));
-        assert_eq!(p_num.as_f64(), Some(7.0));
-
-        let p_removed = GpuSurfaceProperty {
-            name: Arc::from("shader"),
-            value: None,
-        };
-        assert!(p_removed.is_removed());
-        assert_eq!(p_removed.as_str(), None);
-
-        let woke = Arc::new(AtomicUsize::new(0));
-        let woke_cb = woke.clone();
-        let sent = Arc::new(Mutex::new(Vec::<(String, JsonValue)>::new()));
-        let sent_cb = sent.clone();
-        let host = GpuSurfaceHost::new(
-            Arc::from("nsh-gpu-9"),
-            Arc::new(AtomicU32::new(2.0f32.to_bits())),
-            Arc::new(move || {
-                woke_cb.fetch_add(1, Ordering::SeqCst);
-            }),
-            Some(Arc::new(move |name, data| {
-                sent_cb.lock().unwrap().push((name.to_string(), data));
-            })),
-            None,
-        );
-        assert_eq!(host.surface_id(), "nsh-gpu-9");
-        assert_eq!(host.scale(), 2.0);
-        host.request_frame();
-        host.dispatch_event("ready", json!({"adapter": "Maleoon 916"}));
-        assert_eq!(woke.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *sent.lock().unwrap(),
-            vec![("ready".to_owned(), json!({"adapter": "Maleoon 916"}))]
-        );
+impl Drop for GpuSurfaceInstance {
+    fn drop(&mut self) {
+        let _ = self.dispose();
     }
 }

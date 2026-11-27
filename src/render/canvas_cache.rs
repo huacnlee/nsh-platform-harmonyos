@@ -1,8 +1,5 @@
 //! Bounded cross-frame shaped-text LRU cache and active redraw frame-rate
 //! tracker for ArkUI `CanvasView`.
-//!
-//! Pure-Rust logic kept separate from OHOS drawing bindings so host tests can
-//! verify LRU eviction, key discrimination, and 120 Hz voting/idle release.
 
 use std::{
     borrow::Borrow,
@@ -24,11 +21,11 @@ pub(crate) const DEFAULT_TEXT_CACHE_CAPACITY: usize = 1024;
 /// Maximum interval between consecutive `CanvasView::set()` redraws to classify
 /// a canvas as actively streaming/animating (≥ 20 Hz, safely below 530 ms
 /// cursor blink intervals).
-pub(crate) const CANVAS_BURST_WINDOW: Duration = Duration::from_millis(50);
+const CANVAS_BURST_WINDOW: Duration = Duration::from_millis(50);
 
 /// Duration after the last `CanvasView::set()` redraw before releasing the
 /// high-refresh `FrameRate` vote and letting the display return to idle.
-pub(crate) const CANVAS_IDLE_HOLD: Duration = Duration::from_millis(200);
+const CANVAS_IDLE_HOLD: Duration = Duration::from_millis(200);
 
 /// Canonicalizes `f32` to deterministic hashable bits (`-0.0` → `+0.0`, any
 /// `NaN` → quiet canonical `NaN`).
@@ -51,14 +48,14 @@ fn canonical_f32_bits(value: f32) -> u32 {
 /// and therefore do not invalidate cached glyph blobs.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct TextCacheKeyRef<'a> {
-    pub(crate) text: &'a str,
-    pub(crate) font_size_bits: u32,
-    pub(crate) font_weight: u16,
-    pub(crate) font_italic: bool,
-    pub(crate) font_family: Option<&'a str>,
-    pub(crate) font_variant: u8,
-    pub(crate) rtl: bool,
-    pub(crate) font_generation: u64,
+    text: &'a str,
+    font_size_bits: u32,
+    font_weight: u16,
+    font_italic: bool,
+    font_family: Option<&'a str>,
+    font_variant: u8,
+    rtl: bool,
+    font_generation: u64,
 }
 
 impl<'a> TextCacheKeyRef<'a> {
@@ -84,7 +81,7 @@ impl<'a> TextCacheKeyRef<'a> {
 
     /// Converts this borrowed lookup key into an owned key on a cache miss.
     #[inline]
-    pub(crate) fn to_owned_key(self, font_family: Option<Arc<str>>) -> TextCacheKey {
+    fn to_owned_key(self, font_family: Option<Arc<str>>) -> TextCacheKey {
         TextCacheKey {
             text: Arc::from(self.text),
             font_size_bits: self.font_size_bits,
@@ -100,7 +97,7 @@ impl<'a> TextCacheKeyRef<'a> {
 
 /// Owned cache key stored inside [`ShapedTextCache`].
 #[derive(Clone, Debug)]
-pub(crate) struct TextCacheKey {
+struct TextCacheKey {
     text: Arc<str>,
     font_size_bits: u32,
     font_weight: u16,
@@ -209,14 +206,6 @@ struct LruSlot<V> {
     next: Option<usize>,
 }
 
-/// Hit/miss diagnostic counters for [`ShapedTextCache`].
-#[allow(dead_code)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TextCacheStats {
-    pub(crate) hits: u64,
-    pub(crate) misses: u64,
-}
-
 /// Bounded O(1) LRU cache mapping [`TextCacheKey`] to shaped text entries.
 ///
 /// Cache hits perform zero heap allocations and promote entries in O(1). When
@@ -229,8 +218,6 @@ pub(crate) struct ShapedTextCache<V> {
     slots: Vec<LruSlot<V>>,
     head: Option<usize>,
     tail: Option<usize>,
-    hits: u64,
-    misses: u64,
 }
 
 impl<V> Default for ShapedTextCache<V> {
@@ -249,31 +236,11 @@ impl<V> ShapedTextCache<V> {
             slots: Vec::new(),
             head: None,
             tail: None,
-            hits: 0,
-            misses: 0,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn len(&self) -> usize {
-        self.index.len()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.index.is_empty()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn stats(&self) -> TextCacheStats {
-        TextCacheStats {
-            hits: self.hits,
-            misses: self.misses,
         }
     }
 
     /// Drops all cached entries.
-    pub(crate) fn clear(&mut self) {
+    fn clear(&mut self) {
         self.index.clear();
         self.slots.clear();
         self.head = None;
@@ -282,22 +249,11 @@ impl<V> ShapedTextCache<V> {
 
     /// Ensures cached entries belong to `generation`, clearing stale shaped
     /// runs immediately when new custom fonts are registered.
-    pub(crate) fn sync_font_generation(&mut self, generation: u64) {
+    fn sync_font_generation(&mut self, generation: u64) {
         if self.font_generation != generation {
             self.clear();
             self.font_generation = generation;
         }
-    }
-
-    /// Looks up a cached entry by borrowed key, promoting it to most-recently-used
-    /// on a hit without allocating.
-    #[allow(dead_code)]
-    pub(crate) fn get(&mut self, lookup: TextCacheKeyRef<'_>) -> Option<&V> {
-        let key: &dyn TextKey = &lookup;
-        let idx = *self.index.get(key)?;
-        self.hits = self.hits.saturating_add(1);
-        self.move_to_front(idx);
-        Some(&self.slots[idx].value)
     }
 
     /// Looks up `lookup` (promoting on hit) or builds and inserts on a miss,
@@ -312,11 +268,9 @@ impl<V> ShapedTextCache<V> {
         self.sync_font_generation(lookup.font_generation);
         let key: &dyn TextKey = &lookup;
         if let Some(&idx) = self.index.get(key) {
-            self.hits = self.hits.saturating_add(1);
             self.move_to_front(idx);
             return idx;
         }
-        self.misses = self.misses.saturating_add(1);
         let value = build();
         let owned_key = lookup.to_owned_key(family);
         self.insert_owned(owned_key, value)
@@ -326,19 +280,6 @@ impl<V> ShapedTextCache<V> {
     #[inline]
     pub(crate) fn entry(&self, idx: usize) -> &V {
         &self.slots[idx].value
-    }
-
-    /// Looks up `lookup`, or invokes `build` on a miss, inserting the newly
-    /// constructed value and evicting the least-recently-used entry if full.
-    #[allow(dead_code)]
-    pub(crate) fn get_or_insert_with(
-        &mut self,
-        lookup: TextCacheKeyRef<'_>,
-        family: Option<Arc<str>>,
-        build: impl FnOnce() -> V,
-    ) -> &V {
-        let idx = self.ensure_with(lookup, family, build);
-        self.entry(idx)
     }
 
     fn insert_owned(&mut self, key: TextCacheKey, value: V) -> usize {
@@ -408,42 +349,17 @@ impl<V> ShapedTextCache<V> {
 /// streaming, live charts, interactive drawing) so it votes for the display's
 /// high refresh rate (e.g. 120 Hz) while active and automatically releases the
 /// vote when idle.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct CanvasActivity {
-    burst_window: Duration,
-    idle_hold: Duration,
     last_redraw: Option<Instant>,
     active: bool,
 }
 
-impl Default for CanvasActivity {
-    fn default() -> Self {
-        Self::new(CANVAS_BURST_WINDOW, CANVAS_IDLE_HOLD)
-    }
-}
-
 impl CanvasActivity {
-    /// Creates an idle tracker with custom burst and idle-hold thresholds.
-    pub(crate) fn new(burst_window: Duration, idle_hold: Duration) -> Self {
-        Self {
-            burst_window,
-            idle_hold,
-            last_redraw: None,
-            active: false,
-        }
-    }
-
-    /// Returns whether this canvas currently holds a high-refresh vote.
-    #[allow(dead_code)]
-    #[inline]
-    pub(crate) fn is_active(&self) -> bool {
-        self.active
-    }
-
     /// Records a `CanvasView::set()` redraw at `now`.
     ///
     /// Returns `true` on the transition from idle → active (when two redraws
-    /// arrive within `burst_window`), signaling the caller to engage its
+    /// arrive within `CANVAS_BURST_WINDOW`), signaling the caller to engage its
     /// `FrameRate::Vote`.
     pub(crate) fn record_redraw(&mut self, now: Instant) -> bool {
         let prev = self.last_redraw.replace(now);
@@ -451,7 +367,7 @@ impl CanvasActivity {
             return false;
         }
         if let Some(prev) = prev
-            && now.saturating_duration_since(prev) <= self.burst_window
+            && now.saturating_duration_since(prev) <= CANVAS_BURST_WINDOW
         {
             self.active = true;
             return true;
@@ -461,16 +377,16 @@ impl CanvasActivity {
 
     /// Checks on a frame tick whether the active vote should remain held.
     ///
-    /// Returns `true` while still active; returns `false` when `idle_hold` has
-    /// elapsed since the last redraw (transitioning back to idle so the caller
-    /// releases its `FrameRate::Vote`).
+    /// Returns `true` while still active; returns `false` when `CANVAS_IDLE_HOLD`
+    /// has elapsed since the last redraw (transitioning back to idle so the
+    /// caller releases its `FrameRate::Vote`).
     pub(crate) fn check_idle(&mut self, now: Instant) -> bool {
         if !self.active {
             return false;
         }
         let expired = self
             .last_redraw
-            .is_none_or(|last| now.saturating_duration_since(last) >= self.idle_hold);
+            .is_none_or(|last| now.saturating_duration_since(last) >= CANVAS_IDLE_HOLD);
         if expired {
             self.active = false;
             self.last_redraw = None;
@@ -504,7 +420,7 @@ mod tests {
 
     #[test]
     fn terminal_streaming_achieves_high_cross_frame_hit_rate() {
-        let mut cache = ShapedTextCache::<usize>::new(512);
+        let mut cache = ShapedTextCache::<usize>::new(DEFAULT_TEXT_CACHE_CAPACITY);
         let mono = font(14.0, 400, false, Some("JetBrains Mono"), 0);
         let mut build_calls = 0usize;
 
@@ -514,32 +430,31 @@ mod tests {
             .collect();
         for row in &rows {
             let key = TextCacheKeyRef::new(row, &mono, false, 1);
-            cache.get_or_insert_with(key, mono.family.clone(), || {
+            let idx = cache.ensure_with(key, mono.family.clone(), || {
                 build_calls += 1;
                 build_calls
             });
+            assert!(*cache.entry(idx) > 0);
         }
-        assert_eq!(cache.len(), 40);
+        assert_eq!(cache.index.len(), 40);
         assert_eq!(build_calls, 40);
 
-        // Frames 2..=11: only 1 row changes per frame -> 39/40 cache hits per frame!
+        // Frames 2..=11: only 1 row changes per frame -> 39/40 cache hits per frame.
         for frame in 1..=10 {
             rows[39] = format!("row 39: progress {frame}/10 [####]");
             for row in &rows {
                 let key = TextCacheKeyRef::new(row, &mono, false, 1);
-                cache.get_or_insert_with(key, mono.family.clone(), || {
+                let idx = cache.ensure_with(key, mono.family.clone(), || {
                     build_calls += 1;
                     build_calls
                 });
+                assert!(*cache.entry(idx) > 0);
             }
         }
 
         // 40 initial + 10 changed rows = 50 shapes total out of 440 text draws.
         assert_eq!(build_calls, 50);
-        let stats = cache.stats();
-        assert_eq!(stats.misses, 50);
-        assert_eq!(stats.hits, 390);
-        assert_eq!(cache.len(), 50);
+        assert_eq!(cache.index.len(), 50);
     }
 
     #[test]
@@ -549,26 +464,40 @@ mod tests {
 
         for (i, text) in ["a", "b", "c"].into_iter().enumerate() {
             let key = TextCacheKeyRef::new(text, &f, false, 1);
-            cache.get_or_insert_with(key, None, || i as u32);
+            let idx = cache.ensure_with(key, None, || i as u32);
+            assert_eq!(*cache.entry(idx), i as u32);
         }
-        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.index.len(), 3);
 
-        // Touch "a" so "b" becomes the least recently used entry.
-        assert_eq!(cache.get(TextCacheKeyRef::new("a", &f, false, 1)), Some(&0));
+        // Touch "a" via ensure_with so "b" becomes the least recently used entry.
+        let idx_a = cache.ensure_with(TextCacheKeyRef::new("a", &f, false, 1), None, || {
+            panic!("expected cache hit for 'a'")
+        });
+        assert_eq!(*cache.entry(idx_a), 0);
 
         // Inserting "d" must evict "b", keeping "a", "c", "d".
-        cache.get_or_insert_with(TextCacheKeyRef::new("d", &f, false, 1), None, || 3);
-        assert_eq!(cache.len(), 3);
-        assert_eq!(cache.get(TextCacheKeyRef::new("b", &f, false, 1)), None);
-        assert_eq!(cache.get(TextCacheKeyRef::new("a", &f, false, 1)), Some(&0));
-        assert_eq!(cache.get(TextCacheKeyRef::new("c", &f, false, 1)), Some(&2));
-        assert_eq!(cache.get(TextCacheKeyRef::new("d", &f, false, 1)), Some(&3));
+        let idx_d = cache.ensure_with(TextCacheKeyRef::new("d", &f, false, 1), None, || 3);
+        assert_eq!(*cache.entry(idx_d), 3);
+        assert_eq!(cache.index.len(), 3);
+        assert!(
+            !cache
+                .index
+                .contains_key(&TextCacheKeyRef::new("b", &f, false, 1) as &dyn TextKey)
+        );
+
+        for (text, expected) in [("a", 0u32), ("c", 2), ("d", 3)] {
+            let idx = cache.ensure_with(TextCacheKeyRef::new(text, &f, false, 1), None, || {
+                panic!("expected cache hit for {text:?}")
+            });
+            assert_eq!(*cache.entry(idx), expected);
+        }
 
         // Filling well past capacity never exceeds the configured bound.
         for i in 0..100 {
             let s = format!("line-{i}");
-            cache.get_or_insert_with(TextCacheKeyRef::new(&s, &f, false, 1), None, || i);
-            assert!(cache.len() <= 3);
+            let idx = cache.ensure_with(TextCacheKeyRef::new(&s, &f, false, 1), None, || i);
+            assert_eq!(*cache.entry(idx), i);
+            assert!(cache.index.len() <= 3);
         }
     }
 
@@ -595,59 +524,60 @@ mod tests {
 
         for (text, f, rtl, id) in &variants {
             let key = TextCacheKeyRef::new(text, f, *rtl, 1);
-            let got = *cache.get_or_insert_with(key, f.family.clone(), || *id);
-            assert_eq!(got, *id);
+            let idx = cache.ensure_with(key, f.family.clone(), || *id);
+            assert_eq!(*cache.entry(idx), *id);
         }
-        assert_eq!(cache.len(), variants.len());
+        assert_eq!(cache.index.len(), variants.len());
 
-        // Re-querying every variant returns its exact distinct value with 0 misses.
-        let misses_before = cache.stats().misses;
+        // Re-querying every variant returns its exact distinct value with 0 rebuilds.
         for (text, f, rtl, id) in &variants {
             let key = TextCacheKeyRef::new(text, f, *rtl, 1);
-            assert_eq!(cache.get(key), Some(id));
+            let idx = cache.ensure_with(key, f.family.clone(), || {
+                panic!("unexpected cache miss for id={id}")
+            });
+            assert_eq!(*cache.entry(idx), *id);
         }
-        assert_eq!(cache.stats().misses, misses_before);
 
         // -0.0 and +0.0 font sizes canonicalize identically.
         let neg_zero = font(-0.0, 400, false, None, 0);
         let pos_zero = font(0.0, 400, false, None, 0);
-        cache.get_or_insert_with(TextCacheKeyRef::new("z", &neg_zero, false, 1), None, || 99);
-        assert_eq!(
-            cache.get(TextCacheKeyRef::new("z", &pos_zero, false, 1)),
-            Some(&99)
-        );
+        cache.ensure_with(TextCacheKeyRef::new("z", &neg_zero, false, 1), None, || 99);
+        let idx_z = cache.ensure_with(TextCacheKeyRef::new("z", &pos_zero, false, 1), None, || {
+            panic!("expected -0.0 and +0.0 font sizes to share one entry")
+        });
+        assert_eq!(*cache.entry(idx_z), 99);
 
         // Advancing font generation drops stale entries immediately.
-        let got = *cache.get_or_insert_with(
+        let idx_gen2 = cache.ensure_with(
             TextCacheKeyRef::new("hello", &base, false, 2),
             base.family.clone(),
             || 777,
         );
-        assert_eq!(got, 777);
-        assert_eq!(cache.len(), 1);
+        assert_eq!(*cache.entry(idx_gen2), 777);
+        assert_eq!(cache.index.len(), 1);
     }
 
     #[test]
     fn canvas_activity_ignores_static_and_slow_blink_but_engages_120hz_for_streaming() {
         let t0 = Instant::now();
         let mut activity = CanvasActivity::default();
-        assert!(!activity.is_active());
+        assert!(!activity.active);
 
         // Single initial draw does not request 120 Hz.
         assert!(!activity.record_redraw(t0));
-        assert!(!activity.is_active());
+        assert!(!activity.active);
 
         // Slow 530 ms cursor blink does not trigger 120 Hz.
         assert!(!activity.record_redraw(t0 + Duration::from_millis(530)));
-        assert!(!activity.is_active());
+        assert!(!activity.active);
         assert!(!activity.record_redraw(t0 + Duration::from_millis(1060)));
-        assert!(!activity.is_active());
+        assert!(!activity.active);
 
         // Streaming frames every 16 ms engage 120 Hz on the second consecutive frame.
         let stream_start = t0 + Duration::from_millis(2000);
         assert!(!activity.record_redraw(stream_start));
         assert!(activity.record_redraw(stream_start + Duration::from_millis(16)));
-        assert!(activity.is_active());
+        assert!(activity.active);
 
         // Subsequent 8 ms frames stay active without re-firing transition.
         let mut t = stream_start + Duration::from_millis(16);
@@ -659,18 +589,18 @@ mod tests {
 
         // Still active shortly after streaming pauses (< 200 ms hold).
         assert!(activity.check_idle(t + Duration::from_millis(150)));
-        assert!(activity.is_active());
+        assert!(activity.active);
 
         // Releases automatically once idle hold (200 ms) elapses.
         assert!(!activity.check_idle(t + Duration::from_millis(200)));
-        assert!(!activity.is_active());
+        assert!(!activity.active);
 
         // Reset immediately releases an active vote (e.g. backgrounding).
         let t2 = t + Duration::from_millis(500);
         assert!(!activity.record_redraw(t2));
         assert!(activity.record_redraw(t2 + Duration::from_millis(10)));
         assert!(activity.reset());
-        assert!(!activity.is_active());
+        assert!(!activity.active);
         assert!(!activity.reset());
     }
 }
