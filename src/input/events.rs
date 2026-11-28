@@ -264,6 +264,15 @@ impl Interaction {
     pub(crate) fn key_content(&self) -> Option<nsh_core::NodeId> {
         self.props.borrow().key_content
     }
+    pub(crate) fn tab_after(&self) -> Option<nsh_core::NodeId> {
+        self.props.borrow().tab_after
+    }
+    pub(crate) fn is_focus_stop(&self) -> bool {
+        self.key_focusable.get()
+    }
+    pub(crate) fn focusable_prop(&self) -> Option<bool> {
+        self.props.borrow().focusable
+    }
     pub(crate) fn types_into_input(&self) -> bool {
         let props = self.props.borrow();
         !props.accessibility.state.disabled && props.key_capture.types_into_input()

@@ -96,6 +96,7 @@ export interface EditorReceipt {
 export interface EditorSettings {
   belowViewport: boolean
   targetId: number
+  windowId?: number
   multiline: boolean
   secure: boolean
   text: string

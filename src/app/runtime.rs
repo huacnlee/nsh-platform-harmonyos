@@ -126,6 +126,7 @@ pub(crate) enum Message {
     DialogResult {
         id: u32,
         index: i32,
+        value: Option<String>,
     },
     HostEnvironment(NshEnvironment),
     HostNetwork(nsh_core::platform::Network),
@@ -568,8 +569,11 @@ impl State {
                 mounter.flush_arkui()?;
                 self.request_frame()?;
             }
-            Message::DialogResult { id, index } => {
-                self.mounter.as_mut().unwrap().dialog_result(id, index)?;
+            Message::DialogResult { id, index, value } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .dialog_result(id, index, value)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
             Message::HostNetwork(network) => {

@@ -14,6 +14,7 @@ use crate::{interop::attachment::NativeAttachment, render::node::Node};
 pub(crate) struct EditorSettings {
     pub below_viewport: bool,
     pub target_id: u32,
+    pub window_id: Option<u32>,
     pub multiline: bool,
     pub secure: bool,
     pub text: String,

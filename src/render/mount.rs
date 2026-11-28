@@ -983,8 +983,13 @@ impl Mounter {
         }
         Ok(())
     }
-    pub(crate) fn dialog_result(&mut self, id: u32, index: i32) -> Result<()> {
-        self.dialogs.finish(id, index)
+    pub(crate) fn dialog_result(
+        &mut self,
+        id: u32,
+        index: i32,
+        value: Option<String>,
+    ) -> Result<()> {
+        self.dialogs.finish(id, index, value)
     }
     fn apply_desktop_command(
         &mut self,

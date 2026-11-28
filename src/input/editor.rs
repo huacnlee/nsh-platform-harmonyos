@@ -384,8 +384,24 @@ impl Input {
                 owner.emit(EventKind::Focus, EventPayload::None);
             }
             "blur" => {
-                if let Some(route) = owner.dispatcher.upgrade() {
-                    route.keyboard.lock().unwrap().composing = false;
+                let had_composing = if let Some(route) = owner.dispatcher.upgrade() {
+                    std::mem::replace(&mut route.keyboard.lock().unwrap().composing, false)
+                } else {
+                    false
+                };
+                if had_composing {
+                    owner.emit(
+                        EventKind::CompositionChange,
+                        EventPayload::Map(vec![
+                            ("composing", PayloadValue::Bool(false)),
+                            ("text", PayloadValue::Str(String::new())),
+                            ("start", PayloadValue::Number(0.0)),
+                            ("end", PayloadValue::Number(0.0)),
+                        ]),
+                    );
+                }
+                if self.state.borrow_mut().composition(false) {
+                    self.update();
                 }
                 if self.state.borrow_mut().focus(false) {
                     owner.emit(EventKind::Blur, EventPayload::None);
@@ -419,6 +435,7 @@ impl Input {
             ),
             "key"
                 if event.text == "Backspace"
+                    || event.text == "Delete"
                     || event.text == "Enter"
                     || event.text.chars().count() == 1 =>
             {
@@ -588,6 +605,7 @@ impl Input {
                 | KeyboardType::NumbersAndPunctuation => "decimal",
                 KeyboardType::Phone => "phone",
                 KeyboardType::Email => "email",
+                KeyboardType::Url => "url",
                 _ => "normal",
             }
         };
@@ -603,6 +621,10 @@ impl Input {
         let selection = config
             .selection_color
             .unwrap_or(nsh_core::Color(0x3388ff55));
+        let window_id = {
+            let win = owner.key_window_id();
+            (win != nsh_core::ROOT_ID).then_some(win)
+        };
         owner.editor_update(EditorSettings {
             below_viewport: false,
             accessibility: Some(EditorAccessibility {
@@ -619,6 +641,7 @@ impl Input {
                 disabled: accessibility.state.disabled,
             }),
             target_id,
+            window_id,
             multiline: config.multiline && !config.secure,
             secure: config.secure,
             text: self.state.borrow().text.clone(),
@@ -699,11 +722,15 @@ impl Input {
                 self.update();
             } else {
                 self.route.borrow_mut().take();
+                let _ = self.state.borrow_mut().composition(false);
                 // SDK lifecycle cleanup retires its borrowed edge before releasing its BuilderNode.
                 // Keep this target until that cleanup or a later replacement batch acknowledges it.
                 if self.state.borrow_mut().focus(false)
                     && let Some(owner) = self.owner.upgrade()
                 {
+                    if let Some(route) = owner.dispatcher.upgrade() {
+                        route.keyboard.lock().unwrap().composing = false;
+                    }
                     owner.emit(EventKind::Blur, EventPayload::None);
                 }
             }
@@ -776,6 +803,12 @@ impl Input {
         if let Some(owner) = self.owner.upgrade().filter(|_| !self.closed.get())
             && let Some(target_id) = self.target_id()
         {
+            if let Some(route) = owner.dispatcher.upgrade() {
+                route.keyboard.lock().unwrap().composing = false;
+            }
+            if self.state.borrow_mut().composition(false) {
+                self.update();
+            }
             owner.editor_command(EditorCommand {
                 target_id,
                 kind: kind.into(),
@@ -847,7 +880,7 @@ impl Input {
                 };
                 surface = parent;
             }
-            let scale = owner.scale.get().max(1.0);
+            let scale = owner.effective_scale();
             let (origin_x, origin_y) = surface
                 .native
                 .borrow()
@@ -895,6 +928,7 @@ impl Input {
     }
     fn retire(&self) -> Result<()> {
         self.route.borrow_mut().take();
+        let _ = self.state.borrow_mut().composition(false);
         if let Some(owner) = self.owner.upgrade() {
             if let Some(route) = owner.dispatcher.upgrade() {
                 route.keyboard.lock().unwrap().composing = false;
