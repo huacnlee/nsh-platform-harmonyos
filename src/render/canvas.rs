@@ -609,13 +609,14 @@ impl Replay<'_> {
                 } => {
                     if let Some(bitmap) = self.images.get(&image.uri) {
                         let [x, y, w, h] = dest.map(|n| self.num(n));
+                        let density = image.density().max(1.0);
                         let w = if w.is_nan() {
-                            source.map_or(bitmap.width() as f32, |s| s.size.width.0)
+                            source.map_or(bitmap.width() as f32 / density, |s| s.size.width.0)
                         } else {
                             w
                         };
                         let h = if h.is_nan() {
-                            source.map_or(bitmap.height() as f32, |s| s.size.height.0)
+                            source.map_or(bitmap.height() as f32 / density, |s| s.size.height.0)
                         } else {
                             h
                         };

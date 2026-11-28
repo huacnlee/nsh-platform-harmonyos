@@ -737,6 +737,9 @@ impl Input {
             Ok(())
         });
     }
+    pub(crate) fn accessibility_target_id(&self) -> Option<u32> {
+        self.target_id()
+    }
     pub(crate) fn accessibility_id(&self) -> Result<Option<i32>> {
         use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
         self.with_child(|node| node.i32_attribute(A::AccessibilityId, 0))?

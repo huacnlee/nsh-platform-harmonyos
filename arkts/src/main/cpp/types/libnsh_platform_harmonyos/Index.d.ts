@@ -140,9 +140,11 @@ export interface HostCommand {
   enabled?: boolean
   lightContent?: boolean
   animated?: boolean
+  polite?: boolean
   text?: string
   announcement?: string
   elementId?: number
+  customId?: string
   windowId?: number
   openId?: number
   limit?: number

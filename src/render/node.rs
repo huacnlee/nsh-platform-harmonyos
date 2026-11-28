@@ -180,6 +180,7 @@ pub(crate) struct Node {
     raster_origin_y: Cell<f32>,
     presentation: Cell<(f32, f32)>,
     pinned: Cell<(f32, f32)>,
+    pub(crate) sticky_z: Cell<Option<i32>>,
     input_transform: Cell<nsh_core::Matrix>,
     applied_layout_size: Cell<(usize, i32, i32)>,
     applied_position: Cell<(usize, i32, i32)>,

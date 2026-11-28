@@ -108,9 +108,11 @@ pub(crate) struct HostCommand {
     pub enabled: Option<bool>,
     pub light_content: Option<bool>,
     pub animated: Option<bool>,
+    pub polite: Option<bool>,
     pub text: Option<String>,
     pub announcement: Option<String>,
     pub element_id: Option<i64>,
+    pub custom_id: Option<String>,
     pub window_id: Option<u32>,
     pub open_id: Option<u32>,
     pub limit: Option<u32>,
@@ -690,6 +692,7 @@ impl Services {
         route: Weak<Dispatcher>,
         announcement: Option<String>,
         element_id: Option<i64>,
+        custom_id: Option<String>,
     ) -> Result<()> {
         self.check()?;
         if route
@@ -702,6 +705,7 @@ impl Services {
             kind: "accessibility-event".into(),
             announcement,
             element_id,
+            custom_id,
             ..Default::default()
         })
     }
@@ -722,7 +726,12 @@ impl Services {
             .remove(&window_id);
     }
 
-    pub(crate) fn accessibility_live(&self, route: Weak<Dispatcher>, text: String) -> Result<()> {
+    pub(crate) fn accessibility_live(
+        &self,
+        route: Weak<Dispatcher>,
+        text: String,
+        polite: bool,
+    ) -> Result<()> {
         self.check()?;
         if route
             .upgrade()
@@ -733,6 +742,7 @@ impl Services {
         self.send_host_command(HostCommand {
             kind: "accessibility-live".into(),
             text: Some(text),
+            polite: Some(polite),
             ..Default::default()
         })
     }

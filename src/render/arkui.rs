@@ -223,11 +223,12 @@ impl crate::render::mount::UiContext {
         let focus = std::mem::take(&mut *self.accessibility_focus.borrow_mut());
         for owner in focus.into_iter().filter_map(|owner| owner.upgrade()) {
             if owner.visible_in_tree() {
-                let id = owner.accessibility_id()?;
+                let (id, custom_id) = owner.accessibility_custom_id()?;
                 self.host.accessibility_event(
                     self.dispatcher.clone(),
                     None,
                     Some(i64::from(id)),
+                    Some(custom_id),
                 )?;
             }
         }

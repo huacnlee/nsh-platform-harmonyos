@@ -82,9 +82,11 @@ interface HostCommandPayload {
   enabled?: boolean;
   lightContent?: boolean;
   animated?: boolean;
+  polite?: boolean;
   text?: string;
   announcement?: string;
   elementId?: number;
+  customId?: string;
   windowId?: number;
   openId?: number;
   limit?: number;
@@ -1276,83 +1278,87 @@ class HostSession {
   }
 
   private updateCursor(name: string, windowId?: number): void {
-    const controller = this.runtimeContext.getUIContext().getCursorController();
-    if (name === "none") {
-      if (this.savedPointerVisible === undefined) {
-        this.savedPointerVisible = pointer.isPointerVisibleSync();
-      }
-      pointer.setPointerVisibleSync(false);
-      return;
-    }
-    if (this.savedPointerVisible !== undefined) {
-      pointer.setPointerVisibleSync(this.savedPointerVisible);
-      this.savedPointerVisible = undefined;
-    }
-    let style: pointer.PointerStyle;
-    switch (name) {
-      case "default":
-        style = pointer.PointerStyle.DEFAULT;
-        break;
-      case "pointer":
-        style = pointer.PointerStyle.HAND_POINTING;
-        break;
-      case "text":
-        style = pointer.PointerStyle.TEXT_CURSOR;
-        break;
-      case "wait":
-        style = pointer.PointerStyle.LOADING;
-        break;
-      case "progress":
-        style = pointer.PointerStyle.RUNNING;
-        break;
-      case "help":
-        style = pointer.PointerStyle.HELP;
-        break;
-      case "crosshair":
-        style = pointer.PointerStyle.CROSS;
-        break;
-      case "move":
-        style = pointer.PointerStyle.MOVE;
-        break;
-      case "grab":
-        style = pointer.PointerStyle.HAND_OPEN;
-        break;
-      case "grabbing":
-        style = pointer.PointerStyle.HAND_GRABBING;
-        break;
-      case "not-allowed":
-        style = pointer.PointerStyle.CURSOR_FORBID;
-        break;
-      case "zoom-in":
-        style = pointer.PointerStyle.ZOOM_IN;
-        break;
-      case "zoom-out":
-        style = pointer.PointerStyle.ZOOM_OUT;
-        break;
-      case "col-resize":
-        style = pointer.PointerStyle.WEST_EAST;
-        break;
-      case "row-resize":
-        style = pointer.PointerStyle.NORTH_SOUTH;
-        break;
-      case "nwse-resize":
-        style = pointer.PointerStyle.NORTH_WEST_SOUTH_EAST;
-        break;
-      case "nesw-resize":
-        style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
-        break;
-      default:
-        if (windowId !== undefined) {
-          this.desktop?.updateWindowCursor(windowId, undefined);
-        } else {
-          controller.restoreDefault();
+    try {
+      const controller = this.runtimeContext.getUIContext().getCursorController();
+      if (name === "none") {
+        if (this.savedPointerVisible === undefined) {
+          this.savedPointerVisible = pointer.isPointerVisibleSync();
         }
+        pointer.setPointerVisibleSync(false);
         return;
-    }
-    if (windowId !== undefined) {
-      this.desktop?.updateWindowCursor(windowId, style);
-    } else {
-      controller.setCursor(style);
+      }
+      if (this.savedPointerVisible !== undefined) {
+        pointer.setPointerVisibleSync(this.savedPointerVisible);
+        this.savedPointerVisible = undefined;
+      }
+      let style: pointer.PointerStyle;
+      switch (name) {
+        case "default":
+          style = pointer.PointerStyle.DEFAULT;
+          break;
+        case "pointer":
+          style = pointer.PointerStyle.HAND_POINTING;
+          break;
+        case "text":
+          style = pointer.PointerStyle.TEXT_CURSOR;
+          break;
+        case "wait":
+          style = pointer.PointerStyle.LOADING;
+          break;
+        case "progress":
+          style = pointer.PointerStyle.RUNNING;
+          break;
+        case "help":
+          style = pointer.PointerStyle.HELP;
+          break;
+        case "crosshair":
+          style = pointer.PointerStyle.CROSS;
+          break;
+        case "move":
+          style = pointer.PointerStyle.MOVE;
+          break;
+        case "grab":
+          style = pointer.PointerStyle.HAND_OPEN;
+          break;
+        case "grabbing":
+          style = pointer.PointerStyle.HAND_GRABBING;
+          break;
+        case "not-allowed":
+          style = pointer.PointerStyle.CURSOR_FORBID;
+          break;
+        case "zoom-in":
+          style = pointer.PointerStyle.ZOOM_IN;
+          break;
+        case "zoom-out":
+          style = pointer.PointerStyle.ZOOM_OUT;
+          break;
+        case "col-resize":
+          style = pointer.PointerStyle.WEST_EAST;
+          break;
+        case "row-resize":
+          style = pointer.PointerStyle.NORTH_SOUTH;
+          break;
+        case "nwse-resize":
+          style = pointer.PointerStyle.NORTH_WEST_SOUTH_EAST;
+          break;
+        case "nesw-resize":
+          style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
+          break;
+        default:
+          if (windowId !== undefined) {
+            this.desktop?.updateWindowCursor(windowId, undefined);
+          } else {
+            controller.restoreDefault();
+          }
+          return;
+      }
+      if (windowId !== undefined) {
+        this.desktop?.updateWindowCursor(windowId, style);
+      } else {
+        controller.setCursor(style);
+      }
+    } catch {
+      // Touch-only Phone devices without pointer hardware may throw 801 on pointer APIs.
     }
   }
 
@@ -1487,27 +1493,44 @@ class HostSession {
       if (!text) {
         return;
       }
+      const bundleName = this.bundleName();
       accessibility
         .sendAccessibilityEvent({
-          type: "announceForAccessibility",
-          bundleName: this.bundleName(),
+          type: command.polite
+            ? "announceForAccessibilityNotInterrupt"
+            : "announceForAccessibility",
+          bundleName,
           triggerAction: "common",
           textAnnouncedForAccessibility: text,
         })
-        .catch((): void => {});
+        .catch((): void => {
+          if (command.polite) {
+            accessibility
+              .sendAccessibilityEvent({
+                type: "announceForAccessibility",
+                bundleName,
+                triggerAction: "common",
+                textAnnouncedForAccessibility: text,
+              })
+              .catch((): void => {});
+          }
+        });
       return;
     }
 
     if (command.kind === "accessibility-event") {
       const announcement = command.announcement ?? undefined;
       const elementId = command.elementId;
+      const customId =
+        command.customId ??
+        (elementId !== undefined && elementId !== null ? String(elementId) : undefined);
       accessibility
         .sendAccessibilityEvent({
           type: announcement ? "announceForAccessibility" : "requestFocusForAccessibility",
           bundleName: this.bundleName(),
           triggerAction: "common",
           textAnnouncedForAccessibility: announcement,
-          customId: elementId !== undefined && elementId !== null ? String(elementId) : undefined,
+          customId,
         })
         .catch((): void => {});
       return;

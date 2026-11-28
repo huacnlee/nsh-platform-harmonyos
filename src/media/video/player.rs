@@ -77,6 +77,7 @@ pub(super) struct Worker {
     epoch: u64,
     props: Option<VideoProps>,
     paused: bool,
+    ended: bool,
     pending_seek: Option<i32>,
     loading_cancel: Option<Arc<AtomicBool>>,
     loaded_source: Option<(u64, Option<SourceFile>, Option<CString>)>,
@@ -119,6 +120,7 @@ impl Worker {
             epoch: 0,
             props: None,
             paused: true,
+            ended: false,
             pending_seek: None,
             loading_cancel: None,
             loaded_source: None,
@@ -254,6 +256,7 @@ impl Worker {
         if changed {
             self.cancel_loading();
             self.pending_seek = None;
+            self.ended = false;
         }
         self.epoch = epoch;
         validate_props(&props)?;
@@ -263,6 +266,9 @@ impl Worker {
             .is_none_or(|old| old.paused != props.paused)
             || changed
         {
+            if self.paused && !props.paused {
+                self.ended = false;
+            }
             self.paused = props.paused;
         }
         self.props = Some(*props);
@@ -317,12 +323,16 @@ impl Worker {
     }
     fn seek(&mut self, seconds: f64) -> std::result::Result<(), String> {
         let milliseconds = seek_time(seconds)?;
+        let was_ended = std::mem::replace(&mut self.ended, false);
         if let Some(playback) = self.playback.as_mut().filter(|p| p.prepared) {
             self.pending_seek = None;
             playback
                 .player
                 .seek(milliseconds, av::SeekMode::Closest)
                 .map_err(|e| e.to_string())?;
+            if was_ended {
+                self.apply()?;
+            }
         } else {
             self.pending_seek = Some(milliseconds);
             self.ui.time = milliseconds;
@@ -340,6 +350,9 @@ impl Worker {
             .and_then(|playback| playback.player.state().ok())
             .map_or(self.ui.playing, |state| state == av::STATE_PLAYING);
         self.paused = playing;
+        if !self.paused {
+            self.ended = false;
+        }
         self.apply()
     }
     fn bind_window(&mut self) -> std::result::Result<(), String> {
@@ -515,6 +528,7 @@ impl Worker {
             }
             Ok(())
         })();
+        self.ended = false;
         self.playback = Some(playback);
         if let Err(error) = configured {
             self.retire_player();
@@ -576,7 +590,7 @@ impl Worker {
                 playback.applied_rate = rate;
             }
         }
-        let paused = self.paused || props.rate == 0.0 || !self.ui_ready;
+        let paused = self.paused || self.ended || props.rate == 0.0 || !self.ui_ready;
         let state = playback.player.state().map_err(|e| e.to_string())?;
         if paused {
             if state == av::STATE_PLAYING {
@@ -657,6 +671,7 @@ impl Worker {
                 // With `repeat` the player starts over and keeps playing: only
                 // the last run's end stops it.
                 if !self.props.as_ref().is_some_and(|props| props.repeat) {
+                    self.ended = true;
                     self.ui.playing = false;
                 }
                 self.control

@@ -164,13 +164,31 @@ impl Data {
         }
         use ohos_image_native_binding::{DecodingOptions, ImageSource, types::PixelFormat};
         let source = ImageSource::create_from_data(&self.bytes).map_err(|e| e.to_string())?;
+        let raw_info = source.image_info(0).map_err(|e| e.to_string())?;
+        let raw_width = raw_info.width().map_err(|e| e.to_string())?;
+        let raw_height = raw_info.height().map_err(|e| e.to_string())?;
+        let orientation = crate::extensions::read_exif_orientation(&source, &self.bytes);
         let mut options = DecodingOptions::new().map_err(|e| e.to_string())?;
         options
             .set_pixel_format(PixelFormat::Rgba8888)
             .map_err(|e| e.to_string())?;
-        let pixels = source
+        let mut pixels = source
             .create_pixelmap(&mut options)
             .map_err(|e| e.to_string())?;
+        if orientation != crate::extensions::ExifOrientation::Normal {
+            let dec_info = pixels.image_info().map_err(|e| e.to_string())?;
+            let dec_w = dec_info.width().unwrap_or(raw_width);
+            let dec_h = dec_info.height().unwrap_or(raw_height);
+            crate::extensions::apply_orientation(
+                &mut pixels,
+                orientation,
+                raw_width,
+                raw_height,
+                dec_w,
+                dec_h,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         let mut bitmap = ohos_drawing_binding::Bitmap::new(
             self.width,
             self.height,
@@ -409,21 +427,32 @@ impl Loader {
             let source = ohos_image_native_binding::ImageSource::create_from_data(&bytes)
                 .map_err(|e| e.to_string())?;
             let info = source.image_info(0).map_err(|e| e.to_string())?;
-            let (width, height) = (
+            let (raw_width, raw_height) = (
                 info.width().map_err(|e| e.to_string())?,
                 info.height().map_err(|e| e.to_string())?,
             );
+            let orientation = crate::extensions::read_exif_orientation(&source, &bytes);
+            let (width, height) = orientation.display_dimensions(raw_width, raw_height);
             let frames = u64::from(source.frame_count().unwrap_or(1).max(1));
+            let static_multi = frames > 1 && is_non_animated_multi_image(&bytes);
+            let effective_frames = if static_multi { 1 } else { frames };
             let frame_pixels = u64::from(width) * u64::from(height);
             if width == 0
                 || height == 0
                 || frame_pixels > MAX_IMAGE_PIXELS
-                || frame_pixels.saturating_mul(frames) > MAX_ANIMATED_IMAGE_PIXELS
+                || frame_pixels.saturating_mul(effective_frames) > MAX_ANIMATED_IMAGE_PIXELS
             {
                 return Err("image dimensions exceed 16 megapixels".into());
             }
             let pixels = if key.1 {
-                Some(Mutex::new(PixelFrames::decode(&source, frames)?))
+                Some(Mutex::new(PixelFrames::decode(
+                    &source,
+                    frames,
+                    static_multi,
+                    orientation,
+                    raw_width,
+                    raw_height,
+                )?))
             } else {
                 None
             };
@@ -468,18 +497,64 @@ struct PixelFrames {
 // handles under the mutex. Each ArkUI descriptor stays on its UI thread.
 unsafe impl Send for PixelFrames {}
 
+fn is_non_animated_multi_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x00\x00\x01\x00")
+        || bytes.starts_with(b"\x00\x00\x02\x00")
+        || bytes.starts_with(b"II*\x00")
+        || bytes.starts_with(b"MM\x00*")
+}
+
 impl PixelFrames {
     fn decode(
         source: &ohos_image_native_binding::ImageSource,
         count: u64,
+        static_multi: bool,
+        orientation: crate::extensions::ExifOrientation,
+        raw_width: u32,
+        raw_height: u32,
     ) -> std::result::Result<Self, String> {
         let mut options =
             ohos_image_native_binding::DecodingOptions::new().map_err(|e| e.to_string())?;
-        if count > 1 {
-            let pixels = source
+        let orient =
+            |pixel: &mut ohos_image_native_binding::PixelMap| -> std::result::Result<(), String> {
+                if orientation != crate::extensions::ExifOrientation::Normal {
+                    let info = pixel.image_info().map_err(|e| e.to_string())?;
+                    let dec_w = info.width().unwrap_or(raw_width);
+                    let dec_h = info.height().unwrap_or(raw_height);
+                    crate::extensions::apply_orientation(
+                        pixel,
+                        orientation,
+                        raw_width,
+                        raw_height,
+                        dec_w,
+                        dec_h,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+        if static_multi {
+            if let Ok(list) = source.create_pixelmap_list(&mut options)
+                && let Some(mut best) = list.into_iter().max_by_key(|pm| {
+                    pm.image_info().ok().map_or(0u64, |info| {
+                        u64::from(info.width().unwrap_or(0)) * u64::from(info.height().unwrap_or(0))
+                    })
+                })
+            {
+                orient(&mut best)?;
+                return Ok(Self {
+                    pixels: vec![best],
+                    durations: Vec::new(),
+                });
+            }
+        } else if count > 1 {
+            let mut pixels = source
                 .create_pixelmap_list(&mut options)
                 .map_err(|e| e.to_string())?;
             if !pixels.is_empty() {
+                for pixel in &mut pixels {
+                    orient(pixel)?;
+                }
                 let delays = source.delay_time_list().unwrap_or_default();
                 let durations = (0..pixels.len())
                     .map(|idx| {
@@ -490,9 +565,10 @@ impl PixelFrames {
                 return Ok(Self { pixels, durations });
             }
         }
-        let pixel = source
+        let mut pixel = source
             .create_pixelmap(&mut options)
             .map_err(|e| e.to_string())?;
+        orient(&mut pixel)?;
         Ok(Self {
             pixels: vec![pixel],
             durations: Vec::new(),

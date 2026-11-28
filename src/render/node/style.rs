@@ -294,8 +294,17 @@ impl Node {
     pub(crate) fn effects_plan(&self) -> crate::render::effects::EffectsPlan {
         self.effects_plan_for(&self.style.borrow())
     }
+    pub(crate) fn set_sticky_rank(&self, rank: Option<usize>) -> Result<()> {
+        let next = rank.map(|index| 1_000_000 + (index.min(999_999) as i32));
+        if self.sticky_z.replace(next) != next {
+            self.apply_z_index()?;
+        }
+        Ok(())
+    }
     pub(crate) fn desired_z_index(&self) -> i32 {
-        if self.pinned.get() != (0.0, 0.0) {
+        if let Some(z) = self.sticky_z.get() {
+            z
+        } else if self.pinned.get() != (0.0, 0.0) {
             1_000_000
         } else if self.kind == ViewKind::HeaderItem {
             2

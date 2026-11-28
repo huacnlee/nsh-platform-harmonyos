@@ -254,27 +254,34 @@ fn build_typography(
     let mut backgrounds = Vec::new();
     let mut decorations = Vec::new();
     for span in &text.spans {
-        if let Some(bg) = span.style.background
+        let hidden = span.style.hidden;
+        if !hidden
+            && let Some(bg) = span.style.background
             && span.start < span.end
         {
             backgrounds.push((span.start, span.end, bg));
         }
         let mut style = TextStyle::new();
-        let custom_decoration = ((span.style.decoration_thickness.is_some()
-            || span.style.underline_offset.is_some())
-            && (span.style.decoration.underline || span.style.decoration.line_through))
-            || (span.style.decoration.underline && span.style.decoration.line_through);
-        style.set_color(argb(span.style.color));
+        let custom_decoration = !hidden
+            && (((span.style.decoration_thickness.is_some()
+                || span.style.underline_offset.is_some())
+                && (span.style.decoration.underline || span.style.decoration.line_through))
+                || (span.style.decoration.underline && span.style.decoration.line_through));
+        style.set_color(if hidden { 0 } else { argb(span.style.color) });
         let mut decoration = ohos_drawing_binding::TextDecoration::NONE;
-        if span.style.decoration.underline && !custom_decoration {
+        if !hidden && span.style.decoration.underline && !custom_decoration {
             decoration |= ohos_drawing_binding::TextDecoration::UNDERLINE;
         }
-        if span.style.decoration.line_through && !custom_decoration {
+        if !hidden && span.style.decoration.line_through && !custom_decoration {
             decoration |= ohos_drawing_binding::TextDecoration::LINE_THROUGH;
         }
         style.set_decoration(
             decoration,
-            argb(span.style.decoration_color.unwrap_or(span.style.color)),
+            if hidden {
+                0
+            } else {
+                argb(span.style.decoration_color.unwrap_or(span.style.color))
+            },
             match span.style.decoration_style {
                 nsh_core::DecorationStyle::Solid => ohos_drawing_binding::DecorationPattern::Solid,
                 nsh_core::DecorationStyle::Double => {
@@ -289,7 +296,7 @@ fn build_typography(
                 nsh_core::DecorationStyle::Wavy => ohos_drawing_binding::DecorationPattern::Wavy,
             },
         );
-        if let Some(shadow) = text.shadow {
+        if !hidden && let Some(shadow) = text.shadow {
             // Paragraph painting runs under `canvas.scale(scale, scale)`, so shadow blur
             // stays in logical points using the CSS `text-shadow` sigma (`radius * 0.5`).
             let sigma = f64::from(crate::render::composition::geometry::shadow_blur_sigma(
@@ -775,8 +782,15 @@ impl TextEngine for OhosTextEngine {
             raster.attachments = paragraph
                 .placeholder_rectangles()
                 .into_iter()
-                .map(|rect| {
-                    (rect[3] > rect[1] && rect[1] < size.height && rect[0] < size.width)
+                .enumerate()
+                .map(|(idx, rect)| {
+                    let hidden =
+                        prepared.source.attachments.get(idx).is_some_and(|att| {
+                            prepared.source.spans.iter().any(|s| {
+                                s.style.hidden && att.index >= s.start && att.index < s.end
+                            })
+                        });
+                    (!hidden && rect[3] > rect[1] && rect[1] < size.height && rect[0] < size.width)
                         .then_some(Point::new(Points(rect[0]), Points(rect[1])))
                 })
                 .collect();
@@ -925,7 +939,9 @@ impl TextEngine for OhosTextEngine {
                 .spans
                 .iter()
                 .all(|s| Some(s.style.color) == first_color);
+            let has_hidden = prepared.source.spans.iter().any(|s| s.style.hidden);
             let supports_tint = single_color
+                && !has_hidden
                 && prepared.source.shadow.is_none()
                 && !contains_color_emoji(&prepared.source.text);
             match recording.finish() {

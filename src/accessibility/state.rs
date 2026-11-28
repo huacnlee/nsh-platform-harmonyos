@@ -33,6 +33,16 @@ impl Default for State {
         }
     }
 }
+fn effective_live_region(spec: &Accessibility) -> LiveRegion {
+    if spec.live_region != LiveRegion::None {
+        spec.live_region
+    } else if spec.role == nsh_core::AccessibilityRole::Alert {
+        LiveRegion::Assertive
+    } else {
+        LiveRegion::None
+    }
+}
+
 impl State {
     pub(crate) fn has_live(&self) -> bool {
         self.has_live_region.get()
@@ -46,7 +56,7 @@ impl State {
     }
     pub(crate) fn configure(&self, owner: &Rc<Node>, spec: &Accessibility) {
         if *self.spec.borrow() != *spec {
-            let live = spec.live_region != LiveRegion::None;
+            let live = effective_live_region(spec) != LiveRegion::None;
             if self.has_live_region.replace(live) != live {
                 let count = owner.accessibility_live_regions.get();
                 owner.accessibility_live_regions.set(if live {
@@ -68,7 +78,7 @@ impl State {
     fn text_changed(&self, owner: &Rc<Node>) {
         let needs_self_flush = owner.wrapper.borrow().is_some()
             || owner.input.borrow().is_some()
-            || self.spec.borrow().live_region != LiveRegion::None
+            || effective_live_region(&self.spec.borrow()) != LiveRegion::None
             || {
                 #[cfg(feature = "api-23")]
                 {
@@ -181,7 +191,8 @@ impl State {
             self.provider_visibility(owner)?;
         }
         let spec = self.spec.borrow();
-        if spec.live_region == LiveRegion::None || spec.hidden || !owner.visible_in_tree() {
+        let live_region = effective_live_region(&spec);
+        if live_region == LiveRegion::None || spec.hidden || !owner.visible_in_tree() {
             self.announced.borrow_mut().take();
             return Ok(());
         }
@@ -196,10 +207,12 @@ impl State {
             text.push_str(&value);
         }
         let previous = self.announced.borrow_mut().replace(text.clone());
-        if previous.as_ref().is_some_and(|old| *old != text) && !text.is_empty() {
-            owner
-                .host
-                .accessibility_live(owner.dispatcher.clone(), text)?;
+        if !text.is_empty() && previous.as_deref() != Some(text.as_str()) {
+            owner.host.accessibility_live(
+                owner.dispatcher.clone(),
+                text,
+                live_region == LiveRegion::Polite,
+            )?;
         }
         Ok(())
     }

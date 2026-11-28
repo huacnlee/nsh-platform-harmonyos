@@ -1792,18 +1792,24 @@ class EditorEntry {
       this.menuInteracting = false;
     }, 60);
   }
-  blurFromOther(): void {
+  blurFromOther(nextUi: UIContext): void {
     if (!this.focused || this.closed) {
       return;
     }
     this.clearMenuInteraction();
-    try {
-      if (this.settings.multiline && !this.settings.secure) {
-        this.area.stopEditing();
-      } else {
-        this.line.stopEditing();
-      }
-    } catch {}
+    // Only call stopEditing() when focus moves across distinct window UIContexts
+    // (e.g. PC MainWindow <-> SubWindow). Within the same UIContext (such as
+    // tapping between two inputs on Phone), ArkUI transfers focus directly and
+    // calling stopEditing() would prematurely dismiss the mobile soft keyboard.
+    if (this.editorUIContext() !== nextUi) {
+      try {
+        if (this.settings.multiline && !this.settings.secure) {
+          this.area.stopEditing();
+        } else {
+          this.line.stopEditing();
+        }
+      } catch {}
+    }
     this.emit("blur");
   }
   emit(
@@ -1837,7 +1843,7 @@ class EditorEntry {
       this.clearMenuInteraction();
       const previous = activeEditorsByContext.get(this.context);
       if (previous && previous !== this) {
-        previous.blurFromOther();
+        previous.blurFromOther(this.editorUIContext());
       }
       activeEditorsByContext.set(this.context, this);
       const wasFocused = this.focused;

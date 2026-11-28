@@ -9,7 +9,7 @@ use crate::text::typography::NativeText;
 
 impl Node {
     pub(crate) fn input_priority(&self) -> bool {
-        self.pinned.get() != (0.0, 0.0)
+        self.sticky_z.get().is_some() || self.pinned.get() != (0.0, 0.0)
     }
     pub(crate) fn input_visible(&self) -> bool {
         if !self.active.get()

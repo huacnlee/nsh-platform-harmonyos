@@ -155,6 +155,7 @@ struct MultiButtonAlert {
         })
           .id("nsh-alert-input")
           .width("100%")
+          .enterKeyType(EnterKeyType.Done)
           .defaultFocus(true)
           .onAppear((): void => {
             try {
@@ -367,6 +368,7 @@ export function showNativeAlert(options: NativeAlertOptions): () => void {
       ? options.ui.openBindSheet(view, sheetOptions)
       : prompt.openCustomDialog(view, {
           autoCancel: options.autoCancel,
+          keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
           onWillDismiss: (event: DismissDialogAction): void => {
             if (allowDismiss()) {
               event.dismiss();

@@ -228,6 +228,7 @@ pub(crate) struct Mounter {
     nodes: BTreeMap<NodeId, Rc<Node>>,
     // Back priority must not depend on insertion order.
     stacks: Vec<NodeId>,
+    tab_bars: BTreeMap<NodeId, bool>,
     removed: Vec<Rc<Node>>,
     retired: VecDeque<(u64, Vec<Rc<Node>>)>,
     epoch: u64,
@@ -535,7 +536,8 @@ impl Mounter {
             // Do not reply early while the window still displays the dialog.
             return Ok(());
         }
-        self.route_back(true)
+        self.route_back(true)?;
+        self.sync_tab_bar_push_hidden()
     }
     pub(crate) fn dismiss_keyboard(&self) -> Result<()> {
         self.node(nsh_core::ROOT_ID)?.dismiss_keyboard()
@@ -639,11 +641,59 @@ impl Mounter {
         }
         false
     }
+    fn enclosing_modal_scope(&self, mut id: NodeId) -> Option<NodeId> {
+        while let Ok(node) = self.node(id) {
+            if let Some(modal) = node.modal.borrow().as_ref()
+                && !modal.is_main_window_host()
+            {
+                return Some(id);
+            }
+            let parent = node.parent.get()?;
+            id = parent;
+        }
+        None
+    }
+    fn node_shown_in_layout(&self, node: &Rc<Node>) -> bool {
+        let mut frames = Vec::new();
+        let mut cur = Some(node.clone());
+        while let Some(current) = cur {
+            if current.id == nsh_core::ROOT_ID {
+                break;
+            }
+            if current.kind == ViewKind::Modal {
+                let modal_open = current
+                    .modal
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|modal| modal.is_main_window_host() || modal.is_visible());
+                if !modal_open {
+                    return false;
+                }
+                break;
+            }
+            let frame = current.frame.get();
+            frames.push(nsh_core::Bounds::new(
+                nsh_core::Point::new(nsh_core::Points(frame.x), nsh_core::Points(frame.y)),
+                nsh_core::Size::new(
+                    nsh_core::Points(frame.width),
+                    nsh_core::Points(frame.height),
+                ),
+            ));
+            cur = current
+                .parent
+                .get()
+                .and_then(|id| self.nodes.get(&id).cloned());
+        }
+        nsh_core::navigation::shown_in_layout(frames)
+    }
     fn stack_candidate(
         &self,
         id: NodeId,
     ) -> Option<(NodeId, Rc<crate::navigation::stack::Screen>)> {
-        let stack = self.node(id).ok().filter(|node| node.visible_in_tree())?;
+        let stack = self
+            .node(id)
+            .ok()
+            .filter(|node| node.visible_in_tree() && self.node_shown_in_layout(node))?;
         let screens: Vec<_> = stack
             .children
             .borrow()
@@ -663,13 +713,60 @@ impl Mounter {
             .stacks
             .iter()
             .copied()
-            .filter(|id| scope.is_none_or(|scope| self.contains(scope, *id)))
+            .filter(|id| self.enclosing_modal_scope(*id) == scope)
             .filter_map(|id| self.stack_candidate(id))
             .collect();
         nsh_core::navigation::innermost(&candidates, |(outer, _), (inner, _)| {
             self.contains(*outer, *inner)
         })
         .cloned()
+    }
+    fn sync_tab_bar_push_hidden(&mut self) -> Result<()> {
+        if self.tab_bars.is_empty() {
+            return Ok(());
+        }
+        let updates: Vec<(NodeId, bool)> = self
+            .tab_bars
+            .iter()
+            .filter_map(|(&tab_id, &was_hidden)| {
+                self.node(tab_id).ok()?;
+                let scope = self.enclosing_modal_scope(tab_id);
+                let next_hidden = self.stacks.iter().copied().any(|stack_id| {
+                    if self.enclosing_modal_scope(stack_id) != scope {
+                        return false;
+                    }
+                    let Ok(stack) = self.node(stack_id) else {
+                        return false;
+                    };
+                    if !stack.visible_in_tree() || !self.node_shown_in_layout(stack) {
+                        return false;
+                    }
+                    stack
+                        .children
+                        .borrow()
+                        .iter()
+                        .filter_map(std::rc::Weak::upgrade)
+                        .filter_map(|node| node.screen.borrow().clone())
+                        .filter(|screen| !screen.popped.get())
+                        .any(|screen| screen.config.borrow().hides_bottom_bar_when_pushed)
+                });
+                (next_hidden != was_hidden).then_some((tab_id, next_hidden))
+            })
+            .collect();
+        for (tab_id, next_hidden) in updates {
+            if let Some(state) = self.tab_bars.get_mut(&tab_id) {
+                *state = next_hidden;
+            }
+            if let Ok(node) = self.node(tab_id)
+                && let Some(component) = node.component.borrow().as_ref()
+            {
+                component.props(vec![(
+                    Arc::from("pushHidden"),
+                    Some(nsh_core::JsonValue::Bool(next_hidden)),
+                )])?;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn reconcile_navigation(&mut self) -> Result<()> {
         let result = (|| -> Result<()> {
@@ -710,6 +807,7 @@ impl Mounter {
                 }
                 modal.present_if_pending()?;
             }
+            self.sync_tab_bar_push_hidden()?;
             Ok(())
         })();
         // Capture releases deferred by a batch still need synchronization if
@@ -2073,6 +2171,7 @@ impl Mounter {
             mount,
             nodes: BTreeMap::from([(nsh_core::ROOT_ID, root)]),
             stacks: Vec::new(),
+            tab_bars: BTreeMap::new(),
             removed: Vec::new(),
             retired: VecDeque::new(),
             epoch: 0,
@@ -2296,6 +2395,7 @@ impl Mounter {
             {
                 self.stacks.remove(index);
             }
+            self.tab_bars.remove(&id);
             self.removed.push(node);
         }
         Ok(())
@@ -2449,6 +2549,7 @@ impl Mounter {
             let result = (|| -> Result<()> {
                 match item {
                     MountItem::Component { id, name } => {
+                        let is_tab_bar = name.as_ref() == nsh_core::platform::TAB_BAR_COMPONENT;
                         if let Some(component) = self.components.make(
                             self.env,
                             &name,
@@ -2459,9 +2560,14 @@ impl Mounter {
                             self.shaders.frame_rate(),
                             self.dispatcher.clone(),
                         )? {
-                            let node = self.node(id)?;
+                            let node = self.node(id)?.clone();
                             node.component_animated.borrow_mut().clear();
                             node.attach_component(component)?;
+                            if is_tab_bar {
+                                self.tab_bars.insert(id, false);
+                            } else {
+                                self.tab_bars.remove(&id);
+                            }
                             if node.scene_active() {
                                 node.invalidate_scene();
                             }
@@ -2940,6 +3046,7 @@ impl Mounter {
                         Command::Announce(text) => self.host.accessibility_event(
                             self.dispatcher.clone(),
                             Some(text),
+                            None,
                             None,
                         )?,
                         Command::AccessibilityFocus => {
