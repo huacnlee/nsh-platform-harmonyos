@@ -3139,6 +3139,7 @@ dependencies = [
  "nsh-extra",
  "nsh-package",
  "nsh-testing",
+ "nsh-updater",
  "ohos-accessibility-binding",
  "ohos-arkui-binding",
  "ohos-audio-binding",

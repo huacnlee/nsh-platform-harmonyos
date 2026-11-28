@@ -85,6 +85,7 @@ serde.workspace = true
 nsh-core.workspace = true
 nsh-engine = { workspace = true, features = ["js"] }
 nsh-base.workspace = true
+nsh-updater.workspace = true
 nsh-dev = { workspace = true, features = ["server"] }
 nsh-testing = { workspace = true, features = ["bundle", "agent"] }
 image.workspace = true
@@ -169,6 +170,7 @@ nsh-core = "0.7"
 nsh-engine = { version = "0.7", default-features = false }
 nsh-base = { version = "0.7", default-features = false }
 nsh-package = "0.7"
+nsh-updater = "0.7"
 nsh-dev = "0.7"
 nsh-testing = { version = "0.7", default-features = false }
 nsh-extra = { version = "0.7", default-features = false }
