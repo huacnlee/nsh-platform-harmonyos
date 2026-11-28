@@ -616,6 +616,66 @@ impl Modal {
                 .as_ref()
                 .is_some_and(|w| w.focused && !w.hidden && !w.minimized)
     }
+    pub(crate) fn is_desktop_visible(&self) -> bool {
+        self.shown.get()
+            && !self.closing.get()
+            && self
+                .desktop
+                .borrow()
+                .as_ref()
+                .is_some_and(|w| !w.hidden && !w.minimized)
+    }
+    pub(crate) fn desktop_closable(&self) -> bool {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.attrs.closable != Some(false))
+    }
+    pub(crate) fn desktop_minimizable(&self) -> bool {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.attrs.minimizable != Some(false))
+    }
+    pub(crate) fn desktop_zoomable(&self) -> bool {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .is_some_and(|w| w.attrs.maximizable != Some(false) && w.attrs.resizable != Some(false))
+    }
+    pub(crate) fn desktop_scale_factor(&self) -> Option<f32> {
+        self.desktop
+            .borrow()
+            .as_ref()
+            .map(|w| w.scale_factor)
+            .filter(|s| s.is_finite() && *s > 0.0)
+    }
+    pub(crate) fn host_sub_window_scale_factor(&self) -> Option<f32> {
+        self.host_sub_window
+            .borrow()
+            .upgrade()
+            .filter(|host| host.is_desktop_window())
+            .and_then(|host| host.desktop_scale_factor())
+    }
+    pub(crate) fn apply_desktop_backdrop(&self) {
+        let Some(owner) = self.owner.upgrade() else {
+            return;
+        };
+        let Some(backdrop) = self.desktop.borrow().as_ref().map(|w| {
+            w.attrs
+                .backdrop
+                .unwrap_or(nsh_core::desktop::Backdrop::None)
+        }) else {
+            return;
+        };
+        if let Some(mount) = self.sub_window.borrow().as_ref() {
+            crate::render::mount::apply_window_backdrop(
+                &mount.container.borrow(),
+                backdrop,
+                owner.appearance.get(),
+            );
+        }
+    }
     pub(crate) fn is_desktop_modal(&self) -> bool {
         self.is_visible()
             && self
@@ -821,6 +881,7 @@ impl Modal {
             container,
             _root: root,
         });
+        self.apply_desktop_backdrop();
         if let Some(win) = self.desktop.borrow_mut().as_mut() {
             win.platform_window_id = Some(platform_window_id);
         }
@@ -855,6 +916,9 @@ impl Modal {
                 return Ok(());
             };
             win.attrs.merge(&diff);
+        }
+        if diff.backdrop.is_some() {
+            self.apply_desktop_backdrop();
         }
         owner.restore_style()?;
         owner
@@ -970,9 +1034,19 @@ impl Modal {
     }
     pub(crate) fn desktop_window_control(&self, control: WindowControl) -> Result<()> {
         match control {
-            WindowControl::Minimize => self.desktop_request(WindowRequest::Minimize),
+            WindowControl::Minimize => {
+                if self.desktop_minimizable() {
+                    self.desktop_request(WindowRequest::Minimize)?;
+                }
+                Ok(())
+            }
             WindowControl::Maximize => self.desktop_toggle_maximize(),
-            WindowControl::Close => self.on_sub_window_close_press(CloseReason::CloseButton),
+            WindowControl::Close => {
+                if self.desktop_closable() {
+                    self.on_sub_window_close_press(CloseReason::CloseButton)?;
+                }
+                Ok(())
+            }
         }
     }
     pub(crate) fn desktop_start_moving(&self) -> Result<()> {
@@ -998,12 +1072,7 @@ impl Modal {
         let Some(owner) = self.owner.upgrade() else {
             return Ok(());
         };
-        let maximizable = self
-            .desktop
-            .borrow()
-            .as_ref()
-            .is_some_and(|w| w.attrs.maximizable != Some(false));
-        if !maximizable {
+        if !self.desktop_zoomable() {
             return Ok(());
         }
         owner

@@ -814,9 +814,14 @@ impl State {
         Ok(())
     }
     fn is_active(&self) -> bool {
+        let has_visible_surface = self.visible
+            || self
+                .mounter
+                .as_ref()
+                .is_some_and(Mounter::has_visible_desktop_sub_windows);
         self.engine.is_some()
             && self.attached
-            && self.visible
+            && has_visible_surface
             && self.environment.lifecycle != nsh_engine::Lifecycle::Background
     }
     fn update_back(&mut self) {

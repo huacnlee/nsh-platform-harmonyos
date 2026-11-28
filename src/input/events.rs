@@ -388,7 +388,7 @@ impl Interaction {
                         if let Some(owner) = weak.upgrade() {
                             // OnClick's component payload is physical pixels on
                             // device; touch input below already uses the node's vp.
-                            let scale = owner.scale.get().max(1.0);
+                            let scale = owner.effective_scale();
                             let x = event.component_f32(0).unwrap_or_default() / scale;
                             let y = event.component_f32(1).unwrap_or_default() / scale;
                             if !owner.hit_within_clip_path(x, y) {
@@ -769,7 +769,7 @@ impl Interaction {
                             if !uris.is_empty() {
                                 let _ = drag.set_drag_result(DragResult::Successful);
                                 if owner.interaction.mask().contains(EventKind::FileDrop) {
-                                    let scale = owner.scale.get().max(1.0);
+                                    let scale = owner.effective_scale();
                                     let surface = owner.key_surface_root();
                                     let origin = surface
                                         .native
@@ -830,7 +830,7 @@ impl Interaction {
                             return;
                         }
                         // Gesture input snapshots are physical pixels even on VP nodes.
-                        let scale = owner.scale.get().max(1.0);
+                        let scale = owner.effective_scale();
                         let (x, y) = event
                             .input
                             .map_or((0.0, 0.0), |input| (input.x / scale, input.y / scale));
@@ -1052,7 +1052,7 @@ impl Interaction {
         let values = self.gesture_values.get();
         let events = self.mask();
         let activation = self.props.borrow().pan_activation;
-        let spec = gesture_spec(values, events, activation, blocked, owner.scale.get());
+        let spec = gesture_spec(values, events, activation, blocked, owner.effective_scale());
         if self.applied_gesture_spec.get() == Some(spec) {
             return Ok(());
         }
@@ -1140,7 +1140,7 @@ impl Interaction {
                         let ended = event
                             .event_action_type
                             .intersects(GestureEventAction::End | GestureEventAction::Cancel);
-                        let scale = owner.scale.get().max(1.0);
+                        let scale = owner.effective_scale();
                         let mut just_activated = false;
 
                         if accept {
@@ -1661,19 +1661,31 @@ fn dispatch_window_control(
         cur = node.parent_node.borrow().upgrade();
     }
     use crate::services::desktop::{DesktopEvent, WireCommand, wire_request};
+    let (minimizable, zoomable, closable) = {
+        let main = owner.main_window.borrow();
+        (
+            main.minimizable,
+            main.maximizable && main.resizable,
+            main.closable,
+        )
+    };
     match control {
         nsh_core::desktop::WindowControl::Minimize => {
-            owner
-                .host
-                .desktop_command(&wire_request(&nsh_core::desktop::WindowRequest::Minimize))?;
+            if minimizable {
+                owner
+                    .host
+                    .desktop_command(&wire_request(&nsh_core::desktop::WindowRequest::Minimize))?;
+            }
         }
         nsh_core::desktop::WindowControl::Maximize => {
-            owner
-                .host
-                .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+            if zoomable {
+                owner
+                    .host
+                    .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+            }
         }
         nsh_core::desktop::WindowControl::Close => {
-            if let Some(route) = owner.dispatcher.upgrade() {
+            if closable && let Some(route) = owner.dispatcher.upgrade() {
                 route.send(crate::app::runtime::Message::HostDesktop(
                     DesktopEvent::ClosePress(nsh_core::desktop::CloseReason::CloseButton),
                 ));
@@ -2040,7 +2052,7 @@ fn axis_modifiers(owner: &Node, input: &ArkUIInputEvent) -> nsh_core::keymap::Mo
 pub(crate) fn handle_axis_event(owner: &Rc<Node>, input: &ArkUIInputEvent) -> Result<()> {
     use crate::input::wheel::{AxisAction, AxisDispatch, AxisEventKey, AxisInput, AxisNode};
     let surface = owner.key_surface_root();
-    let scale = owner.scale.get().max(1.0);
+    let scale = owner.effective_scale();
     let surface_origin = surface
         .native
         .borrow()
@@ -2236,13 +2248,13 @@ fn handle_window_drag_press(
             .as_ref()
             .is_some_and(|modal| modal.is_main_window_host())
     {
-        let (movable, maximizable) = {
+        let (movable, zoomable) = {
             let main = owner.main_window.borrow();
-            (main.movable, main.maximizable)
+            (main.movable, main.maximizable && main.resizable)
         };
         if double_click {
             owner.touches.borrow_mut().clear_pending_window_drag();
-            if maximizable {
+            if zoomable {
                 owner.host.desktop_command(
                     &crate::services::desktop::WireCommand::ToggleMaximize { window_id: None },
                 )?;

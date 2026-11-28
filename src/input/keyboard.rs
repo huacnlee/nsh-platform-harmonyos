@@ -34,6 +34,29 @@ impl crate::render::node::Node {
         }
         Ok(())
     }
+    pub(crate) fn effective_scale(&self) -> f32 {
+        if let Some(modal) = self.modal.borrow().as_ref() {
+            if let Some(scale) = modal.desktop_scale_factor() {
+                return scale;
+            }
+            if let Some(scale) = modal.host_sub_window_scale_factor() {
+                return scale;
+            }
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                if let Some(scale) = modal.desktop_scale_factor() {
+                    return scale;
+                }
+                if let Some(scale) = modal.host_sub_window_scale_factor() {
+                    return scale;
+                }
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        self.scale.get().max(1.0)
+    }
     pub(crate) fn key_window_id(&self) -> NodeId {
         if let Some(modal) = self.modal.borrow().as_ref() {
             if modal.is_desktop_window() {
@@ -622,6 +645,21 @@ impl KeyboardWindow {
                     route.send(crate::app::runtime::Message::DesktopMenuAction {
                         id: 0,
                         role: Some(nsh_core::desktop::MenuRole::Quit),
+                    });
+                    consumed = true;
+                } else if !repeat
+                    && snapshot.desktop
+                    && !editing
+                    && stroke.key == Key::Char('w')
+                    && stroke.modifiers
+                        == (Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        })
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuAction {
+                        id: 0,
+                        role: Some(nsh_core::desktop::MenuRole::Close),
                     });
                     consumed = true;
                 } else if !repeat

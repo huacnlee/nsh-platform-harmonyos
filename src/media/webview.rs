@@ -1483,7 +1483,7 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                         };
                         surface = parent;
                     }
-                    let scale = node.scale.get().max(1.0);
+                    let scale = node.effective_scale();
                     let (origin_x, origin_y) = surface
                         .native
                         .borrow()

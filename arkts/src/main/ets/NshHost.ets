@@ -579,6 +579,47 @@ class HostSession {
   private screenReaderHandler?: (enabled: boolean) => void;
   private reduceMotionHandler?: (enabled: boolean) => void;
 
+  private resolveEffectiveLifecycle(): string {
+    if (this.desktop !== undefined) {
+      if (this.desktop.isMainWindowVisible()) {
+        try {
+          if (this.mainWindow.isFocused()) {
+            return "active";
+          }
+        } catch {}
+      }
+      if (this.desktop.hasFocusedSubWindow()) {
+        return "active";
+      }
+      if (this.desktop.isMainWindowVisible() || this.desktop.hasVisibleSubWindows()) {
+        return "inactive";
+      }
+      return "background";
+    }
+    try {
+      return this.mainWindow.isWindowShowing()
+        ? this.mainWindow.isFocused()
+          ? "active"
+          : "inactive"
+        : "background";
+    } catch {
+      return "background";
+    }
+  }
+
+  static resolveAlertOptions(options: NativeAlertOptions): NativeAlertOptions {
+    const windowName = options.ui.getWindowName() ?? "";
+    if (!windowName) {
+      return options;
+    }
+    const session = HostSession.windows.get(windowName);
+    const subUi = session?.desktop?.getFocusedSubWindowUIContext();
+    if (subUi !== undefined) {
+      options.ui = subUi;
+    }
+    return options;
+  }
+
   private readonly onWindowStageEvent = (event: window.WindowStageEventType): void => {
     if (this.closed) {
       return;
@@ -589,14 +630,26 @@ class HostSession {
         this.onLifecycleChanged("active");
         break;
       case window.WindowStageEventType.SHOWN:
-        this.onLifecycleChanged(this.mainWindow.isFocused() ? "active" : "inactive");
+        this.onLifecycleChanged(
+          this.mainWindow.isFocused() || (this.desktop?.hasFocusedSubWindow() ?? false)
+            ? "active"
+            : "inactive",
+        );
         break;
       case window.WindowStageEventType.INACTIVE:
       case window.WindowStageEventType.PAUSED:
-        this.onLifecycleChanged("inactive");
+        this.onLifecycleChanged(
+          this.desktop?.hasFocusedSubWindow() ? "active" : "inactive",
+        );
         break;
       case window.WindowStageEventType.HIDDEN:
-        this.onLifecycleChanged("background");
+        if (this.desktop?.hasVisibleSubWindows()) {
+          this.onLifecycleChanged(
+            this.desktop.hasFocusedSubWindow() ? "active" : "inactive",
+          );
+        } else {
+          this.onLifecycleChanged("background");
+        }
         break;
     }
   };
@@ -794,6 +847,11 @@ class HostSession {
           (targetId: number, content: FrameNode | null): boolean =>
             this.runtimeContext.attachNativeNode(targetId, content),
           (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
+          (): void => {
+            if (!this.closed && this.desktop !== undefined && !this.desktop.isMainWindowVisible()) {
+              this.onLifecycleChanged(this.resolveEffectiveLifecycle());
+            }
+          },
         );
         this.runtimeContext.setFocusHandler((componentId: string): boolean =>
           this.desktop?.requestComponentFocus(componentId) ?? false,
@@ -1597,7 +1655,8 @@ const nativeHostModule = getNativeModule();
 nativeHostModule.nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
-  showNativeAlert,
+  (options: NativeAlertOptions): (() => void) =>
+    showNativeAlert(HostSession.resolveAlertOptions(options)),
 );
 
 interface WindowPixelSize {

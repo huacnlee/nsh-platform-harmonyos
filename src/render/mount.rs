@@ -388,39 +388,22 @@ impl Mounter {
     }
     fn apply_main_backdrop(&self) {
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
-            use nsh_core::{desktop::Backdrop, platform::Appearance};
-            use ohos_arkui_binding::{
-                common::attribute::ArkUINodeAttributeNumber,
-                types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
-            };
-            let backdrop = self.main_window.borrow().backdrop;
-            let style = match backdrop {
-                Backdrop::None => None,
-                Backdrop::Window => Some(BlurStyle::BackgroundThick),
-                Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
-                Backdrop::Popover => Some(BlurStyle::BackgroundThin),
-                Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
-            };
-            if let Some(style) = style {
-                // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
-                let color_mode = match self.appearance.get() {
-                    Appearance::System => 0,
-                    Appearance::Light => 1,
-                    Appearance::Dark => 2,
-                };
-                let _ = root.native.borrow().set_background_blur_style([
-                    ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
-                    ArkUINodeAttributeNumber::Int(color_mode),
-                ]);
-            } else {
-                let _ = root.native.borrow().reset_attribute(A::BackgroundBlurStyle);
-            }
+            apply_window_backdrop(
+                &root.native.borrow(),
+                self.main_window.borrow().backdrop,
+                self.appearance.get(),
+            );
         }
     }
     fn system_appearance(&self) -> Result<()> {
         let appearance = self.appearance.get();
         self.host.set_appearance(appearance)?;
         self.apply_main_backdrop();
+        for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
+            if modal.is_desktop_window() {
+                modal.apply_desktop_backdrop();
+            }
+        }
         let dark =
             appearance.resolve(self.platform.get().color_scheme) == nsh_engine::ColorScheme::Dark;
         let config = self.dispatcher.upgrade().and_then(|route| {
@@ -916,6 +899,12 @@ impl Mounter {
             .iter()
             .filter_map(std::rc::Weak::upgrade)
             .any(|m| m.is_desktop_window() && m.is_visible())
+    }
+    pub(crate) fn has_visible_desktop_sub_windows(&self) -> bool {
+        self.modals
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|m| m.is_desktop_visible())
     }
     fn close_hosted_main_window(
         &mut self,
@@ -1422,6 +1411,9 @@ impl Mounter {
         };
         match event {
             DesktopEvent::ClosePress(reason) => {
+                if !self.main_window.borrow().closable {
+                    return Ok(());
+                }
                 if let Some(window_id) = self.desktop.hosted_main_window {
                     self.control.dispatch_event(
                         window_id,
@@ -1648,12 +1640,18 @@ impl Mounter {
                 }
                 MenuRole::Close => {
                     if let Some(modal) = self.focused_desktop_modal() {
-                        modal.on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
-                        if !modal.is_visible()
-                            && let Some(window_id) = modal.node_id()
-                        {
-                            self.close_desktop_children(window_id)?;
+                        if modal.desktop_closable() {
+                            modal
+                                .on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
+                            if !modal.is_visible()
+                                && let Some(window_id) = modal.node_id()
+                            {
+                                self.close_desktop_children(window_id)?;
+                            }
                         }
+                        return Ok(());
+                    }
+                    if !self.main_window.borrow().closable {
                         return Ok(());
                     }
                     return self.desktop_event(crate::services::desktop::DesktopEvent::ClosePress(
@@ -1662,8 +1660,10 @@ impl Mounter {
                 }
                 MenuRole::Minimize => {
                     if let Some(modal) = self.focused_desktop_modal() {
-                        modal.desktop_request(WindowRequest::Minimize)?;
-                    } else {
+                        if modal.desktop_minimizable() {
+                            modal.desktop_request(WindowRequest::Minimize)?;
+                        }
+                    } else if self.main_window.borrow().minimizable {
                         self.host
                             .desktop_command(&wire_request(&WindowRequest::Minimize))?;
                     }
@@ -1692,8 +1692,15 @@ impl Mounter {
                     if let Some(modal) = self.focused_desktop_modal() {
                         modal.desktop_toggle_maximize()?;
                     } else {
-                        self.host
-                            .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+                        let can_zoom = {
+                            let main = self.main_window.borrow();
+                            main.maximizable && main.resizable
+                        };
+                        if can_zoom {
+                            self.host.desktop_command(&WireCommand::ToggleMaximize {
+                                window_id: None,
+                            })?;
+                        }
                     }
                     return Ok(());
                 }
@@ -3714,5 +3721,38 @@ pub(crate) fn window_avoid_environment(
         safe_left: Some(left),
         keyboard_height: Some(keyboard_height),
         ..crate::app::environment::NshEnvironment::default()
+    }
+}
+
+pub(crate) fn apply_window_backdrop(
+    node: &ohos_arkui_binding::common::node::ArkUINode,
+    backdrop: nsh_core::desktop::Backdrop,
+    appearance: nsh_core::platform::Appearance,
+) {
+    use nsh_core::{desktop::Backdrop, platform::Appearance};
+    use ohos_arkui_binding::{
+        common::attribute::ArkUINodeAttributeNumber,
+        types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
+    };
+    let style = match backdrop {
+        Backdrop::None => None,
+        Backdrop::Window => Some(BlurStyle::BackgroundThick),
+        Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
+        Backdrop::Popover => Some(BlurStyle::BackgroundThin),
+        Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
+    };
+    if let Some(style) = style {
+        // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
+        let color_mode = match appearance {
+            Appearance::System => 0,
+            Appearance::Light => 1,
+            Appearance::Dark => 2,
+        };
+        let _ = node.set_background_blur_style([
+            ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
+            ArkUINodeAttributeNumber::Int(color_mode),
+        ]);
+    } else {
+        let _ = node.reset_attribute(A::BackgroundBlurStyle);
     }
 }

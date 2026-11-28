@@ -338,9 +338,10 @@ impl Touches {
                 input.pointer_window_x_by_index(i),
                 input.pointer_window_y_by_index(i),
             );
+            let scale = root.effective_scale();
             let page = (
-                window.0 - origin.x as f32 / root.scale.get(),
-                window.1 - origin.y as f32 / root.scale.get(),
+                window.0 - origin.x as f32 / scale,
+                window.1 - origin.y as f32 / scale,
             );
             if phase == TouchPhase::Start && changed == Some(id) {
                 let Some(node) = hit(root, local, &nsh_core::Matrix::IDENTITY)? else {
