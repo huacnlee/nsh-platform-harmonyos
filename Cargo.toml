@@ -22,12 +22,34 @@ path = "src/main.rs"
 
 [features]
 # None by default: the CLI builds for the computer without them, and the
-# runner it writes asks for `backend` (with `dev`, `api-23` or `api-26` as
-# the app needs).
+# runner it writes enables only the parts the app uses (or `backend` + `dev`
+# in development/testing).
 default = []
-# What the HarmonyOS library is built with.
-backend = ["editor", "emoji-picker", "highlight", "math", "plot", "rich-editor", "term", "zlib", "crypto", "websocket"]
-dev = ["dep:nsh-dev", "dep:nsh-testing", "dep:url"]
+# Full runtime feature set, for embedders and fallback/development runners.
+backend = [
+  "js",
+  "shader",
+  "updater",
+  "editor",
+  "emoji-picker",
+  "highlight",
+  "math",
+  "plot",
+  "rich-editor",
+  "term",
+  "zlib",
+  "crypto",
+  "websocket",
+]
+# JS apps (bundles, bytecode, signed packages); without it, a Rust app links
+# no QuickJS, `nsh-js`, or `nsh-package`.
+js = ["nsh-engine/js-core", "dep:nsh-package"]
+dev = ["backend", "dep:nsh-dev", "dep:nsh-testing", "dep:url"]
+# Shaders (`Shader`, `ShaderEffect`, `ShaderTransition`, page/dialog shader
+# transitions), translated from WGSL to GLSL ES 3.00 via `naga`.
+shader = ["nsh-core/shader", "nsh-core/glsl"]
+# Signed OTA package updates (`nsh/updater`).
+updater = ["nsh-engine/updater"]
 # Registers the HarmonyOS HMS speech recognizer with `nsh-extra`'s `speech`
 # module when an app enables `nsh-extra`'s `speech` feature.
 speech = ["dep:nsh-extra"]
@@ -50,9 +72,9 @@ math = ["nsh-base/math"]
 # `EmojiPicker`, with Unicode's emoji and their English names (about 440 kB).
 emoji-picker = ["nsh-base/emoji-picker"]
 # The standard JS module `zlib`: deflate, gzip, brotli and zstd.
-zlib = ["nsh-engine/zlib"]
+zlib = ["js", "nsh-engine/zlib"]
 # The standard JS module `crypto` and the globals of Web Crypto.
-crypto = ["nsh-engine/crypto"]
+crypto = ["js", "nsh-engine/crypto"]
 # The native WebSocket client (`websocket` module `connect`). Without it,
 # `connect` rejects with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.
 websocket = ["nsh-engine/websocket"]
@@ -84,7 +106,16 @@ serde_json.workspace = true
 serde.workspace = true
 nsh-core.workspace = true
 nsh-engine = { workspace = true, features = ["js"] }
-nsh-base.workspace = true
+nsh-base = { workspace = true, features = [
+  "editor",
+  "emoji-picker",
+  "highlight",
+  "math",
+  "plot",
+  "rich-editor",
+  "term",
+] }
+nsh-bundler = { workspace = true, features = ["bundle"] }
 nsh-dev = { workspace = true, features = ["server"] }
 nsh-testing = { workspace = true, features = ["bundle", "agent"] }
 image.workspace = true
@@ -92,14 +123,14 @@ ctrlc.workspace = true
 
 # The backend, on the device.
 [target.'cfg(target_env = "ohos")'.dependencies]
-nsh-core = { workspace = true, features = ["svg", "shader", "glsl"] }
+nsh-core = { workspace = true, features = ["svg"] }
 getrandom = { workspace = true, features = ["std"] }
-nsh-package.workspace = true
+nsh-package = { workspace = true, optional = true }
 nsh-dev = { workspace = true, features = ["client"], optional = true }
 nsh-testing = { workspace = true, features = ["agent"], optional = true }
 nsh-extra = { workspace = true, features = ["speech"], optional = true }
 url = { workspace = true, optional = true }
-nsh-engine = { workspace = true, features = ["js"] }
+nsh-engine.workspace = true
 nsh-base.workspace = true
 napi-ohos.workspace = true
 napi-derive-ohos.workspace = true
@@ -132,7 +163,6 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
-ttf-parser.workspace = true
 base64.workspace = true
 percent-encoding.workspace = true
 unicode-segmentation.workspace = true
@@ -168,6 +198,7 @@ unreachable_pub = "deny"
 nsh-core = "0.7"
 nsh-engine = { version = "0.7", default-features = false }
 nsh-base = { version = "0.7", default-features = false }
+nsh-bundler = { version = "0.7", default-features = false }
 nsh-package = "0.7"
 nsh-dev = "0.7"
 nsh-testing = { version = "0.7", default-features = false }
@@ -177,7 +208,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 ctrlc = { version = "3", features = ["termination"] }
 
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 getrandom = "0.3"
 json5 = "1.3"
 log = "0.4"
@@ -187,7 +218,6 @@ rustc-hash = "2.1"
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", default-features = false }
-ttf-parser = "0.25"
 unicode-segmentation = "1.13"
 ureq = "~3.5.2"
 url = "2.5"
@@ -219,7 +249,7 @@ ohos-audio-binding = { version = "0.1.1", default-features = false, features = [
 ohos-multi-modal-input-binding = { version = "0.1.1", default-features = false, features = ["api-20"] }
 ohos-xcomponent-binding = { version = "0.6.2", default-features = false, features = ["callbacks", "multi_mode", "api-20"] }
 ohos-native-window-binding = { version = "0.3.4", default-features = false, features = ["api-20"] }
-ohos-hilog-binding = { version = "0.2.6", features = ["log"] }
+ohos-hilog-binding = { version = "0.2.6", default-features = false }
 ohos-net-connection-binding = { version = "0.1.4", default-features = false }
 ohos-vibrator-binding = { version = "0.2.5", default-features = false, features = ["api-20"] }
 

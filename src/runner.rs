@@ -17,6 +17,7 @@ use anyhow::{Context as _, bail};
 use crate::{
     nshm::{LinkedCrate, PatchEntry},
     paths::join_all,
+    prune::{Plan, UiRegistration},
     sdk::{ApiLevel, Arch, Ndk},
 };
 
@@ -28,22 +29,28 @@ pub(crate) const LIBRARY: &str = "libnsh_platform_harmonyos.so";
 /// when set, else this package's own source (the nshm's directory, a
 /// checkout or crates.io's copy) when it is still there, else this version
 /// from crates.io.
-fn backend(dev: bool, speech: bool, api: ApiLevel) -> String {
-    let mut enabled = vec!["\"backend\""];
-    if dev {
-        enabled.push("\"dev\"");
-    }
-    if speech {
-        enabled.push("\"speech\"");
+fn backend(plan: &Plan, dev: bool, speech: bool, api: ApiLevel) -> String {
+    let mut enabled: Vec<&str> = if dev {
+        vec!["backend", "dev"]
+    } else {
+        plan.backend_features()
+    };
+    if speech && !enabled.contains(&"speech") {
+        enabled.push("speech");
     }
     if let Some(feature) = api.backend_feature() {
         enabled.push(match feature {
-            "api-23" => "\"api-23\"",
-            "api-26" => "\"api-26\"",
+            "api-23" => "api-23",
+            "api-26" => "api-26",
             _ => unreachable!(),
         });
     }
-    let features = format!(", features = [{}]", enabled.join(", "));
+    let features = if enabled.is_empty() {
+        String::new()
+    } else {
+        let quoted: Vec<String> = enabled.into_iter().map(|f| format!("{f:?}")).collect();
+        format!(", features = [{}]", quoted.join(", "))
+    };
     let checkout = std::env::var_os("NSH_HARMONYOS_SOURCE")
         .map(PathBuf::from)
         .or_else(|| {
@@ -275,6 +282,7 @@ fn merge_patch_entries(base: &str, entries: &[PatchEntry]) -> String {
 pub(crate) fn write(
     dir: &Path,
     app: App<'_>,
+    plan: &Plan,
     dev: bool,
     speech: bool,
     api: ApiLevel,
@@ -295,6 +303,11 @@ pub(crate) fn write(
             if speech {
                 patches = sibling_nsh_patch(&patches, Some(&manifest), "nsh-extra");
             }
+            let call = if !dev && matches!(plan.ui, UiRegistration::RustApp) {
+                "backend::app!(rust = nsh_rust_app::app_ui_sets, nsh_rust_app::root);"
+            } else {
+                "backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);"
+            };
             (
                 format!(
                     "nsh_rust_app = {{ package = {}, path = {} }}\n",
@@ -302,10 +315,10 @@ pub(crate) fn write(
                     toml_string(&rust_app.to_string_lossy()),
                 ),
                 patches,
-                "// An app written in Rust: its UI sets (`nsh/base`'s, then its crates')\n\
-                 // and its root, which `NshSurface.runApp()` starts.\n\
-                 backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root);\n"
-                    .to_owned(),
+                format!(
+                    "// An app written in Rust: its UI sets and its root, which `NshSurface.runApp()` starts.\n\
+                     {call}\n"
+                ),
             )
         }
         App::TsxWithCrates {
@@ -329,24 +342,40 @@ pub(crate) fn write(
             if speech {
                 patches = sibling_nsh_patch(&patches, None, "nsh-extra");
             }
+            let call = match (&plan.ui, dev) {
+                (UiRegistration::Parts(parts), false) => format!(
+                    "backend::app!(parts = [{}], sets = [{}]);",
+                    parts.join(", "),
+                    sets.join(", ")
+                ),
+                _ => format!("backend::app!(sets = [{}]);", sets.join(", ")),
+            };
             (
                 dependencies,
                 patches,
                 format!(
                     "// A TSX app with Rust crates of its own: its bundle is a raw file of the\n\
                      // HAP (`loadResource`), and it imports the crates' UI sets.\n\
-                     backend::app!(sets = [{}]);\n",
-                    sets.join(", ")
+                     {call}\n"
                 ),
             )
         }
-        App::Tsx => (
-            String::new(),
-            crate::embedded::NSH_PATCH.to_owned(),
-            "// A TSX app: its bundle is a raw file of the HAP (`loadResource`).\n\
-             backend::app!();\n"
-                .to_owned(),
-        ),
+        App::Tsx => {
+            let call = match (&plan.ui, dev) {
+                (UiRegistration::Parts(parts), false) => {
+                    format!("backend::app!(parts = [{}]);", parts.join(", "))
+                }
+                _ => "backend::app!();".to_owned(),
+            };
+            (
+                String::new(),
+                crate::embedded::NSH_PATCH.to_owned(),
+                format!(
+                    "// A TSX app: its bundle is a raw file of the HAP (`loadResource`).\n\
+                     {call}\n"
+                ),
+            )
+        }
     };
     fs::create_dir_all(dir)?;
     fs::write(
@@ -360,8 +389,8 @@ pub(crate) fn write(
              [profile.release]\nlto = \"fat\"\ncodegen-units = 1\nstrip = true\n\n\
              [profile.dev.package.quickjs-jit-sys]\nopt-level = 3\n\
              [profile.dev.package.taffy]\nopt-level = 3\n\n\
-             {patch}\n[workspace]\n",
-            backend(dev, speech, api),
+             {patch}\n[workspace]\nresolver = \"3\"\n",
+            backend(plan, dev, speech, api),
         ),
     )?;
     fs::write(
@@ -628,9 +657,11 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
+        let rust_plan = Plan::for_rust_app(&[]);
         write(
             &dir.join("runner"),
             App::Rust(&app),
+            &rust_plan,
             false,
             false,
             ApiLevel::Api20,
@@ -641,13 +672,16 @@ mod tests {
         assert!(manifest.contains("[lib]\nname = \"nsh_platform_harmonyos\""));
         assert!(manifest.contains("crate-type = [\"cdylib\"]"));
         assert!(manifest.contains("nsh-core = { path = \"/src/nsh/crates/nsh-core\" }"));
-        assert!(manifest.contains("features = [\"backend\"]"));
+        assert!(!manifest.contains("features ="), "{manifest}");
         let lib = fs::read_to_string(dir.join("runner").join("lib.rs")).unwrap();
-        assert!(lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
+        assert!(
+            lib.contains("backend::app!(rust = nsh_rust_app::app_ui_sets, nsh_rust_app::root)")
+        );
 
         write(
             &dir.join("runner-dev"),
             App::Rust(&app),
+            &rust_plan,
             true,
             true,
             ApiLevel::Api20,
@@ -655,6 +689,8 @@ mod tests {
         .unwrap();
         let dev_manifest = fs::read_to_string(dir.join("runner-dev").join("Cargo.toml")).unwrap();
         assert!(dev_manifest.contains("features = [\"backend\", \"dev\", \"speech\"]"));
+        let dev_lib = fs::read_to_string(dir.join("runner-dev").join("lib.rs")).unwrap();
+        assert!(dev_lib.contains("backend::app!(nsh_rust_app::ui_sets, nsh_rust_app::root)"));
         let expected_testing = format!(
             "nsh-testing = {{ path = {:?} }}",
             Path::new("/src/nsh/crates/nsh-core").with_file_name("nsh-testing")
@@ -666,7 +702,16 @@ mod tests {
         );
         assert!(dev_manifest.contains(&expected_extra), "{dev_manifest}");
 
-        write(&dir.join("tsx"), App::Tsx, true, false, ApiLevel::Api23).unwrap();
+        let full = Plan::full();
+        write(
+            &dir.join("tsx"),
+            App::Tsx,
+            &full,
+            true,
+            false,
+            ApiLevel::Api23,
+        )
+        .unwrap();
         let tsx_manifest = fs::read_to_string(dir.join("tsx").join("Cargo.toml")).unwrap();
         assert!(tsx_manifest.contains("features = [\"backend\", \"dev\", \"api-23\"]"));
         let lib = fs::read_to_string(dir.join("tsx").join("lib.rs")).unwrap();
@@ -675,6 +720,7 @@ mod tests {
         write(
             &dir.join("tsx-api26"),
             App::Tsx,
+            &full,
             false,
             false,
             ApiLevel::Api26,
@@ -729,6 +775,7 @@ mod tests {
                 path: one.clone(),
             },
         ];
+        let full = Plan::full();
         write(
             &dir.join("runner"),
             App::TsxWithCrates {
@@ -736,6 +783,7 @@ mod tests {
                 patches: &lock_patches,
                 workspace: &ws,
             },
+            &full,
             false,
             false,
             ApiLevel::Api20,
@@ -791,6 +839,7 @@ mod tests {
                 patches: &lock_patches,
                 workspace: &ws,
             },
+            &full,
             true,
             false,
             ApiLevel::Api20,
@@ -825,6 +874,7 @@ mod tests {
         write(
             &dir.join("runner-dev"),
             App::Rust(&app),
+            &Plan::for_rust_app(&[]),
             true,
             false,
             ApiLevel::Api20,

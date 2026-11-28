@@ -18,14 +18,20 @@ use crate::{
 pub(crate) struct ResourceChunks {
     host: Arc<Services>,
     prefix: String,
+    entry_file: String,
 }
 #[cfg(target_env = "ohos")]
 impl ResourceChunks {
     pub(crate) fn new(host: Arc<Services>, entry: &str) -> Arc<Self> {
-        let prefix = entry
-            .rsplit_once('/')
-            .map_or(String::new(), |(p, _)| format!("{p}/"));
-        Arc::new(Self { host, prefix })
+        let (prefix, entry_file) = entry.rsplit_once('/').map_or_else(
+            || (String::new(), entry.to_owned()),
+            |(p, f)| (format!("{p}/"), f.to_owned()),
+        );
+        Arc::new(Self {
+            host,
+            prefix,
+            entry_file,
+        })
     }
     pub(crate) fn read_chunk(&self, id: &str) -> Result<nsh_engine::Chunk, String> {
         if !valid_chunk_name(id) {
@@ -44,7 +50,7 @@ impl ResourceChunks {
         Ok(chunk)
     }
     pub(crate) fn preload(&self, bundle: &mut Bundle) -> Result<(), String> {
-        preload(bundle, |name| {
+        preload_entry(bundle, &self.entry_file, |name| {
             self.host
                 .resource(&format!("{}{name}", self.prefix))
                 .map_err(|e| e.to_string())
@@ -155,24 +161,32 @@ pub(crate) fn load_resource_bundle(
         .map_err(napi_ohos::Error::from_reason)?;
     bundle.policy.granted = granted;
     let updater = chunks.read_optional("assets/nsh-updater.json");
-    let package = if !has_custom_assets {
-        nsh_engine::updates::package_to_run(&mut bundle, updater, Some(&host.data_directory()))
-    } else {
-        bundle.updater_config = updater.map(Arc::from);
-        None
-    };
-    if let Some(run) = package {
-        match crate::services::assets::AssetDirectory::from_path(&run.assets) {
-            Ok(dir) => {
-                let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
-                    crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
-                );
-                return Ok((run.bundle, Some(assets)));
-            }
-            Err(err) => {
-                log::warn!("cannot set the package's assets, running the app's own: {err}");
+    #[cfg(feature = "js")]
+    {
+        let package = if !has_custom_assets {
+            nsh_engine::updates::package_to_run(&mut bundle, updater, Some(&host.data_directory()))
+        } else {
+            bundle.updater_config = updater.map(Arc::from);
+            None
+        };
+        if let Some(run) = package {
+            match crate::services::assets::AssetDirectory::from_path(&run.assets) {
+                Ok(dir) => {
+                    let assets: Arc<dyn crate::services::assets::StreamAssets> = Arc::new(
+                        crate::services::assets::HostAssets::new(host.clone(), Some(dir)),
+                    );
+                    return Ok((run.bundle, Some(assets)));
+                }
+                Err(err) => {
+                    log::warn!("cannot set the package's assets, running the app's own: {err}");
+                }
             }
         }
+    }
+    #[cfg(not(feature = "js"))]
+    {
+        let _ = (host, has_custom_assets);
+        bundle.updater_config = updater.map(Arc::from);
     }
     Ok((bundle, None))
 }
@@ -220,8 +234,17 @@ impl Preload {
 }
 
 /// Reads optional companions and every static dependency before the VM links the entry.
+#[cfg(test)]
 fn preload(
     bundle: &mut Bundle,
+    read: impl FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    preload_entry(bundle, "bundle.js", read)
+}
+
+fn preload_entry(
+    bundle: &mut Bundle,
+    entry_file: &str,
     mut read: impl FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<(), String> {
     let mut load = Preload::default();
@@ -279,6 +302,20 @@ fn preload(
         let value =
             serde_json::from_slice(&bytes).map_err(|e| format!("capabilities.json: {e}"))?;
         bundle.policy.declared = Some(nsh_engine::Capabilities::from_json(&value)?);
+    }
+    if bundle.source_map.is_none() {
+        let map_name = match entry_file.strip_suffix(".nshc") {
+            Some(stem) => format!("{stem}.js.map"),
+            None => format!("{entry_file}.map"),
+        };
+        if let Ok(bytes) = read(&map_name) {
+            load.account(bytes.len())?;
+            if let Ok(map) = String::from_utf8(bytes)
+                && !map.is_empty()
+            {
+                bundle.source_map = Some(map.into());
+            }
+        }
     }
     if let BundleCode::Source(code) = &bundle.code {
         for name in static_chunk_imports(code) {
@@ -640,5 +677,35 @@ mod tests {
             .expect("title_bar parsed from app.json");
         assert_eq!(title_bar.style, nsh_core::desktop::TitleBarStyle::Hidden);
         assert_eq!(title_bar.height, Some(nsh_core::Points(44.0)));
+    }
+
+    #[test]
+    fn preload_entry_loads_companion_source_map_for_bytecode_and_source() {
+        let mut bytecode_bundle = unsafe { Bundle::bytecode(vec![2, 0, 1]) };
+        preload_entry(
+            &mut bytecode_bundle,
+            "bundle.nshc",
+            resources(&[("bundle.js.map", r#"{"version":3,"file":"bundle.js"}"#)]),
+        )
+        .unwrap();
+        assert_eq!(
+            bytecode_bundle.source_map.as_deref(),
+            Some(r#"{"version":3,"file":"bundle.js"}"#)
+        );
+
+        let mut custom_bundle = Bundle::source("export default 1;".into());
+        preload_entry(
+            &mut custom_bundle,
+            "screen.js",
+            resources(&[
+                ("bundle.js.map", r#"{"version":3,"file":"bundle.js"}"#),
+                ("screen.js.map", r#"{"version":3,"file":"screen.js"}"#),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            custom_bundle.source_map.as_deref(),
+            Some(r#"{"version":3,"file":"screen.js"}"#)
+        );
     }
 }

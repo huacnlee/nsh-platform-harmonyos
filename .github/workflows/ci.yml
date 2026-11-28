@@ -58,6 +58,8 @@ jobs:
           export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER=$CC_aarch64_unknown_linux_ohos
           export LIBCLANG_PATH=$N/llvm/lib
           export BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_ohos="--target=aarch64-linux-ohos --sysroot=$N/sysroot -D__MUSL__"
+          cargo clippy -p nsh-platform-harmonyos --target aarch64-unknown-linux-ohos --lib --no-default-features -- -D warnings
+          cargo clippy -p nsh-platform-harmonyos --target aarch64-unknown-linux-ohos --lib --features js -- -D warnings
           for features in "" dev api-23 api-26; do
             cargo clippy -p nsh-platform-harmonyos --target aarch64-unknown-linux-ohos --lib --features "backend $features" -- -D warnings
           done

@@ -336,6 +336,7 @@ pub(super) fn is_warmed(gpu: &TextureContext, layer: &ShaderLayer) -> bool {
         .is_some_and(|compiled| compiled.warmed.get())
 }
 
+#[cfg(feature = "shader")]
 fn adapt_vertex_source(vertex: &str) -> String {
     // Core's GLSL targets a displayed canvas. Our intermediate pictures have
     // their first row at the top; adapt clip space in the vertex stage instead
@@ -346,6 +347,7 @@ fn adapt_vertex_source(vertex: &str) -> String {
 
 /// # Safety
 /// Caller must hold `gl`'s owning context current on this thread.
+#[cfg(feature = "shader")]
 unsafe fn compile_from_source(
     gl: &glow::Context,
     vertex: &str,
@@ -451,50 +453,60 @@ pub(super) fn precompile_to_binary(
     gpu: &TextureContext,
     layer: &ShaderLayer,
 ) -> Result<Option<glow::ProgramBinary>> {
-    let source = layer
-        .shader
-        .glsl_es()
-        .map_err(|e| Error::Shader(e.to_string()))?;
-    let vertex = adapt_vertex_source(&source.vertex);
-    let _current = gpu.context.enter()?;
-    let gl = &gpu.gl;
-    // SAFETY: `gpu.context` is current; temporary `native` is always deleted below.
-    unsafe {
-        let native =
-            compile_from_source(gl, &vertex, &source.fragment, gpu.supports_program_binary)?;
-        for (binding, name) in [
-            source.builtins_block.as_deref(),
-            source.uniforms_block.as_deref(),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            if let Some(name) = name
-                && let Some(index) = gl.get_uniform_block_index(native, name)
+    #[cfg(not(feature = "shader"))]
+    {
+        let _ = (gpu, layer);
+        Err(Error::Shader(
+            "shaders are not enabled in this build".into(),
+        ))
+    }
+    #[cfg(feature = "shader")]
+    {
+        let source = layer
+            .shader
+            .glsl_es()
+            .map_err(|e| Error::Shader(e.to_string()))?;
+        let vertex = adapt_vertex_source(&source.vertex);
+        let _current = gpu.context.enter()?;
+        let gl = &gpu.gl;
+        // SAFETY: `gpu.context` is current; temporary `native` is always deleted below.
+        unsafe {
+            let native =
+                compile_from_source(gl, &vertex, &source.fragment, gpu.supports_program_binary)?;
+            for (binding, name) in [
+                source.builtins_block.as_deref(),
+                source.uniforms_block.as_deref(),
+            ]
+            .into_iter()
+            .enumerate()
             {
-                gl.uniform_block_binding(native, index, binding as u32);
+                if let Some(name) = name
+                    && let Some(index) = gl.get_uniform_block_index(native, name)
+                {
+                    gl.uniform_block_binding(native, index, binding as u32);
+                }
             }
+            let pictures: Vec<_> = source
+                .pictures
+                .iter()
+                .filter_map(|(name, input)| {
+                    gl.get_uniform_location(native, name)
+                        .map(|location| (location, *input))
+                })
+                .collect();
+            let draw_result = warmup_draw_program(gpu, native, &pictures, layer, true);
+            let binary = if draw_result.is_ok() && gpu.supports_program_binary {
+                let bin = gl.get_program_binary(native);
+                while gl.get_error() != glow::NO_ERROR {}
+                bin
+            } else {
+                None
+            };
+            gl.use_program(None);
+            gl.delete_program(native);
+            draw_result?;
+            Ok(binary)
         }
-        let pictures: Vec<_> = source
-            .pictures
-            .iter()
-            .filter_map(|(name, input)| {
-                gl.get_uniform_location(native, name)
-                    .map(|location| (location, *input))
-            })
-            .collect();
-        let draw_result = warmup_draw_program(gpu, native, &pictures, layer, true);
-        let binary = if draw_result.is_ok() && gpu.supports_program_binary {
-            let bin = gl.get_program_binary(native);
-            while gl.get_error() != glow::NO_ERROR {}
-            bin
-        } else {
-            None
-        };
-        gl.use_program(None);
-        gl.delete_program(native);
-        draw_result?;
-        Ok(binary)
     }
 }
 
@@ -514,69 +526,80 @@ pub(super) fn precompile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<()
 
 impl Program {
     fn compile(gpu: &TextureContext, layer: &ShaderLayer) -> Result<Rc<Compiled>> {
-        let _current = gpu.context.enter()?;
-        let gl = &gpu.gl;
-        let hash = layer.shader.hash();
-        // SAFETY: validated core-generated GLSL and all program objects are
-        // compiled and used exclusively on this worker's current context.
-        unsafe {
-            if let Some(cached) = gpu.programs.borrow().get(&hash).cloned() {
-                return Ok(cached);
-            }
-            let source = layer
-                .shader
-                .glsl_es()
-                .map_err(|e| Error::Shader(e.to_string()))?;
-            let mut from_binary = false;
-            let native = if gpu.supports_program_binary
-                && let Some(binary) = gpu.take_program_binary(hash)
-            {
-                let program = gl.create_program()?;
-                gl.program_binary(program, &binary);
-                let ok = gl.get_program_link_status(program) && gl.get_error() == glow::NO_ERROR;
-                if ok {
-                    from_binary = true;
-                    program
+        #[cfg(not(feature = "shader"))]
+        {
+            let _ = (gpu, layer);
+            Err(Error::Shader(
+                "shaders are not enabled in this build".into(),
+            ))
+        }
+        #[cfg(feature = "shader")]
+        {
+            let _current = gpu.context.enter()?;
+            let gl = &gpu.gl;
+            let hash = layer.shader.hash();
+            // SAFETY: validated core-generated GLSL and all program objects are
+            // compiled and used exclusively on this worker's current context.
+            unsafe {
+                if let Some(cached) = gpu.programs.borrow().get(&hash).cloned() {
+                    return Ok(cached);
+                }
+                let source = layer
+                    .shader
+                    .glsl_es()
+                    .map_err(|e| Error::Shader(e.to_string()))?;
+                let mut from_binary = false;
+                let native = if gpu.supports_program_binary
+                    && let Some(binary) = gpu.take_program_binary(hash)
+                {
+                    let program = gl.create_program()?;
+                    gl.program_binary(program, &binary);
+                    let ok =
+                        gl.get_program_link_status(program) && gl.get_error() == glow::NO_ERROR;
+                    if ok {
+                        from_binary = true;
+                        program
+                    } else {
+                        while gl.get_error() != glow::NO_ERROR {}
+                        gl.delete_program(program);
+                        let vertex = adapt_vertex_source(&source.vertex);
+                        compile_from_source(gl, &vertex, &source.fragment, false)?
+                    }
                 } else {
-                    while gl.get_error() != glow::NO_ERROR {}
-                    gl.delete_program(program);
                     let vertex = adapt_vertex_source(&source.vertex);
                     compile_from_source(gl, &vertex, &source.fragment, false)?
-                }
-            } else {
-                let vertex = adapt_vertex_source(&source.vertex);
-                compile_from_source(gl, &vertex, &source.fragment, false)?
-            };
-            for (binding, name) in [
-                source.builtins_block.as_deref(),
-                source.uniforms_block.as_deref(),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                if let Some(name) = name
-                    && let Some(index) = gl.get_uniform_block_index(native, name)
+                };
+                for (binding, name) in [
+                    source.builtins_block.as_deref(),
+                    source.uniforms_block.as_deref(),
+                ]
+                .into_iter()
+                .enumerate()
                 {
-                    gl.uniform_block_binding(native, index, binding as u32);
+                    if let Some(name) = name
+                        && let Some(index) = gl.get_uniform_block_index(native, name)
+                    {
+                        gl.uniform_block_binding(native, index, binding as u32);
+                    }
                 }
+                let pictures = source
+                    .pictures
+                    .iter()
+                    .filter_map(|(name, input)| {
+                        gl.get_uniform_location(native, name)
+                            .map(|location| (location, *input))
+                    })
+                    .collect();
+                let compiled = Rc::new(Compiled {
+                    context: gpu.context.clone(),
+                    gl: gpu.gl.clone(),
+                    native,
+                    pictures,
+                    warmed: Cell::new(from_binary),
+                });
+                gpu.programs.borrow_mut().insert(hash, compiled.clone());
+                Ok(compiled)
             }
-            let pictures = source
-                .pictures
-                .iter()
-                .filter_map(|(name, input)| {
-                    gl.get_uniform_location(native, name)
-                        .map(|location| (location, *input))
-                })
-                .collect();
-            let compiled = Rc::new(Compiled {
-                context: gpu.context.clone(),
-                gl: gpu.gl.clone(),
-                native,
-                pictures,
-                warmed: Cell::new(from_binary),
-            });
-            gpu.programs.borrow_mut().insert(hash, compiled.clone());
-            Ok(compiled)
         }
     }
 

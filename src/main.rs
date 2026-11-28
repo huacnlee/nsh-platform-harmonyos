@@ -25,6 +25,7 @@ mod module_meta;
 mod nshm;
 mod paths;
 mod project;
+mod prune;
 mod runner;
 mod sdk;
 mod sign;
@@ -432,15 +433,43 @@ fn package(
         }
     };
     let runner = work.join("runner");
-    runner::write(&runner, linked, dev, false, options.api)?;
+    let mut plan = if dev {
+        prune::Plan::full()
+    } else {
+        match linked {
+            runner::App::Rust(rust_app_dir) => {
+                let has_app_ui_sets = fs::read_to_string(rust_app_dir.join("lib.rs"))
+                    .is_ok_and(|src| src.contains("pub fn app_ui_sets("));
+                if has_app_ui_sets {
+                    prune::Plan::for_rust_app(&config.features)
+                } else {
+                    prune::Plan::full()
+                }
+            }
+            runner::App::Tsx => prune::Plan::for_tsx_build(&build, false, &config.features),
+            runner::App::TsxWithCrates { .. } => {
+                prune::Plan::for_tsx_build(&build, true, &config.features)
+            }
+        }
+    };
+    runner::write(&runner, linked, &plan, dev, false, options.api)?;
     // Merge `[package.metadata.nsh.harmonyos]` (and active feature sections)
     // from every resolved crate before compiling the native library so clashes
-    // and invalid declarations fail fast.
+    // and invalid declarations fail fast, and propagate any `nsh-core` /
+    // `nsh-base` features enabled by linked Rust crates into the pruned plan.
     let crate_meta =
         module_meta::ModuleMeta::of_manifest(&runner.join("Cargo.toml"), arch.triple())?;
     crate_meta.apply(&mut config.harmonyos)?;
-    if crate_meta.speech_enabled {
-        runner::write(&runner, linked, dev, true, options.api)?;
+    let features_changed = plan.merge_crate_features(&crate_meta.crate_features);
+    if crate_meta.speech_enabled || features_changed {
+        runner::write(
+            &runner,
+            linked,
+            &plan,
+            dev,
+            crate_meta.speech_enabled,
+            options.api,
+        )?;
     }
     let library = runner::build(&runner, &ndk, arch, release, options.verbose)?;
     let written = project::write(
@@ -450,6 +479,7 @@ fn package(
             arch,
             library: &library,
             build: &build,
+            release,
             runtime_os: options.runtime_os,
             min_api: options.api,
             compile_api: base_sdk

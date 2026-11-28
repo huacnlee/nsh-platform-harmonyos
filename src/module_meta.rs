@@ -37,7 +37,7 @@
 //!   `libnsh_platform_harmonyos.so`, `app_name`) are rejected.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     env,
     path::{Path, PathBuf},
     process::Command,
@@ -202,6 +202,21 @@ impl std::fmt::Display for Clash {
     }
 }
 
+/// Optional NSH features enabled by crates in the runner's OHOS dependency graph.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct CrateFeatures {
+    pub(crate) shader: bool,
+    pub(crate) updater: bool,
+    pub(crate) websocket: bool,
+    pub(crate) editor: bool,
+    pub(crate) rich_editor: bool,
+    pub(crate) plot: bool,
+    pub(crate) term: bool,
+    pub(crate) highlight: bool,
+    pub(crate) math: bool,
+    pub(crate) emoji_picker: bool,
+}
+
 /// What the resolved crates of a HarmonyOS runner declare under
 /// `[package.metadata.nsh]`.
 #[derive(Debug, Default, Clone, PartialEq)]
@@ -209,8 +224,47 @@ pub(crate) struct ModuleMeta {
     pub(crate) meta: HarmonyMeta,
     /// Whether `nsh-extra` is resolved with its `speech` feature enabled.
     pub(crate) speech_enabled: bool,
+    /// Optional `nsh-core` / `nsh-base` features enabled in the dependency graph.
+    pub(crate) crate_features: CrateFeatures,
     owners: BTreeMap<String, String>,
     clashes: Vec<Clash>,
+}
+
+type ResolvedFeatures = BTreeMap<(String, String), BTreeSet<String>>;
+
+/// Parses `cargo tree --target <triple> -e normal,no-proc-macro --prefix none -f "{p}|{f}"`
+/// output into Resolver v3 active feature sets per `(name, version)`.
+///
+/// `cargo metadata --format-version 1` always runs Cargo's legacy v1 feature
+/// resolver, which unifies `[dev-dependencies]` and host `cfg(not(target_env = "ohos"))`
+/// features of path dependencies onto `resolve.nodes[*].features`. Querying
+/// `cargo tree` gives the exact target-filtered Resolver v3 graph.
+fn parse_cargo_tree_features(output: &str) -> ResolvedFeatures {
+    let mut map: ResolvedFeatures = BTreeMap::new();
+    for raw in output.lines() {
+        let line = raw.trim().trim_end_matches(" (*)");
+        let Some((pkg_part, feat_part)) = line.split_once('|') else {
+            continue;
+        };
+        let mut tokens = pkg_part.split_whitespace();
+        let (Some(name), Some(version)) = (
+            tokens.next(),
+            tokens.next().and_then(|v| v.strip_prefix('v')),
+        ) else {
+            continue;
+        };
+        let entry = map
+            .entry((name.to_owned(), version.to_owned()))
+            .or_default();
+        for feat in feat_part
+            .split(',')
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+        {
+            entry.insert(feat.to_owned());
+        }
+    }
+    map
 }
 
 impl ModuleMeta {
@@ -226,7 +280,7 @@ impl ModuleMeta {
 
     fn read_manifest(manifest: &Path, triple: &str) -> anyhow::Result<(Self, Vec<String>)> {
         let cargo = env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let out = Command::new(cargo)
+        let out = Command::new(&cargo)
             .args([
                 "metadata",
                 "--format-version",
@@ -245,15 +299,43 @@ impl ModuleMeta {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
+        let tree_out = Command::new(&cargo)
+            .args([
+                "tree",
+                "--target",
+                triple,
+                "-e",
+                "normal,no-proc-macro",
+                "--prefix",
+                "none",
+                "-f",
+                "{p}|{f}",
+                "--manifest-path",
+            ])
+            .arg(manifest)
+            .output()
+            .context("running cargo tree for HarmonyOS target features")?;
+        let tree_features = tree_out
+            .status
+            .success()
+            .then(|| parse_cargo_tree_features(&String::from_utf8_lossy(&tree_out.stdout)));
         let json: Value =
             serde_json::from_slice(&out.stdout).context("cargo metadata printed no JSON")?;
-        Self::from_metadata(&json)
+        Self::from_metadata_with_features(&json, tree_features.as_ref())
     }
 
     /// Parses `cargo metadata --format-version 1` JSON and merges every
     /// resolved package's `[package.metadata.nsh.harmonyos]` and active
     /// `[package.metadata.nsh.features.<feat>.harmonyos]` tables.
+    #[cfg(test)]
     pub(crate) fn from_metadata(json: &Value) -> anyhow::Result<(Self, Vec<String>)> {
+        Self::from_metadata_with_features(json, None)
+    }
+
+    fn from_metadata_with_features(
+        json: &Value,
+        tree_features: Option<&ResolvedFeatures>,
+    ) -> anyhow::Result<(Self, Vec<String>)> {
         let packages: BTreeMap<&str, &Value> = json["packages"]
             .as_array()
             .into_iter()
@@ -273,15 +355,36 @@ impl ModuleMeta {
                 continue;
             };
             let name = package["name"].as_str().unwrap_or("?");
-            let enabled: Vec<&str> = node["features"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(Value::as_str)
-                .collect();
+            let version = package["version"].as_str().unwrap_or("");
+            let enabled: Vec<&str> = if let Some(tree) = tree_features {
+                let Some(feats) = tree.get(&(name.to_owned(), version.to_owned())) else {
+                    continue;
+                };
+                feats.iter().map(String::as_str).collect()
+            } else {
+                node["features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect()
+            };
             let is_extra_speech = name == "nsh-extra" && enabled.contains(&"speech");
             if is_extra_speech {
                 collected.speech_enabled = true;
+            }
+            if name == "nsh-core" {
+                collected.crate_features.shader |= enabled.contains(&"shader");
+                collected.crate_features.updater |= enabled.contains(&"updater");
+                collected.crate_features.websocket |= enabled.contains(&"websocket");
+            } else if name == "nsh-base" {
+                collected.crate_features.editor |= enabled.contains(&"editor");
+                collected.crate_features.rich_editor |= enabled.contains(&"rich-editor");
+                collected.crate_features.plot |= enabled.contains(&"plot");
+                collected.crate_features.term |= enabled.contains(&"term");
+                collected.crate_features.highlight |= enabled.contains(&"highlight");
+                collected.crate_features.math |= enabled.contains(&"math");
+                collected.crate_features.emoji_picker |= enabled.contains(&"emoji-picker");
             }
             if let Some(nsh) = package["metadata"]["nsh"].as_object() {
                 let dir = package["manifest_path"]

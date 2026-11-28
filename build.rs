@@ -22,7 +22,14 @@ fn files(root: &Path, dir: &Path, out: &mut Vec<(String, PathBuf)>) {
             .unwrap_or_default();
         if matches!(
             name,
-            "oh_modules" | "node_modules" | "build" | ".hvigor" | ".DS_Store"
+            "oh_modules"
+                | "node_modules"
+                | "build"
+                | ".hvigor"
+                | ".idea"
+                | ".vscode"
+                | ".cxx"
+                | ".DS_Store"
         ) {
             continue;
         }

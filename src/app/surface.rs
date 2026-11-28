@@ -1419,7 +1419,9 @@ impl NshSurface {
                                     let is_package = package_assets.is_some();
                                     if !is_package {
                                         bundle.policy.granted = config.policy.granted.clone();
-                                        bundle.source_map = source_map.map(Into::into);
+                                        if let Some(source_map) = source_map {
+                                            bundle.source_map = Some(source_map.into());
+                                        }
                                     }
                                     let mut app = App::new(
                                         bundle,
@@ -1463,7 +1465,9 @@ impl NshSurface {
                         let is_package = package_assets.is_some();
                         if !is_package {
                             bundle.policy.granted = config.policy.granted.clone();
-                            bundle.source_map = source_map.map(Into::into);
+                            if let Some(source_map) = source_map {
+                                bundle.source_map = Some(source_map.into());
+                            }
                         }
                         let mut app = App::new(
                             bundle,
@@ -1524,7 +1528,9 @@ impl NshSurface {
                     let is_package = package_assets.is_some();
                     if !is_package {
                         bundle.policy.granted = config.policy.granted.clone();
-                        bundle.source_map = source_map.map(Into::into);
+                        if let Some(source_map) = source_map {
+                            bundle.source_map = Some(source_map.into());
+                        }
                     }
                     let mut app = App::new(
                         bundle,
@@ -2019,9 +2025,33 @@ pub fn init_logging() {
     #[cfg(feature = "dev")]
     crate::app::dev::init_logging();
     #[cfg(not(feature = "dev"))]
-    ohos_hilog_binding::log::init_once(
-        ohos_hilog_binding::log::Config::default()
-            .with_tag("nsh")
-            .with_max_level(log::LevelFilter::Info),
-    );
+    {
+        struct ReleaseLogger;
+        impl log::Log for ReleaseLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() <= log::Level::Info
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                if !self.enabled(record.metadata()) {
+                    return;
+                }
+                let line = format!("{}: {}", record.target(), record.args());
+                match record.level() {
+                    log::Level::Error => ohos_hilog_binding::error(line),
+                    log::Level::Warn => ohos_hilog_binding::warn(line),
+                    log::Level::Info => ohos_hilog_binding::info(line),
+                    _ => ohos_hilog_binding::debug(line),
+                }
+            }
+            fn flush(&self) {}
+        }
+        static LOGGER: ReleaseLogger = ReleaseLogger;
+        ohos_hilog_binding::set_global_options(ohos_hilog_binding::LogOptions {
+            domain: 0,
+            tag: "nsh",
+        });
+        if log::set_logger(&LOGGER).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    }
 }
