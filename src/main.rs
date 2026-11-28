@@ -477,6 +477,7 @@ fn package(
             arch,
             library: &library,
             build: &build,
+            release,
             runtime_os: options.runtime_os,
             min_api: options.api,
             compile_api: base_sdk

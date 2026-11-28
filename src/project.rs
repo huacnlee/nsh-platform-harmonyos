@@ -198,6 +198,8 @@ pub(crate) struct Contents<'a> {
     /// `nsh build`'s output: a TSX app's `bundle.js`, `app.json`,
     /// `capabilities.json`, and the app's `assets/`.
     pub(crate) build: &'a Path,
+    /// Whether this is a release package (omits `.map` source maps from rawfile).
+    pub(crate) release: bool,
     /// The OS the HAP targets.
     pub(crate) runtime_os: RuntimeOs,
     /// The minimum API level the native library and HAP target.
@@ -1409,7 +1411,8 @@ pub(crate) fn write(
     let (entry_dependencies, extra_modules) = stage_ohpm_dependencies(out, &config.harmonyos)?;
     let entry_build_option = build_entry_build_option(&config.harmonyos);
     let ability_stage_source = render_entry_ability_stage(&config.harmonyos.providers);
-    let bundle_resource = if contents.build.join("bundle.nshc").is_file() {
+    let has_bytecode = contents.build.join("bundle.nshc").is_file();
+    let bundle_resource = if has_bytecode {
         "bundle.nshc"
     } else {
         "bundle.js"
@@ -1527,12 +1530,16 @@ pub(crate) fn write(
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 let path = entry.path();
-                if path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|ext| matches!(ext, "js" | "nshc" | "map"))
-                {
-                    fs::copy(&path, rawfile.join(entry.file_name()))?;
+                let file_name = entry.file_name();
+                let name_str = file_name.to_str().unwrap_or_default();
+                let keep = match path.extension().and_then(|e| e.to_str()) {
+                    Some("nshc") => true,
+                    Some("js") => !(has_bytecode && name_str == "bundle.js"),
+                    Some("map") => !contents.release,
+                    _ => false,
+                };
+                if keep {
+                    fs::copy(&path, rawfile.join(file_name))?;
                 }
             }
         }
@@ -1851,6 +1858,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2099,6 +2107,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2256,6 +2265,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2328,6 +2338,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2340,26 +2351,37 @@ mod tests {
         assert!(index.contains("this.surface.loadResource(\"bundle.js\")"));
         assert!(!index.contains("{{"));
 
-        // When bundle.nshc is present, the template loads precompiled bytecode.
+        // When bundle.nshc is present, release omits bundle.js and *.map while keeping chunks.
         fs::write(build.join("bundle.nshc"), b"\x02bytecode").unwrap();
+        fs::write(build.join("bundle.js.map"), "{\"version\":3}").unwrap();
+        fs::write(build.join("chunk-1.js"), "export const x = 1;").unwrap();
+        fs::write(build.join("chunk-1.js.map"), "{\"version\":3}").unwrap();
         write(&out, &config, &contents).unwrap();
         let index =
             fs::read_to_string(join_relative(&out, "entry/src/main/ets/pages/Index.ets")).unwrap();
         assert!(index.contains("this.surface.loadResource(\"bundle.nshc\")"));
-        assert!(
-            join_all(
-                &out,
-                [
-                    "entry",
-                    "src",
-                    "main",
-                    "resources",
-                    "rawfile",
-                    "bundle.nshc"
-                ]
-            )
-            .is_file()
-        );
+        let rawfile = join_all(&out, ["entry", "src", "main", "resources", "rawfile"]);
+        assert!(rawfile.join("bundle.nshc").is_file());
+        assert!(!rawfile.join("bundle.js").exists());
+        assert!(!rawfile.join("bundle.js.map").exists());
+        assert!(rawfile.join("chunk-1.js").is_file());
+        assert!(!rawfile.join("chunk-1.js.map").exists());
+
+        // Debug (`release: false`) keeps *.map files for stack symbolication.
+        write(
+            &out,
+            &config,
+            &Contents {
+                release: false,
+                ..contents
+            },
+        )
+        .unwrap();
+        assert!(rawfile.join("bundle.nshc").is_file());
+        assert!(!rawfile.join("bundle.js").exists());
+        assert!(rawfile.join("bundle.js.map").is_file());
+        assert!(rawfile.join("chunk-1.js").is_file());
+        assert!(rawfile.join("chunk-1.js.map").is_file());
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -2405,6 +2427,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2476,6 +2499,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2585,6 +2609,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2741,6 +2766,7 @@ mod tests {
             arch: Arch::Arm64,
             library: &library,
             build: &build,
+            release: true,
             runtime_os: RuntimeOs::HarmonyOs,
             min_api: ApiLevel::Api20,
             compile_api: MIN_API,
@@ -2894,6 +2920,7 @@ mod tests {
                 arch: Arch::Arm64,
                 library: &library,
                 build: &build,
+                release: true,
                 runtime_os: RuntimeOs::OpenHarmony,
                 min_api: ApiLevel::Api20,
                 compile_api: MIN_API,
@@ -2964,6 +2991,7 @@ mod tests {
                 arch: Arch::Arm64,
                 library: &library,
                 build: &build,
+                release: true,
                 runtime_os: RuntimeOs::OpenHarmony,
                 min_api: ApiLevel::Api20,
                 compile_api: MIN_API,
@@ -3003,6 +3031,7 @@ mod tests {
                 arch: Arch::Arm64,
                 library: &library,
                 build: &build,
+                release: true,
                 runtime_os: RuntimeOs::OpenHarmony,
                 min_api: ApiLevel::Api20,
                 compile_api: MIN_API,
@@ -3064,6 +3093,7 @@ mod tests {
                 arch: Arch::Arm64,
                 library: &library,
                 build: &build,
+                release: true,
                 runtime_os: RuntimeOs::OpenHarmony,
                 min_api: ApiLevel::Api20,
                 compile_api: MIN_API,
@@ -3090,6 +3120,7 @@ mod tests {
                 arch: Arch::Arm64,
                 library: &library,
                 build: &build,
+                release: true,
                 runtime_os: RuntimeOs::HarmonyOs,
                 min_api: ApiLevel::Api20,
                 compile_api: MIN_API,

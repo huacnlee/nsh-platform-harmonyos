@@ -1419,7 +1419,9 @@ impl NshSurface {
                                     let is_package = package_assets.is_some();
                                     if !is_package {
                                         bundle.policy.granted = config.policy.granted.clone();
-                                        bundle.source_map = source_map.map(Into::into);
+                                        if let Some(source_map) = source_map {
+                                            bundle.source_map = Some(source_map.into());
+                                        }
                                     }
                                     let mut app = App::new(
                                         bundle,
@@ -1463,7 +1465,9 @@ impl NshSurface {
                         let is_package = package_assets.is_some();
                         if !is_package {
                             bundle.policy.granted = config.policy.granted.clone();
-                            bundle.source_map = source_map.map(Into::into);
+                            if let Some(source_map) = source_map {
+                                bundle.source_map = Some(source_map.into());
+                            }
                         }
                         let mut app = App::new(
                             bundle,
@@ -1524,7 +1528,9 @@ impl NshSurface {
                     let is_package = package_assets.is_some();
                     if !is_package {
                         bundle.policy.granted = config.policy.granted.clone();
-                        bundle.source_map = source_map.map(Into::into);
+                        if let Some(source_map) = source_map {
+                            bundle.source_map = Some(source_map.into());
+                        }
                     }
                     let mut app = App::new(
                         bundle,
