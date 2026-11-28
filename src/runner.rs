@@ -657,7 +657,7 @@ mod tests {
             "[workspace]\n[patch.crates-io]\nnsh-core = { path = \"/src/nsh/crates/nsh-core\" }\n",
         )
         .unwrap();
-        let rust_plan = Plan::for_rust_app();
+        let rust_plan = Plan::for_rust_app(&[]);
         write(
             &dir.join("runner"),
             App::Rust(&app),
@@ -874,7 +874,7 @@ mod tests {
         write(
             &dir.join("runner-dev"),
             App::Rust(&app),
-            &Plan::for_rust_app(),
+            &Plan::for_rust_app(&[]),
             true,
             false,
             ApiLevel::Api20,

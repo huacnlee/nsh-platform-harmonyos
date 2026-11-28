@@ -88,18 +88,28 @@ impl Plan {
     }
 
     /// Initial pruning plan for a pure Rust root app (`App::Rust` when `!dev`):
-    /// no JS runtime, minimal `nsh_base::parts::core` + `nsh_rust_app::app_ui_sets`.
-    pub(crate) fn for_rust_app() -> Self {
+    /// no JS runtime, minimal `nsh_base::parts::core` + `nsh_rust_app::app_ui_sets`,
+    /// plus any native features explicitly retained in `nsh.json` `"features"`.
+    pub(crate) fn for_rust_app(keep: &[String]) -> Self {
+        if keep.iter().any(|f| f == "backend") {
+            return Self::full();
+        }
+        let mut features = BTreeSet::new();
+        apply_direct_keep_features(&mut features, keep);
         Self {
             full_backend: false,
-            features: BTreeSet::new(),
+            features,
             ui: UiRegistration::RustApp,
         }
     }
 
     /// Analyzes `nsh build`'s output directory (`.nsh/harmonyos/build`) for a
     /// TSX app (`App::Tsx` or `App::TsxWithCrates` when `!dev`).
-    pub(crate) fn for_tsx_build(build_dir: &Path, has_linked_rust_crates: bool) -> Self {
+    pub(crate) fn for_tsx_build(
+        build_dir: &Path,
+        has_linked_rust_crates: bool,
+        keep: &[String],
+    ) -> Self {
         let entry_js = build_dir.join("bundle.js");
         if !entry_js.is_file() {
             return Self::full();
@@ -136,12 +146,19 @@ impl Plan {
                 !spec.starts_with('.') && !spec.starts_with('/')
             });
         }
-        Self::from_native_use(&uses, has_linked_rust_crates)
+        Self::from_native_use_with_keep(&uses, has_linked_rust_crates, keep)
     }
 
-    /// Computes a pruned TSX plan from `NativeUse`.
-    pub(crate) fn from_native_use(uses: &NativeUse, has_linked_rust_crates: bool) -> Self {
-        if uses.computed_import || uses.imports.contains_key("nsh/updater") {
+    /// Computes a pruned TSX plan from `NativeUse` and `nsh.json` `"features"`.
+    pub(crate) fn from_native_use_with_keep(
+        uses: &NativeUse,
+        has_linked_rust_crates: bool,
+        keep: &[String],
+    ) -> Self {
+        if uses.computed_import
+            || uses.imports.contains_key("nsh/updater")
+            || keep.iter().any(|f| f == "updater" || f == "backend")
+        {
             return Self::full();
         }
 
@@ -172,6 +189,8 @@ impl Plan {
         {
             features.insert("shader");
         }
+
+        apply_direct_keep_features(&mut features, keep);
 
         let whole_base = matches!(uses.imports.get(nsh_base::SPECIFIER), Some(Imported::All));
         if whole_base {
@@ -207,14 +226,21 @@ impl Plan {
                 }
             }
         }
+        apply_keep_parts(&mut wanted_parts, keep);
+        if !wanted_parts.is_empty() {
+            wanted_parts.insert("core");
+        }
 
-        // Map active `nsh/base` parts to their corresponding Cargo features.
+        // Map active `nsh/base` parts to their corresponding Cargo features
+        // (`nsh-cli/src/native_features.rs` `BY_GATE`).
         if wanted_parts.contains("editor") || wanted_parts.contains("diff") {
             features.insert("editor");
             features.insert("highlight");
         }
         if wanted_parts.contains("rich_editor") {
             features.insert("rich-editor");
+            features.insert("highlight");
+            features.insert("math");
         }
         if wanted_parts.contains("plot") {
             features.insert("plot");
@@ -241,6 +267,11 @@ impl Plan {
             features,
             ui: UiRegistration::Parts(ordered_parts),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_native_use(uses: &NativeUse, has_linked_rust_crates: bool) -> Self {
+        Self::from_native_use_with_keep(uses, has_linked_rust_crates, &[])
     }
 
     /// Merges features required by resolved Rust crates in the runner's OHOS
@@ -296,6 +327,87 @@ impl Plan {
             .copied()
             .filter(|f| self.features.contains(f))
             .collect()
+    }
+}
+
+fn apply_direct_keep_features(features: &mut BTreeSet<&'static str>, keep: &[String]) {
+    for item in keep {
+        match item.as_str() {
+            "js" => {
+                features.insert("js");
+            }
+            "shader" => {
+                features.insert("shader");
+            }
+            "updater" => {
+                features.insert("updater");
+            }
+            "editor" | "diff" => {
+                features.insert("editor");
+                features.insert("highlight");
+            }
+            "emoji-picker" | "emoji_picker" => {
+                features.insert("emoji-picker");
+            }
+            "highlight" => {
+                features.insert("highlight");
+            }
+            "math" => {
+                features.insert("math");
+            }
+            "plot" => {
+                features.insert("plot");
+            }
+            "rich-editor" | "rich_editor" => {
+                features.insert("rich-editor");
+                features.insert("highlight");
+                features.insert("math");
+            }
+            "text-view" | "text_view" => {
+                features.insert("highlight");
+                features.insert("math");
+            }
+            "term" => {
+                features.insert("term");
+            }
+            "zlib" => {
+                features.insert("zlib");
+            }
+            "crypto" => {
+                features.insert("crypto");
+            }
+            "websocket" => {
+                features.insert("websocket");
+            }
+            _ => {}
+        }
+    }
+}
+
+fn apply_keep_parts(wanted_parts: &mut BTreeSet<&'static str>, keep: &[String]) {
+    for item in keep {
+        match item.as_str() {
+            "editor" | "diff" => {
+                wanted_parts.insert("editor");
+                wanted_parts.insert("diff");
+            }
+            "rich-editor" | "rich_editor" => {
+                wanted_parts.insert("rich_editor");
+            }
+            "plot" => {
+                wanted_parts.insert("plot");
+            }
+            "term" => {
+                wanted_parts.insert("term");
+            }
+            "emoji-picker" | "emoji_picker" => {
+                wanted_parts.insert("emoji_picker");
+            }
+            "text-view" | "text_view" => {
+                wanted_parts.insert("text_view");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -431,7 +543,7 @@ mod tests {
 
     #[test]
     fn rust_app_plan_omits_js_and_merges_resolved_crate_features() {
-        let mut plan = Plan::for_rust_app();
+        let mut plan = Plan::for_rust_app(&[]);
         assert_eq!(plan.backend_features(), Vec::<&str>::new());
         assert_eq!(plan.ui, UiRegistration::RustApp);
 
@@ -447,5 +559,40 @@ mod tests {
             websocket: true,
             ..Default::default()
         }));
+
+        let kept = Plan::for_rust_app(&["math".into(), "rich-editor".into()]);
+        assert_eq!(
+            kept.backend_features(),
+            vec!["highlight", "math", "rich-editor"]
+        );
+    }
+
+    #[test]
+    fn rich_editor_keeps_highlight_and_math_and_named_features_keep_parts() {
+        let rich = analyze_code(r#"import { RichEditor } from "nsh/base"; RichEditor;"#);
+        assert_eq!(
+            rich.backend_features(),
+            vec!["js", "highlight", "math", "rich-editor"]
+        );
+        assert_eq!(rich.ui, UiRegistration::Parts(vec!["core", "rich_editor"]));
+
+        let mut uses = NativeUse::default();
+        uses.add(
+            r#"import { element, mount } from "nsh:rt"; mount(() => element("view"));"#,
+            |s| !s.starts_with('.') && !s.starts_with('/'),
+        );
+        let kept = Plan::from_native_use_with_keep(
+            &uses,
+            false,
+            &["plot".into(), "editor".into(), "crypto".into()],
+        );
+        assert_eq!(
+            kept.backend_features(),
+            vec!["js", "editor", "highlight", "plot", "crypto"]
+        );
+        assert_eq!(
+            kept.ui,
+            UiRegistration::Parts(vec!["core", "editor", "diff", "plot"])
+        );
     }
 }

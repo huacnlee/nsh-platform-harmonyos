@@ -441,13 +441,15 @@ fn package(
                 let has_app_ui_sets = fs::read_to_string(rust_app_dir.join("lib.rs"))
                     .is_ok_and(|src| src.contains("pub fn app_ui_sets("));
                 if has_app_ui_sets {
-                    prune::Plan::for_rust_app()
+                    prune::Plan::for_rust_app(&config.features)
                 } else {
                     prune::Plan::full()
                 }
             }
-            runner::App::Tsx => prune::Plan::for_tsx_build(&build, false),
-            runner::App::TsxWithCrates { .. } => prune::Plan::for_tsx_build(&build, true),
+            runner::App::Tsx => prune::Plan::for_tsx_build(&build, false, &config.features),
+            runner::App::TsxWithCrates { .. } => {
+                prune::Plan::for_tsx_build(&build, true, &config.features)
+            }
         }
     };
     runner::write(&runner, linked, &plan, dev, false, options.api)?;

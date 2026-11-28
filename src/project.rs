@@ -49,6 +49,8 @@ pub(crate) struct AppConfig {
     pub(crate) links: Vec<nsh_core::url_scheme::WebLink>,
     /// `"fileTypes"`: file types the app declares for system Open With / share delivery.
     pub(crate) file_types: Vec<nsh_core::file_type::FileType>,
+    /// `"features"`: native backend features explicitly retained by `nsh.json`.
+    pub(crate) features: Vec<String>,
     /// Standalone apps declaring WebView can initialize ArkWeb before accepting input.
     webview: bool,
     /// Web pages may use the microphone (`capabilities.webview.media`).
@@ -100,6 +102,25 @@ impl AppConfig {
             }
             None => Vec::new(),
         };
+        let features = match json.get("features") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .enumerate()
+                .map(|(idx, item)| {
+                    item.as_str().map(str::to_owned).with_context(|| {
+                        format!(
+                            "{}: `features[{idx}]` must be a string",
+                            app.join("nsh.json").display()
+                        )
+                    })
+                })
+                .collect::<anyhow::Result<Vec<String>>>()?,
+            Some(Value::Null) | None => Vec::new(),
+            Some(_) => bail!(
+                "{}: `features` must be an array of strings",
+                app.join("nsh.json").display()
+            ),
+        };
         let harmonyos = HarmonyMeta::from_app_json(app, json)?;
         Ok(AppConfig {
             name: json["name"]
@@ -120,6 +141,7 @@ impl AppConfig {
             schemes,
             links,
             file_types,
+            features,
             webview: json["capabilities"]["webview"].is_object(),
             web_microphone: web_media(json, "microphone"),
             web_camera: web_media(json, "camera"),
