@@ -3,4 +3,5 @@ pub(crate) mod request;
 pub(crate) mod video;
 pub(crate) mod web_downloads;
 pub(crate) mod web_evaluation;
+pub(crate) mod web_scheme;
 pub(crate) mod webview;

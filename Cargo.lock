@@ -3867,9 +3867,9 @@ dependencies = [
 
 [[package]]
 name = "ohos-web-binding"
-version = "0.3.4"
+version = "0.3.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "73b30bbc77a5afb2a1b1caa9c51a65667f13d105035c18d26aa03238ca047ebd"
+checksum = "8cf70677f9ff13060e32e5eeaa22ddd85ea7e8098bae3b840878ef1d79885ad1"
 dependencies = [
  "bitflags 2.13.2",
  "ohos-enum-derive",

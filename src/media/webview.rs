@@ -1164,55 +1164,34 @@ fn install_asset_protocol(
         }
         let scheme_handler = CustomProtocolHandler::new();
         let scheme_clone = scheme.clone();
-        type CancelSlot = (u64, nsh_core::web_resource::WebResourceCancel);
-        let active_cancels: Arc<std::sync::Mutex<FxHashMap<String, Vec<CancelSlot>>>> =
-            Arc::default();
-        let next_req_id = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let active_cancels: Arc<super::web_scheme::SchemeCancels> = Arc::default();
         let stop_cancels = active_cancels.clone();
         scheme_handler.on_request_stop(move |request| {
-            let url = request.url();
-            if let Some(entries) = stop_cancels.lock().expect("scheme cancels").remove(&url) {
-                for (_, cancel) in entries {
-                    cancel.cancel();
-                }
-            }
+            stop_cancels.stop(request.user_token(), request.as_id());
         });
         scheme_handler.on_request_start(move |request, request_handle| {
             let url = request.url();
             let method = request.method();
             let responder = AssetReply(Some(request_handle));
-            let req_id = next_req_id.fetch_add(1, Ordering::Relaxed);
+            let req_id = active_cancels.allocate_id();
+            let _ = request.set_user_token(req_id);
             let done_cancels = active_cancels.clone();
-            let done_url = url.clone();
             let (req, cancel) = nsh_core::web_resource::WebResourceRequest::new(
-                url.clone(),
+                url,
                 if method.is_empty() {
                     "GET".to_owned()
                 } else {
                     method
                 },
                 move |resource| {
-                    {
-                        let mut map = done_cancels.lock().expect("scheme cancels");
-                        if let Some(list) = map.get_mut(&done_url) {
-                            list.retain(|(id, _)| *id != req_id);
-                            if list.is_empty() {
-                                map.remove(&done_url);
-                            }
-                        }
-                    }
+                    done_cancels.finish(req_id);
                     match resource {
                         Some(res) => responder.respond(200, res.mime_type_or_default(), &res.bytes),
                         None => responder.respond(404, "text/plain; charset=utf-8", &[]),
                     }
                 },
             );
-            active_cancels
-                .lock()
-                .expect("scheme cancels")
-                .entry(url)
-                .or_default()
-                .push((req_id, cancel));
+            active_cancels.register(req_id, request.as_id(), cancel);
             scheme_clone.handle(req);
             true
         });
