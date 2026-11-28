@@ -81,7 +81,11 @@ impl Dialogs {
     }
     pub(crate) fn show(&mut self, request: nsh_core::Dialog) -> Result<()> {
         if request.buttons.is_empty() || self.alerts.len() >= 32 {
-            self.reply(request.id, -1);
+            self.reply(
+                request.id,
+                -1,
+                request.input.as_ref().map(|input| input.text.clone()),
+            );
             return Ok(());
         }
         if self.alerts.is_empty() {
@@ -106,9 +110,12 @@ impl Dialogs {
                 Ok(()) => return,
                 Err(error) => {
                     log::error!("OHOS system dialog: {error}");
-                    let id = alert.request.id;
-                    self.alerts.pop_front();
-                    self.reply(id, -1);
+                    let alert = self.alerts.pop_front().expect("checked front");
+                    self.reply(
+                        alert.request.id,
+                        -1,
+                        alert.request.input.as_ref().map(|input| input.text.clone()),
+                    );
                 }
             }
         }
@@ -147,6 +154,39 @@ impl Dialogs {
                 )?;
             }
             let result = Rc::new(Cell::new(None));
+            let input_value = if !request.sheet {
+                if let Some(input) = &request.input {
+                    let stored = Rc::new(RefCell::new(input.text.clone()));
+                    let mut input_obj = Object::new(env)?;
+                    input_obj.set("text", input.text.as_str())?;
+                    if let Some(placeholder) = &input.placeholder {
+                        input_obj.set("placeholder", placeholder.as_str())?;
+                    }
+                    input_obj.set("selectAll", input.select_all)?;
+                    input_obj.set("required", input.required)?;
+                    let sink = stored.clone();
+                    input_obj.set(
+                        "onChange",
+                        env.create_function_from_closure::<String, (), _>(
+                            "nshDialogInputChange",
+                            move |ctx| {
+                                if let Ok(text) = ctx.try_get::<String>(1)
+                                    && let napi_ohos::Either::A(text) = text
+                                {
+                                    *sink.borrow_mut() = text;
+                                }
+                                Ok(())
+                            },
+                        )?,
+                    )?;
+                    options.set("input", input_obj)?;
+                    Some(stored)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             let mut buttons = Vec::new();
             let cancel = request
                 .sheet
@@ -209,6 +249,7 @@ impl Dialogs {
                         route.send(Message::DialogResult {
                             id,
                             index: result.get().unwrap_or(-1),
+                            value: input_value.as_ref().map(|v| v.borrow().clone()),
                         });
                     }
                     Ok(())
@@ -251,7 +292,7 @@ impl Dialogs {
         }
         Ok(())
     }
-    pub(crate) fn finish(&mut self, id: u32, index: i32) -> Result<()> {
+    pub(crate) fn finish(&mut self, id: u32, index: i32, value: Option<String>) -> Result<()> {
         if self
             .alerts
             .front()
@@ -261,19 +302,28 @@ impl Dialogs {
         }
         let alert = self.alerts.pop_front().expect("checked front");
         if !alert.programmatic_close.get() {
-            self.reply(id, index);
+            let reply_value = if alert.request.sheet {
+                None
+            } else {
+                value.or_else(|| alert.request.input.as_ref().map(|input| input.text.clone()))
+            };
+            self.reply(id, index, reply_value);
         }
         self.show_next();
         Ok(())
     }
-    fn reply(&self, id: u32, index: i32) {
+    fn reply(&self, id: u32, index: i32, value: Option<String>) {
+        let mut fields = vec![
+            ("id", PayloadValue::Number(id as f64)),
+            ("index", PayloadValue::Number(index as f64)),
+        ];
+        if let Some(value) = value {
+            fields.push(("value", PayloadValue::Str(value)));
+        }
         self.context.control.dispatch_event(
             nsh_core::ROOT_ID,
             EventKind::Dialog,
-            EventPayload::Map(vec![
-                ("id", PayloadValue::Number(id as f64)),
-                ("index", PayloadValue::Number(index as f64)),
-            ]),
+            EventPayload::Map(fields),
         );
     }
     pub(crate) fn clear(&mut self) {

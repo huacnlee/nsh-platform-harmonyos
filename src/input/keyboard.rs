@@ -34,6 +34,29 @@ impl crate::render::node::Node {
         }
         Ok(())
     }
+    pub(crate) fn effective_scale(&self) -> f32 {
+        if let Some(modal) = self.modal.borrow().as_ref() {
+            if let Some(scale) = modal.desktop_scale_factor() {
+                return scale;
+            }
+            if let Some(scale) = modal.host_sub_window_scale_factor() {
+                return scale;
+            }
+        }
+        let mut parent = self.parent_node.borrow().upgrade();
+        while let Some(node) = parent {
+            if let Some(modal) = node.modal.borrow().as_ref() {
+                if let Some(scale) = modal.desktop_scale_factor() {
+                    return scale;
+                }
+                if let Some(scale) = modal.host_sub_window_scale_factor() {
+                    return scale;
+                }
+            }
+            parent = node.parent_node.borrow().upgrade();
+        }
+        self.scale.get().max(1.0)
+    }
     pub(crate) fn key_window_id(&self) -> NodeId {
         if let Some(modal) = self.modal.borrow().as_ref() {
             if modal.is_desktop_window() {
@@ -355,7 +378,7 @@ impl KeyboardWindow {
                 input.key_text,
             )
             .into();
-            // ArkUI exposes a logical key identifier but no hardware scan code.
+            details.code = physical_code(code).into();
             details.modifiers = modifiers;
             match code {
                 N::ShiftLeft | N::ShiftRight => {
@@ -625,6 +648,21 @@ impl KeyboardWindow {
                     });
                     consumed = true;
                 } else if !repeat
+                    && snapshot.desktop
+                    && !editing
+                    && stroke.key == Key::Char('w')
+                    && stroke.modifiers
+                        == (Modifiers {
+                            ctrl: true,
+                            ..Modifiers::default()
+                        })
+                {
+                    route.send(crate::app::runtime::Message::DesktopMenuAction {
+                        id: 0,
+                        role: Some(nsh_core::desktop::MenuRole::Close),
+                    });
+                    consumed = true;
+                } else if !repeat
                     && stroke.key == Key::Escape
                     && stroke.modifiers == Modifiers::default()
                 {
@@ -652,6 +690,23 @@ impl KeyboardWindow {
                 {
                     drop(snapshot);
                     consumed = back(route);
+                } else if stroke.key == Key::Tab
+                    && (stroke.modifiers == Modifiers::default()
+                        || stroke.modifiers
+                            == (Modifiers {
+                                shift: true,
+                                ..Modifiers::default()
+                            }))
+                {
+                    let current = snapshot
+                        .focused
+                        .and_then(|id| owner.node_by_id(id))
+                        .filter(|node| node.visible_in_tree() && node.key_window_id() == window)
+                        .or_else(|| (!covered).then(|| focus.clone()).flatten());
+                    drop(snapshot);
+                    let tab_root = scope_modal.as_ref().unwrap_or(owner);
+                    consumed =
+                        advance_tab_focus(tab_root, current.as_ref(), stroke.modifiers.shift);
                 } else if snapshot.desktop
                     && !editing
                     && !covered
@@ -734,6 +789,104 @@ impl KeyboardWindow {
 
         held.record_down(code, consumed);
         consumed
+    }
+}
+
+fn advance_tab_focus(
+    root: &std::rc::Rc<crate::render::node::Node>,
+    current: Option<&std::rc::Rc<crate::render::node::Node>>,
+    backwards: bool,
+) -> bool {
+    let ordered = nsh_core::input::tab_order(
+        root.clone(),
+        |node| {
+            node.children
+                .borrow()
+                .iter()
+                .filter_map(std::rc::Weak::upgrade)
+                .filter(|child| {
+                    child.visible_in_tree()
+                        && !child.accessibility_state.spec.borrow().state.disabled
+                        && child
+                            .modal
+                            .borrow()
+                            .as_ref()
+                            .is_none_or(|modal| modal.is_main_window_host())
+                })
+                .collect()
+        },
+        |node| node.id,
+        |node| node.interaction.tab_after(),
+    );
+    let stops: Vec<_> = ordered
+        .into_iter()
+        .filter(|node| {
+            if node.id == nsh_core::ROOT_ID
+                || node.kind == nsh_core::ViewKind::Modal
+                || node.accessibility_state.spec.borrow().state.disabled
+            {
+                return false;
+            }
+            match node.kind {
+                nsh_core::ViewKind::Input => {
+                    node.input.borrow().is_some()
+                        && node.interaction.focusable_prop() != Some(false)
+                }
+                nsh_core::ViewKind::WebView => {
+                    node.web.borrow().is_some() && node.interaction.focusable_prop() != Some(false)
+                }
+                _ => node.interaction.is_focus_stop(),
+            }
+        })
+        .collect();
+    if stops.is_empty() {
+        return false;
+    }
+    let next_idx = match current.and_then(|cur| stops.iter().position(|stop| stop.id == cur.id)) {
+        Some(idx) => {
+            if backwards {
+                if idx == 0 { stops.len() - 1 } else { idx - 1 }
+            } else {
+                (idx + 1) % stops.len()
+            }
+        }
+        None => {
+            if backwards {
+                stops.len() - 1
+            } else {
+                0
+            }
+        }
+    };
+    let target = &stops[next_idx];
+    if let Some(prev) = current
+        && prev.id != target.id
+        && target.kind != nsh_core::ViewKind::Input
+        && let Some(prev_input) = prev.input.borrow().as_ref()
+    {
+        let _ = prev_input.focus(false);
+        let _ = prev.flush_arkui();
+    }
+    match target.kind {
+        nsh_core::ViewKind::Input => {
+            if let Some(input) = target.input.borrow().as_ref() {
+                let _ = input.focus(true);
+                let _ = target.flush_arkui();
+                return true;
+            }
+            false
+        }
+        nsh_core::ViewKind::WebView => {
+            if let Some(web) = target.web.borrow().as_ref() {
+                return request_node_focus(&web.native().borrow()).is_ok();
+            }
+            false
+        }
+        _ => {
+            let _ = target.interaction.command_focus(target, true);
+            let _ = target.flush_arkui();
+            true
+        }
     }
 }
 
@@ -1143,6 +1296,117 @@ fn logical_key(
     }
 }
 
+fn physical_code(code: N) -> &'static str {
+    match code {
+        N::A => "KeyA",
+        N::B => "KeyB",
+        N::C => "KeyC",
+        N::D => "KeyD",
+        N::E => "KeyE",
+        N::F => "KeyF",
+        N::G => "KeyG",
+        N::H => "KeyH",
+        N::I => "KeyI",
+        N::J => "KeyJ",
+        N::K => "KeyK",
+        N::L => "KeyL",
+        N::M => "KeyM",
+        N::N => "KeyN",
+        N::O => "KeyO",
+        N::P => "KeyP",
+        N::Q => "KeyQ",
+        N::R => "KeyR",
+        N::S => "KeyS",
+        N::T => "KeyT",
+        N::U => "KeyU",
+        N::V => "KeyV",
+        N::W => "KeyW",
+        N::X => "KeyX",
+        N::Y => "KeyY",
+        N::Z => "KeyZ",
+        N::Digit0 => "Digit0",
+        N::Digit1 => "Digit1",
+        N::Digit2 => "Digit2",
+        N::Digit3 => "Digit3",
+        N::Digit4 => "Digit4",
+        N::Digit5 => "Digit5",
+        N::Digit6 => "Digit6",
+        N::Digit7 => "Digit7",
+        N::Digit8 => "Digit8",
+        N::Digit9 => "Digit9",
+        N::F1 => "F1",
+        N::F2 => "F2",
+        N::F3 => "F3",
+        N::F4 => "F4",
+        N::F5 => "F5",
+        N::F6 => "F6",
+        N::F7 => "F7",
+        N::F8 => "F8",
+        N::F9 => "F9",
+        N::F10 => "F10",
+        N::F11 => "F11",
+        N::F12 => "F12",
+        N::Numpad0 => "Numpad0",
+        N::Numpad1 => "Numpad1",
+        N::Numpad2 => "Numpad2",
+        N::Numpad3 => "Numpad3",
+        N::Numpad4 => "Numpad4",
+        N::Numpad5 => "Numpad5",
+        N::Numpad6 => "Numpad6",
+        N::Numpad7 => "Numpad7",
+        N::Numpad8 => "Numpad8",
+        N::Numpad9 => "Numpad9",
+        N::NumpadDivide => "NumpadDivide",
+        N::NumpadMultiply => "NumpadMultiply",
+        N::NumpadSubtract => "NumpadSubtract",
+        N::NumpadAdd => "NumpadAdd",
+        N::NumpadDot => "NumpadDecimal",
+        N::NumpadComma => "NumpadComma",
+        N::NumpadEnter => "NumpadEnter",
+        N::NumpadEquals => "NumpadEqual",
+        N::NumpadLeftParen => "NumpadParenLeft",
+        N::NumpadRightParen => "NumpadParenRight",
+        N::ShiftLeft => "ShiftLeft",
+        N::ShiftRight => "ShiftRight",
+        N::CtrlLeft => "ControlLeft",
+        N::CtrlRight => "ControlRight",
+        N::AltLeft => "AltLeft",
+        N::AltRight => "AltRight",
+        N::MetaLeft => "MetaLeft",
+        N::MetaRight => "MetaRight",
+        N::CapsLock => "CapsLock",
+        N::NumLock => "NumLock",
+        N::ScrollLock => "ScrollLock",
+        N::Enter => "Enter",
+        N::Escape => "Escape",
+        N::Tab => "Tab",
+        N::Space => "Space",
+        N::Del => "Backspace",
+        N::ForwardDel => "Delete",
+        N::Insert => "Insert",
+        N::DpadUp => "ArrowUp",
+        N::DpadDown => "ArrowDown",
+        N::DpadLeft => "ArrowLeft",
+        N::DpadRight => "ArrowRight",
+        N::MoveHome => "Home",
+        N::MoveEnd => "End",
+        N::PageUp => "PageUp",
+        N::PageDown => "PageDown",
+        N::Comma => "Comma",
+        N::Period => "Period",
+        N::Grave => "Backquote",
+        N::Minus => "Minus",
+        N::Equals => "Equal",
+        N::LeftBracket => "BracketLeft",
+        N::RightBracket => "BracketRight",
+        N::Backslash => "Backslash",
+        N::Semicolon => "Semicolon",
+        N::Apostrophe => "Quote",
+        N::Slash => "Slash",
+        _ => "",
+    }
+}
+
 fn key(code: N) -> Option<Key> {
     use Key as K;
     Some(match code {
@@ -1172,16 +1436,16 @@ fn key(code: N) -> Option<Key> {
         N::X => K::Char('x'),
         N::Y => K::Char('y'),
         N::Z => K::Char('z'),
-        N::Digit0 => K::Char('0'),
-        N::Digit1 => K::Char('1'),
-        N::Digit2 => K::Char('2'),
-        N::Digit3 => K::Char('3'),
-        N::Digit4 => K::Char('4'),
-        N::Digit5 => K::Char('5'),
-        N::Digit6 => K::Char('6'),
-        N::Digit7 => K::Char('7'),
-        N::Digit8 => K::Char('8'),
-        N::Digit9 => K::Char('9'),
+        N::Digit0 | N::Numpad0 => K::Char('0'),
+        N::Digit1 | N::Numpad1 => K::Char('1'),
+        N::Digit2 | N::Numpad2 => K::Char('2'),
+        N::Digit3 | N::Numpad3 => K::Char('3'),
+        N::Digit4 | N::Numpad4 => K::Char('4'),
+        N::Digit5 | N::Numpad5 => K::Char('5'),
+        N::Digit6 | N::Numpad6 => K::Char('6'),
+        N::Digit7 | N::Numpad7 => K::Char('7'),
+        N::Digit8 | N::Numpad8 => K::Char('8'),
+        N::Digit9 | N::Numpad9 => K::Char('9'),
         N::F1 => K::F(1),
         N::F2 => K::F(2),
         N::F3 => K::F(3),
@@ -1209,11 +1473,16 @@ fn key(code: N) -> Option<Key> {
         N::MoveEnd => K::End,
         N::PageUp => K::PageUp,
         N::PageDown => K::PageDown,
-        N::Comma => K::Char(','),
-        N::Period => K::Char('.'),
+        N::Comma | N::NumpadComma => K::Char(','),
+        N::Period | N::NumpadDot => K::Char('.'),
         N::Grave => K::Char('`'),
-        N::Minus => K::Char('-'),
-        N::Equals => K::Char('='),
+        N::Minus | N::NumpadSubtract => K::Char('-'),
+        N::Equals | N::NumpadEquals => K::Char('='),
+        N::NumpadAdd => K::Char('+'),
+        N::NumpadMultiply => K::Char('*'),
+        N::NumpadDivide => K::Char('/'),
+        N::NumpadLeftParen => K::Char('('),
+        N::NumpadRightParen => K::Char(')'),
         N::LeftBracket => K::Char('['),
         N::RightBracket => K::Char(']'),
         N::Backslash => K::Char('\\'),
@@ -1285,6 +1554,24 @@ mod tests {
             false
         });
     }
+    #[test]
+    fn physical_codes_and_numpad_keys_follow_dom_spellings() {
+        assert_eq!(physical_code(N::A), "KeyA");
+        assert_eq!(physical_code(N::Digit7), "Digit7");
+        assert_eq!(physical_code(N::NumpadEnter), "NumpadEnter");
+        assert_eq!(physical_code(N::NumpadDot), "NumpadDecimal");
+        assert_eq!(physical_code(N::CtrlLeft), "ControlLeft");
+        assert_eq!(physical_code(N::DpadLeft), "ArrowLeft");
+        assert_eq!(physical_code(N::Unknown), "");
+        assert_eq!(key(N::Numpad5), Some(Key::Char('5')));
+        assert_eq!(key(N::NumpadAdd), Some(Key::Char('+')));
+        assert_eq!(key(N::NumpadDivide), Some(Key::Char('/')));
+        assert_eq!(
+            logical_key(N::Numpad3, 0, false, Some(false), "KEYCODE_NUMPAD_3"),
+            "3"
+        );
+    }
+
     #[test]
     fn logical_key_maps_space_and_letters_when_unicode_is_zero() {
         assert_eq!(

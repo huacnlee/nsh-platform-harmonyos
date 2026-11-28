@@ -1612,7 +1612,9 @@ pub(crate) fn ctrl_wheel_pinch_delta(dy_lines: f32) -> f32 {
 #[allow(dead_code)]
 pub(crate) struct MainWindowState {
     pub(crate) movable: bool,
+    pub(crate) minimizable: bool,
     pub(crate) maximizable: bool,
+    pub(crate) closable: bool,
     pub(crate) resizable: bool,
     pub(crate) frame_none: bool,
     pub(crate) title_bar_hidden: bool,
@@ -1626,7 +1628,9 @@ impl Default for MainWindowState {
     fn default() -> Self {
         Self {
             movable: true,
+            minimizable: true,
             maximizable: true,
+            closable: true,
             resizable: true,
             frame_none: false,
             title_bar_hidden: false,
@@ -1644,8 +1648,14 @@ impl MainWindowState {
         if let Some(movable) = attrs.movable {
             self.movable = movable;
         }
+        if let Some(minimizable) = attrs.minimizable {
+            self.minimizable = minimizable;
+        }
         if let Some(maximizable) = attrs.maximizable {
             self.maximizable = maximizable;
+        }
+        if let Some(closable) = attrs.closable {
+            self.closable = closable;
         }
         if let Some(resizable) = attrs.resizable {
             self.resizable = resizable;

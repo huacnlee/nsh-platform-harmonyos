@@ -96,6 +96,7 @@ export interface EditorReceipt {
 export interface EditorSettings {
   belowViewport: boolean
   targetId: number
+  windowId?: number
   multiline: boolean
   secure: boolean
   text: string
@@ -139,9 +140,11 @@ export interface HostCommand {
   enabled?: boolean
   lightContent?: boolean
   animated?: boolean
+  polite?: boolean
   text?: string
   announcement?: string
   elementId?: number
+  customId?: string
   windowId?: number
   openId?: number
   limit?: number
@@ -475,6 +478,7 @@ export interface WebSettings {
   sharedCookies: boolean
   clearCookies: boolean
   targetId: number
+  windowId?: number
   url?: string
   html?: string
   htmlBaseUrl?: string

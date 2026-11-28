@@ -1515,7 +1515,13 @@ impl Scroller {
     pub(crate) fn sticky(&self, cells: Vec<(nsh_core::StickyCell, Weak<Node>)>) -> Result<()> {
         for (_, node) in self.sticky.borrow().iter() {
             if let Some(node) = node.upgrade() {
+                node.set_sticky_rank(None)?;
                 node.pin(0.0, 0.0)?;
+            }
+        }
+        for (index, (_, node)) in cells.iter().enumerate() {
+            if let Some(node) = node.upgrade() {
+                node.set_sticky_rank(Some(index))?;
             }
         }
         let animated = cells.iter().any(|(c, _)| c.offset.is_some());

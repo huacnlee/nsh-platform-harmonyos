@@ -1,5 +1,5 @@
 //! Per-surface native audio service powered by `ohos-avplayer-binding` (`AvPlayer`)
-//! for short `Sound` effects (polyphonic, up to 8 voices) and streaming `AudioPlayer`s.
+//! for short `Sound` effects (polyphonic, up to 32 voices) and streaming `AudioPlayer`s.
 
 use std::{
     cell::RefCell,
@@ -29,7 +29,7 @@ use crate::{
     services::assets::StreamAssets,
 };
 
-const MAX_VOICES: usize = 8;
+const MAX_VOICES: usize = 32;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 
 fn clamp(v: f32, lo: f32, hi: f32) -> f32 {
@@ -59,6 +59,42 @@ fn set_opened_file(player: &mut AvPlayer, file: &File) -> Result<(), String> {
 /// Owned temporary file in the Ability audio cache, removed on drop.
 struct TempAudioFile(PathBuf);
 
+fn audio_hint_extension(hint: &str) -> &'static str {
+    let trimmed = hint.trim();
+    let mime = trimmed.split(';').next().unwrap_or(trimmed).trim();
+    match mime.to_ascii_lowercase().as_str() {
+        "audio/mpeg" | "audio/mp3" => return "mp3",
+        "audio/mp4" | "audio/x-m4a" | "audio/m4a" => return "m4a",
+        "audio/aac" | "audio/aacp" => return "aac",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => return "wav",
+        "audio/ogg" | "audio/vorbis" => return "ogg",
+        "audio/opus" => return "opus",
+        "audio/flac" | "audio/x-flac" => return "flac",
+        "audio/webm" => return "webm",
+        "audio/3gpp" => return "3gp",
+        _ => {}
+    }
+    match Path::new(trimmed.split(['?', '#']).next().unwrap_or(trimmed))
+        .extension()
+        .and_then(|e| e.to_str())
+        .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("mp3") => "mp3",
+        Some("m4a") => "m4a",
+        Some("mp4") => "mp4",
+        Some("aac") => "aac",
+        Some("wav") => "wav",
+        Some("ogg") | Some("oga") => "ogg",
+        Some("opus") => "opus",
+        Some("flac") => "flac",
+        Some("webm") => "webm",
+        Some("3gp") => "3gp",
+        _ => "bin",
+    }
+}
+
 impl TempAudioFile {
     fn create(
         cache_dir: &Path,
@@ -69,11 +105,7 @@ impl TempAudioFile {
     ) -> io::Result<Self> {
         let dir = cache_dir.join("audio");
         std::fs::create_dir_all(&dir)?;
-        let ext = Path::new(hint.split(['?', '#']).next().unwrap_or(hint))
-            .extension()
-            .and_then(|e| e.to_str())
-            .filter(|e| !e.is_empty() && e.chars().all(|c| c.is_ascii_alphanumeric()))
-            .unwrap_or("bin");
+        let ext = audio_hint_extension(hint);
         let mut random = [0u8; 8];
         let _ = getrandom::fill(&mut random);
         let path = dir.join(format!(

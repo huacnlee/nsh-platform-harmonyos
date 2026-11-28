@@ -9,7 +9,7 @@ use crate::text::typography::NativeText;
 
 impl Node {
     pub(crate) fn input_priority(&self) -> bool {
-        self.pinned.get() != (0.0, 0.0)
+        self.sticky_z.get().is_some() || self.pinned.get() != (0.0, 0.0)
     }
     pub(crate) fn input_visible(&self) -> bool {
         if !self.active.get()
@@ -157,9 +157,10 @@ impl Node {
                         self.mounted().borrow().layout_position_in_window(),
                         root.mounted().borrow().layout_position_in_window(),
                     ) {
+                        let scale = self.effective_scale();
                         page_position = nsh_core::Point::new(
-                            Points((node.x - origin.x) as f32 / self.scale.get() + x),
-                            Points((node.y - origin.y) as f32 / self.scale.get() + y),
+                            Points((node.x - origin.x) as f32 / scale + x),
+                            Points((node.y - origin.y) as f32 / scale + y),
                         );
                     }
                     break;

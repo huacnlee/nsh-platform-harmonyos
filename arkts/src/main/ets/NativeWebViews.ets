@@ -9,6 +9,7 @@ export interface WebSettings {
   sharedCookies: boolean;
   clearCookies: boolean;
   targetId: number;
+  windowId?: number | null;
   url?: string | null;
   html?: string | null;
   htmlBaseUrl?: string | null;
@@ -168,6 +169,9 @@ struct WebViewHost {
         this.entry.onControllerAttached();
       })
       .onLoadIntercept((event): boolean => {
+        if (!event.data.isMainFrame()) {
+          return false;
+        }
         return this.entry.onLoadIntercept(event.data.getRequestUrl());
       })
       .onPageBegin(() => {
@@ -197,11 +201,16 @@ struct WebViewHost {
       .onErrorReceive((event) => {
         if (event.request.isMainFrame()) {
           this.entry.onFirstBufferReady();
-          this.entry.emit("error", event.error.getErrorInfo(), event.error.getErrorCode());
+          this.entry.emit(
+            "error",
+            event.error.getErrorInfo(),
+            event.error.getErrorCode(),
+            event.request.getRequestUrl(),
+          );
         }
       })
       .onRenderExited(() => {
-        this.entry.emit("render-exited");
+        this.entry.onRenderExited();
       })
       .onTouch((event: TouchEvent): void => {
         this.entry.onTouch(event);
@@ -275,7 +284,7 @@ class WebEntry {
     this.settings = settings;
     this.context = context;
     this.viewState.zoomable = settings.zoomable;
-    this.node = new BuilderNode<[WebContentParams]>(context.getUIContext());
+    this.node = new BuilderNode<[WebContentParams]>(this.webUIContext());
   }
 
   belongsTo(context: NshRuntimeContext): boolean {
@@ -305,13 +314,23 @@ class WebEntry {
   }
 
   private webUIContext(): UIContext {
+    if (
+      this.settings.windowId !== undefined &&
+      this.settings.windowId !== null &&
+      this.context.getWindowUIContext
+    ) {
+      const sub = this.context.getWindowUIContext(this.settings.windowId);
+      if (sub) {
+        return sub;
+      }
+    }
     const id = this.webId();
     return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.context.getUIContext();
   }
 
   create(): void {
     // Let the settled navigation or commit frame present before creating NWeb.
-    this.context.getUIContext().postFrameCallback(new WebMountFrame(this));
+    this.webUIContext().postFrameCallback(new WebMountFrame(this));
   }
 
   mountAfterFrame(): void {
@@ -698,7 +717,7 @@ class WebEntry {
     }
     const limit = mode === FileSelectorMode.FileOpenMultipleMode ? 100 : 1;
     const accept = selector.getAcceptType().map((type: string) => type.toLowerCase());
-    const host = this.context.getUIContext().getHostContext();
+    const host = this.webUIContext().getHostContext();
     if (!host) {
       return [];
     }
@@ -792,20 +811,29 @@ class WebEntry {
     }
   }
 
-  emit(phase: string, message?: string, code?: number): void {
+  onRenderExited(): void {
+    this.loading = false;
+    this.sourceApplied = false;
+    this.viewState.revealed = false;
+    this.emit("render-exited");
+  }
+
+  emit(phase: string, message?: string, code?: number, explicitUrl?: string): void {
     if (!this.attached || this.closed || !this.context.isActive()) {
       return;
     }
     if (phase === "error") {
       this.loading = false;
     }
-    let url = "";
+    let url = explicitUrl ?? "";
     let title = "";
     let canGoBack = false;
     let canGoForward = false;
     if (this.controllerReady) {
       try {
-        url = this.controller.getUrl();
+        if (!url) {
+          url = this.controller.getUrl();
+        }
         title = this.controller.getTitle();
         canGoBack = this.controller.accessBackward();
         canGoForward = this.controller.accessForward();

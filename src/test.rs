@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use nsh_testing::{HostTarget, Platform, TestRun};
 use std::{
     fs,
-    io::{self, Read},
+    io::{self, IsTerminal as _, Read},
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -175,7 +175,10 @@ impl Plan {
             files.push(path.clone());
         } else {
             let mut steps = String::new();
-            io::stdin().read_to_string(&mut steps)?;
+            let stdin = io::stdin();
+            if !stdin.is_terminal() {
+                stdin.lock().read_to_string(&mut steps)?;
+            }
             let files_dir = work.join("files");
             fs::create_dir_all(&files_dir)?;
             let file = files_dir.join(format!("steps-{}.test.ts", std::process::id()));
@@ -184,7 +187,7 @@ impl Plan {
             fs::write(
                 &file,
                 format!(
-                    "import {{ test, open, expect }} from 'nsh/test';\ntest('steps', async () => {{\nconst app = await open({entry});\n{steps}\n}});\n"
+                    "import {{ test, open, expect }} from 'nsh/test';\ntest('steps', async () => {{\nconst app = await open({entry}, {{ network: 'live' }});\nawait app.wait(500);\n{steps}\n}});\n"
                 ),
             )?;
             files.push(file);

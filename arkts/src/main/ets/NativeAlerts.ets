@@ -14,6 +14,14 @@ interface NativeAlertButton {
   action: () => void;
 }
 
+export interface NativeAlertInput {
+  text: string;
+  placeholder?: string;
+  selectAll: boolean;
+  required: boolean;
+  onChange: (value: string) => void;
+}
+
 export interface NativeAlertOptions {
   ui: UIContext;
   title?: string;
@@ -21,6 +29,7 @@ export interface NativeAlertOptions {
   autoCancel: boolean;
   sheet: boolean;
   appearance?: string;
+  input?: NativeAlertInput;
   buttons?: NativeAlertButton[];
   sheets?: NativeAlertButton[];
   confirm?: NativeAlertButton;
@@ -46,30 +55,67 @@ function isDestructive(item: NativeAlertButton): boolean {
 class AlertContent {
   options: NativeAlertOptions;
   colorMode: ThemeColorMode;
+  rawButtons: NativeAlertButton[];
   buttons: AdvancedDialogV2Button[];
   actions: NativeAlertButton[];
   cancel?: NativeAlertButton;
   hasHeader: boolean;
+  inputValue: string;
   select: (button: NativeAlertButton) => void;
+  updateInput: (value: string) => void;
+  submitInput: () => void;
   constructor(options: NativeAlertOptions, close: () => void) {
     this.options = options;
     this.colorMode = parseColorMode(options.appearance);
+    this.rawButtons = options.buttons ?? [];
+    this.inputValue = options.input?.text ?? "";
+    const requiredEmpty =
+      options.input !== undefined && options.input.required && this.inputValue.length === 0;
     const button = (item: NativeAlertButton): AdvancedDialogV2Button =>
       new AdvancedDialogV2Button({
         content: item.value ?? item.title ?? "",
         role: isDestructive(item) ? ButtonRole.ERROR : ButtonRole.NORMAL,
+        enabled: item.style === "cancel" || !requiredEmpty,
         action: (): void => {
           item.action();
           close();
         },
       });
-    this.buttons = (options.buttons ?? []).map(button);
+    this.buttons = this.rawButtons.map(button);
     this.actions = (options.sheets ?? []).slice();
     this.cancel = options.confirm;
     this.hasHeader = (options.title ?? "").length > 0 || (options.message ?? "").length > 0;
     this.select = (item: NativeAlertButton): void => {
       item.action();
       close();
+    };
+    this.updateInput = (value: string): void => {
+      this.inputValue = value;
+      this.options.input?.onChange(value);
+      if (this.options.input?.required) {
+        const allow = value.length > 0;
+        for (let i = 0; i < this.buttons.length; i++) {
+          if (this.rawButtons[i]?.style !== "cancel") {
+            this.buttons[i].enabled = allow;
+          }
+        }
+      }
+    };
+    this.submitInput = (): void => {
+      if (this.options.input?.required && this.inputValue.length === 0) {
+        return;
+      }
+      for (let i = 0; i < this.rawButtons.length; i++) {
+        if (this.rawButtons[i].style !== "cancel") {
+          this.rawButtons[i].action();
+          close();
+          return;
+        }
+      }
+      if (this.rawButtons.length === 1) {
+        this.rawButtons[0].action();
+        close();
+      }
     };
   }
 }
@@ -79,22 +125,60 @@ struct MultiButtonAlert {
   @Param title?: string = undefined;
   @Param message: string = "";
   @Param buttons: AdvancedDialogV2Button[] = [];
+  @Param input?: NativeAlertInput = undefined;
+  @Param ui?: UIContext = undefined;
+  @Param onInputChange?: (value: string) => void = undefined;
+  @Param onInputSubmit?: () => void = undefined;
+  private readonly inputController: TextInputController = new TextInputController();
 
   @Builder
   private buildMessage() {
-    if (this.message.length > 0) {
-      Text(this.message)
-        .fontSize(
-          this.title && this.title.length > 0 ? $r("sys.float.Body_M") : $r("sys.float.Body_L"),
-        )
-        .fontColor(
-          this.title && this.title.length > 0
-            ? $r("sys.color.font_secondary")
-            : $r("sys.color.font_primary"),
-        )
-        .width("100%")
-        .textAlign(TextAlign.Center);
+    Column({ space: 12 }) {
+      if (this.message.length > 0) {
+        Text(this.message)
+          .fontSize(
+            this.title && this.title.length > 0 ? $r("sys.float.Body_M") : $r("sys.float.Body_L"),
+          )
+          .fontColor(
+            this.title && this.title.length > 0
+              ? $r("sys.color.font_secondary")
+              : $r("sys.color.font_primary"),
+          )
+          .width("100%")
+          .textAlign(TextAlign.Center);
+      }
+      if (this.input !== undefined) {
+        TextInput({
+          text: this.input.text,
+          placeholder: this.input.placeholder ?? "",
+          controller: this.inputController,
+        })
+          .id("nsh-alert-input")
+          .width("100%")
+          .enterKeyType(EnterKeyType.Done)
+          .defaultFocus(true)
+          .onAppear((): void => {
+            try {
+              this.ui?.getFocusController().requestFocus("nsh-alert-input");
+            } catch {}
+            if (this.input !== undefined && this.input.selectAll && this.input.text.length > 0) {
+              const len = this.input.text.length;
+              Promise.resolve().then((): void => {
+                try {
+                  this.inputController.setTextSelection(0, len);
+                } catch {}
+              });
+            }
+          })
+          .onChange((value: string): void => {
+            this.onInputChange?.(value);
+          })
+          .onSubmit((): void => {
+            this.onInputSubmit?.();
+          });
+      }
     }
+    .width("100%");
   }
 
   build() {
@@ -196,7 +280,7 @@ function nativeAlert(content: AlertContent) {
       });
     } else {
       Column() {
-        if (content.buttons.length <= 2) {
+        if (content.options.input === undefined && content.buttons.length <= 2) {
           AlertDialogV2({
             primaryTitle: content.options.title,
             content: content.options.message,
@@ -208,6 +292,10 @@ function nativeAlert(content: AlertContent) {
             title: content.options.title,
             message: content.options.message,
             buttons: content.buttons,
+            input: content.options.input,
+            ui: content.options.ui,
+            onInputChange: content.updateInput,
+            onInputSubmit: content.submitInput,
           });
         }
       }
@@ -280,6 +368,7 @@ export function showNativeAlert(options: NativeAlertOptions): () => void {
       ? options.ui.openBindSheet(view, sheetOptions)
       : prompt.openCustomDialog(view, {
           autoCancel: options.autoCancel,
+          keyboardAvoidMode: KeyboardAvoidMode.DEFAULT,
           onWillDismiss: (event: DismissDialogAction): void => {
             if (allowDismiss()) {
               event.dismiss();

@@ -468,7 +468,7 @@ impl<T> PendingTable<T> {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-enum ExifOrientation {
+pub(crate) enum ExifOrientation {
     #[default]
     Normal,
     FlipHorizontal,
@@ -513,14 +513,14 @@ impl ExifOrientation {
         }
     }
 
-    fn swaps_axes(self) -> bool {
+    pub(crate) fn swaps_axes(self) -> bool {
         matches!(
             self,
             Self::Transpose | Self::Rotate90 | Self::Transverse | Self::Rotate270
         )
     }
 
-    fn display_dimensions(self, raw_width: u32, raw_height: u32) -> (u32, u32) {
+    pub(crate) fn display_dimensions(self, raw_width: u32, raw_height: u32) -> (u32, u32) {
         if self.swaps_axes() {
             (raw_height, raw_width)
         } else {
@@ -757,7 +757,7 @@ mod ohos {
         Some("pending JS exception".into())
     }
 
-    fn read_exif_orientation(source: &ImageSource, bytes: &[u8]) -> ExifOrientation {
+    pub(crate) fn read_exif_orientation(source: &ImageSource, bytes: &[u8]) -> ExifOrientation {
         if let Ok(mut key) = ImageString::from_str("Orientation")
             && let Ok(prop) = source.get_image_property(&mut key)
             && let Some(raw) = prop.to_string_lossy()
@@ -768,7 +768,7 @@ mod ohos {
         parse_jpeg_exif_orientation(bytes).unwrap_or(ExifOrientation::Normal)
     }
 
-    fn apply_orientation(
+    pub(crate) fn apply_orientation(
         pixelmap: &mut PixelMap,
         orientation: ExifOrientation,
         raw_width: u32,
@@ -1305,12 +1305,12 @@ mod ohos {
 }
 
 #[cfg(target_env = "ohos")]
-pub(crate) use ohos::prepare_image_owned;
-#[cfg(target_env = "ohos")]
 pub use ohos::{
     UiThread, ability, cache_dir, files_dir, launch_want, on_ability_want, prepare_image,
     prepare_image_bytes, run_on_ui_thread,
 };
+#[cfg(target_env = "ohos")]
+pub(crate) use ohos::{apply_orientation, prepare_image_owned, read_exif_orientation};
 #[cfg(target_env = "ohos")]
 pub(crate) use ohos::{
     complete_ability_result, deliver_ability_want, on_session_closed, run_ui_task,

@@ -21,6 +21,8 @@ interface TabProperty {
 class TabSettings {
   items: TabItem[] = [];
   selected: number = 0;
+  appHidden: boolean = false;
+  pushHidden: boolean = false;
   hidden: boolean = false;
   tint?: string;
   colorMode: ThemeColorMode = ThemeColorMode.SYSTEM;
@@ -178,6 +180,8 @@ export class NativeTabBar {
     const next = new TabSettings(this.controller, this.settings.change);
     next.items = this.settings.items;
     next.selected = this.settings.selected;
+    next.appHidden = this.settings.appHidden;
+    next.pushHidden = this.settings.pushHidden;
     next.hidden = this.settings.hidden;
     next.tint = this.settings.tint;
     next.colorMode = this.settings.colorMode;
@@ -204,7 +208,8 @@ export class NativeTabBar {
     }
     const next = this.cloneSettings();
     for (const change of changes) {
-      switch (change.name) {
+      const propName = change.name.startsWith("$") ? change.name.slice(1) : change.name;
+      switch (propName) {
         case "items":
           next.items = change.removed ? [] : (change.value as TabItem[]);
           break;
@@ -212,14 +217,19 @@ export class NativeTabBar {
           next.selected = change.removed ? 0 : (change.value as number);
           break;
         case "hidden":
-          next.hidden = !change.removed && (change.value as boolean);
+          next.appHidden = !change.removed && (change.value as boolean);
+          break;
+        case "pushHidden":
+          next.pushHidden = !change.removed && (change.value as boolean);
           break;
         case "tint":
           next.tint = change.removed || change.value == null ? undefined : (change.value as string);
           break;
       }
     }
+    next.hidden = next.appHidden || next.pushHidden;
     const prevSelected = this.settings.selected;
+    const prevHidden = this.settings.hidden;
     this.settings = next;
     this.builder.update(next);
     if (next.selected !== prevSelected) {
@@ -227,7 +237,9 @@ export class NativeTabBar {
         this.controller.changeIndex(next.selected);
       } catch {}
     }
-    this.context.height(next.hidden ? 0 : 56);
+    if (next.hidden !== prevHidden) {
+      this.context.height(next.hidden ? 0 : 56);
+    }
   }
   dispose(): void {
     if (!this.closed) {

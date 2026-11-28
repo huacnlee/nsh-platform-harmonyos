@@ -82,9 +82,11 @@ interface HostCommandPayload {
   enabled?: boolean;
   lightContent?: boolean;
   animated?: boolean;
+  polite?: boolean;
   text?: string;
   announcement?: string;
   elementId?: number;
+  customId?: string;
   windowId?: number;
   openId?: number;
   limit?: number;
@@ -579,6 +581,47 @@ class HostSession {
   private screenReaderHandler?: (enabled: boolean) => void;
   private reduceMotionHandler?: (enabled: boolean) => void;
 
+  private resolveEffectiveLifecycle(): string {
+    if (this.desktop !== undefined) {
+      if (this.desktop.isMainWindowVisible()) {
+        try {
+          if (this.mainWindow.isFocused()) {
+            return "active";
+          }
+        } catch {}
+      }
+      if (this.desktop.hasFocusedSubWindow()) {
+        return "active";
+      }
+      if (this.desktop.isMainWindowVisible() || this.desktop.hasVisibleSubWindows()) {
+        return "inactive";
+      }
+      return "background";
+    }
+    try {
+      return this.mainWindow.isWindowShowing()
+        ? this.mainWindow.isFocused()
+          ? "active"
+          : "inactive"
+        : "background";
+    } catch {
+      return "background";
+    }
+  }
+
+  static resolveAlertOptions(options: NativeAlertOptions): NativeAlertOptions {
+    const windowName = options.ui.getWindowName() ?? "";
+    if (!windowName) {
+      return options;
+    }
+    const session = HostSession.windows.get(windowName);
+    const subUi = session?.desktop?.getFocusedSubWindowUIContext();
+    if (subUi !== undefined) {
+      options.ui = subUi;
+    }
+    return options;
+  }
+
   private readonly onWindowStageEvent = (event: window.WindowStageEventType): void => {
     if (this.closed) {
       return;
@@ -589,14 +632,26 @@ class HostSession {
         this.onLifecycleChanged("active");
         break;
       case window.WindowStageEventType.SHOWN:
-        this.onLifecycleChanged(this.mainWindow.isFocused() ? "active" : "inactive");
+        this.onLifecycleChanged(
+          this.mainWindow.isFocused() || (this.desktop?.hasFocusedSubWindow() ?? false)
+            ? "active"
+            : "inactive",
+        );
         break;
       case window.WindowStageEventType.INACTIVE:
       case window.WindowStageEventType.PAUSED:
-        this.onLifecycleChanged("inactive");
+        this.onLifecycleChanged(
+          this.desktop?.hasFocusedSubWindow() ? "active" : "inactive",
+        );
         break;
       case window.WindowStageEventType.HIDDEN:
-        this.onLifecycleChanged("background");
+        if (this.desktop?.hasVisibleSubWindows()) {
+          this.onLifecycleChanged(
+            this.desktop.hasFocusedSubWindow() ? "active" : "inactive",
+          );
+        } else {
+          this.onLifecycleChanged("background");
+        }
         break;
     }
   };
@@ -794,6 +849,11 @@ class HostSession {
           (targetId: number, content: FrameNode | null): boolean =>
             this.runtimeContext.attachNativeNode(targetId, content),
           (targetId: number): boolean => this.runtimeContext.retireNativeNode(targetId),
+          (): void => {
+            if (!this.closed && this.desktop !== undefined && !this.desktop.isMainWindowVisible()) {
+              this.onLifecycleChanged(this.resolveEffectiveLifecycle());
+            }
+          },
         );
         this.runtimeContext.setFocusHandler((componentId: string): boolean =>
           this.desktop?.requestComponentFocus(componentId) ?? false,
@@ -1218,83 +1278,87 @@ class HostSession {
   }
 
   private updateCursor(name: string, windowId?: number): void {
-    const controller = this.runtimeContext.getUIContext().getCursorController();
-    if (name === "none") {
-      if (this.savedPointerVisible === undefined) {
-        this.savedPointerVisible = pointer.isPointerVisibleSync();
-      }
-      pointer.setPointerVisibleSync(false);
-      return;
-    }
-    if (this.savedPointerVisible !== undefined) {
-      pointer.setPointerVisibleSync(this.savedPointerVisible);
-      this.savedPointerVisible = undefined;
-    }
-    let style: pointer.PointerStyle;
-    switch (name) {
-      case "default":
-        style = pointer.PointerStyle.DEFAULT;
-        break;
-      case "pointer":
-        style = pointer.PointerStyle.HAND_POINTING;
-        break;
-      case "text":
-        style = pointer.PointerStyle.TEXT_CURSOR;
-        break;
-      case "wait":
-        style = pointer.PointerStyle.LOADING;
-        break;
-      case "progress":
-        style = pointer.PointerStyle.RUNNING;
-        break;
-      case "help":
-        style = pointer.PointerStyle.HELP;
-        break;
-      case "crosshair":
-        style = pointer.PointerStyle.CROSS;
-        break;
-      case "move":
-        style = pointer.PointerStyle.MOVE;
-        break;
-      case "grab":
-        style = pointer.PointerStyle.HAND_OPEN;
-        break;
-      case "grabbing":
-        style = pointer.PointerStyle.HAND_GRABBING;
-        break;
-      case "not-allowed":
-        style = pointer.PointerStyle.CURSOR_FORBID;
-        break;
-      case "zoom-in":
-        style = pointer.PointerStyle.ZOOM_IN;
-        break;
-      case "zoom-out":
-        style = pointer.PointerStyle.ZOOM_OUT;
-        break;
-      case "col-resize":
-        style = pointer.PointerStyle.WEST_EAST;
-        break;
-      case "row-resize":
-        style = pointer.PointerStyle.NORTH_SOUTH;
-        break;
-      case "nwse-resize":
-        style = pointer.PointerStyle.NORTH_WEST_SOUTH_EAST;
-        break;
-      case "nesw-resize":
-        style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
-        break;
-      default:
-        if (windowId !== undefined) {
-          this.desktop?.updateWindowCursor(windowId, undefined);
-        } else {
-          controller.restoreDefault();
+    try {
+      const controller = this.runtimeContext.getUIContext().getCursorController();
+      if (name === "none") {
+        if (this.savedPointerVisible === undefined) {
+          this.savedPointerVisible = pointer.isPointerVisibleSync();
         }
+        pointer.setPointerVisibleSync(false);
         return;
-    }
-    if (windowId !== undefined) {
-      this.desktop?.updateWindowCursor(windowId, style);
-    } else {
-      controller.setCursor(style);
+      }
+      if (this.savedPointerVisible !== undefined) {
+        pointer.setPointerVisibleSync(this.savedPointerVisible);
+        this.savedPointerVisible = undefined;
+      }
+      let style: pointer.PointerStyle;
+      switch (name) {
+        case "default":
+          style = pointer.PointerStyle.DEFAULT;
+          break;
+        case "pointer":
+          style = pointer.PointerStyle.HAND_POINTING;
+          break;
+        case "text":
+          style = pointer.PointerStyle.TEXT_CURSOR;
+          break;
+        case "wait":
+          style = pointer.PointerStyle.LOADING;
+          break;
+        case "progress":
+          style = pointer.PointerStyle.RUNNING;
+          break;
+        case "help":
+          style = pointer.PointerStyle.HELP;
+          break;
+        case "crosshair":
+          style = pointer.PointerStyle.CROSS;
+          break;
+        case "move":
+          style = pointer.PointerStyle.MOVE;
+          break;
+        case "grab":
+          style = pointer.PointerStyle.HAND_OPEN;
+          break;
+        case "grabbing":
+          style = pointer.PointerStyle.HAND_GRABBING;
+          break;
+        case "not-allowed":
+          style = pointer.PointerStyle.CURSOR_FORBID;
+          break;
+        case "zoom-in":
+          style = pointer.PointerStyle.ZOOM_IN;
+          break;
+        case "zoom-out":
+          style = pointer.PointerStyle.ZOOM_OUT;
+          break;
+        case "col-resize":
+          style = pointer.PointerStyle.WEST_EAST;
+          break;
+        case "row-resize":
+          style = pointer.PointerStyle.NORTH_SOUTH;
+          break;
+        case "nwse-resize":
+          style = pointer.PointerStyle.NORTH_WEST_SOUTH_EAST;
+          break;
+        case "nesw-resize":
+          style = pointer.PointerStyle.NORTH_EAST_SOUTH_WEST;
+          break;
+        default:
+          if (windowId !== undefined) {
+            this.desktop?.updateWindowCursor(windowId, undefined);
+          } else {
+            controller.restoreDefault();
+          }
+          return;
+      }
+      if (windowId !== undefined) {
+        this.desktop?.updateWindowCursor(windowId, style);
+      } else {
+        controller.setCursor(style);
+      }
+    } catch {
+      // Touch-only Phone devices without pointer hardware may throw 801 on pointer APIs.
     }
   }
 
@@ -1429,27 +1493,44 @@ class HostSession {
       if (!text) {
         return;
       }
+      const bundleName = this.bundleName();
       accessibility
         .sendAccessibilityEvent({
-          type: "announceForAccessibility",
-          bundleName: this.bundleName(),
+          type: command.polite
+            ? "announceForAccessibilityNotInterrupt"
+            : "announceForAccessibility",
+          bundleName,
           triggerAction: "common",
           textAnnouncedForAccessibility: text,
         })
-        .catch((): void => {});
+        .catch((): void => {
+          if (command.polite) {
+            accessibility
+              .sendAccessibilityEvent({
+                type: "announceForAccessibility",
+                bundleName,
+                triggerAction: "common",
+                textAnnouncedForAccessibility: text,
+              })
+              .catch((): void => {});
+          }
+        });
       return;
     }
 
     if (command.kind === "accessibility-event") {
       const announcement = command.announcement ?? undefined;
       const elementId = command.elementId;
+      const customId =
+        command.customId ??
+        (elementId !== undefined && elementId !== null ? String(elementId) : undefined);
       accessibility
         .sendAccessibilityEvent({
           type: announcement ? "announceForAccessibility" : "requestFocusForAccessibility",
           bundleName: this.bundleName(),
           triggerAction: "common",
           textAnnouncedForAccessibility: announcement,
-          customId: elementId !== undefined && elementId !== null ? String(elementId) : undefined,
+          customId,
         })
         .catch((): void => {});
       return;
@@ -1597,7 +1678,8 @@ const nativeHostModule = getNativeModule();
 nativeHostModule.nshRegisterSessionBinder(
   deviceInfo.sdkApiVersion,
   (uiContext: UIContext): number => HostSession.bind(uiContext),
-  showNativeAlert,
+  (options: NativeAlertOptions): (() => void) =>
+    showNativeAlert(HostSession.resolveAlertOptions(options)),
 );
 
 interface WindowPixelSize {

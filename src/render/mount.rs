@@ -132,6 +132,7 @@ pub(crate) struct UiContext {
     pub(crate) animator: Rc<crate::render::animation::Animator>,
     pub(crate) images: Arc<crate::media::image::Loader>,
     pub(crate) access: Arc<nsh_engine::Access>,
+    pub(crate) media_files: Arc<nsh_core::access::MediaFiles>,
     pub(crate) assets: Arc<dyn crate::services::assets::StreamAssets>,
     pub(crate) components: crate::interop::component::Components,
     pub(crate) touches: crate::input::touch::State,
@@ -227,6 +228,7 @@ pub(crate) struct Mounter {
     nodes: BTreeMap<NodeId, Rc<Node>>,
     // Back priority must not depend on insertion order.
     stacks: Vec<NodeId>,
+    tab_bars: BTreeMap<NodeId, bool>,
     removed: Vec<Rc<Node>>,
     retired: VecDeque<(u64, Vec<Rc<Node>>)>,
     epoch: u64,
@@ -387,39 +389,22 @@ impl Mounter {
     }
     fn apply_main_backdrop(&self) {
         if let Ok(root) = self.node(nsh_core::ROOT_ID) {
-            use nsh_core::{desktop::Backdrop, platform::Appearance};
-            use ohos_arkui_binding::{
-                common::attribute::ArkUINodeAttributeNumber,
-                types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
-            };
-            let backdrop = self.main_window.borrow().backdrop;
-            let style = match backdrop {
-                Backdrop::None => None,
-                Backdrop::Window => Some(BlurStyle::BackgroundThick),
-                Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
-                Backdrop::Popover => Some(BlurStyle::BackgroundThin),
-                Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
-            };
-            if let Some(style) = style {
-                // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
-                let color_mode = match self.appearance.get() {
-                    Appearance::System => 0,
-                    Appearance::Light => 1,
-                    Appearance::Dark => 2,
-                };
-                let _ = root.native.borrow().set_background_blur_style([
-                    ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
-                    ArkUINodeAttributeNumber::Int(color_mode),
-                ]);
-            } else {
-                let _ = root.native.borrow().reset_attribute(A::BackgroundBlurStyle);
-            }
+            apply_window_backdrop(
+                &root.native.borrow(),
+                self.main_window.borrow().backdrop,
+                self.appearance.get(),
+            );
         }
     }
     fn system_appearance(&self) -> Result<()> {
         let appearance = self.appearance.get();
         self.host.set_appearance(appearance)?;
         self.apply_main_backdrop();
+        for modal in self.modals.iter().filter_map(std::rc::Weak::upgrade) {
+            if modal.is_desktop_window() {
+                modal.apply_desktop_backdrop();
+            }
+        }
         let dark =
             appearance.resolve(self.platform.get().color_scheme) == nsh_engine::ColorScheme::Dark;
         let config = self.dispatcher.upgrade().and_then(|route| {
@@ -551,7 +536,8 @@ impl Mounter {
             // Do not reply early while the window still displays the dialog.
             return Ok(());
         }
-        self.route_back(true)
+        self.route_back(true)?;
+        self.sync_tab_bar_push_hidden()
     }
     pub(crate) fn dismiss_keyboard(&self) -> Result<()> {
         self.node(nsh_core::ROOT_ID)?.dismiss_keyboard()
@@ -655,11 +641,59 @@ impl Mounter {
         }
         false
     }
+    fn enclosing_modal_scope(&self, mut id: NodeId) -> Option<NodeId> {
+        while let Ok(node) = self.node(id) {
+            if let Some(modal) = node.modal.borrow().as_ref()
+                && !modal.is_main_window_host()
+            {
+                return Some(id);
+            }
+            let parent = node.parent.get()?;
+            id = parent;
+        }
+        None
+    }
+    fn node_shown_in_layout(&self, node: &Rc<Node>) -> bool {
+        let mut frames = Vec::new();
+        let mut cur = Some(node.clone());
+        while let Some(current) = cur {
+            if current.id == nsh_core::ROOT_ID {
+                break;
+            }
+            if current.kind == ViewKind::Modal {
+                let modal_open = current
+                    .modal
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|modal| modal.is_main_window_host() || modal.is_visible());
+                if !modal_open {
+                    return false;
+                }
+                break;
+            }
+            let frame = current.frame.get();
+            frames.push(nsh_core::Bounds::new(
+                nsh_core::Point::new(nsh_core::Points(frame.x), nsh_core::Points(frame.y)),
+                nsh_core::Size::new(
+                    nsh_core::Points(frame.width),
+                    nsh_core::Points(frame.height),
+                ),
+            ));
+            cur = current
+                .parent
+                .get()
+                .and_then(|id| self.nodes.get(&id).cloned());
+        }
+        nsh_core::navigation::shown_in_layout(frames)
+    }
     fn stack_candidate(
         &self,
         id: NodeId,
     ) -> Option<(NodeId, Rc<crate::navigation::stack::Screen>)> {
-        let stack = self.node(id).ok().filter(|node| node.visible_in_tree())?;
+        let stack = self
+            .node(id)
+            .ok()
+            .filter(|node| node.visible_in_tree() && self.node_shown_in_layout(node))?;
         let screens: Vec<_> = stack
             .children
             .borrow()
@@ -679,13 +713,60 @@ impl Mounter {
             .stacks
             .iter()
             .copied()
-            .filter(|id| scope.is_none_or(|scope| self.contains(scope, *id)))
+            .filter(|id| self.enclosing_modal_scope(*id) == scope)
             .filter_map(|id| self.stack_candidate(id))
             .collect();
         nsh_core::navigation::innermost(&candidates, |(outer, _), (inner, _)| {
             self.contains(*outer, *inner)
         })
         .cloned()
+    }
+    fn sync_tab_bar_push_hidden(&mut self) -> Result<()> {
+        if self.tab_bars.is_empty() {
+            return Ok(());
+        }
+        let updates: Vec<(NodeId, bool)> = self
+            .tab_bars
+            .iter()
+            .filter_map(|(&tab_id, &was_hidden)| {
+                self.node(tab_id).ok()?;
+                let scope = self.enclosing_modal_scope(tab_id);
+                let next_hidden = self.stacks.iter().copied().any(|stack_id| {
+                    if self.enclosing_modal_scope(stack_id) != scope {
+                        return false;
+                    }
+                    let Ok(stack) = self.node(stack_id) else {
+                        return false;
+                    };
+                    if !stack.visible_in_tree() || !self.node_shown_in_layout(stack) {
+                        return false;
+                    }
+                    stack
+                        .children
+                        .borrow()
+                        .iter()
+                        .filter_map(std::rc::Weak::upgrade)
+                        .filter_map(|node| node.screen.borrow().clone())
+                        .filter(|screen| !screen.popped.get())
+                        .any(|screen| screen.config.borrow().hides_bottom_bar_when_pushed)
+                });
+                (next_hidden != was_hidden).then_some((tab_id, next_hidden))
+            })
+            .collect();
+        for (tab_id, next_hidden) in updates {
+            if let Some(state) = self.tab_bars.get_mut(&tab_id) {
+                *state = next_hidden;
+            }
+            if let Ok(node) = self.node(tab_id)
+                && let Some(component) = node.component.borrow().as_ref()
+            {
+                component.props(vec![(
+                    Arc::from("pushHidden"),
+                    Some(nsh_core::JsonValue::Bool(next_hidden)),
+                )])?;
+            }
+        }
+        Ok(())
     }
     pub(crate) fn reconcile_navigation(&mut self) -> Result<()> {
         let result = (|| -> Result<()> {
@@ -726,6 +807,7 @@ impl Mounter {
                 }
                 modal.present_if_pending()?;
             }
+            self.sync_tab_bar_push_hidden()?;
             Ok(())
         })();
         // Capture releases deferred by a batch still need synchronization if
@@ -916,6 +998,12 @@ impl Mounter {
             .filter_map(std::rc::Weak::upgrade)
             .any(|m| m.is_desktop_window() && m.is_visible())
     }
+    pub(crate) fn has_visible_desktop_sub_windows(&self) -> bool {
+        self.modals
+            .iter()
+            .filter_map(std::rc::Weak::upgrade)
+            .any(|m| m.is_desktop_visible())
+    }
     fn close_hosted_main_window(
         &mut self,
         id: NodeId,
@@ -993,8 +1081,13 @@ impl Mounter {
         }
         Ok(())
     }
-    pub(crate) fn dialog_result(&mut self, id: u32, index: i32) -> Result<()> {
-        self.dialogs.finish(id, index)
+    pub(crate) fn dialog_result(
+        &mut self,
+        id: u32,
+        index: i32,
+        value: Option<String>,
+    ) -> Result<()> {
+        self.dialogs.finish(id, index, value)
     }
     fn apply_desktop_command(
         &mut self,
@@ -1421,6 +1514,9 @@ impl Mounter {
         };
         match event {
             DesktopEvent::ClosePress(reason) => {
+                if !self.main_window.borrow().closable {
+                    return Ok(());
+                }
                 if let Some(window_id) = self.desktop.hosted_main_window {
                     self.control.dispatch_event(
                         window_id,
@@ -1647,12 +1743,18 @@ impl Mounter {
                 }
                 MenuRole::Close => {
                     if let Some(modal) = self.focused_desktop_modal() {
-                        modal.on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
-                        if !modal.is_visible()
-                            && let Some(window_id) = modal.node_id()
-                        {
-                            self.close_desktop_children(window_id)?;
+                        if modal.desktop_closable() {
+                            modal
+                                .on_sub_window_close_press(nsh_core::desktop::CloseReason::Menu)?;
+                            if !modal.is_visible()
+                                && let Some(window_id) = modal.node_id()
+                            {
+                                self.close_desktop_children(window_id)?;
+                            }
                         }
+                        return Ok(());
+                    }
+                    if !self.main_window.borrow().closable {
                         return Ok(());
                     }
                     return self.desktop_event(crate::services::desktop::DesktopEvent::ClosePress(
@@ -1661,8 +1763,10 @@ impl Mounter {
                 }
                 MenuRole::Minimize => {
                     if let Some(modal) = self.focused_desktop_modal() {
-                        modal.desktop_request(WindowRequest::Minimize)?;
-                    } else {
+                        if modal.desktop_minimizable() {
+                            modal.desktop_request(WindowRequest::Minimize)?;
+                        }
+                    } else if self.main_window.borrow().minimizable {
                         self.host
                             .desktop_command(&wire_request(&WindowRequest::Minimize))?;
                     }
@@ -1691,8 +1795,15 @@ impl Mounter {
                     if let Some(modal) = self.focused_desktop_modal() {
                         modal.desktop_toggle_maximize()?;
                     } else {
-                        self.host
-                            .desktop_command(&WireCommand::ToggleMaximize { window_id: None })?;
+                        let can_zoom = {
+                            let main = self.main_window.borrow();
+                            main.maximizable && main.resizable
+                        };
+                        if can_zoom {
+                            self.host.desktop_command(&WireCommand::ToggleMaximize {
+                                window_id: None,
+                            })?;
+                        }
                     }
                     return Ok(());
                 }
@@ -2060,6 +2171,7 @@ impl Mounter {
             mount,
             nodes: BTreeMap::from([(nsh_core::ROOT_ID, root)]),
             stacks: Vec::new(),
+            tab_bars: BTreeMap::new(),
             removed: Vec::new(),
             retired: VecDeque::new(),
             epoch: 0,
@@ -2283,6 +2395,7 @@ impl Mounter {
             {
                 self.stacks.remove(index);
             }
+            self.tab_bars.remove(&id);
             self.removed.push(node);
         }
         Ok(())
@@ -2436,6 +2549,7 @@ impl Mounter {
             let result = (|| -> Result<()> {
                 match item {
                     MountItem::Component { id, name } => {
+                        let is_tab_bar = name.as_ref() == nsh_core::platform::TAB_BAR_COMPONENT;
                         if let Some(component) = self.components.make(
                             self.env,
                             &name,
@@ -2446,9 +2560,14 @@ impl Mounter {
                             self.shaders.frame_rate(),
                             self.dispatcher.clone(),
                         )? {
-                            let node = self.node(id)?;
+                            let node = self.node(id)?.clone();
                             node.component_animated.borrow_mut().clear();
                             node.attach_component(component)?;
+                            if is_tab_bar {
+                                self.tab_bars.insert(id, false);
+                            } else {
+                                self.tab_bars.remove(&id);
+                            }
                             if node.scene_active() {
                                 node.invalidate_scene();
                             }
@@ -2927,6 +3046,7 @@ impl Mounter {
                         Command::Announce(text) => self.host.accessibility_event(
                             self.dispatcher.clone(),
                             Some(text),
+                            None,
                             None,
                         )?,
                         Command::AccessibilityFocus => {
@@ -3713,5 +3833,38 @@ pub(crate) fn window_avoid_environment(
         safe_left: Some(left),
         keyboard_height: Some(keyboard_height),
         ..crate::app::environment::NshEnvironment::default()
+    }
+}
+
+pub(crate) fn apply_window_backdrop(
+    node: &ohos_arkui_binding::common::node::ArkUINode,
+    backdrop: nsh_core::desktop::Backdrop,
+    appearance: nsh_core::platform::Appearance,
+) {
+    use nsh_core::{desktop::Backdrop, platform::Appearance};
+    use ohos_arkui_binding::{
+        common::attribute::ArkUINodeAttributeNumber,
+        types::{advanced::BlurStyle, attribute::ArkUINodeAttributeType as A},
+    };
+    let style = match backdrop {
+        Backdrop::None => None,
+        Backdrop::Window => Some(BlurStyle::BackgroundThick),
+        Backdrop::Sidebar => Some(BlurStyle::BackgroundRegular),
+        Backdrop::Popover => Some(BlurStyle::BackgroundThin),
+        Backdrop::Hud => Some(BlurStyle::BackgroundUltraThick),
+    };
+    if let Some(style) = style {
+        // `ArkUI_ColorMode`: 0 = SYSTEM, 1 = LIGHT, 2 = DARK.
+        let color_mode = match appearance {
+            Appearance::System => 0,
+            Appearance::Light => 1,
+            Appearance::Dark => 2,
+        };
+        let _ = node.set_background_blur_style([
+            ArkUINodeAttributeNumber::Int(u32::from(style) as i32),
+            ArkUINodeAttributeNumber::Int(color_mode),
+        ]);
+    } else {
+        let _ = node.reset_attribute(A::BackgroundBlurStyle);
     }
 }

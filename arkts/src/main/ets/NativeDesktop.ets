@@ -740,6 +740,7 @@ class SubWindowHost {
       this.syncTitleBar();
     }
     syncActiveEditorImeCursor();
+    this.owner.notifySubWindowLifecycleChanged();
   };
 
   private readonly onWindowEvent = (event: window.WindowEventType): void => {
@@ -781,6 +782,7 @@ class SubWindowHost {
             JSON.stringify({ windowId: this.windowId }),
           );
         }
+        this.owner.notifySubWindowLifecycleChanged();
         return;
     }
     this.syncState();
@@ -788,6 +790,7 @@ class SubWindowHost {
       this.syncTitleBar();
     }
     syncActiveEditorImeCursor();
+    this.owner.notifySubWindowLifecycleChanged();
   };
 
   private readonly onTitleButtonRectChange = (rect: window.TitleButtonRect): void => {
@@ -798,6 +801,9 @@ class SubWindowHost {
 
   private readonly onWindowWillClose = (): Promise<boolean> => {
     if (!this.destroyed && !this.closingByHost) {
+      if (!this.closable) {
+        return Promise.resolve(true);
+      }
       this.owner.emitEvent(
         "sub-window-close-press",
         JSON.stringify({ windowId: this.windowId, reason: "closeButton" }),
@@ -819,6 +825,38 @@ class SubWindowHost {
 
   uiContext(): UIContext | undefined {
     return this.destroyed ? undefined : this.ui;
+  }
+
+  isVisibleNonMinimized(): boolean {
+    if (this.destroyed || this.closingByHost || this.hiddenByApp || this.minimized) {
+      return false;
+    }
+    const sub = this.win;
+    if (sub === undefined) {
+      return false;
+    }
+    try {
+      return (
+        sub.isWindowShowing() && sub.getWindowStatus() !== window.WindowStatusType.MINIMIZE
+      );
+    } catch {
+      return this.visible && !this.minimized;
+    }
+  }
+
+  isFocusedVisible(): boolean {
+    if (!this.isVisibleNonMinimized()) {
+      return false;
+    }
+    const sub = this.win;
+    if (sub === undefined) {
+      return false;
+    }
+    try {
+      return sub.isFocused() || this.focused;
+    } catch {
+      return this.focused;
+    }
   }
 
   widthVp(): number {
@@ -1928,6 +1966,7 @@ export class NativeDesktop {
   private switchingMenuBar: boolean = false;
   private readonly attachNativeNodeCb?: (targetId: number, content: FrameNode | null) => boolean;
   private readonly retireNativeNodeCb?: (targetId: number) => boolean;
+  private readonly onSubWindowLifecycleChanged?: () => void;
   private readonly tray: NativeTray;
 
   private readonly onWindowRectChange = (_data: window.RectChangeOptions): void => {
@@ -2036,6 +2075,9 @@ export class NativeDesktop {
         });
         return Promise.resolve(true);
       }
+      if (!this.closable) {
+        return Promise.resolve(true);
+      }
       this.emit("close-press", JSON.stringify({ reason: "closeButton" }));
       // Always defer teardown to Rust so ClosePress, child windows, Closed, and Quit run cleanly.
       return Promise.resolve(true);
@@ -2056,6 +2098,7 @@ export class NativeDesktop {
     onDisplayMetricsChanged?: () => void,
     attachNativeNode?: (targetId: number, content: FrameNode | null) => boolean,
     retireNativeNode?: (targetId: number) => boolean,
+    onSubWindowLifecycleChanged?: () => void,
   ) {
     this.ui = ui;
     this.abilityContext = abilityContext;
@@ -2065,6 +2108,7 @@ export class NativeDesktop {
     this.onDisplayMetricsChanged = onDisplayMetricsChanged;
     this.attachNativeNodeCb = attachNativeNode;
     this.retireNativeNodeCb = retireNativeNode;
+    this.onSubWindowLifecycleChanged = onSubWindowLifecycleChanged;
     const trayHost: NativeTrayHost = {
       isClosed: (): boolean => this.closed,
       isMainParked: (): boolean => this.mainParked,
@@ -2806,30 +2850,64 @@ export class NativeDesktop {
     return this.minimized || this.isMainWindowCurrentlyMinimized();
   }
 
-  private hasAnyVisibleWindow(): boolean {
-    if (!this.hiddenByAbility && !this.isMainWindowCurrentlyMinimized()) {
-      try {
-        if (this.mainWindow.isWindowShowing()) {
-          return true;
-        }
-      } catch {}
+  notifySubWindowLifecycleChanged(): void {
+    if (!this.closed) {
+      this.onSubWindowLifecycleChanged?.();
     }
+  }
+
+  isMainWindowVisible(): boolean {
+    if (this.closed || this.mainParked || this.hiddenByApp || this.hiddenByAbility) {
+      return false;
+    }
+    if (this.isMainWindowMinimized()) {
+      return false;
+    }
+    try {
+      return this.mainWindow.isWindowShowing();
+    } catch {
+      return this.visible;
+    }
+  }
+
+  hasVisibleSubWindows(): boolean {
     const hosts = Array.from(this.subWindows.values());
     for (let i = 0; i < hosts.length; i++) {
-      const subWin = hosts[i].windowRef();
-      if (subWin === undefined) {
-        continue;
+      if (hosts[i].isVisibleNonMinimized()) {
+        return true;
       }
-      try {
-        if (
-          subWin.isWindowShowing() &&
-          subWin.getWindowStatus() !== window.WindowStatusType.MINIMIZE
-        ) {
-          return true;
-        }
-      } catch {}
     }
     return false;
+  }
+
+  hasFocusedSubWindow(): boolean {
+    const hosts = Array.from(this.subWindows.values());
+    for (let i = 0; i < hosts.length; i++) {
+      if (hosts[i].isFocusedVisible()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  getFocusedSubWindowUIContext(): UIContext | undefined {
+    const hosts = Array.from(this.subWindows.values());
+    for (let i = hosts.length - 1; i >= 0; i--) {
+      if (hosts[i].isFocusedVisible()) {
+        const ui = hosts[i].uiContext();
+        if (ui !== undefined) {
+          return ui;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  private hasAnyVisibleWindow(): boolean {
+    if (this.isMainWindowVisible()) {
+      return true;
+    }
+    return this.hasVisibleSubWindows();
   }
 
   private noteInternalAbilityTransition(durationMs: number = 600): void {
@@ -3401,6 +3479,12 @@ export class NativeDesktop {
     } catch {}
   }
 
+  private menuBarInsetPx(scale: number): number {
+    return this.menuBarNode !== undefined && this.menuBarState.items.length > 0
+      ? Math.round(32 * scale)
+      : 0;
+  }
+
   private async applyContentSizeAsync(width?: number, height?: number): Promise<void> {
     try {
       const props = this.mainWindow.getWindowProperties();
@@ -3409,11 +3493,11 @@ export class NativeDesktop {
       const scale = resolveScaleFactor(props.displayId, this.ui);
       const chromeW = drawable.width > 0 ? Math.max(0, rect.width - drawable.width) : 0;
       const chromeH =
-        this.titleBarHidden || this.frameNone
+        (this.titleBarHidden || this.frameNone
           ? 0
           : drawable.height > 0
             ? Math.max(0, rect.height - drawable.height)
-            : 0;
+            : 0) + this.menuBarInsetPx(scale);
       const targetW =
         width !== undefined ? Math.max(1, Math.round(width * scale) + chromeW) : rect.width;
       const targetH =
@@ -3441,13 +3525,13 @@ export class NativeDesktop {
       const chromeW =
         cmd.contentSized && drawable.width > 0 ? Math.max(0, rect.width - drawable.width) : 0;
       const chromeH =
-        cmd.contentSized &&
+        (cmd.contentSized &&
         !this.titleBarHidden &&
         !this.frameNone &&
         cmd.titleBarHidden !== true &&
         drawable.height > 0
           ? Math.max(0, rect.height - drawable.height)
-          : 0;
+          : 0) + (cmd.contentSized ? this.menuBarInsetPx(scale) : 0);
       const targetW =
         cmd.width !== undefined ? Math.max(1, Math.round(cmd.width * scale) + chromeW) : rect.width;
       const targetH =

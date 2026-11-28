@@ -164,13 +164,31 @@ impl Data {
         }
         use ohos_image_native_binding::{DecodingOptions, ImageSource, types::PixelFormat};
         let source = ImageSource::create_from_data(&self.bytes).map_err(|e| e.to_string())?;
+        let raw_info = source.image_info(0).map_err(|e| e.to_string())?;
+        let raw_width = raw_info.width().map_err(|e| e.to_string())?;
+        let raw_height = raw_info.height().map_err(|e| e.to_string())?;
+        let orientation = crate::extensions::read_exif_orientation(&source, &self.bytes);
         let mut options = DecodingOptions::new().map_err(|e| e.to_string())?;
         options
             .set_pixel_format(PixelFormat::Rgba8888)
             .map_err(|e| e.to_string())?;
-        let pixels = source
+        let mut pixels = source
             .create_pixelmap(&mut options)
             .map_err(|e| e.to_string())?;
+        if orientation != crate::extensions::ExifOrientation::Normal {
+            let dec_info = pixels.image_info().map_err(|e| e.to_string())?;
+            let dec_w = dec_info.width().unwrap_or(raw_width);
+            let dec_h = dec_info.height().unwrap_or(raw_height);
+            crate::extensions::apply_orientation(
+                &mut pixels,
+                orientation,
+                raw_width,
+                raw_height,
+                dec_w,
+                dec_h,
+            )
+            .map_err(|e| e.to_string())?;
+        }
         let mut bitmap = ohos_drawing_binding::Bitmap::new(
             self.width,
             self.height,
@@ -191,6 +209,7 @@ impl Loader {
     pub(crate) fn new(
         assets: Arc<dyn Assets>,
         access: Access,
+        media_files: Arc<nsh_core::access::MediaFiles>,
         dispatcher: Weak<Dispatcher>,
     ) -> Arc<Self> {
         let access = Arc::new(access);
@@ -198,6 +217,7 @@ impl Loader {
             context: Mutex::new(Context {
                 read_asset: Some(Arc::new(move |uri| assets.read(uri))),
                 access,
+                media_files,
                 transport: Some(transport()),
                 ..Default::default()
             }),
@@ -236,13 +256,23 @@ impl Loader {
             };
             return LoadResult::Ready(result);
         }
-        let key = (uri.clone(), matches!(target, Target::View { .. }));
         let context = self.context.lock().expect("image context").clone();
-        if inline.is_none() && !context.access.allows_media(&uri) {
-            return LoadResult::Ready(Err(
-                "image URL is not granted by capabilities.network".into()
-            ));
-        }
+        let uri = if inline.is_none() {
+            match context
+                .access
+                .media_url(&uri, None, Some(&context.media_files))
+            {
+                Some(resolved) => resolved.into_owned(),
+                None => {
+                    return LoadResult::Ready(Err(
+                        "image URL is not granted by capabilities".into()
+                    ));
+                }
+            }
+        } else {
+            uri
+        };
+        let key = (uri.clone(), matches!(target, Target::View { .. }));
         if let Some((decoded, lease)) = self.cache.get(&key) {
             return LoadResult::Ready(Ok(Arc::new(Data {
                 decoded,
@@ -397,21 +427,32 @@ impl Loader {
             let source = ohos_image_native_binding::ImageSource::create_from_data(&bytes)
                 .map_err(|e| e.to_string())?;
             let info = source.image_info(0).map_err(|e| e.to_string())?;
-            let (width, height) = (
+            let (raw_width, raw_height) = (
                 info.width().map_err(|e| e.to_string())?,
                 info.height().map_err(|e| e.to_string())?,
             );
+            let orientation = crate::extensions::read_exif_orientation(&source, &bytes);
+            let (width, height) = orientation.display_dimensions(raw_width, raw_height);
             let frames = u64::from(source.frame_count().unwrap_or(1).max(1));
+            let static_multi = frames > 1 && is_non_animated_multi_image(&bytes);
+            let effective_frames = if static_multi { 1 } else { frames };
             let frame_pixels = u64::from(width) * u64::from(height);
             if width == 0
                 || height == 0
                 || frame_pixels > MAX_IMAGE_PIXELS
-                || frame_pixels.saturating_mul(frames) > MAX_ANIMATED_IMAGE_PIXELS
+                || frame_pixels.saturating_mul(effective_frames) > MAX_ANIMATED_IMAGE_PIXELS
             {
                 return Err("image dimensions exceed 16 megapixels".into());
             }
             let pixels = if key.1 {
-                Some(Mutex::new(PixelFrames::decode(&source, frames)?))
+                Some(Mutex::new(PixelFrames::decode(
+                    &source,
+                    frames,
+                    static_multi,
+                    orientation,
+                    raw_width,
+                    raw_height,
+                )?))
             } else {
                 None
             };
@@ -456,18 +497,64 @@ struct PixelFrames {
 // handles under the mutex. Each ArkUI descriptor stays on its UI thread.
 unsafe impl Send for PixelFrames {}
 
+fn is_non_animated_multi_image(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"\x00\x00\x01\x00")
+        || bytes.starts_with(b"\x00\x00\x02\x00")
+        || bytes.starts_with(b"II*\x00")
+        || bytes.starts_with(b"MM\x00*")
+}
+
 impl PixelFrames {
     fn decode(
         source: &ohos_image_native_binding::ImageSource,
         count: u64,
+        static_multi: bool,
+        orientation: crate::extensions::ExifOrientation,
+        raw_width: u32,
+        raw_height: u32,
     ) -> std::result::Result<Self, String> {
         let mut options =
             ohos_image_native_binding::DecodingOptions::new().map_err(|e| e.to_string())?;
-        if count > 1 {
-            let pixels = source
+        let orient =
+            |pixel: &mut ohos_image_native_binding::PixelMap| -> std::result::Result<(), String> {
+                if orientation != crate::extensions::ExifOrientation::Normal {
+                    let info = pixel.image_info().map_err(|e| e.to_string())?;
+                    let dec_w = info.width().unwrap_or(raw_width);
+                    let dec_h = info.height().unwrap_or(raw_height);
+                    crate::extensions::apply_orientation(
+                        pixel,
+                        orientation,
+                        raw_width,
+                        raw_height,
+                        dec_w,
+                        dec_h,
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            };
+        if static_multi {
+            if let Ok(list) = source.create_pixelmap_list(&mut options)
+                && let Some(mut best) = list.into_iter().max_by_key(|pm| {
+                    pm.image_info().ok().map_or(0u64, |info| {
+                        u64::from(info.width().unwrap_or(0)) * u64::from(info.height().unwrap_or(0))
+                    })
+                })
+            {
+                orient(&mut best)?;
+                return Ok(Self {
+                    pixels: vec![best],
+                    durations: Vec::new(),
+                });
+            }
+        } else if count > 1 {
+            let mut pixels = source
                 .create_pixelmap_list(&mut options)
                 .map_err(|e| e.to_string())?;
             if !pixels.is_empty() {
+                for pixel in &mut pixels {
+                    orient(pixel)?;
+                }
                 let delays = source.delay_time_list().unwrap_or_default();
                 let durations = (0..pixels.len())
                     .map(|idx| {
@@ -478,9 +565,10 @@ impl PixelFrames {
                 return Ok(Self { pixels, durations });
             }
         }
-        let pixel = source
+        let mut pixel = source
             .create_pixelmap(&mut options)
             .map_err(|e| e.to_string())?;
+        orient(&mut pixel)?;
         Ok(Self {
             pixels: vec![pixel],
             durations: Vec::new(),
@@ -1156,6 +1244,7 @@ impl loader::Transport for OhosTransport {
         let proxy = crate::services::net::SystemProxy::read().map_err(|error| error.to_string())?;
         let deadline = std::time::Instant::now() + TIMEOUT;
         let mut url = get.url.to_owned();
+        let mut redirects = Vec::new();
         for hop in 0..=MAX_REDIRECTS {
             if get.cancelled.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
@@ -1169,7 +1258,7 @@ impl loader::Transport for OhosTransport {
                 .ok_or("image request timed out")?;
             let mut response = request
                 .config()
-                .proxy(proxy.value())
+                .proxy(proxy.for_url(&url))
                 .timeout_global(Some(remaining))
                 .build()
                 .call()
@@ -1184,8 +1273,16 @@ impl loader::Transport for OhosTransport {
                     .get("location")
                     .and_then(|v| v.to_str().ok())
                     .ok_or("image redirect without a Location")?;
-                url = redirect(get.access, &url, location)?;
-                continue;
+                match redirect(get.access, &url, location) {
+                    Ok(next) => {
+                        redirects.push(next.clone());
+                        url = next;
+                        continue;
+                    }
+                    Err(refusal) => {
+                        return Ok(Fetched::refused(status, refusal).redirected(redirects));
+                    }
+                }
             }
             let headers = CacheHeaders::from_lookup(|name| {
                 let values: Vec<_> = response
@@ -1197,7 +1294,7 @@ impl loader::Transport for OhosTransport {
                 (!values.is_empty()).then(|| values.join(", "))
             });
             if status >= 300 {
-                return Ok(Fetched::new(status, headers, Vec::new()));
+                return Ok(Fetched::new(status, headers, Vec::new()).redirected(redirects));
             }
             let total = response.body().content_length().unwrap_or(0);
             if total > MAX_BYTES {
@@ -1224,7 +1321,7 @@ impl loader::Transport for OhosTransport {
                 bytes.extend_from_slice(&chunk[..count]);
                 (get.progress)(bytes.len() as u64, total);
             }
-            return Ok(Fetched::new(status, headers, bytes));
+            return Ok(Fetched::new(status, headers, bytes).redirected(redirects));
         }
         Err("no image response".into())
     }

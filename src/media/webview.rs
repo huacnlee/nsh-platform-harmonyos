@@ -103,9 +103,19 @@ struct AssetReply(Option<ResourceHandle>);
 unsafe impl Send for AssetReply {}
 
 impl AssetReply {
-    fn respond(mut self, status: u16, mime_type: &str, body: &[u8]) {
+    fn respond(self, status: u16, mime_type: &str, body: &[u8]) {
+        self.respond_with_headers(status, mime_type, &[], body);
+    }
+
+    fn respond_with_headers(
+        mut self,
+        status: u16,
+        mime_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: &[u8],
+    ) {
         if let Some(handle) = self.0.take() {
-            send_response(&handle, status, mime_type, body);
+            send_response(&handle, status, mime_type, extra_headers, body);
         }
     }
 }
@@ -113,16 +123,38 @@ impl AssetReply {
 impl Drop for AssetReply {
     fn drop(&mut self) {
         if let Some(handle) = self.0.take() {
-            send_response(&handle, 503, "text/plain; charset=utf-8", &[]);
+            send_response(&handle, 503, "text/plain; charset=utf-8", &[], &[]);
         }
     }
 }
 
-fn send_response(handle: &ResourceHandle, status: u16, mime_type: &str, body: &[u8]) {
+fn send_response(
+    handle: &ResourceHandle,
+    status: u16,
+    mime_type: &str,
+    extra_headers: &[(&str, &str)],
+    body: &[u8],
+) {
     let response = ArkWebResponse::new();
+    response.set_mime_type(mime_type);
     response.set_header("content-type", mime_type, true);
+    response.set_header("content-length", &body.len().to_string(), true);
     response.set_header("access-control-allow-origin", "*", true);
+    for &(name, value) in extra_headers {
+        response.set_header(name, value, true);
+    }
     response.set_status(i32::from(status));
+    let status_text = match status {
+        200 => "OK",
+        206 => "Partial Content",
+        404 => "Not Found",
+        416 => "Range Not Satisfiable",
+        503 => "Service Unavailable",
+        _ => "",
+    };
+    if !status_text.is_empty() {
+        response.set_status_text(status_text);
+    }
     handle.receive_response(response);
     handle.receive_data(body);
     handle.finish();
@@ -277,6 +309,7 @@ impl Drop for RouteRegistration {
 
 #[derive(PartialEq)]
 struct DocumentSettings {
+    window_id: Option<u32>,
     javascript: bool,
     shared_cookies: bool,
     script: Option<Arc<str>>,
@@ -298,6 +331,7 @@ pub(crate) struct WebView {
     pending_commands: RefCell<Vec<WebCommand>>,
     arkts_mounted: Cell<bool>,
     waiting_transition: Cell<bool>,
+    terminated: Cell<bool>,
     load_generation: Cell<u32>,
     ready: Cell<bool>,
     closed: Cell<bool>,
@@ -366,6 +400,7 @@ impl WebView {
             pending_commands: RefCell::new(Vec::new()),
             arkts_mounted: Cell::new(false),
             waiting_transition: Cell::new(false),
+            terminated: Cell::new(false),
             load_generation: Cell::new(0),
             closed: Cell::new(false),
         })
@@ -517,6 +552,9 @@ impl WebView {
         let web_command = match command {
             Command::Reload => {
                 self.evaluations.navigated();
+                if self.terminated.replace(false) {
+                    return self.sync(&node);
+                }
                 WebCommand {
                     target_id,
                     kind: "reload".into(),
@@ -604,6 +642,7 @@ impl WebView {
                     );
                     return Ok(());
                 }
+                self.terminated.set(false);
                 self.evaluations.navigated();
                 WebCommand {
                     target_id,
@@ -745,6 +784,7 @@ impl WebView {
         *self.applied_source.borrow_mut() = None;
         *self.applied_document.borrow_mut() = None;
         *self.pending_settings.borrow_mut() = None;
+        self.terminated.set(false);
         self.fail_pending_requests(node, "WebView recreated");
         let was_mounted = self.arkts_mounted.replace(false);
         self.waiting_transition.set(false);
@@ -799,7 +839,12 @@ impl WebView {
             self.evaluations.scripts_disabled();
         }
         let shared_cookies = !props.incognito;
+        let window_id = {
+            let id = node.key_window_id();
+            (id != nsh_core::ROOT_ID).then_some(id)
+        };
         let document = DocumentSettings {
+            window_id,
             javascript: props.javascript_enabled,
             shared_cookies,
             script: props.injected_js_before.clone(),
@@ -829,6 +874,7 @@ impl WebView {
 
         let source_changed = self.applied_source.borrow().as_ref() != Some(&props.source);
         if source_changed {
+            self.terminated.set(false);
             self.evaluations.navigated();
             *self.applied_source.borrow_mut() = Some(props.source.clone());
             self.load_generation
@@ -849,6 +895,7 @@ impl WebView {
             .map_or_else(|| BRIDGE.to_owned(), |script| format!("{BRIDGE}\n{script}"));
         let settings = WebSettings {
             target_id,
+            window_id,
             shared_cookies,
             clear_cookies: !shared_cookies && (first_document || new_document),
             url,
@@ -965,6 +1012,11 @@ impl WebView {
             }
         }
     }
+
+    fn on_render_exited(&self) {
+        self.terminated.set(true);
+        *self.applied_source.borrow_mut() = None;
+    }
 }
 
 pub(crate) fn on_controller_attached(target_id: u32, native_tag: &str) -> napi_ohos::Result<bool> {
@@ -1027,6 +1079,10 @@ fn install_asset_protocol(
     let handler = CustomProtocolHandler::new();
     handler.on_request_start(move |request, request_handle| {
         let url = request.url();
+        let range_header = request
+            .headers()
+            .into_iter()
+            .find_map(|(k, v)| k.eq_ignore_ascii_case("range").then_some(v));
         let name = asset_name_from_url(&url);
         let assets = assets.clone();
         let permit = host.reserve_load();
@@ -1037,24 +1093,49 @@ fn install_asset_protocol(
                     .ok_or_else(|| "invalid asset URL".to_owned())
                     .and_then(|name| assets.read(&format!("asset:/{name}")))
             });
-            let mime = match std::path::Path::new(name.as_deref().unwrap_or_default())
-                .extension()
-                .and_then(|x| x.to_str())
-            {
-                Some("html" | "htm") => "text/html",
-                Some("js" | "mjs") => "text/javascript",
-                Some("css") => "text/css",
-                Some("svg") => "image/svg+xml",
-                Some("png") => "image/png",
-                Some("jpg" | "jpeg") => "image/jpeg",
-                Some("woff2") => "font/woff2",
-                _ => "application/octet-stream",
-            };
-            let (status, bytes) = match result {
-                Ok(bytes) => (200, bytes),
-                Err(error) => (404, error.into_bytes()),
-            };
-            responder.respond(status, mime, &bytes);
+            let mime = asset_mime_type(name.as_deref().unwrap_or_default());
+            match result {
+                Ok(bytes) => {
+                    if let Some(raw_range) = range_header.as_deref() {
+                        match parse_byte_range(raw_range, bytes.len()) {
+                            Some(Ok((start, end))) => {
+                                let content_range = format!("bytes {start}-{end}/{}", bytes.len());
+                                responder.respond_with_headers(
+                                    206,
+                                    mime,
+                                    &[
+                                        ("accept-ranges", "bytes"),
+                                        ("content-range", &content_range),
+                                    ],
+                                    &bytes[start..=end],
+                                );
+                                return;
+                            }
+                            Some(Err(())) => {
+                                let content_range = format!("bytes */{}", bytes.len());
+                                responder.respond_with_headers(
+                                    416,
+                                    "text/plain; charset=utf-8",
+                                    &[
+                                        ("accept-ranges", "bytes"),
+                                        ("content-range", &content_range),
+                                    ],
+                                    &[],
+                                );
+                                return;
+                            }
+                            None => {}
+                        }
+                    }
+                    responder.respond_with_headers(
+                        200,
+                        mime,
+                        &[("accept-ranges", "bytes")],
+                        &bytes,
+                    );
+                }
+                Err(error) => responder.respond(404, "text/plain; charset=utf-8", error.as_bytes()),
+            }
         };
         if let Err(error) = Executor::assets().and_then(|pool| pool.submit(job)) {
             log::error!("OHOS WebView asset worker: {error}");
@@ -1083,22 +1164,34 @@ fn install_asset_protocol(
         }
         let scheme_handler = CustomProtocolHandler::new();
         let scheme_clone = scheme.clone();
+        let active_cancels: Arc<super::web_scheme::SchemeCancels> = Arc::default();
+        let stop_cancels = active_cancels.clone();
+        scheme_handler.on_request_stop(move |request| {
+            stop_cancels.stop(request.user_token(), request.as_id());
+        });
         scheme_handler.on_request_start(move |request, request_handle| {
             let url = request.url();
             let method = request.method();
             let responder = AssetReply(Some(request_handle));
-            let (req, _cancel) = nsh_core::web_resource::WebResourceRequest::new(
+            let req_id = active_cancels.allocate_id();
+            let _ = request.set_user_token(req_id);
+            let done_cancels = active_cancels.clone();
+            let (req, cancel) = nsh_core::web_resource::WebResourceRequest::new(
                 url,
                 if method.is_empty() {
                     "GET".to_owned()
                 } else {
                     method
                 },
-                move |resource| match resource {
-                    Some(res) => responder.respond(200, res.mime_type_or_default(), &res.bytes),
-                    None => responder.respond(404, "text/plain; charset=utf-8", &[]),
+                move |resource| {
+                    done_cancels.finish(req_id);
+                    match resource {
+                        Some(res) => responder.respond(200, res.mime_type_or_default(), &res.bytes),
+                        None => responder.respond(404, "text/plain; charset=utf-8", &[]),
+                    }
                 },
             );
+            active_cancels.register(req_id, request.as_id(), cancel);
             scheme_clone.handle(req);
             true
         });
@@ -1134,12 +1227,30 @@ pub(crate) fn on_navigate(target_id: u32, url: &str) -> napi_ohos::Result<bool> 
         {
             return true;
         }
-        !allows_navigation(
+        let allowed = allows_navigation(
             &route.access,
             url,
             &route.url_schemes,
             route.allow_origin.borrow().as_ref(),
-        )
+        );
+        if !allowed {
+            node.control.dispatch_event(
+                node.id,
+                EventKind::Error,
+                EventPayload::Map(vec![
+                    (
+                        "message",
+                        PayloadValue::Str("WebView navigation is not granted".into()),
+                    ),
+                    (
+                        "code",
+                        PayloadValue::Str(nsh_core::element::codes::ACCESS_DENIED.into()),
+                    ),
+                    ("url", PayloadValue::Str(url.to_owned())),
+                ]),
+            );
+        }
+        !allowed
     })
 }
 
@@ -1296,6 +1407,9 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                 route.on_ready();
             }
             "render-exited" => {
+                if let Some(web) = node.web.borrow().as_ref() {
+                    web.on_render_exited();
+                }
                 route.evaluations.process_terminated();
                 node.control.dispatch_event(
                     node.id,
@@ -1348,7 +1462,7 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                         };
                         surface = parent;
                     }
-                    let scale = node.scale.get().max(1.0);
+                    let scale = node.effective_scale();
                     let (origin_x, origin_y) = surface
                         .native
                         .borrow()
@@ -1415,7 +1529,7 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
                     ]),
                 );
                 node.control
-                    .dispatch_event(node.id, EventKind::LoadEnd, state());
+                    .dispatch_event(node.id, EventKind::NavigationStateChange, state());
             }
             "start" => {
                 route.evaluations.navigated();
@@ -1427,8 +1541,6 @@ pub(crate) fn on_event(event: WebEvent) -> napi_ohos::Result<bool> {
             "finish" => {
                 node.control
                     .dispatch_event(node.id, EventKind::Load, state());
-                node.control
-                    .dispatch_event(node.id, EventKind::LoadEnd, state());
                 node.control
                     .dispatch_event(node.id, EventKind::NavigationStateChange, state());
             }
@@ -1448,6 +1560,86 @@ pub(crate) fn abort_evaluation(control: &EngineControl, node_id: nsh_core::NodeI
 fn asset_url(uri: &str) -> String {
     uri.strip_prefix("asset:/")
         .map_or_else(|| uri.to_owned(), |path| format!("{SCHEME}://app/{path}"))
+}
+
+fn asset_mime_type(name: &str) -> &'static str {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .and_then(|x| x.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("html" | "htm") => "text/html",
+        Some("js" | "mjs" | "cjs") => "text/javascript",
+        Some("css") => "text/css",
+        Some("json" | "map") => "application/json",
+        Some("wasm") => "application/wasm",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        Some("ico") => "image/x-icon",
+        Some("bmp") => "image/bmp",
+        Some("avif") => "image/avif",
+        Some("mp4" | "m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("mp3") => "audio/mpeg",
+        Some("m4a") => "audio/mp4",
+        Some("ogg" | "oga") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("flac") => "audio/flac",
+        Some("woff2") => "font/woff2",
+        Some("woff") => "font/woff",
+        Some("ttf") => "font/ttf",
+        Some("otf") => "font/otf",
+        Some("txt") => "text/plain; charset=utf-8",
+        Some("xml") => "application/xml",
+        Some("pdf") => "application/pdf",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parses a single-part HTTP `Range: bytes=...` header against `total_len`.
+/// Returns:
+/// - `None` when the header does not use `bytes=` or specifies multiple ranges (serve full `200`),
+/// - `Some(Ok((start, end)))` for a satisfiable inclusive byte slice,
+/// - `Some(Err(()))` for an unsatisfiable single range (`416 Range Not Satisfiable`).
+fn parse_byte_range(
+    header: &str,
+    total_len: usize,
+) -> Option<std::result::Result<(usize, usize), ()>> {
+    let spec = header.trim().strip_prefix("bytes=")?;
+    if spec.contains(',') {
+        return None;
+    }
+    let (start_raw, end_raw) = spec.trim().split_once('-')?;
+    if total_len == 0 {
+        return Some(Err(()));
+    }
+    let start_raw = start_raw.trim();
+    let end_raw = end_raw.trim();
+    if start_raw.is_empty() {
+        let suffix: usize = end_raw.parse().ok()?;
+        if suffix == 0 {
+            return Some(Err(()));
+        }
+        let start = total_len.saturating_sub(suffix);
+        return Some(Ok((start, total_len - 1)));
+    }
+    let start: usize = start_raw.parse().ok()?;
+    if start >= total_len {
+        return Some(Err(()));
+    }
+    let end = if end_raw.is_empty() {
+        total_len - 1
+    } else {
+        let parsed: usize = end_raw.parse().ok()?;
+        if parsed < start {
+            return Some(Err(()));
+        }
+        parsed.min(total_len - 1)
+    };
+    Some(Ok((start, end)))
 }
 
 fn asset_name_from_url(url: &str) -> Option<String> {
@@ -1515,5 +1707,21 @@ mod tests {
             asset_name_from_url("nsh-asset://app/docs/hello%20world.html?x=1#top").as_deref(),
             Some("docs/hello world.html")
         );
+    }
+
+    #[test]
+    fn asset_mime_and_byte_ranges_follow_http_semantics() {
+        assert_eq!(asset_mime_type("pkg/app.wasm"), "application/wasm");
+        assert_eq!(asset_mime_type("media/clip.mp4"), "video/mp4");
+        assert_eq!(asset_mime_type("fonts/inter.ttf"), "font/ttf");
+        assert_eq!(asset_mime_type("data/config.json"), "application/json");
+
+        assert_eq!(parse_byte_range("bytes=0-99", 1000), Some(Ok((0, 99))));
+        assert_eq!(parse_byte_range("bytes=900-", 1000), Some(Ok((900, 999))));
+        assert_eq!(parse_byte_range("bytes=-200", 1000), Some(Ok((800, 999))));
+        assert_eq!(parse_byte_range("bytes=0-5000", 1000), Some(Ok((0, 999))));
+        assert_eq!(parse_byte_range("bytes=1000-1001", 1000), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=50-10", 1000), Some(Err(())));
+        assert_eq!(parse_byte_range("bytes=0-10, 20-30", 1000), None);
     }
 }

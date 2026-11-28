@@ -9,6 +9,7 @@ import { ExtractedPasteData, extractPasteData } from "./NativeClipboard";
 export interface EditorSettings {
   belowViewport?: boolean;
   targetId: number;
+  windowId?: number | null;
   multiline: boolean;
   secure: boolean;
   text: string;
@@ -180,6 +181,7 @@ const inputTypes: Map<string, InputType> = new Map([
   ["decimal", InputType.NUMBER_DECIMAL],
   ["phone", InputType.PhoneNumber],
   ["email", InputType.Email],
+  ["url", InputType.URL],
   ["password", InputType.Password],
   ["number-password", InputType.NUMBER_PASSWORD],
 ]);
@@ -189,6 +191,7 @@ const areaTypes: Map<string, TextAreaType> = new Map([
   ["decimal", TextAreaType.NUMBER_DECIMAL],
   ["phone", TextAreaType.PHONE_NUMBER],
   ["email", TextAreaType.EMAIL],
+  ["url", TextAreaType.URL],
 ]);
 const enterTypes: Map<string, EnterKeyType> = new Map([
   ["go", EnterKeyType.Go],
@@ -265,7 +268,7 @@ const SINK_PAD: string = "\u200b".repeat(SINK_PAD_LEN);
 const SINK_BYTE_LIMIT: number = 256;
 
 function isSinkSettings(s: EditorSettings): boolean {
-  return s.multiline && s.reportPaste && s.hitTest === 3 && s.color === 0 && s.caretColor === 0;
+  return !s.secure && s.reportPaste && s.hitTest === 3 && s.color === 0 && s.caretColor === 0;
 }
 
 function isImeCursorSinkSettings(s: EditorSettings): boolean {
@@ -462,10 +465,12 @@ function editorContent(params: EditorContentParams) {
         .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
         .onWillChange((info: EditableTextChangeValue): boolean => params.entry.willChange(info))
         .onWillInsert((value: InsertValue): boolean => params.entry.willInsert(value))
-        .onWillDelete((): boolean => {
+        .onWillDelete((info: DeleteValue): boolean => {
           if (!params.entry.canEdit()) return false;
-          if (!params.entry.isSink() || params.entry.text.length === 0) {
-            params.entry.editKey("Backspace");
+          const key =
+            info.direction === TextDeleteDirection.FORWARD ? "Delete" : "Backspace";
+          if (!params.entry.isSink() || params.entry.text.length === 0 || key === "Delete") {
+            params.entry.editKey(key);
           }
           return true;
         })
@@ -500,9 +505,13 @@ function editorContent(params: EditorContentParams) {
         .onPaste((text: string, event: PasteEvent) => params.entry.paste(text, event))
         .onWillChange((info: EditableTextChangeValue): boolean => params.entry.willChange(info))
         .onWillInsert((value: InsertValue): boolean => params.entry.willInsert(value))
-        .onWillDelete((): boolean => {
+        .onWillDelete((info: DeleteValue): boolean => {
           if (!params.entry.canEdit()) return false;
-          params.entry.editKey("Backspace");
+          const key =
+            info.direction === TextDeleteDirection.FORWARD ? "Delete" : "Backspace";
+          if (!params.entry.isSink() || params.entry.text.length === 0 || key === "Delete") {
+            params.entry.editKey(key);
+          }
           return true;
         })
         .onMouse((event: MouseEvent): void => params.entry.handleMouse(event))
@@ -785,7 +794,7 @@ class EditorEntry {
     this.count = settings.count;
     this.selStart = this.text.length;
     this.selEnd = this.text.length;
-    this.node = new BuilderNode<[EditorContentParams]>(context.getUIContext());
+    this.node = new BuilderNode<[EditorContentParams]>(this.editorUIContext());
   }
   isSink(): boolean {
     return isSinkSettings(this.settings);
@@ -794,6 +803,12 @@ class EditorEntry {
     return isImeCursorSinkSettings(this.settings);
   }
   private editorUIContext(): UIContext {
+    if (this.settings.windowId != null && this.context.getWindowUIContext) {
+      const subUi = this.context.getWindowUIContext(this.settings.windowId);
+      if (subUi !== undefined) {
+        return subUi;
+      }
+    }
     const id = `nsh-editor-${this.settings.targetId}`;
     return this.context.getUIContextFor ? this.context.getUIContextFor(id) : this.context.getUIContext();
   }
@@ -809,7 +824,11 @@ class EditorEntry {
     this.selStart = end;
     this.selEnd = end;
     try {
-      this.area.setTextSelection(end, end);
+      if (this.settings.multiline && !this.settings.secure) {
+        this.area.setTextSelection(end, end);
+      } else {
+        this.line.setTextSelection(end, end);
+      }
     } catch {}
   }
   create(): void {
@@ -1773,11 +1792,24 @@ class EditorEntry {
       this.menuInteracting = false;
     }, 60);
   }
-  blurFromOther(): void {
+  blurFromOther(nextUi: UIContext): void {
     if (!this.focused || this.closed) {
       return;
     }
     this.clearMenuInteraction();
+    // Only call stopEditing() when focus moves across distinct window UIContexts
+    // (e.g. PC MainWindow <-> SubWindow). Within the same UIContext (such as
+    // tapping between two inputs on Phone), ArkUI transfers focus directly and
+    // calling stopEditing() would prematurely dismiss the mobile soft keyboard.
+    if (this.editorUIContext() !== nextUi) {
+      try {
+        if (this.settings.multiline && !this.settings.secure) {
+          this.area.stopEditing();
+        } else {
+          this.line.stopEditing();
+        }
+      } catch {}
+    }
     this.emit("blur");
   }
   emit(
@@ -1811,7 +1843,7 @@ class EditorEntry {
       this.clearMenuInteraction();
       const previous = activeEditorsByContext.get(this.context);
       if (previous && previous !== this) {
-        previous.blurFromOther();
+        previous.blurFromOther(this.editorUIContext());
       }
       activeEditorsByContext.set(this.context, this);
       const wasFocused = this.focused;
@@ -1856,6 +1888,8 @@ class EditorEntry {
         this.focusGen += 1;
       }
       this.focused = false;
+      this.preview = "";
+      this.previewStart = 0;
       this.pointerFocusing = false;
       this.pointerActive = false;
       this.pointerMoved = false;
@@ -1915,7 +1949,7 @@ class EditorEntry {
         this.context.requestFocus(id);
         return;
       }
-      this.context.getUIContext().getFocusController().requestFocus(id);
+      this.editorUIContext().getFocusController().requestFocus(id);
     } catch {}
   }
   command(command: EditorCommand): void {
@@ -2075,6 +2109,11 @@ class EditorEntry {
   insertText(inserted: string, normalizePaste = false): void {
     if (!this.canEdit() || this.closed) {
       return;
+    }
+    if (this.preview.length > 0) {
+      this.preview = "";
+      this.previewStart = 0;
+      this.emit("composition", "", this.selStart, this.selStart);
     }
     if (this.isSink()) {
       if (inserted.length > 0) {
@@ -2364,7 +2403,12 @@ export class NativeEditors {
       }
     });
     try {
-      context.getUIContext().postFrameCallback(callback);
+      const first = this.pending.values().next().value as EditorSettings | undefined;
+      const ui =
+        first?.windowId != null && context.getWindowUIContext
+          ? (context.getWindowUIContext(first.windowId) ?? context.getUIContext())
+          : context.getUIContext();
+      ui.postFrameCallback(callback);
     } catch (error) {
       this.scheduled = false;
       throw error instanceof Error ? error : new Error(String(error));

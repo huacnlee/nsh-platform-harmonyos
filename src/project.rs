@@ -55,9 +55,92 @@ pub(crate) struct AppConfig {
     web_microphone: bool,
     /// Web pages may use the camera (`capabilities.webview.media`).
     web_camera: bool,
+    /// `"appearance"`: `"light"`, `"dark"`, or `"system"`.
+    appearance: Option<String>,
+    /// Validated `assets/nsh-updater.json` payload when `nsh.json` configures `"updater"`.
+    updater_json: Option<Vec<u8>>,
     /// HarmonyOS packaging declarations from `nsh.json` `"harmonyos"` merged
     /// with crates' `[package.metadata.nsh.harmonyos]`.
     pub(crate) harmonyos: HarmonyMeta,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdaterPackagesInput {
+    roots: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdaterInput {
+    github: Option<String>,
+    url: Option<String>,
+    #[serde(default)]
+    channels: BTreeMap<String, String>,
+    public_key: Option<String>,
+    packages: Option<UpdaterPackagesInput>,
+}
+
+fn sanitize_bundle_segment(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | '.') {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "app".to_owned()
+    } else if trimmed.as_bytes()[0].is_ascii_alphabetic() {
+        trimmed.to_owned()
+    } else {
+        format!("app_{trimmed}")
+    }
+}
+
+fn parse_icon_path(app: &Path, raw: &Value) -> Option<PathBuf> {
+    let rel = raw.as_str().or_else(|| {
+        raw.as_object().and_then(|obj| {
+            obj.get("harmonyos")
+                .and_then(Value::as_str)
+                .or_else(|| obj.get("default").and_then(Value::as_str))
+        })
+    })?;
+    let path = join_relative(app, rel);
+    path.extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        .then_some(path)
+}
+
+fn build_updater_config_bytes(
+    json: &Value,
+    id: &str,
+    name: &str,
+    version: &str,
+    build: u64,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(raw) = json.get("updater").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let parsed: UpdaterInput = serde_json::from_value(raw.clone()).context("nsh.json updater")?;
+    let mut runtime = nsh_updater::Config::default();
+    runtime.id = id.to_owned();
+    runtime.version = version.to_owned();
+    runtime.name = Some(name.to_owned());
+    runtime.github = parsed.github;
+    runtime.url = parsed.url;
+    runtime.channels = parsed.channels;
+    runtime.public_key = parsed.public_key;
+    runtime.build = Some(build);
+    runtime.packages = parsed.packages.map(|pkgs| {
+        let mut out = nsh_updater::Packages::default();
+        out.roots = pkgs.roots.iter().map(|r| r.trim().to_owned()).collect();
+        out
+    });
+    runtime.validate().context("nsh.json")?;
+    Ok(Some(serde_json::to_vec(&runtime)?))
 }
 
 /// Whether `capabilities.webview.media` grants `kind` (`"microphone"`, `"camera"`).
@@ -101,28 +184,34 @@ impl AppConfig {
             None => Vec::new(),
         };
         let harmonyos = HarmonyMeta::from_app_json(app, json)?;
+        let name = json["name"]
+            .as_str()
+            .map_or_else(|| dir_name.clone(), str::to_owned);
+        let id = json["id"].as_str().map_or_else(
+            || format!("com.example.{}", sanitize_bundle_segment(&dir_name)),
+            str::to_owned,
+        );
+        let version = json["version"].as_str().unwrap_or("1.0.0").to_owned();
+        let build = build.unwrap_or(1);
+        let appearance = match json["appearance"].as_str() {
+            Some(mode @ ("light" | "dark" | "system")) => Some(mode.to_owned()),
+            _ => None,
+        };
+        let updater_json = build_updater_config_bytes(json, &id, &name, &version, build)?;
         Ok(AppConfig {
-            name: json["name"]
-                .as_str()
-                .map_or(dir_name.clone(), str::to_owned),
-            id: json["id"]
-                .as_str()
-                .map_or_else(|| format!("com.example.{dir_name}"), str::to_owned),
-            version: json["version"].as_str().unwrap_or("1.0.0").to_owned(),
-            build: build.unwrap_or(1),
-            icon: json["icon"]
-                .as_str()
-                .map(|icon| join_relative(app, icon))
-                .filter(|icon| {
-                    icon.extension()
-                        .is_some_and(|e| e.eq_ignore_ascii_case("png"))
-                }),
+            name,
+            id,
+            version,
+            build,
+            icon: parse_icon_path(app, &json["icon"]),
             schemes,
             links,
             file_types,
             webview: json["capabilities"]["webview"].is_object(),
             web_microphone: web_media(json, "microphone"),
             web_camera: web_media(json, "camera"),
+            appearance,
+            updater_json,
             harmonyos,
         })
     }
@@ -1394,6 +1483,7 @@ pub(crate) fn write(
         &["entry", "libs"],
         &["entry", "nshm-deps"],
         &["entry", "src", "main", "ets", "entryabilitystage"],
+        &["entry", "src", "main", "resources", "dark"],
         &["entry", "src", "main", "resources", "rawfile"],
         &["AppScope", "resources", "base", "media"],
     ] {
@@ -1415,6 +1505,12 @@ pub(crate) fn write(
         "bundle.js"
     };
 
+    let start_window_background = if config.appearance.as_deref() == Some("dark") {
+        "#000000"
+    } else {
+        "#ffffff"
+    };
+
     let substitutions = [
         ("{{bundleName}}", json_text(&config.id)),
         ("{{vendor}}", json_text(&config.name)),
@@ -1434,6 +1530,10 @@ pub(crate) fn write(
         ("{{entryStrings}}", entry_strings),
         ("{{entryDependencies}}", entry_dependencies),
         ("{{entryBuildOption}}", entry_build_option),
+        (
+            "{{startWindowBackground}}",
+            start_window_background.to_owned(),
+        ),
     ];
 
     for (path, bytes) in crate::embedded::TEMPLATE {
@@ -1458,6 +1558,24 @@ pub(crate) fn write(
             None => bytes.to_vec(),
         };
         write_file(&target, &out_bytes)?;
+    }
+    if config.appearance.as_deref() != Some("light") {
+        let dark_color = join_all(
+            out,
+            [
+                "entry",
+                "src",
+                "main",
+                "resources",
+                "dark",
+                "element",
+                "color.json",
+            ],
+        );
+        write_file(
+            &dark_color,
+            b"{\n  \"color\": [\n    {\n      \"name\": \"start_window_background\",\n      \"value\": \"#000000\"\n    }\n  ]\n}\n",
+        )?;
     }
     if let Some(stage_ets) = ability_stage_source {
         let stage_path = join_all(
@@ -1540,6 +1658,12 @@ pub(crate) fn write(
     let assets = contents.build.join("assets");
     if assets.is_dir() {
         copy_dir(&assets, &rawfile.join("assets"))?;
+    }
+    if let Some(updater_bytes) = &config.updater_json {
+        write_file(
+            &join_all(&rawfile, ["assets", nsh_updater::CONFIG_ASSET]),
+            updater_bytes,
+        )?;
     }
     Ok(ProjectOutput {
         signed: preserved_signing.product_signing_config.is_some(),
@@ -3105,6 +3229,180 @@ mod tests {
         assert!(hmos_default.contains("@hms.filemanagement.fileManagerService"));
         assert!(hmos_default.contains("@hms.ai.speechRecognizer"));
         assert!(hmos_default.contains("@hms.pcService.statusBarManager"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn writes_updater_asset_platform_icon_sanitized_id_and_launch_colors() {
+        let dir = std::env::temp_dir().join(format!("nsh-hm-cli-parity-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let app_dir = dir.join("my-music-2");
+        let assets_dir = app_dir.join("assets");
+        fs::create_dir_all(&assets_dir).unwrap();
+        fs::write(assets_dir.join("hm-icon.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        fs::write(assets_dir.join("default-icon.png"), b"\x89PNG\r\n\x1a\ndef").unwrap();
+        let build = dir.join("build");
+        fs::create_dir_all(&build).unwrap();
+        fs::write(build.join("bundle.js"), "export default 1;").unwrap();
+        let library = dir.join("lib.so");
+        fs::write(&library, b"\x7fELF").unwrap();
+
+        // Invalid custom updater URL without publicKey fails validation.
+        let bad_updater = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "updater": {
+                    "url": "https://updates.example.com/latest.json"
+                }
+            }),
+        );
+        assert!(bad_updater.is_err());
+
+        // Hyphenated dir fallback bundleName + platform icon object + GitHub updater + dark appearance.
+        let dark_config = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "version": "1.4.2",
+                "build": 9,
+                "appearance": "dark",
+                "icon": {
+                    "harmonyos": "assets/hm-icon.png",
+                    "default": "assets/default-icon.png"
+                },
+                "updater": {
+                    "github": "acme/my-music"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(dark_config.id, "com.example.my_music_2");
+        assert_eq!(dark_config.icon, Some(assets_dir.join("hm-icon.png")));
+
+        let fallback_icon_cfg = AppConfig::from_json(
+            &dir.join("2048-game"),
+            &json!({
+                "icon": {
+                    "ios": "assets/ios.png",
+                    "default": "assets/default-icon.png"
+                }
+            }),
+        )
+        .unwrap();
+        assert_eq!(fallback_icon_cfg.id, "com.example.app_2048_game");
+        assert_eq!(
+            fallback_icon_cfg.icon,
+            Some(
+                dir.join("2048-game")
+                    .join("assets")
+                    .join("default-icon.png")
+            )
+        );
+
+        let out = dir.join("out");
+        let contents = Contents {
+            arch: Arch::Arm64,
+            library: &library,
+            build: &build,
+            runtime_os: RuntimeOs::HarmonyOs,
+            min_api: ApiLevel::Api20,
+            compile_api: MIN_API,
+        };
+        write(&out, &dark_config, &contents).unwrap();
+
+        let updater_bytes = fs::read(join_all(
+            &out,
+            [
+                "entry",
+                "src",
+                "main",
+                "resources",
+                "rawfile",
+                "assets",
+                "nsh-updater.json",
+            ],
+        ))
+        .unwrap();
+        let parsed_updater = nsh_updater::Config::parse(&updater_bytes).unwrap();
+        assert_eq!(parsed_updater.id, "com.example.my_music_2");
+        assert_eq!(parsed_updater.version, "1.4.2");
+        assert_eq!(parsed_updater.build, Some(9));
+        assert_eq!(parsed_updater.github.as_deref(), Some("acme/my-music"));
+
+        let base_color: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "base",
+                    "element",
+                    "color.json",
+                ],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(base_color["color"][0]["value"], "#000000");
+        assert!(
+            join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "dark",
+                    "element",
+                    "color.json"
+                ]
+            )
+            .is_file()
+        );
+
+        // Switching to appearance: "light" sets base to #ffffff and removes stale dark/color.json.
+        let light_config = AppConfig::from_json(
+            &app_dir,
+            &json!({
+                "appearance": "light"
+            }),
+        )
+        .unwrap();
+        write(&out, &light_config, &contents).unwrap();
+        let light_base: Value = serde_json::from_str(
+            &fs::read_to_string(join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "base",
+                    "element",
+                    "color.json",
+                ],
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(light_base["color"][0]["value"], "#ffffff");
+        assert!(
+            !join_all(
+                &out,
+                [
+                    "entry",
+                    "src",
+                    "main",
+                    "resources",
+                    "dark",
+                    "element",
+                    "color.json"
+                ]
+            )
+            .exists()
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

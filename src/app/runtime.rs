@@ -126,6 +126,7 @@ pub(crate) enum Message {
     DialogResult {
         id: u32,
         index: i32,
+        value: Option<String>,
     },
     HostEnvironment(NshEnvironment),
     HostNetwork(nsh_core::platform::Network),
@@ -568,8 +569,11 @@ impl State {
                 mounter.flush_arkui()?;
                 self.request_frame()?;
             }
-            Message::DialogResult { id, index } => {
-                self.mounter.as_mut().unwrap().dialog_result(id, index)?;
+            Message::DialogResult { id, index, value } => {
+                self.mounter
+                    .as_mut()
+                    .unwrap()
+                    .dialog_result(id, index, value)?;
             }
             Message::HostEnvironment(changes) => self.update_environment(changes)?,
             Message::HostNetwork(network) => {
@@ -814,9 +818,14 @@ impl State {
         Ok(())
     }
     fn is_active(&self) -> bool {
+        let has_visible_surface = self.visible
+            || self
+                .mounter
+                .as_ref()
+                .is_some_and(Mounter::has_visible_desktop_sub_windows);
         self.engine.is_some()
             && self.attached
-            && self.visible
+            && has_visible_surface
             && self.environment.lifecycle != nsh_engine::Lifecycle::Background
     }
     fn update_back(&mut self) {
@@ -1130,7 +1139,7 @@ pub(crate) struct BootedEngine {
 impl BootedEngine {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn start(
-        app: App,
+        mut app: App,
         size: Size,
         size_px: (i32, i32),
         config: &Config,
@@ -1195,16 +1204,28 @@ impl BootedEngine {
         } else {
             Vec::new()
         };
+        // Wait for any retiring engine using the same host storage/data directory
+        // to finish flushing before opening the new FileStorage/Engine.
+        let host_data_dir = config.host.data_directory();
+        if let nsh_engine::App::Js(bundle) = &mut app.app
+            && bundle.system_paths.home_dir.is_none()
+        {
+            let mut paths = bundle.system_paths.clone();
+            paths.home_dir = Some(host_data_dir.clone());
+            *bundle = std::mem::take(bundle).with_system_paths(paths);
+        }
         let access = match &app.app {
             nsh_engine::App::Js(bundle) => bundle.policy.access(),
-            nsh_engine::App::Rust(_) => nsh_engine::Policy::default().access(),
+            nsh_engine::App::Rust(root) => nsh_engine::Policy {
+                harden: true,
+                declared: root.capabilities_ref().cloned(),
+                granted: config.policy.granted.clone(),
+            }
+            .access(),
         };
         let engine_assets: Arc<dyn nsh_engine::Assets> = app.assets.clone();
         let access = Arc::new(access);
         let assets = app.assets.clone();
-        // Wait for any retiring engine using the same host storage/data directory
-        // to finish flushing before opening the new FileStorage/Engine.
-        let host_data_dir = config.host.data_directory();
         await_engine_drop(Some(&host_data_dir));
         let main_window_options = app.app.main_window().cloned();
         let storage: Option<Arc<dyn nsh_engine::StorageBackend>> =
@@ -1669,9 +1690,11 @@ impl Runtime {
         let size = booted.size;
         let scale = environment.pixel_ratio;
         let engine_assets: Arc<dyn nsh_engine::Assets> = booted.assets.clone();
+        let media_files = engine.media_files();
         let images = crate::media::image::Loader::new(
             engine_assets,
             (*booted.access).clone(),
+            media_files.clone(),
             Arc::downgrade(&dispatcher),
         );
         images.set_disk_cache(engine.image_cache());
@@ -1717,6 +1740,7 @@ impl Runtime {
             animator: crate::render::animation::Animator::new(control, Arc::downgrade(&dispatcher)),
             images,
             access: booted.access.clone(),
+            media_files,
             assets: booted.assets.clone(),
             components,
             touches: RefCell::default(),

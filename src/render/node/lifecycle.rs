@@ -101,6 +101,7 @@ impl Node {
             raster_origin_y: Cell::new(0.0),
             presentation: Cell::new((1.0, 0.0)),
             pinned: Cell::new((0.0, 0.0)),
+            sticky_z: Cell::new(None),
             input_transform: Cell::new(nsh_core::Matrix::IDENTITY),
             applied_layout_size: Cell::new((0, 0, 0)),
             applied_position: Cell::new((0, 0, 0)),

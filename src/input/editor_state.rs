@@ -245,6 +245,22 @@ mod tests {
     }
 
     #[test]
+    fn blur_clears_composition_and_releases_deferred_controlled_value() {
+        let mut state = State::default();
+        assert_eq!(state.changed("ni".into()), Some(1));
+        assert!(state.focus(true));
+        state.composition(true);
+        assert!(!state.controlled("cleared".into(), 1));
+        assert_eq!(state.text, "ni");
+        // Blurring while IME preedit is active ends composition and flushes deferred value.
+        assert!(state.composition(false));
+        assert!(state.focus(false));
+        assert_eq!(state.text, "cleared");
+        assert!(state.controlled("next".into(), 1));
+        assert_eq!(state.text, "next");
+    }
+
+    #[test]
     fn focus_is_deduplicated() {
         let mut state = State::default();
         assert!(state.focus(true));

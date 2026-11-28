@@ -425,22 +425,39 @@ impl Node {
     pub(crate) fn wrapper_owns_semantics(&self) -> bool {
         self.wrapper.borrow().is_some() && owns_semantics(&self.accessibility_state.spec.borrow())
     }
-    pub(crate) fn accessibility_id(&self) -> Result<i32> {
-        use ohos_arkui_binding::types::attribute::ArkUINodeAttributeType as A;
+    pub(crate) fn accessibility_custom_id(&self) -> Result<(i32, String)> {
+        use ohos_arkui_binding::{
+            component::attribute::ArkUICommonAttribute,
+            types::attribute::ArkUINodeAttributeType as A,
+        };
+        if let Some(input) = self.input.borrow().as_ref()
+            && let Some(target_id) = input.accessibility_target_id()
+        {
+            let numeric = input.accessibility_id()?.unwrap_or(0);
+            return Ok((numeric, format!("nsh-editor-{target_id}")));
+        }
         let spec = self.accessibility_state.spec.borrow();
         if owns_semantics(&spec)
             && let Some(wrapper) = self.wrapper.borrow().as_ref()
-            && let Some(id) =
-                wrapper.with_child(|node| node.i32_attribute(A::AccessibilityId, 0))?
+            && let Some(found) = wrapper.with_child(|node| -> Result<(i32, String)> {
+                let fallback = format!("nsh-a11y-{}", self.id);
+                let _ = node.id(&fallback);
+                let numeric = node.i32_attribute(A::AccessibilityId, 0)?;
+                Ok((numeric, fallback))
+            })?
         {
-            return Ok(id?);
+            return found;
         }
-        if let Some(input) = self.input.borrow().as_ref()
-            && let Some(id) = input.accessibility_id()?
-        {
-            return Ok(id);
-        }
-        Ok(self.native.borrow().i32_attribute(A::AccessibilityId, 0)?)
+        drop(spec);
+        let custom_id = if let Some(test_id) = self.interaction.test_id() {
+            test_id
+        } else {
+            let fallback = format!("nsh-a11y-{}", self.id);
+            self.native.borrow().id(&fallback)?;
+            fallback
+        };
+        let numeric = self.native.borrow().i32_attribute(A::AccessibilityId, 0)?;
+        Ok((numeric, custom_id))
     }
     pub(crate) fn mounted(&self) -> NativeNode {
         self.wrapper
