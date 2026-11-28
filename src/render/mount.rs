@@ -132,6 +132,7 @@ pub(crate) struct UiContext {
     pub(crate) animator: Rc<crate::render::animation::Animator>,
     pub(crate) images: Arc<crate::media::image::Loader>,
     pub(crate) access: Arc<nsh_engine::Access>,
+    pub(crate) media_files: Arc<nsh_core::access::MediaFiles>,
     pub(crate) assets: Arc<dyn crate::services::assets::StreamAssets>,
     pub(crate) components: crate::interop::component::Components,
     pub(crate) touches: crate::input::touch::State,

@@ -475,6 +475,7 @@ export interface WebSettings {
   sharedCookies: boolean
   clearCookies: boolean
   targetId: number
+  windowId?: number
   url?: string
   html?: string
   htmlBaseUrl?: string

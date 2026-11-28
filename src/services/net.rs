@@ -73,9 +73,29 @@ impl SystemProxy {
         Ok(Self { proxy: None })
     }
 
-    pub(crate) fn value(&self) -> Option<ureq::Proxy> {
-        self.proxy.clone()
+    pub(crate) fn for_url(&self, url: &str) -> Option<ureq::Proxy> {
+        if is_loopback_url(url) {
+            None
+        } else {
+            self.proxy.clone()
+        }
     }
+}
+
+/// Returns `true` when `url` targets a loopback host (`localhost`, `127.0.0.0/8`, `[::1]`)
+/// that must bypass system HTTP proxies.
+pub(crate) fn is_loopback_url(url: &str) -> bool {
+    let Some(parts) = nsh_core::access::parse_url(url) else {
+        return false;
+    };
+    let host = parts.host.as_str();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host == "[::1]"
+        || host == "::1"
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn spawn_fetch(task: impl FnOnce() + Send + 'static) -> Result<(), String> {
@@ -537,7 +557,7 @@ fn run(
     let requested: http::Uri = request.url.parse()?;
     // Query on the request worker, so proxy changes apply without rebuilding an
     // engine or blocking its thread. A failed query must not bypass host policy.
-    let proxy = SystemProxy::read()?.value();
+    let proxy = SystemProxy::read()?.for_url(&request.url);
     let mut builder = http::Request::builder()
         .method(request.method.as_str())
         .uri(requested.clone());
@@ -939,5 +959,16 @@ mod tests {
         assert_eq!(body, b"reuse");
         wait_zero_permits(&net.requests, Duration::from_secs(2));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn loopback_urls_bypass_system_proxy() {
+        assert!(is_loopback_url("http://127.0.0.1:8080/api"));
+        assert!(is_loopback_url("http://127.0.0.42/test"));
+        assert!(is_loopback_url("http://localhost:3000/"));
+        assert!(is_loopback_url("http://sub.localhost/"));
+        assert!(is_loopback_url("http://[::1]:9000/ws"));
+        assert!(!is_loopback_url("https://example.com/"));
+        assert!(!is_loopback_url("http://192.168.1.2:8080/"));
     }
 }

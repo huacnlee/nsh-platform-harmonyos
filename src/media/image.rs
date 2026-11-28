@@ -191,6 +191,7 @@ impl Loader {
     pub(crate) fn new(
         assets: Arc<dyn Assets>,
         access: Access,
+        media_files: Arc<nsh_core::access::MediaFiles>,
         dispatcher: Weak<Dispatcher>,
     ) -> Arc<Self> {
         let access = Arc::new(access);
@@ -198,6 +199,7 @@ impl Loader {
             context: Mutex::new(Context {
                 read_asset: Some(Arc::new(move |uri| assets.read(uri))),
                 access,
+                media_files,
                 transport: Some(transport()),
                 ..Default::default()
             }),
@@ -236,13 +238,23 @@ impl Loader {
             };
             return LoadResult::Ready(result);
         }
-        let key = (uri.clone(), matches!(target, Target::View { .. }));
         let context = self.context.lock().expect("image context").clone();
-        if inline.is_none() && !context.access.allows_media(&uri) {
-            return LoadResult::Ready(Err(
-                "image URL is not granted by capabilities.network".into()
-            ));
-        }
+        let uri = if inline.is_none() {
+            match context
+                .access
+                .media_url(&uri, None, Some(&context.media_files))
+            {
+                Some(resolved) => resolved.into_owned(),
+                None => {
+                    return LoadResult::Ready(Err(
+                        "image URL is not granted by capabilities".into()
+                    ));
+                }
+            }
+        } else {
+            uri
+        };
+        let key = (uri.clone(), matches!(target, Target::View { .. }));
         if let Some((decoded, lease)) = self.cache.get(&key) {
             return LoadResult::Ready(Ok(Arc::new(Data {
                 decoded,
@@ -1156,6 +1168,7 @@ impl loader::Transport for OhosTransport {
         let proxy = crate::services::net::SystemProxy::read().map_err(|error| error.to_string())?;
         let deadline = std::time::Instant::now() + TIMEOUT;
         let mut url = get.url.to_owned();
+        let mut redirects = Vec::new();
         for hop in 0..=MAX_REDIRECTS {
             if get.cancelled.load(Ordering::Relaxed) {
                 return Err("cancelled".into());
@@ -1169,7 +1182,7 @@ impl loader::Transport for OhosTransport {
                 .ok_or("image request timed out")?;
             let mut response = request
                 .config()
-                .proxy(proxy.value())
+                .proxy(proxy.for_url(&url))
                 .timeout_global(Some(remaining))
                 .build()
                 .call()
@@ -1184,8 +1197,16 @@ impl loader::Transport for OhosTransport {
                     .get("location")
                     .and_then(|v| v.to_str().ok())
                     .ok_or("image redirect without a Location")?;
-                url = redirect(get.access, &url, location)?;
-                continue;
+                match redirect(get.access, &url, location) {
+                    Ok(next) => {
+                        redirects.push(next.clone());
+                        url = next;
+                        continue;
+                    }
+                    Err(refusal) => {
+                        return Ok(Fetched::refused(status, refusal).redirected(redirects));
+                    }
+                }
             }
             let headers = CacheHeaders::from_lookup(|name| {
                 let values: Vec<_> = response
@@ -1197,7 +1218,7 @@ impl loader::Transport for OhosTransport {
                 (!values.is_empty()).then(|| values.join(", "))
             });
             if status >= 300 {
-                return Ok(Fetched::new(status, headers, Vec::new()));
+                return Ok(Fetched::new(status, headers, Vec::new()).redirected(redirects));
             }
             let total = response.body().content_length().unwrap_or(0);
             if total > MAX_BYTES {
@@ -1224,7 +1245,7 @@ impl loader::Transport for OhosTransport {
                 bytes.extend_from_slice(&chunk[..count]);
                 (get.progress)(bytes.len() as u64, total);
             }
-            return Ok(Fetched::new(status, headers, bytes));
+            return Ok(Fetched::new(status, headers, bytes).redirected(redirects));
         }
         Err("no image response".into())
     }
